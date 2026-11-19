@@ -59,6 +59,9 @@ concurrency:
 
 permissions:
   contents: read
+  # PAN-367: the changes job's merge-group-verified lookup reads the Actions
+  # API (merge-group runs of this SHA and their jobs) via `gh api`.
+  actions: read
   # pull-requests: read and issues: read are narrowed further at the job
   # level below (codex-clean) -- a job's own permissions: block can only
   # be a SUBSET of what's granted here, never wider. Without these scopes
@@ -77,21 +80,30 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Job gating policy (revised 2026-07-21):
+# Job gating policy (revised 2026-11-19, PAN-367):
 #
-# CI is the AUTHORITATIVE gate. The heavy lanes now run on every PR AND every
-# push to main, so `main` is comprehensively gated regardless of how a change
-# lands (PR merge or — if ever enabled — a direct push). This replaced the old
-# "skip heavy lanes on direct push; the pre-push hook covers it" policy: the
-# local pre-push hook (scripts/check.sh) is now a FAST pre-flight (~5 min) and
-# defers the full test run + examples build to CI here. See scripts/check.sh.
+# CI is the AUTHORITATIVE gate. The heavy lanes run on every PR, every merge
+# group, schedule (weekly drift) and manual dispatch, and on every push to
+# main EXCEPT a push whose commit a successful merge-group CI run already
+# verified at both heavy lanes (Workspace Check + Workspace Tests): the native
+# merge queue fast-forwards main to the group head, so that push re-tests a
+# byte-identical tree ~26-29 s after the merge-group run completed. The
+# `changes` job's merge-group-verified lookup decides and fails closed (any
+# error runs the lanes). A push that changed a cache-key input (manifest,
+# toolchain, .cargo, or this workflow) still runs both lanes — the push run is
+# the only writer of those rust-cache generations. See
+# docs/DECISIONS/config-and-platform.md (PAN-367).
+# The local pre-push hook (scripts/check.sh) is now a FAST pre-flight (~5 min)
+# and defers the full test run + examples build to CI here. See scripts/check.sh.
 #
-#   - clippy + fmt + workspace-check + workspace-tests + deny: every PR + every push
-#     to main + schedule (weekly drift) + manual dispatch — but SKIPPED (not
-#     unfiltered) on docs/report-only diffs via the `changes` job below, so
-#     that traffic doesn't spend CI minutes while the required `CI` check
-#     still always runs and reports (see the `on:` comment above for why this
-#     replaced top-level `paths:` filtering).
+#   - clippy + fmt + deny: every PR + every push to main + schedule + manual
+#     dispatch — but SKIPPED (not unfiltered) on docs/report-only diffs via
+#     the `changes` job below, so that traffic doesn't spend CI minutes while
+#     the required `CI` check still always runs and reports (see the `on:`
+#     comment above for why this replaced top-level `paths:` filtering).
+#   - workspace-check + workspace-tests: same events as the lanes above, and
+#     on push additionally gated on the merge-group verification and its
+#     cache-input exception (PAN-367).
 #   - merge_group: all five Rust lanes, except research/notes-only groups.
 #     A failed scope detector runs every lane.
 #   - cross-platform-check: PR + schedule + dispatch only (macos runners ~10x
@@ -106,7 +118,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      research: ${{ steps.filter.outputs.research }}
       merge_group_notes_only: ${{ steps.merge-group-scope.outputs.notes_only }}
+      merge_group_verified: ${{ steps.merge-group-verified.outputs.verified }}
+      merge_group_run: ${{ steps.merge-group-verified.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -128,6 +143,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
               - '.config/nextest.toml'
+              - 'pancetta-protocol/tests/fixtures/rig-api.v1.schema.json'
               # PAN-284: the Workspace Check lane runs this gate on real bench output.
               - 'scripts/ci/check-criterion-budget.sh'
               # PAN-384: packaging inputs that are not .rs or Cargo.toml
@@ -140,6 +156,87 @@ jobs:
               - 'pancetta-ft8/assets/**'
               - 'pancetta-ft8/*.h'
               - 'pancetta-ft8/vendor/**'
+            # PAN-372: research crate and its direct build inputs.
+            research:
+              - 'pancetta-research/**'
+              - 'pancetta-ft8/**'
+              - 'pancetta-qso/**'
+              - 'pancetta-dsp/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'pancetta-ft8/vendor/ft8_lib'
+              - '.github/workflows/ci.yml'
+            # PAN-367: rust-cache key inputs. A push that changes any of these
+            # still runs the two heavy lanes even when a merge group verified
+            # the tree — the push run is the only writer of those cache
+            # generations (all live caches sit on refs/heads/main), so skipping
+            # would leave PRs restoring a stale generation for up to a week.
+            cache_inputs:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+
+      # PAN-367: a push to main whose exact SHA already passed CI as a merge
+      # group re-tests nothing new: the native merge queue fast-forwards main
+      # to the group head, so the push run lands on a byte-identical tree
+      # 26-29 s after the merge-group run completed (14 of 14 sampled
+      # commits). This step looks up whether a successful merge-group CI run
+      # of github.sha proved the two heavy lanes (job `Workspace Check`
+      # `success` and at least one `Workspace Tests (n/4)` `success` — the
+      # run-level conclusion alone is not proof, a notes-only group is green
+      # with every Rust lane skipped) and, if so, publishes
+      # merge_group_verified=true so those lanes skip on this push only.
+      # Runs on push only: PRs, merge groups, schedule and dispatch leave the
+      # output empty and their lanes run exactly as before. Fails CLOSED:
+      # verified=false is written first, no `set -e`, every error path
+      # records its reason and exits 0, and the lanes' `!= 'true'` gate
+      # treats empty as "run". continue-on-error + the aggregator's unchanged
+      # needs (no `changes`) keep a hard failure here from silently greening
+      # the run.
+      - name: Skip lanes a merge group already verified (PAN-367)
+        id: merge-group-verified
+        if: github.event_name == 'push'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          CACHE_INPUTS: ${{ steps.filter.outputs.cache_inputs }}
+        run: |
+          set -uo pipefail
+          # Fails CLOSED: verified=false is written first; every error path
+          # records its reason and exits 0 (PAN-367, docs/DECISIONS/config-and-platform.md).
+          summary() { printf '%s\n' "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+          if [ "${CACHE_INPUTS:-}" = "true" ]; then
+            summary "push $SHA not skipped: cache-key inputs changed; running the heavy lanes"
+            exit 0
+          fi
+          runs=$(gh api --paginate "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=merge_group&status=success&per_page=100" 2>/dev/null) || {
+            summary "push $SHA not skipped: merge-group run lookup failed (fail closed)"; exit 0; }
+          run=$(jq -rs --arg sha "$SHA" '[.[].workflow_runs[]
+                | select(.event=="merge_group" and .head_sha==$sha and .conclusion=="success")]
+                | sort_by(.created_at) | last // empty | "\(.id) \(.html_url)"' <<<"$runs") || {
+            summary "push $SHA not skipped: could not parse the run list (fail closed)"; exit 0; }
+          [ -n "$run" ] || { summary "push $SHA not skipped: no successful merge-group run of this SHA"; exit 0; }
+          id=${run%% *}; url=${run#* }
+          jobs=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100&filter=latest" 2>/dev/null) || {
+            summary "push $SHA not skipped: job lookup for merge-group run $id failed (fail closed)"; exit 0; }
+          proof=$(jq -rs '[.[].jobs[]] | { wc: ([.[] | select(.name=="Workspace Check" and .conclusion=="success")] | length),
+                wt: ([.[] | select((.name|startswith("Workspace Tests (")) and .conclusion=="success")] | length) }' <<<"$jobs") || {
+            summary "push $SHA not skipped: could not parse the job list (fail closed)"; exit 0; }
+          wc=$(jq -r .wc <<<"$proof"); wt=$(jq -r .wt <<<"$proof")
+          if [ "$wc" -ge 1 ] && [ "$wt" -ge 1 ]; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+            echo "run=$id" >> "$GITHUB_OUTPUT"
+            echo "::notice::already verified in merge group $id ($url)"
+            summary "already verified in merge group $id ($url) -- Workspace Check and Workspace Tests skipped"
+          else
+            summary "push $SHA not skipped: merge-group run $id did not succeed at the heavy lanes (Workspace Check=$wc, Workspace Tests=$wt)"
+          fi
 
       # PAN-172: a merge group whose cumulative diff (base_sha..head_sha covers every PR
       # ahead in the queue plus this one) touches nothing outside research/notes/ has a
@@ -375,7 +472,7 @@ jobs:
           submodules: recursive
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
@@ -423,7 +520,9 @@ jobs:
     name: Workspace Tests (${{ matrix.partition }}/4)
     needs: [changes, codex-clean]
     # See workspace-check's own comment below for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
+    # PAN-367: on push, a merge-group-verified tree skips this lane (see the
+    # changes job's merge-group-verified step); every other event is unchanged.
+    if: always() && ((needs.changes.outputs.code == 'true' && needs.changes.outputs.merge_group_verified != 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -459,7 +558,7 @@ jobs:
           df -h /
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
@@ -474,6 +573,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-tests
 
+      # The completion test validates and loads the generated script.
+      - name: Install zsh (PAN-377 completion check)
+        run: sudo apt-get install -y zsh && zsh --version
+
       - name: Install nextest
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$HOME/.cargo/bin" cargo-nextest
@@ -483,6 +586,8 @@ jobs:
         run: cargo nextest run --profile ci --workspace --exclude pancetta-research --features transmit --no-run
 
       - name: Test workspace partition
+        env:
+          PANCETTA_REQUIRE_ZSH: "1"
         run: cargo nextest run --profile ci --workspace --exclude pancetta-research --features transmit --partition count:${{ matrix.partition }}/4 --no-fail-fast
 
   workspace-check:
@@ -496,7 +601,9 @@ jobs:
     # even though the `changes` condition below explicitly allows it. The
     # `changes`-gate itself is untouched -- that's a real, intentional skip
     # unrelated to codex-clean.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
+    # PAN-367: on push, a merge-group-verified tree skips this lane (see the
+    # changes job's merge-group-verified step); every other event is unchanged.
+    if: always() && ((needs.changes.outputs.code == 'true' && needs.changes.outputs.merge_group_verified != 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     env:
       # Examples and test binaries link a large dependency tree. Full
@@ -537,7 +644,7 @@ jobs:
           df -h /
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
@@ -716,6 +823,31 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check bans licenses sources advisories
+
+  # PAN-372: visible, non-required compile check for the local research crate.
+  # Dependabot PRs skip codex-clean, so this job depends only on changes.
+  research-check:
+    name: Research Check
+    needs: changes
+    if: always() && (needs.changes.outputs.research == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: research-check
+      - name: Check research crate (default features)
+        run: cargo check -p pancetta-research --all-targets
+      - name: Check research crate (research-eval)
+        run: cargo check -p pancetta-research --all-targets --features research-eval
 
   # Summary gate for branch protection. A single "CI" check covers the core
   # lanes so branch-protection only needs to require one check name.

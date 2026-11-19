@@ -584,10 +584,14 @@ const FT8_GRAY_MAP: [u8; 8] = [0, 1, 3, 2, 5, 6, 4, 7];
 /// FT8 Gray code: tone symbol → binary value (inverse of FT8_GRAY_MAP)
 const FT8_GRAY_UNMAP: [u8; 8] = [0, 1, 3, 2, 6, 4, 5, 7];
 
+/// Map a 3-bit binary value (0..7) to its FT8 tone index using
+/// ft8_lib's `kFT8_Gray_map`. Panics if `b` is 8 or more.
 pub fn binary_to_gray(b: u8) -> u8 {
     FT8_GRAY_MAP[b as usize]
 }
 
+/// Map an FT8 tone index (0..7) back to its 3-bit binary value; the
+/// inverse of [`binary_to_gray`]. Panics if `g` is 8 or more.
 pub fn gray_to_binary(g: u8) -> u8 {
     FT8_GRAY_UNMAP[g as usize]
 }
@@ -712,6 +716,7 @@ impl Default for LdpcEncoder {
 }
 
 impl LdpcEncoder {
+    /// Create an encoder for the FT8 LDPC(174,91) code.
     pub fn new() -> Self {
         Self {
             parity_check_matrix: ParityCheckMatrix::new_ft8(),

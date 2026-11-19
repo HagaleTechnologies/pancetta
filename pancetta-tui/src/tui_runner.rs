@@ -185,6 +185,13 @@ pub enum TuiMessage {
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on.
     TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
+    /// Authoritative TX audio drive from the station.
+    TxDriveState {
+        db: f32,
+        ceiling_db: f32,
+        mode: pancetta_core::tx_drive_mode::TxDriveMode,
+        available: bool,
+    },
     /// DX spot
     DxSpot {
         callsign: String,
@@ -508,6 +515,9 @@ pub enum TuiMessage {
         callsign: String,
         score: u32,
         factors: pancetta_qso::priority::PriorityFactors,
+        /// The rescored inputs came from a same-host WSJT-X decode (PAN-381).
+        /// It applies only to a row of the same origin.
+        external: bool,
     },
 }
 
@@ -565,6 +575,12 @@ pub enum TuiCommand {
     /// Coordinator owns the tone-active state; the TUI just sends the
     /// toggle.
     ToggleTune,
+    /// Start a one-shot Tune carrier calibration; h halts it.
+    StartDriveCalibration,
+    /// Adjust station TX audio drive by one signed dB step.
+    AdjustTxDrive { delta_db: i8 },
+    /// Toggle Auto or Manual TX drive on the effective TX band.
+    ToggleTxDriveMode,
     /// Call a station (click-to-call from band activity)
     CallStation {
         callsign: String,
@@ -1082,6 +1098,22 @@ impl TuiRunner {
             }
             TuiMessage::TxMeterCapability(capability) => {
                 app.set_tx_meter_capability(capability);
+                if !capability.alc {
+                    app.tx_drive_available = false;
+                }
+            }
+            TuiMessage::TxDriveState {
+                db,
+                ceiling_db,
+                mode,
+                available,
+            } => {
+                app.tx_drive = Some((db, ceiling_db));
+                app.tx_drive_mode = Some(mode);
+                app.tx_drive_available = available
+                    && app
+                        .tx_meter_capability
+                        .is_none_or(|capability| capability.alc);
             }
             TuiMessage::DxSpot {
                 callsign,
@@ -1383,8 +1415,9 @@ impl TuiRunner {
                 callsign,
                 score,
                 factors,
+                external,
             } => {
-                app.refresh_local_rank(&callsign, score, factors);
+                app.refresh_local_rank_from(&callsign, score, factors, external);
             }
         }
 
@@ -1498,6 +1531,14 @@ impl TuiRunner {
         self.dispatched.push(action);
 
         match action {
+            Action::TxDriveDown | Action::TxDriveUp => {
+                self.message_tx.send(TuiCommand::AdjustTxDrive {
+                    delta_db: if action == Action::TxDriveDown { -1 } else { 1 },
+                })?;
+            }
+            Action::ToggleTxDriveMode => {
+                self.message_tx.send(TuiCommand::ToggleTxDriveMode)?;
+            }
             Action::AckOutOfBand => {
                 app.out_of_band_ack_visible = false;
                 {
@@ -2530,6 +2571,16 @@ impl TuiRunner {
                     self.message_tx.send(TuiCommand::ToggleTune)?;
                 }
             }
+            Action::CalibrateTxDrive => {
+                if !app.tx_policy.allows_any_tx() {
+                    app.set_local_status(
+                        "Can't calibrate — TX is DISABLED (press g to re-enable)".to_string(),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    );
+                } else {
+                    self.message_tx.send(TuiCommand::StartDriveCalibration)?;
+                }
+            }
             Action::FindClearOffset => {
                 // Lowercase t: find and HOLD the best TX offset. Always
                 // picks something (least-congested if nothing is truly
@@ -2932,7 +2983,22 @@ impl TuiRunner {
             // legacy Unix terminals send Ctrl+Enter and Ctrl+M as a plain
             // Enter, which no guard can tell apart.
             Action::ReplyToSelectedCaller => {
-                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+                let selected = app.get_selected_station();
+                // PAN-435: a reply to a caller heard only through a same-host
+                // WSJT-X on another band or mode would key on pancetta's own
+                // dial and mode, where that station is not; refuse it.
+                let refusal = selected.as_ref().and_then(|(callsign, _, _)| {
+                    app.selected_caller()
+                        .filter(|m| {
+                            m.call_sign.as_deref().is_some_and(|c| {
+                                pancetta_core::callsign::callsigns_match(c, callsign)
+                            })
+                        })
+                        .and_then(|m| app.external_decode_refusal(m))
+                });
+                if let Some(text) = refusal {
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                } else if let Some((callsign, frequency, dx_parity)) = selected {
                     let step = app.current_caller_reply_step();
                     let snr = app.selected_caller().map(|m| m.snr as f32);
                     self.message_tx.send(TuiCommand::RespondToCaller {
@@ -4977,6 +5043,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -5507,6 +5574,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             a.callers_scroll = 0;
             assert!(a.get_selected_station().is_some());
@@ -5596,6 +5664,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
         }
         for event in [
@@ -7002,6 +7071,7 @@ mod key_tests {
                 priority_score: None,
                 priority_factors: None,
                 is_own_tx: false,
+                external: false,
             });
             for i in 0..2 {
                 a.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
@@ -7325,6 +7395,24 @@ mod key_tests {
             "Shift+T must not emit ToggleTune while TX is Disabled"
         );
         assert!(app.read().await.status_message().contains("Can't tune"));
+    }
+
+    #[tokio::test]
+    async fn shift_c_emits_start_drive_calibration_only_when_tx_allowed() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::StartDriveCalibration)
+        ));
+        app.write().await.tx_policy = pancetta_core::TxPolicy::Disabled;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app
+            .read()
+            .await
+            .status_message()
+            .contains("Can't calibrate"));
     }
 
     // === PAN-21: global `k` abort ===================================
@@ -7888,16 +7976,16 @@ mod key_tests {
 
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        // Leave enough rows for all bindings and headings, including Shift+L.
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 64));
+        // Leave enough rows for all bindings and headings, including F9.
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 80));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
             crate::keymap::KEYBINDINGS.len() + crate::keymap::Category::ALL.len(),
             "nothing wraps at full width; one heading per group"
         );
-        let buf = render_help(160, 64, 0);
-        let inner = help_inner(160, 64);
+        let buf = render_help(160, 80, 0);
+        let inner = help_inner(160, 80);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -7909,7 +7997,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 64, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 80, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]
@@ -8812,6 +8900,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
@@ -9205,6 +9294,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
             assert!(a.is_engaged("G8KHF"));
@@ -10115,6 +10205,7 @@ mod decode_log_level_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -10282,3 +10373,11 @@ mod pan333_terminal_guard {
 #[cfg(test)]
 #[path = "tui_runner/tests/waterfall_key_tests.rs"]
 mod waterfall_key_tests;
+
+#[cfg(test)]
+#[path = "tui_runner/tests/tx_drive_tests.rs"]
+mod tx_drive_tests;
+
+#[cfg(test)]
+#[path = "tui_runner/tests/external_reply_tests.rs"]
+mod external_reply_tests;

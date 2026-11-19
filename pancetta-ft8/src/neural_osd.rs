@@ -16,7 +16,11 @@ use crate::neural_osd_weights::{
 
 const N_CODEWORD: usize = 174;
 const K_INFO: usize = 91;
+/// Number of belief-propagation iterations whose LLRs form the model's
+/// trajectory input (rows `0..BP_ITERS` of the input).
 pub const BP_ITERS: usize = 25;
+/// Input channels of the model: the `BP_ITERS` LLR rows plus one row of
+/// normalized unsatisfied-parity-check counts.
 pub const IN_CHANNELS: usize = BP_ITERS + 1;
 const CONV1_OUT: usize = 32;
 const CONV2_OUT: usize = 16;

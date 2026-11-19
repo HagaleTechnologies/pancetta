@@ -47,6 +47,18 @@ a single file at `~/.pancetta/pancetta.toml`, and run
 `pancetta config --validate` to see which file(s) were read. A table only
 needs the keys you change; every key you leave out keeps its default.
 
+With `--data-dir <DIR>` and no `--config`, pancetta searches only `DIR` for
+those four file names. It does not merge the current directory, the
+system directories, `~/.pancetta` or `~/.config/pancetta`, so a second
+station never picks up the first station's config. `PANCETTA_*`
+environment overrides still apply. With both `--config <path>` and
+`--data-dir <DIR>`, pancetta reads the `--config` file, and `DIR` holds
+everything else (logbook, logs, keys, upload queue). `--data-dir` is a
+global flag, so it works before or after a subcommand. A leading `~`
+expands to your home directory even when the shell does not expand it,
+and a relative path is resolved against the current directory. See
+[Running a second station](#running-a-second-station).
+
 ---
 
 ## Minimum viable config
@@ -134,6 +146,31 @@ Fresh generated configs omit it. This setting never applied automatic gain.
 input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
+`[audio.levels].output_gain_db` controls transmitted audio drive relative to
+the former fixed level of 0.5 full scale. It defaults to 0 dB and remains the
+station-wide value when automatic drive is disabled. F7/F8 change drive in
+1 dB steps and select Manual for the current band when automatic drive is on.
+F9 toggles Auto and Manual for that band. `output_gain_floor_db` defaults to
+-20 dB and may be set between -20 dB and the ceiling.
+`output_gain_ceiling_db` defaults to 0 dB and may be
+set from -20 to +5 dB. A positive ceiling reserves headroom for FT audio
+(single frames and bundles, both normalized to a 0.95 peak) before the
+selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
+0 dB are quieter than the original baseline in that mode; Tune is not
+reserved. A finite legacy gain outside the selectable
+range starts at the nearest bound with a warning. Invalid or non-finite
+ceilings and non-finite gain values fail config validation.
+
+`[audio.auto_drive]` enables per-band automatic drive by default. Its defaults
+are `enabled = true`, `alc_onset = 0.10`, `step_up_db = 0.5`,
+`step_down_db = 2.0`, and `start_db = -6.0`. A band without learned drive
+starts at the bounded `start_db`. Valid ALC below the onset permits a slow
+increase; confirmed ALC above `[rig.power_control.protection].max_alc` backs
+drive off. Values between onset and limit hold drive. `alc_onset` must be below
+the effective ALC limit while automatic drive is enabled. All numeric settings
+must be finite, and step magnitudes must be positive. Config edits apply at
+restart. A rig without ALC readback cannot train automatic drive.
+
 ### `[audio.recording]` — save decode windows as WAV (off by default)
 
 Pancetta can save every live decode window it hands the decoder as a WAV
@@ -149,7 +186,7 @@ directory = "~/.pancetta/recordings"
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
-| `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+| `directory` | string | `""` | Where recordings go. Omitted or empty uses `<data-dir>/recordings` (`~/.pancetta/recordings` by default). Pancetta creates the directory if needed and expands a leading `~` to your home directory (`~user` is not expanded). |
 | `raw_capture_minutes` | integer | `0` | Minutes of raw 48 kHz capture after each start, one WAV per FT8 slot, into `raw48/` inside `directory`. `0` is off. Needs `auto_record = true` and `[audio] sample_rate = 48000`. |
 
 - Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
@@ -173,9 +210,9 @@ directory = "~/.pancetta/recordings"
 **Station decoder corpus.** The corpus offload job (magazzino
 `clients/pancetta-wav-offload.sh`) and the decoder research tools
 (`curate --source-dir ~/.pancetta/recordings`, see docs/RUNBOOK.md) read
-`~/.pancetta/recordings`. A station that feeds them must set both keys as
-shown above. `auto_record = true` on its own records into the default
-`~/Documents/Pancetta/Recordings`, which nothing collects.
+`~/.pancetta/recordings`. A station using the default data directory only
+needs `auto_record = true`. With a custom data directory, point the tools
+at that station's recordings or set `directory` explicitly as shown above.
 
 **Raw 48 kHz capture.** For decimation studies, pancetta can also keep the
 raw capture stream, before it is decimated to 12 kHz, for a set time after
@@ -637,11 +674,86 @@ atno_bonus             = 0.15   # extra premium on top of needed_dxcc for an
   bias, DX-proximity window, own-QSO separation, neighbor guard).
 - `[autonomous.listen_cycle]` — adaptive forced-listen-slot cadence for
   collision detection.
-- `[autonomous.band_hopping]` — off by default; ordered band list with a
-  low-activity hop threshold.
 
-Defaults for all three live in `Config::default()`; see
+Defaults for both live in `Config::default()`; see
 `pancetta-config/src/autonomous.rs` for every field with doc comments.
+
+### `[autonomous.band_hopping]` — automatic band changes
+
+Off by default. When enabled, the autonomous operator changes band on its
+own for three reasons, checked every slot in this order: a UTC plan window
+starting (`[[autonomous.band_plan]]`, below), needed activity spotted on
+cqdx.io, and the low-activity round-robin over `bands`. A hop never happens
+while the rig is keyed or while a QSO partner has answered; it waits and is
+re-evaluated next slot. Each hop writes one line, naming its trigger, to the
+Diagnostics overlay (Shift+D). Every key is restart-required.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch for every automatic band change, including `[[autonomous.band_plan]]`. |
+| `hop_threshold` | integer | `20` | Slots with no decodes before a low-activity hop; also the hop interval (`hop_threshold` slots, 5 min by default) that a needed-activity hop waits before another one. Must be at least 1. |
+| `needed_activity` | boolean | `true` | Hop toward a band where cqdx.io spots more needed FT8/FT4 entities (all-time new ones first). Needs cqdx configured; inert without its data. |
+| `needed_idle_secs` | integer | `600` | Seconds with no needed caller (a decoded CQ tiered new-DXCC-on-band or better) heard on the current band before a `needed_activity` hop. |
+| `grey_line` | boolean | `true` | Within 30 min of local sunrise or sunset (computed from the station grid square), prefer bands below 14 MHz when needed-activity candidates tie, and on a plan window's start pick its first band below 14 MHz. |
+
+`bands` is the ordered list of `[[autonomous.band_hopping.bands]]` entries
+(`band_name`, `dial_frequency`, `priority`). Each `dial_frequency` must fall
+inside an amateur band.
+
+### `[[autonomous.band_plan]]` — UTC band plan
+
+Optional, empty by default, restart-required, and used only when
+`[autonomous.band_hopping]` `enabled = true` (otherwise loading warns that
+the plan is not used). Each window names the bands to work during a UTC
+time of day:
+
+```toml
+[autonomous.band_hopping]
+enabled = true            # master switch for every automatic band change
+hop_threshold = 20        # silent slots before a low-activity hop; also the hop interval
+needed_activity = true    # hop toward needed entities spotted on cqdx.io
+needed_idle_secs = 600    # no needed caller heard on this band for this long first
+grey_line = true          # near sunrise/sunset prefer bands below 14 MHz on a tie
+
+[[autonomous.band_hopping.bands]]
+band_name = "20m"
+dial_frequency = 14074000
+priority = 1
+
+[[autonomous.band_hopping.bands]]
+band_name = "17m"
+dial_frequency = 18100000
+priority = 2
+
+[[autonomous.band_plan]]
+utc = "00:00-06:00"        # start inclusive, end exclusive
+bands = ["40m", "80m"]     # preference order
+
+[[autonomous.band_plan]]
+utc = "06:00-24:00"
+bands = ["20m", "17m"]
+```
+
+- `utc` is `HH:MM-HH:MM`, start inclusive and end exclusive. A start later
+  than the end wraps midnight (`"22:00-02:00"`); `24:00` is allowed as an
+  end (`"18:00-24:00"`, `"00:00-24:00"`). Start and end must differ.
+- `bands` is a non-empty list of canonical lowercase band names (`"160m"`
+  to `"6m"`), in preference order. Each band needs an FT8 dial frequency or
+  a `[[autonomous.band_hopping.bands]]` entry on that band; a configured
+  entry's `dial_frequency` wins over the standard FT8 dial.
+- Windows are matched in file order, first match wins. Time not covered by
+  any window has no plan constraint.
+- A window acts on entry only. When UTC enters a window (or at startup
+  inside one) and the rig is not on one of its bands, the operator hops to
+  the first listed band, or, with `grey_line` on near local sunrise or
+  sunset, to the first listed band below 14 MHz (the Diagnostics line then
+  ends `grey-line sunrise favours 40m`). A manual QSY inside the window is left alone
+  until the next window starts.
+- While a window is active, needed-activity and low-activity hops choose
+  only among its bands.
+
+This is not `[rig.frequency.band_plan]`, which sets the band edges TX is
+allowed within (PAN-118).
 
 ### `[duplicate_checking]` — don't call the same station twice
 
@@ -697,21 +809,24 @@ without asking for it. See `docs/observability-diagnostics-plan.md`
 
 ---
 
-### `[logging]` — attribution comment in logged contacts
+### `[logging]` — attribution comment and N1MM UDP in logged contacts
 
 ```toml
 [logging]
 attribution_comment = false
+# n1mm_udp = "127.0.0.1:12060"
 ```
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `attribution_comment` | bool | `false` | Append the Pancetta/cqdx software attribution to new ADIF comments. |
+| `n1mm_udp` | string | absent | IP address and port that receives one N1MM Logger+ contactinfo datagram per logged QSO. Absent or blank: off. Hostnames are rejected. Never sent under --replay. See [INTEROP.md](INTEROP.md). |
 
-This covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads and WSJT-X LoggedADIF.
-Operator notes and the HOUND marker are always preserved. The cqdx.io JSON
-upload and `pancetta export` do not add attribution. Existing records are not
-rewritten. Changes require a restart.
+Attribution covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads, WSJT-X
+LoggedADIF and the N1MM contactinfo comment. Operator notes and the HOUND
+marker are always preserved. The cqdx.io JSON upload and `pancetta export` do
+not add attribution. Existing records are not rewritten. Both settings require
+a restart.
 
 ## `[network]` — external services
 
@@ -1048,13 +1163,15 @@ JTAlert, and most loggers already consume — decodes, status, and logged
 QSOs show up live with zero work on the companion app's side. It can
 also *consume* the protocol's Reply/HaltTx requests, which is what makes
 a GridTracker double-click call a station on pancetta's behalf. Default
-**off** end to end: `enabled = false` binds no socket and emits nothing.
+**off** end to end: `enabled = false` binds no companion-broadcast socket and
+emits nothing, and `accept_decodes = false` binds no decode listener.
 See `docs/GUIDE.md`'s "…use GridTracker with pancetta?" section for the
-same-host and cross-machine setup recipes.
+same-host and cross-machine setup recipes, and its "…feed WSJT-X's decodes
+into pancetta?" section for the decode listener.
 
 ```toml
 [network.wsjtx_udp]
-enabled = false                     # master: emit nothing, bind nothing
+enabled = false                     # companion broadcast: emit nothing, bind nothing
 destination = "127.0.0.1:2237"      # unicast host:port or multicast group:port
 multicast_interface = ""            # LAN IP to send multicast from ("" = OS default)
 multicast_ttl = 3                   # only used for multicast destinations
@@ -1062,11 +1179,13 @@ instance_id = "WSJT-X - pancetta"   # the protocol Id field
 accept_udp_requests = false         # master switch for ALL inbound processing
 allow_tx_initiation = false         # Reply(4) may start a QSO (arm-gated, see below)
 allowed_request_hosts = []          # required for multicast inbound; unicast infers the peer
+accept_decodes = false              # listen for a same-host WSJT-X's Decode/Status datagrams
+decode_listen = "127.0.0.1:2238"    # loopback address:port WSJT-X's UDP Server points at
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch. `false` ⇒ no socket is ever bound and nothing is emitted. |
+| `enabled` | bool | `false` | Companion-broadcast switch (pancetta in the WSJT-X role). `false` ⇒ the companion-broadcast socket is never bound and nothing is emitted. The decode listener has its own switch, `accept_decodes`. |
 | `destination` | string | `"127.0.0.1:2237"` | Where pancetta sends. A unicast `host:port` for a same-host or point-to-point companion, or a multicast group `address:port` (e.g. `"224.0.0.73:2237"`) to reach multiple companions / another machine. |
 | `multicast_interface` | string | `""` | Local LAN interface IP to send multicast from. `""` = OS default (which is typically loopback-only — cross-host multicast needs this set to your real NIC's IP). Only used when `destination` is a multicast group. |
 | `multicast_ttl` | integer (`u32`) | `3` | IP multicast TTL/hop-limit. Only used for multicast destinations; GridTracker uses `3` for its own sends, so `3` is a safe match. |
@@ -1074,10 +1193,50 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 | `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
 | `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `[network.station_agent].remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
 | `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (the configured destination host must also pass source-port pinning below) and this list is unused. |
+| `accept_decodes` | bool | `false` | Listen on `decode_listen` for a same-host WSJT-X's Decode(2) and Status(1) datagrams (PAN-381). Live decodes are shown in Band Activity and DX Hunter tagged `EXT` and scored like pancetta's own; display and scoring only, they never start a transmission. Independent of `enabled`: the listener runs whether or not the companion broadcast is on. Restart required. |
+| `decode_listen` | string | `"127.0.0.1:2238"` | Loopback `address:port` WSJT-X's UDP Server is pointed at. Checked only when `accept_decodes = true`: it must be an IP address and port, a loopback address (`127.0.0.1` or `[::1]`), a fixed (non-zero) port, and must differ from `destination`. Restart required. |
 
 `destination` must parse as a valid `host:port` socket address, and
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
+
+#### WSJT-X decode listener (PAN-381)
+
+With `accept_decodes = true`, pancetta binds a second, receive-only UDP socket
+on `decode_listen` and never sends a datagram from it. Point WSJT-X's
+**Settings → Reporting → UDP Server** at that address and port. The listener
+learns WSJT-X's dial from its Status datagrams and drops every Decode until
+that WSJT-X instance has sent a Status with a non-zero dial; there is no
+fallback to pancetta's own dial. It keeps only live, confident FT8 (`~`) and
+FT4 (`+`) decodes: replays (`New = false`), `.wav` decodes, low-confidence
+decodes, other modes and datagrams carrying pancetta's own `instance_id` are
+dropped silently. At most 250 decodes are accepted per 15 s window.
+
+An accepted decode reaches the TUI only. Band Activity shows `EXT` before
+its message; DX Hunter's Src column shows `EXT` (heard only through WSJT-X)
+or `EX+N` (heard through WSJT-X and spotted on the network). As soon as
+pancetta's own decoder hears the station, the row becomes `RX` or `RX+N`.
+It is scored by the same priority scorer as a native decode, banded by
+WSJT-X's Status dial. It never reaches the QSO engine, the autonomous
+operator, alerts, PSKReporter, the remote gateway or the WSJT-X re-emit.
+
+Validation runs at load only when `accept_decodes = true`:
+
+```
+network.wsjtx_udp.decode_listen 0.0.0.0:2238 is not a loopback address; the decode listener accepts only a same-host WSJT-X, so bind to 127.0.0.1 or [::1]
+network.wsjtx_udp.decode_listen needs a fixed port (got 0) so WSJT-X can be pointed at it
+network.wsjtx_udp.decode_listen must differ from network.wsjtx_udp.destination (127.0.0.1:2237), or pancetta would receive its own datagrams
+Invalid configuration value: network.wsjtx_udp.decode_listen = localhost:2238
+```
+
+Diagnostics go to the Shift+D overlay under target `remote.wsjtx`: one Info
+line when the listener binds, one Warn line when it cannot bind (the station
+keeps running with WSJT-X decodes off), and at most one summary per 60 s when
+datagrams were dropped for an operator-actionable reason, for example
+`WSJT-X decode listener dropped 4 datagrams in the last 60 s: 4 before WSJT-X sent a Status`
+(Info when the only reason is a missing Status, Warn otherwise). Headless
+mode and `--replay` do not start the listener; each writes one log line.
+Both keys need a restart to take effect.
 
 #### WSJT-X UDP admission and Replay (PAN-312)
 
@@ -1527,7 +1686,7 @@ revocation does not depend on cqdx availability.
 
 - Autonomous `slot_parity`, `needed_means`, `unattended_policy`,
   `max_concurrent_qsos`, `tx_offset_hz`, `qso_stall_switch_after`, `frequency.*`,
-  `listen_cycle.*`, `band_hopping.*` and `priorities.*`.
+  `listen_cycle.*`, `band_hopping.*`, `band_plan` and `priorities.*`.
 - Station identity and `power_watts` (log metadata), and every rig setting
   except receive gain presets, including hardware bindings, band plans and
   protection settings.
@@ -1566,7 +1725,12 @@ To revoke a suspect remote client step by step, see
 
 ## Pancetta data files
 
-All persistent state lives under `~/.pancetta/`.
+All persistent state lives in the data directory: `~/.pancetta/` unless
+`--data-dir` names another. The paths below use `~/.pancetta/`; with
+`--data-dir`, the same files are in that directory instead. An explicit
+`[network.station_agent] key_dir` or `audit_log_path`, `[audio.recording]
+directory` or `[database] adif_backup_directory` still wins over the data
+directory, and `~` inside a config value still means your home directory.
 
 Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
 Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
@@ -1583,7 +1747,9 @@ and external keys.
 | `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
 | `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
-| `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
+| `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. This is the per-write lock. | Yes — safe to delete while nothing runs. |
+| `~/.pancetta/pancetta.lock` | An empty file. A running station (no subcommand, or `run`) locks it from startup until it exits, so a second station on the same data directory refuses to start with `another pancetta is running (pid N)`. Subcommands such as `import`, `export` and `doctor`, `--wav` and `--replay` never take it. The operating system releases the lock when the station exits or crashes. | Never delete it while a station runs. Safe to delete while nothing runs. |
+| `~/.pancetta/pancetta.pid` | The process id of the last station that took `pancetta.lock`. The refusal message reads it. It goes stale after that station exits, and the next station overwrites it. | Yes, safe to delete. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
 | `~/.pancetta/backups/qsos_adi_YYYYMMDD_HHMMSS_microseconds.adi` | Changed startup snapshots of the ADIF source. Seven kept by default, configurable under `[database]`. | Contains contacts only through the latest snapshot. |
 | `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only; ADIF snapshots have independent retention. | Yes — same recovery path as `qso.db`. |
@@ -1605,6 +1771,58 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 `--dry-run` to preview). It appends only the contacts you don't already have
 and backs up `qsos.adi` first. Do not copy another logger's file over
 `qsos.adi`: that replaces your own contacts.
+
+### Running a second station
+
+Give each station its own data directory. For example, to run a 40 m
+station beside the 20 m station that uses `~/.pancetta`, create its
+config first:
+
+```bash
+pancetta --data-dir ~/.pancetta-40m setup
+pancetta --data-dir ~/.pancetta-40m config --validate
+```
+
+Then start it:
+
+```bash
+pancetta --headless --data-dir ~/.pancetta-40m
+```
+
+That station keeps its config, logbook, logs, station keys and upload
+queue in `~/.pancetta-40m`:
+
+```
+~/.pancetta-40m/
+  pancetta.toml          config (unless --config names another file)
+  pancetta.lock          locked by the running station; never delete it while a station runs
+  pancetta.pid           pid of the last station that took the lock
+  qsos.adi  qsos.adi.lock  qso.db*  imports/  backups/
+  logs/
+  agent/  agent-audit.log
+  upload_outbox.json
+  session_state.json  tui_state.json  tx-log.jsonl*  tier_cache.json
+  contest_serial.txt  callsign_seed.txt  recordings/
+```
+
+Each data directory runs one station at a time. A second station started
+on a directory that already has one running exits with status 1 and
+prints:
+
+```
+Error: another pancetta is running (pid 4242) with data directory /home/op/.pancetta
+Stop it first, or give this station its own directory with --data-dir.
+```
+
+Two spellings of one directory (a relative path, `..`, a symlink) still
+point at one lock file, so they are refused too. Maintenance commands run
+beside a station on the same directory, for example
+`pancetta --data-dir ~/.pancetta-40m export`. Commands that print a
+follow-up command, such as `config --validate` and `identity`, include
+`--data-dir` in it when you gave one.
+
+The two stations still need separate rigs, audio devices and listener
+ports. Pancetta does not check those.
 
 ### TX log
 
@@ -1651,11 +1869,9 @@ for this file.
 ### Decode-window recordings
 
 Decode-window WAVs exist only on a station whose config sets
-`[audio.recording] auto_record = true`, and land in
-`audio.recording.directory` (see the `[audio.recording]` section above).
-The station decoder corpus — the magazzino offload job and the
-`pancetta-research` curation tools — reads `~/.pancetta/recordings`, so a
-corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
+`[audio.recording] auto_record = true`. They land in `<data-dir>/recordings`
+unless `audio.recording.directory` names a path (see the `[audio.recording]`
+section above).
 Releases before this setting existed recorded every window into
 `~/.pancetta/recordings` unconditionally; upgrading does not touch those
 files, and deleting them reclaims the space (the directory was capped at

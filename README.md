@@ -272,6 +272,8 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 
 | Command | What it does |
 |---|---|
+| `pancetta --version` | Version, commit, build date and target, e.g. `pancetta 0.9.6 (50e5208 2026-11-18 x86_64-unknown-linux-gnu)`. Paste it into bug reports. |
+| `pancetta completions zsh` | Print a zsh completion script for every subcommand and flag ([Shell completions](#shell-completions)). |
 | `pancetta` | Run the station (TUI). First run launches the setup wizard. |
 | `pancetta doctor [--json]` | Station prerequisites and fixes. Exit 0: ON-AIR READY; 1: DECODE-ONLY; 2: NOT CONFIGURED; 3: NOT READY. JSON includes all checks. |
 | `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
@@ -289,6 +291,21 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
 | `pancetta --headless --log-format json` | The same, with one JSON object per log line on stderr and in the log file (for journald, jq or a log shipper). |
 | `pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain.json` | Measure per-band receive gain and save an advisory report. [Limits and timing](docs/receive-gain-sweep.md). |
+
+### Shell completions
+
+`pancetta completions zsh` prints a zsh completion script generated from the
+binary's own command line, so it always matches the installed version.
+Save it as `_pancetta` in a directory on your `fpath`:
+
+    mkdir -p ~/.zfunc
+    pancetta completions zsh > ~/.zfunc/_pancetta
+    # in ~/.zshrc, before compinit:
+    fpath=(~/.zfunc $fpath)
+    autoload -U compinit && compinit
+
+or add `source <(pancetta completions zsh)` to `~/.zshrc` after `compinit`.
+Regenerate the file after upgrading. Only zsh is supported for now.
 
 ### LoTW confirmations
 
@@ -352,14 +369,19 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | Tier-based pouncing, decode alerts and editable watchlist | Implemented, *Unreleased* | Optional tier admission; bell, ntfy and webhook alerts; persistent pins edited with Shift+W. No live notification-service or on-air qualification | [configuration](docs/CONFIG.md#dx-tiers-alerts-and-watchlist) |
 | CQ DX and regional CQ modifiers in autonomous pouncing | Integration-tested, *Unreleased* | PAN-292: skips a same-continent CQ DX and a CQ NA/SA/EU/AS/AF/OC for another continent; unresolvable calls are answered; manual and spot calls unchanged. No on-air run recorded | [autonomous operator](pancetta-qso/src/autonomous.rs) |
+| Autonomous band scheduler (UTC plan, needed activity, grey-line) | Integration-tested, *Unreleased* | PAN-385: `[[autonomous.band_plan]]` windows, hops toward needed entities spotted on cqdx.io and a grey-line tie-break, never while keyed or mid-exchange. Automated coverage only; no on-air run recorded, and cqdx needed-activity data is unverified against the live API | [configuration](docs/CONFIG.md#autonomousband_plan--utc-band-plan) |
 | Needed, ATNO, band-slot, mode and confirmed status from the local logbook | Integration-tested, *Unreleased* | Answers when cqdx.io has not; confirmations come from QSL_RCVD and LOTW_QSL_RCVD in qsos.adi, including LoTW report imports; opt-in `needed_means = "unconfirmed"` uses local confirmations even with cqdx loaded; the remote client still shows cqdx-only needed | [local logbook needs](pancetta/tests/local_logbook_needs.rs) |
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
+| FT8 Fox mode (DXpedition) | Integration-tested, *Unreleased* | PAN-386: Shift+X; CQ and Hound streams on 60 Hz slots in 300-900 Hz; RR73 to one Hound and a report to another share one type 0.1 frame; a Hound is logged when its RR73 airs. Decoded by pancetta's native and ft8_lib decoders only; no WSJT-X Hound or on-air run recorded. SuperFox not supported | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT. Optional `rig.data_mode` applies the CAT mode before TX at connection and after commanded retunes; this new option is hardware-unverified. Omit it for manual rig-mode control. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
 | SWR protection | Integration-tested, *Unreleased* | Halts all TX after high-SWR keyed time reaches `swr_trip_delay_ms` (default 5000 ms; `0` trips on the first high reading) above `max_swr` (default 3.0). High keyed time accumulates across transmissions; unkeyed time does not count. A reading at or below the limit resets it, as does more than two minutes without a high reading. CAT support is required; real-rig trip qualification is pending | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | TX metering and ALC overdrive warning | Integration-tested, *Unreleased* | While keyed, Shift+S shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Needs a Hamlib backend that reports ALC and RFPOWER_METER; real-rig qualification is pending | [TX meter](pancetta/src/coordinator/tx_meter.rs) |
+| Live TX audio drive | Implemented, *Unreleased* | F7/F8 change TX audio drive in 1 dB steps from the station TUI, including over SSH. The chosen value is saved in `audio.levels.output_gain_db` and applies to the next FT transmission or Tune. Hardware qualification is pending | [drive](pancetta/src/coordinator/tx_drive.rs) |
+| Automatic per-band TX drive | Implemented, *Unreleased* | A completed FT burst with CAT ALC can raise clean drive by 0.5 dB, hold at the ALC onset, or lower overdriven drive by 2 dB. Each band retains its selected gain and Auto/Manual mode across restarts. F7/F8 select Manual and F9 toggles Auto/Manual. Hardware qualification is pending | [drive](pancetta/src/coordinator/tx_drive.rs) |
+| One-shot TX drive calibration | Implemented, *Unreleased* | Shift+C runs a bounded Tune carrier sweep from the drive floor, saves one step below ALC onset for the current band, and refuses without a known ALC meter or TX permission. Hardware qualification is pending | [drive calibration](pancetta/src/coordinator/tx/drive_calibration.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
 | Config changes while running | Implemented, *Unreleased* | Selected autonomous policy, TX timing and receive gain presets apply live, alongside remote-access consent and revocations; hardware bindings and other keys need restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
 | ClubLog, QRZ Logbook upload | Integration-tested, *Unreleased* | Opt-in. Local mock server only; no live-account run recorded. ClubLog, QRZ Logbook, LoTW, eQSL and cqdx.io uploads use a persistent outbox (`~/.pancetta/upload_outbox.json`, unreleased): transient failures retry on `[network.reliability.retry]`, then every five minutes; login rejection pauses a destination for the session; record rejection holds that entry until restart; startup drains pending entries. Local ADIF remains the durable log | [upload clients](pancetta-dx/src/qso_upload.rs), [upload outbox](pancetta/src/coordinator/upload_outbox.rs) |
@@ -372,10 +394,12 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info. Queue bounds and datagram chunking are tested; live delivery is unverified | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
-| WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
+| WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status; inbound WSJT-X Decode display (*Unreleased*, PAN-381): loopback listener, display and scoring only; not yet checked against a real WSJT-X; [compatibility](docs/INTEROP.md) | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
+| N1MM contactinfo UDP | Integration-tested, *Unreleased* | Opt-in `[logging] n1mm_udp`: one datagram per logged QSO to one IP address and port; never under --replay. Local sockets only; no logger checked yet ([compatibility](docs/INTEROP.md)) | [N1MM emitter](pancetta/src/coordinator/n1mm_udp.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import and entity enrichment *Unreleased* | Offline COUNTRY/DXCC/CQZ/ITUZ inference uses prefix and exact-call zone overrides. Stored fields take precedence individually; unresolved calls gain no inferred fields. Old rows can gain fields on export; existing files are not rewritten. Automated coverage; live qualification pending. Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
+| Separate data directories and one station per directory (`--data-dir`) | Integration-tested, *Unreleased* | PAN-376: config, logbook, logs, keys and upload queue live in the `--data-dir` directory (default `~/.pancetta`); a second live station on one directory refuses with `another pancetta is running (pid N)`. Linux CI only; Windows lock and paths compile-checked, not run; macOS relaunch with `--data-dir` unverified | [data directory](pancetta/tests/data_dir_cli.rs), [instance lock](pancetta/tests/instance_lock_cli.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station; compile-checked for `x86_64-pc-windows-gnu` on every code PR). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 
 ### Platform archive evidence

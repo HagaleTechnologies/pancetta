@@ -197,8 +197,11 @@ pub enum QsoApProgress {
 /// Own callsign encoded for AP injection.
 #[derive(Debug, Clone)]
 pub struct MyCallAp {
+    /// The callsign as given to [`MyCallAp::new`].
     pub callsign: String,
+    /// The callsign's standard 28-bit packed value (`pack28`).
     pub packed_28: u32,
+    /// `packed_28` as 28 bits, most significant bit first.
     pub bits: [bool; 28],
 }
 
@@ -218,9 +221,14 @@ impl MyCallAp {
 /// A recently-heard callsign, used for AP2 injection.
 #[derive(Debug, Clone)]
 pub struct RecentCallAp {
+    /// The callsign as given to [`RecentCallAp::new`].
     pub callsign: String,
+    /// The callsign's standard 28-bit packed value (`pack28`).
     pub packed_28: u32,
+    /// `packed_28` as 28 bits, most significant bit first.
     pub bits: [bool; 28],
+    /// SNR in dB given to [`RecentCallAp::new`]; the coordinator passes the
+    /// SNR of the decode the callsign was heard in.
     pub last_snr: f32,
 }
 
@@ -249,9 +257,13 @@ impl RecentCallAp {
 /// performed (or wasn't applicable for this state).
 #[derive(Debug, Clone)]
 pub struct QsoAp {
+    /// The QSO partner's callsign as given to [`QsoAp::new`].
     pub their_call: String,
+    /// The partner callsign's standard 28-bit packed value (`pack28`).
     pub their_packed_28: u32,
+    /// `their_packed_28` as 28 bits, most significant bit first.
     pub their_bits: [bool; 28],
+    /// Which message the QSO is waiting for next from the partner.
     pub progress: QsoApProgress,
     /// a8 sequenced-QSO-state AP candidate set: small list of expected
     /// next partner messages (canonical FT8 text, e.g.

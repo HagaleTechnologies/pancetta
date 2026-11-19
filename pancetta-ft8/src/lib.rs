@@ -105,7 +105,7 @@
 //! # }
 //! ```
 
-#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
+#![deny(missing_docs)]
 #![allow(dead_code, unused_imports)]
 
 // Protocol abstraction layer (FT8/FT4/FT2)
@@ -229,8 +229,8 @@ pub use sync::{SyncResult, TimeSync};
 // Encoder and modulator exports (every build)
 pub use encoder::{Ft8Encoder, Ft8EncodingConfig};
 pub use modulator::{
-    convert_samples, modulate_multi_tx, AudioFormat, Ft8Modulator, ModulatorConfig, MultiTxItem,
-    PulseShape, SampleType,
+    convert_samples, modulate_multi_tx, modulate_multi_tx_with_guard, AudioFormat, Ft8Modulator,
+    ModulatorConfig, MultiTxItem, PulseShape, SampleType,
 };
 // Audio/PTT transmitter exports (`transmit` feature)
 #[cfg(feature = "transmit")]
@@ -276,32 +276,64 @@ pub type Ft8Result<T> = Result<T, Ft8Error>;
 /// Errors that can occur during FT8 processing
 #[derive(Error, Debug)]
 pub enum Ft8Error {
+    /// The configured sample rate is not the one the decoder runs at.
     #[error("Invalid sample rate: expected {expected}, got {actual}")]
-    InvalidSampleRate { expected: u32, actual: u32 },
+    InvalidSampleRate {
+        /// Sample rate the decoder requires, in Hz.
+        expected: u32,
+        /// Sample rate that was supplied, in Hz.
+        actual: u32,
+    },
 
+    /// An audio window holds fewer samples than one full transmission needs
+    /// (`ProtocolParams::total_samples`).
     #[error("Invalid window size: expected {expected}, got {actual}")]
-    InvalidWindowSize { expected: usize, actual: usize },
+    InvalidWindowSize {
+        /// Minimum number of samples required.
+        expected: usize,
+        /// Number of samples supplied.
+        actual: usize,
+    },
 
+    /// An FFT step failed; the string describes the failure.
     #[error("FFT processing error: {0}")]
     FftError(String),
 
+    /// A signal-processing step failed; the string describes the failure.
     #[error("Signal processing error: {0}")]
     SignalProcessingError(String),
 
+    /// A message could not be decoded or unpacked, or the LDPC encoder
+    /// rejected an input length; the string describes why.
     #[error("Message decoding error: {0}")]
     MessageDecodingError(String),
 
+    /// Time synchronization failed; the string describes why.
     #[error("Time synchronization error: {0}")]
     SyncError(String),
 
+    /// A configuration value was invalid, or an audio output stream could
+    /// not be built or started; the string describes which.
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
+    /// Fewer samples were available than the operation needs.
     #[error("Insufficient data: need {needed} samples, got {available}")]
-    InsufficientData { needed: usize, available: usize },
+    InsufficientData {
+        /// Number of samples the operation needs.
+        needed: usize,
+        /// Number of samples that were available.
+        available: usize,
+    },
 
+    /// An input buffer had the wrong length (for example symbols or LLRs).
     #[error("Invalid data size: expected {expected}, got {actual}")]
-    InvalidDataSize { expected: usize, actual: usize },
+    InvalidDataSize {
+        /// Length the operation requires.
+        expected: usize,
+        /// Length that was supplied.
+        actual: usize,
+    },
 }
 
 /// Performance metrics for FT8 decoding

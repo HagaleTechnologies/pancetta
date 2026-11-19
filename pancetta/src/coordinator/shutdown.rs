@@ -243,6 +243,27 @@ impl super::ApplicationCoordinator {
         };
         tokio::join!(direct, drain);
 
+        // Persist the latest learned drive after the TX worker stops. This
+        // also retries a failed background write without delaying unkey.
+        if self.tx_drive.needs_persist() {
+            let record = self.session_record.clone();
+            let path = self.session_state_path.clone();
+            let drive = self.tx_drive.clone();
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || {
+                    super::session_state::persist_tx_drive_current(&record, &path, &drive)
+                }),
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => (),
+                Ok(Ok(Err(error))) => warn!("Shutdown: could not save TX drive: {error}"),
+                Ok(Err(error)) => warn!("Shutdown: TX drive save task failed: {error}"),
+                Err(_) => warn!("Shutdown: TX drive save timed out"),
+            }
+        }
+
         // Both unkey paths have finished before gain restoration or rig teardown.
         let sweep_result = if let Some(handle) = sweep_handle {
             handle

@@ -108,6 +108,24 @@ pub(super) const SCENARIOS: &[Scenario] = &[
         rich: true,
         setup: waterfall_setup,
     },
+    // PAN-435: the rich fixture's G8KHF decode heard only through a
+    // same-host WSJT-X (PAN-381), on another band (refused), or on
+    // pancetta's own band and mode (acted on).
+    Scenario {
+        name: "rich/band/ext-off-band",
+        rich: true,
+        setup: |a| ext_setup(a, ActivePanel::BandActivity, 7.074),
+    },
+    Scenario {
+        name: "rich/callers/ext-off-band",
+        rich: true,
+        setup: |a| ext_setup(a, ActivePanel::Callers, 7.074),
+    },
+    Scenario {
+        name: "rich/callers/ext-on-band",
+        rich: true,
+        setup: |a| ext_setup(a, ActivePanel::Callers, 14.074),
+    },
     Scenario {
         name: "rich/band/zoomed",
         rich: true,
@@ -299,6 +317,9 @@ pub(super) fn key_universe() -> Vec<KeyCode> {
         KeyCode::F(2),
         KeyCode::F(3),
         KeyCode::F(5),
+        KeyCode::F(7),
+        KeyCode::F(8),
+        KeyCode::F(9),
     ]);
     codes
 }
@@ -456,6 +477,7 @@ fn rich_fixture(app: &mut App) {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         });
     app.dx_stations.insert("VK9XX".to_string(), cq_dx_station());
     app.clamp_dx_hunter_selection();
@@ -580,6 +602,17 @@ fn snapshot(app: &App) -> Vec<(&'static str, String)> {
         ("waterfall_palette", format!("{:?}", app.waterfall_palette)),
         ("waterfall_gain_db", format!("{:?}", app.waterfall_gain_db)),
     ]
+}
+
+/// PAN-435 scenarios: mark the rich fixture's decode as a WSJT-X decode
+/// heard on `dial_mhz` in FT8 and focus `panel`.
+fn ext_setup(a: &mut App, panel: ActivePanel, dial_mhz: f64) {
+    a.station_info.mode = "FT8".to_string();
+    for m in a.decoded_messages.iter_mut() {
+        m.external = true;
+        m.frequency = dial_mhz;
+    }
+    a.active_panel = panel;
 }
 
 /// PAN-389: the Monitor view with the waterfall focused. The colour

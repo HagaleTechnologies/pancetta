@@ -220,15 +220,23 @@ pub struct CoordSim {
 
 impl CoordSim {
     pub async fn new(our_callsign: &str) -> Self {
+        Self::new_with_utc_clock(our_callsign, pancetta_core::time::system_utc_clock()).await
+    }
+
+    pub async fn new_with_utc_clock(
+        our_callsign: &str,
+        utc_clock: pancetta_core::time::UtcClock,
+    ) -> Self {
         let mut config = pancetta_config::Config::default();
         config.station.callsign = our_callsign.to_string();
         config.autonomous.max_concurrent_qsos = 8;
         let home = tempfile::tempdir().expect("temporary station home");
         let arm_now = pancetta_agent::arm::ArmTime::now();
-        let worker = pancetta_lib::coordinator::testing::WorkerHarness::new(
+        let worker = pancetta_lib::coordinator::testing::WorkerHarness::new_with_utc_clock(
             config,
             home.path().to_owned(),
             Arc::new(move || arm_now),
+            utc_clock.clone(),
         )
         .await;
         let mut manager = QsoManager::new(QsoManagerConfig {
@@ -272,6 +280,7 @@ impl CoordSim {
         }
         {
             let rx = worker.audio.clone();
+            let utc_clock = utc_clock.clone();
             let stop = stop_consumers.clone();
             let obs = observations.clone();
             consumers.push(tokio::spawn(async move {
@@ -280,6 +289,7 @@ impl CoordSim {
                         match message.message_type {
                             MessageType::AudioOutput {
                                 samples,
+                                sample_rate,
                                 playback_started,
                                 ..
                             } => {
@@ -288,10 +298,12 @@ impl CoordSim {
                                         samples.iter().any(|x| *x != 0.0),
                                         "worker waveform is silent"
                                     );
-                                    obs.lock().unwrap().audio += 1;
+                                    let mut obs = obs.lock().unwrap();
+                                    obs.audio += 1;
+                                    obs.audio_frames.push((samples.clone(), sample_rate));
                                 }
                                 if let Some(ack) = playback_started {
-                                    ack.started(chrono::Utc::now());
+                                    ack.started(utc_clock());
                                 }
                             }
                             MessageType::AudioFlush { ack, .. } => {
@@ -364,6 +376,33 @@ impl CoordSim {
             outcomes,
             arm_now,
         }
+    }
+
+    pub fn ptt_sync_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.worker.ptt_sync_gate.clone()
+    }
+
+    pub fn before_ptt_gate(&self) -> Arc<tokio::sync::Notify> {
+        self.worker.before_ptt_gate.clone()
+    }
+
+    pub fn record_dx_sighting(&self, callsign: &str, parity: SlotParity, dial_hz: u64) {
+        self.worker
+            .cross_time_state
+            .a7_recent_calls
+            .write()
+            .unwrap()
+            .record(pancetta_qso::A7ExpectedCall {
+                callsign: callsign.to_string(),
+                freq_hz: 2317.0,
+                slot_parity: match parity {
+                    SlotParity::Even => 0,
+                    SlotParity::Odd => 1,
+                },
+                decoded_at: std::time::SystemTime::now(),
+                captured_dial_hz: dial_hz,
+                slot_ns: 15_000_000_000,
+            });
     }
 
     pub fn set_rx_dial(&self, hz: u64) {
@@ -552,12 +591,22 @@ impl CoordSim {
     }
 
     pub async fn drive_slot(&mut self, pending: Vec<PendingTx>) -> u64 {
+        self.drive_slot_inner(pending, false).await
+    }
+
+    pub async fn drive_submitted_slot(&mut self, pending: Vec<PendingTx>) -> u64 {
+        self.drive_slot_inner(pending, true).await
+    }
+
+    async fn drive_slot_inner(&mut self, pending: Vec<PendingTx>, already_submitted: bool) -> u64 {
         let slot = self.slot;
         self.slot += 1;
         self.timeline.last_slot = slot;
         let before = self.observations.lock().unwrap().audio;
         let ptt_start = self.observations.lock().unwrap().ptt.len();
-        self.submit(&pending).await;
+        if !already_submitted {
+            self.submit(&pending).await;
+        }
         let mut remaining = pending.clone();
         let deadline = Instant::now() + Duration::from_secs(45);
         while !remaining.is_empty() {
@@ -742,6 +791,17 @@ impl CoordSim {
     pub fn home(&self) -> &std::path::Path {
         self.home.path()
     }
+
+    /// Admit `qso_id` as a Fox stream in the worker's `fox_admitted_qsos`,
+    /// as the coordinator's Fox mode does (PAN-386).
+    #[allow(dead_code)]
+    pub fn admit_fox(&self, qso_id: &pancetta_qso::QsoId) {
+        self.worker
+            .fox_admitted_qsos
+            .write()
+            .unwrap()
+            .insert(active_tx_qso_key(&qso_id.to_string()));
+    }
 }
 
 impl Drop for CoordSim {
@@ -756,6 +816,33 @@ pub struct Observations {
     pub audio: usize,
     pub diagnostics: Vec<String>,
     pub settlements: Vec<(String, Option<pancetta_qso::TxAttemptId>, bool)>,
+    /// Every non-empty `AudioOutput` waveform the worker played, with its
+    /// sample rate (PAN-386: decoded to prove what aired).
+    pub audio_frames: Vec<(Vec<f32>, u32)>,
+}
+
+/// Decode a worker waveform (12 kHz) with a Hound context for `fox` through
+/// both production decoders, native first. Returns `(frequency, text)` rows.
+#[allow(dead_code)]
+pub fn decode_fox_audio(samples: &[f32], fox: &str) -> Vec<(f64, String)> {
+    let mut audio = samples.to_vec();
+    audio.resize(pancetta_ft8::WINDOW_SAMPLES, 0.0);
+    let mut decoder =
+        pancetta_ft8::Ft8Decoder::new(pancetta_ft8::Ft8Config::default()).expect("decoder");
+    decoder.set_hound_foxes(&[fox.to_string()]);
+    let mut rows: Vec<(f64, String)> = decoder
+        .decode_window(&audio)
+        .expect("native decode")
+        .into_iter()
+        .map(|m| (m.frequency_offset, m.text))
+        .collect();
+    rows.extend(
+        decoder
+            .decode_window_ft8lib_with_context(&audio, pancetta_ft8::Protocol::Ft8)
+            .into_iter()
+            .map(|m| (m.frequency_offset, m.text)),
+    );
+    rows
 }
 
 #[derive(Debug, Clone)]

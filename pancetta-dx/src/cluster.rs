@@ -1993,3 +1993,7 @@ mod tests {
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "cluster/tests/tls_security_tests.rs"]
+mod tls_security_tests;

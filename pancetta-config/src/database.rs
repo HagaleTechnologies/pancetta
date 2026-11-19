@@ -62,10 +62,7 @@ impl ConfigSection for DatabaseConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.persist_qso_timeline = other.persist_qso_timeline;
-        self.adif_backup_enabled = other.adif_backup_enabled;
-        self.adif_backup_directory = other.adif_backup_directory;
-        self.adif_backup_retain_count = other.adif_backup_retain_count;
+        *self = other;
     }
 }
 

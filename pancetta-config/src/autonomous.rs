@@ -81,6 +81,24 @@ pub struct BandHoppingConfig {
     pub hop_threshold: u32,
     /// Ordered list of bands to hop between.
     pub bands: Vec<BandHopEntry>,
+    /// PAN-385: hop toward needed entities spotted on cqdx.io.
+    pub needed_activity: bool,
+    /// PAN-385: seconds with no needed caller heard on the current band
+    /// before a needed-activity hop.
+    pub needed_idle_secs: u64,
+    /// PAN-385: near local sunrise/sunset prefer bands below 14 MHz on a tie.
+    pub grey_line: bool,
+}
+
+/// PAN-385: one `[[autonomous.band_plan]]` UTC time-of-day window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BandPlanWindow {
+    /// `HH:MM-HH:MM` UTC, start inclusive, end exclusive; wraps midnight
+    /// when start > end; `24:00` allowed as an end.
+    pub utc: String,
+    /// Bands to operate on during the window, in preference order
+    /// (canonical names such as `"40m"`).
+    pub bands: Vec<String>,
 }
 
 impl Default for BandHoppingConfig {
@@ -100,6 +118,9 @@ impl Default for BandHoppingConfig {
                     priority: 2,
                 },
             ],
+            needed_activity: true,
+            needed_idle_secs: 600,
+            grey_line: true,
         }
     }
 }
@@ -281,6 +302,9 @@ pub struct AutonomousConfig {
     pub listen_cycle: ListenCycleConfig,
     /// Band-hopping configuration.
     pub band_hopping: BandHoppingConfig,
+    /// PAN-385: UTC time-of-day band plan (`[[autonomous.band_plan]]`).
+    #[serde(default)]
+    pub band_plan: Vec<BandPlanWindow>,
     /// Priority scoring weights for autonomous operator decisions.
     pub priorities: PriorityWeightsConfig,
     /// Dry-run mode: when true, the coordinator logs autonomous-issued
@@ -313,9 +337,79 @@ impl Default for AutonomousConfig {
             cq_direction: String::new(),
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
+            band_plan: Vec::new(),
             priorities: PriorityWeightsConfig::default(),
             dry_run: false,
         }
+    }
+}
+
+impl AutonomousConfig {
+    /// PAN-385: the load warning for a band plan that cannot act because
+    /// `band_hopping.enabled` (the one master switch) is off.
+    pub fn band_plan_warning(&self) -> Option<String> {
+        if self.band_plan.is_empty() || self.band_hopping.enabled {
+            return None;
+        }
+        let count = self.band_plan.len();
+        let windows = if count == 1 { "window" } else { "windows" };
+        Some(format!(
+            "autonomous.band_plan has {count} {windows} but autonomous.band_hopping.enabled is false; the plan is not used"
+        ))
+    }
+
+    /// PAN-385: `band_hopping` and `band_plan` checks. Plan text is stored
+    /// as written and parsed strictly here, so an error names its entry.
+    fn validate_band_scheduling(&self) -> ConfigResult<()> {
+        use pancetta_core::utc_window::UtcWindow;
+        use pancetta_core::Band;
+        use std::str::FromStr;
+
+        let hopping = &self.band_hopping;
+        if hopping.hop_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "autonomous.band_hopping.hop_threshold".into(),
+                value: "0".into(),
+            });
+        }
+        for (i, entry) in hopping.bands.iter().enumerate() {
+            if Band::from_frequency(entry.dial_frequency).is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("autonomous.band_hopping.bands[{i}].dial_frequency"),
+                    value: entry.dial_frequency.to_string(),
+                });
+            }
+        }
+        for (i, window) in self.band_plan.iter().enumerate() {
+            if window.utc.parse::<UtcWindow>().is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("autonomous.band_plan[{i}].utc"),
+                    value: window.utc.clone(),
+                });
+            }
+            if window.bands.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("autonomous.band_plan[{i}].bands"),
+                    value: "[]".into(),
+                });
+            }
+            for name in &window.bands {
+                let reachable = Band::from_str(name).is_ok_and(|band| {
+                    band.ft8_frequency().is_some()
+                        || hopping
+                            .bands
+                            .iter()
+                            .any(|entry| Band::from_frequency(entry.dial_frequency) == Some(band))
+                });
+                if !reachable {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("autonomous.band_plan[{i}].bands"),
+                        value: name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -363,32 +457,19 @@ impl ConfigSection for AutonomousConfig {
                 value: self.tx_offset_hz.to_string(),
             });
         }
+        self.validate_band_scheduling()?;
         self.priorities.validate()?;
         Ok(())
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.recent_failure_window_secs = other.recent_failure_window_secs;
-        self.needed_means = other.needed_means;
-        self.unattended_policy = other.unattended_policy;
-        self.slot_parity = other.slot_parity;
-        self.cq_after_idle_cycles = other.cq_after_idle_cycles;
-        self.cq_no_response_switch_after = other.cq_no_response_switch_after;
-        self.qso_stall_switch_after = other.qso_stall_switch_after;
-        self.max_concurrent_qsos = other.max_concurrent_qsos;
-        self.tx_offset_hz = other.tx_offset_hz;
-        self.min_dx_score = other.min_dx_score;
-        self.pounce_min_tier = other.pounce_min_tier;
-        self.min_multi_slot_score = other.min_multi_slot_score;
-        self.frequency = other.frequency;
-        self.cq_direction = other.cq_direction;
-        self.listen_cycle = other.listen_cycle;
-        self.band_hopping = other.band_hopping;
-        self.priorities = other.priorities;
-        self.dry_run = other.dry_run;
+        *self = other;
     }
 }
+
+#[cfg(test)]
+#[path = "autonomous/tests/band_plan_tests.rs"]
+mod band_plan_tests;
 
 #[cfg(test)]
 // rationale: test-only builder structs assigned field-by-field after

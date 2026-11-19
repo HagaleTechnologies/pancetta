@@ -57,6 +57,9 @@ pub struct AudioConfig {
     /// Monitoring and level settings
     pub levels: AudioLevelsConfig,
 
+    /// Per-band automatic TX audio drive policy.
+    pub auto_drive: AutoDriveConfig,
+
     /// Custom audio device parameters
     #[serde(default)]
     pub device_parameters: HashMap<String, String>,
@@ -425,7 +428,7 @@ pub struct RecordingConfig {
 
     /// Where recordings go; created if missing. A leading `~` is expanded
     /// by pancetta itself (the loader never expands values); `~user` is not.
-    /// Empty means `~/.pancetta/recordings`.
+    /// Omitted or empty means `<data-dir>/recordings`.
     pub directory: String,
 
     /// File naming pattern. Not read yet (recordings are always named
@@ -466,6 +469,12 @@ pub struct AudioLevelsConfig {
     /// Output level adjustment in dB
     pub output_gain_db: f32,
 
+    /// Lowest selectable TX audio drive.
+    pub output_gain_floor_db: f32,
+
+    /// Highest selectable TX audio drive in dB, relative to the 0.5 baseline.
+    pub output_gain_ceiling_db: f32,
+
     /// Peak level warning threshold in dB
     pub peak_warning_db: f32,
 
@@ -477,6 +486,29 @@ pub struct AudioLevelsConfig {
 
     /// Meter ballistics configuration
     pub meter_ballistics: MeterBallisticsConfig,
+}
+
+/// Automatic TX drive policy. Values are applied at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoDriveConfig {
+    pub enabled: bool,
+    pub alc_onset: f32,
+    pub step_up_db: f32,
+    pub step_down_db: f32,
+    pub start_db: f32,
+}
+
+impl Default for AutoDriveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            alc_onset: 0.10,
+            step_up_db: 0.5,
+            step_down_db: 2.0,
+            start_db: -6.0,
+        }
+    }
 }
 
 /// Audio meter ballistics configuration
@@ -512,6 +544,7 @@ impl Default for AudioConfig {
             routing: AudioRoutingConfig::default(),
             recording: RecordingConfig::default(),
             levels: AudioLevelsConfig::default(),
+            auto_drive: AutoDriveConfig::default(),
             device_parameters: HashMap::new(),
         }
     }
@@ -655,7 +688,7 @@ impl Default for RecordingConfig {
             sample_rate: 44100,
             max_length_minutes: 60,
             raw_capture_minutes: 0,
-            directory: "~/Documents/Pancetta/Recordings".to_string(),
+            directory: String::new(),
             filename_pattern: "pancetta_%Y%m%d_%H%M%S".to_string(),
             compression_level: 5,
         }
@@ -667,6 +700,8 @@ impl Default for AudioLevelsConfig {
         Self {
             input_gain_db: 0.0,
             output_gain_db: 0.0,
+            output_gain_floor_db: -20.0,
+            output_gain_ceiling_db: 0.0,
             peak_warning_db: -6.0,
             peak_clip_db: -1.0,
             rms_target_db: -20.0,
@@ -688,6 +723,50 @@ impl Default for MeterBallisticsConfig {
 
 impl ConfigSection for AudioConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        if !self.levels.output_gain_ceiling_db.is_finite()
+            || !(-20.0..=5.0).contains(&self.levels.output_gain_ceiling_db)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_ceiling_db".into(),
+                value: self.levels.output_gain_ceiling_db.to_string(),
+            });
+        }
+        if !self.levels.output_gain_floor_db.is_finite()
+            || !(-20.0..=self.levels.output_gain_ceiling_db)
+                .contains(&self.levels.output_gain_floor_db)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_floor_db".into(),
+                value: self.levels.output_gain_floor_db.to_string(),
+            });
+        }
+        if !self.levels.output_gain_db.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_db".into(),
+                value: self.levels.output_gain_db.to_string(),
+            });
+        }
+        for (field, value) in [
+            ("audio.auto_drive.alc_onset", self.auto_drive.alc_onset),
+            ("audio.auto_drive.step_up_db", self.auto_drive.step_up_db),
+            (
+                "audio.auto_drive.step_down_db",
+                self.auto_drive.step_down_db,
+            ),
+            ("audio.auto_drive.start_db", self.auto_drive.start_db),
+        ] {
+            if !value.is_finite()
+                || (field == "audio.auto_drive.alc_onset" && value < 0.0)
+                || ((field == "audio.auto_drive.step_up_db"
+                    || field == "audio.auto_drive.step_down_db")
+                    && value <= 0.0)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: value.to_string(),
+                });
+            }
+        }
         // Validate sample rate
         if ![
             8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000, 176400, 192000,
@@ -775,6 +854,7 @@ impl ConfigSection for AudioConfig {
         self.routing.merge_with(other.routing);
         self.recording.merge_with(other.recording);
         self.levels.merge_with(other.levels);
+        self.auto_drive = other.auto_drive;
 
         // Merge custom parameters
         self.device_parameters.extend(other.device_parameters);
@@ -812,6 +892,10 @@ impl AudioLevelsConfig {
         *self = other;
     }
 }
+
+#[cfg(test)]
+#[path = "audio/tests/tx_drive_tests.rs"]
+mod tx_drive_tests;
 
 #[cfg(test)]
 // rationale: test-only builder structs assigned field-by-field after

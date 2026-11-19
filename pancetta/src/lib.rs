@@ -32,6 +32,7 @@
 pub mod clock_skew;
 pub mod coordinator;
 pub mod cqdx_bridge;
+pub mod instance_lock;
 pub mod message_bus;
 pub mod priority_evaluator;
 pub mod runtime;

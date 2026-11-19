@@ -611,7 +611,9 @@ struct RankInputs {
 /// The `last_rank_inputs` key for a decoded callsign: the DX Hunter row's call
 /// (a resolved hash-render unwrapped, as `pancetta_tui`'s row key does), so a
 /// station heard as both `6W/IK2HKT` and `<6W/IK2HKT>` keeps one entry — its
-/// newest decode — and a QSO outcome rescores its single row once.
+/// newest decode — and a QSO outcome rescores its single row once. The cache
+/// pairs it with the decode's origin (`true` for a same-host WSJT-X decode,
+/// PAN-381), so native and external inputs never replace each other.
 fn rank_inputs_key(call: &str) -> String {
     pancetta_core::callsign::resolve_hash_render(call)
         .unwrap_or(call)
@@ -626,7 +628,7 @@ fn rank_inputs_key(call: &str) -> String {
 /// decoded in this relay session.
 fn outcome_rank_refresh(
     scorer: &pancetta_qso::PriorityScorer,
-    last_inputs: &RelayCache<String, RankInputs>,
+    last_inputs: &RelayCache<(String, bool), RankInputs>,
     callsign: &str,
 ) -> Vec<pancetta_tui::tui_runner::TuiMessage> {
     let identity = |call: &str| {
@@ -637,8 +639,8 @@ fn outcome_rank_refresh(
     };
     last_inputs
         .iter()
-        .filter(|(call, _)| identity(call).as_deref() == Some(target.as_str()))
-        .filter_map(|(call, inputs)| {
+        .filter(|((call, _), _)| identity(call).as_deref() == Some(target.as_str()))
+        .filter_map(|((call, external), inputs)| {
             let (Some(score), Some(factors)) = display_rank(
                 scorer,
                 Some(call),
@@ -652,6 +654,7 @@ fn outcome_rank_refresh(
                 callsign: call.clone(),
                 score,
                 factors,
+                external: *external,
             })
         })
         .collect()
@@ -702,8 +705,104 @@ pub(crate) struct TxPolicyCmdCtx {
     pub(crate) cq_active: Arc<std::sync::atomic::AtomicBool>,
     /// Tune-tone deadline, cleared on every halt-to-Disabled path.
     pub(crate) tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    pub(crate) calibration_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
     /// Best-effort TUI echo channel (bounded; headless sends are dropped).
     pub(crate) tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+const TUNE_DURATION_SECS: u32 = 12;
+const TUNE_TONE_HZ: f64 = 1500.0;
+
+struct CalibrationCmdCtx {
+    bus: crate::message_bus::MessageBus,
+    tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    tx_restart_inhibit: Arc<std::sync::atomic::AtomicU32>,
+    drive: Arc<super::tx_drive::TxDrive>,
+    tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    calibration_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
+    split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
+    status_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+async fn start_drive_calibration(ctx: &CalibrationCmdCtx) {
+    let now = tokio::time::Instant::now();
+    let running = ctx.calibration_until.read().await.is_some_and(|t| t > now);
+    let tuning = ctx.tune_until.read().await.is_some_and(|t| t > now);
+    let policy = pancetta_core::TxPolicy::from_u8(ctx.tx_policy.load(Ordering::Acquire));
+    let capability = *ctx.bus.tx_meter_capability.lock().unwrap();
+    let refusal = calibration_refusal(
+        running,
+        tuning,
+        !policy.allows_any_tx() || ctx.tx_restart_inhibit.load(Ordering::Acquire) != 0,
+        capability,
+        ctx.drive.auto_enabled(),
+    );
+    if let Some(reason) = refusal {
+        let _ = ctx
+            .status_tx
+            .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX".to_string(),
+                status: reason.to_string(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+        return;
+    }
+    let msg = ComponentMessage::new(
+        ComponentId::Tui,
+        ComponentId::Ft8Transmitter,
+        MessageType::DriveCalibrationRequest {
+            tone_offset_hz: TUNE_TONE_HZ,
+        },
+        Instant::now(),
+    );
+    if matches!(ctx.bus.send_message_checked(msg).await, Ok(true)) {
+        *ctx.calibration_until.write().await =
+            Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
+        let band =
+            pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                ctx.operating_frequency_hz.load(Ordering::Acquire),
+                ctx.split_tx_hz.load(Ordering::Acquire),
+            ));
+        let label = band.map_or_else(|| "this band".to_string(), |b| b.name().replace('m', " m"));
+        let _ = ctx.status_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+            component: "TX".to_string(),
+            status: format!("Calibrating TX drive on {label} — stepping up from the floor until ALC onset (h halts)"),
+            level: pancetta_core::DiagnosticLevel::Info,
+        });
+    } else {
+        let _ = ctx
+            .status_tx
+            .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX".to_string(),
+                status: "Can't calibrate — transmitter is unavailable".to_string(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+    }
+}
+
+fn calibration_refusal(
+    running: bool,
+    tuning: bool,
+    policy_blocked: bool,
+    capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    auto_drive_enabled: bool,
+) -> Option<&'static str> {
+    if running {
+        Some("Drive calibration already running (press h to halt)")
+    } else if tuning {
+        Some("Can't calibrate — a tune is running")
+    } else if policy_blocked {
+        Some("Can't calibrate — TX is DISABLED (press g to re-enable)")
+    } else if capability.is_none() {
+        Some("Can't calibrate — waiting for the rig's meter capability")
+    } else if capability.is_some_and(|c| !c.alc) {
+        Some("Can't calibrate — this rig does not report ALC over CAT")
+    } else if !auto_drive_enabled {
+        Some("Can't calibrate — set [audio.auto_drive] enabled = true first")
+    } else {
+        None
+    }
 }
 
 /// `TuiCommand::CycleTxPolicy` (`g`): cycle Full → RespondOnly → Disabled →
@@ -731,6 +830,7 @@ pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
         ctx.abort_current_tx.store(true, Ordering::Release);
         ctx.cq_active.store(false, Ordering::Relaxed);
         *ctx.tune_until.write().await = None;
+        *ctx.calibration_until.write().await = None;
         let msg = ComponentMessage::new(
             ComponentId::Tui,
             ComponentId::Qso,
@@ -777,6 +877,7 @@ pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
     ctx.tx_halt.halt();
     ctx.cq_active.store(false, Ordering::Relaxed);
     *ctx.tune_until.write().await = None;
+    *ctx.calibration_until.write().await = None;
     let _ = ctx
         .tui_msg_tx
         .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
@@ -818,6 +919,10 @@ struct TuiRelayLoop {
     gain_mutation_tx:
         tokio::sync::mpsc::UnboundedSender<(String, pancetta_config::rig::ReceiveGainPreset)>,
     gain_frequency: Arc<std::sync::atomic::AtomicU64>,
+    /// PAN-439: live drive state and split TX dial for worker drive reports.
+    tx_drive: Arc<super::tx_drive::TxDrive>,
+    drive_split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
+    meter_capability: Arc<std::sync::Mutex<Option<pancetta_core::tx_meter::TxMeterCapability>>>,
     station_lookup: Arc<crate::priority_evaluator::CachedStationLookup>,
     station_coords: Option<(f64, f64)>,
     our_callsign: String,
@@ -829,7 +934,7 @@ struct TuiRelayLoop {
     /// 4,096 entries) instead of an unbounded HashMap.
     sent_states: RelayCache<String, String>,
     last_grids: RelayCache<(String, String), String>,
-    last_rank_inputs: RelayCache<String, RankInputs>,
+    last_rank_inputs: RelayCache<(String, bool), RankInputs>,
     last_rig_state: Option<u8>,
     last_audio_default: Option<bool>,
     last_input_fallback: Option<bool>,
@@ -1198,12 +1303,31 @@ impl RelayDriverHost for TuiRelayLoop {
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
             }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                band,
+                ..
+            }) => {
+                // PAN-439: a worker report is asynchronous and can trail a
+                // direct band-change, F7/F8 or F9 echo. Forward the live state
+                // of the current TX band, never the report's own payload.
+                if let Some(tui_msg) = live_tx_drive_message(
+                    band,
+                    &self.tx_drive,
+                    &self.gain_frequency,
+                    &self.drive_split_tx_hz,
+                ) {
+                    let _ = tui_msg_tx_relay.send(tui_msg);
+                }
+            }
             MessageType::RigControl(
                 msg @ (crate::message_bus::RigControlMessage::TxMeterResponse(_)
                 | crate::message_bus::RigControlMessage::TxMeterCapability(_)),
             ) => {
                 // PAN-291: real keyed power/ALC reads and the session's meter
                 // plan, forwarded verbatim to the Shift+S panel.
+                if let crate::message_bus::RigControlMessage::TxMeterCapability(capability) = &msg {
+                    *self.meter_capability.lock().unwrap() = Some(*capability);
+                }
                 if let Some(tui_msg) = tx_meter_tui_message(&msg) {
                     let _ = tui_msg_tx_relay.send(tui_msg);
                 }
@@ -1692,6 +1816,18 @@ impl super::ApplicationCoordinator {
             crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
+        let initial_band =
+            pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                self.operating_frequency_hz.load(Ordering::Relaxed),
+                self.split_tx_frequency_hz().load(Ordering::Relaxed),
+            ));
+        let initial_drive = self.tx_drive.snapshot_for_band(initial_band);
+        let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+            db: initial_drive.db,
+            ceiling_db: self.tx_drive.ceiling_db(),
+            mode: initial_drive.mode,
+            available: initial_drive.available,
+        });
 
         // Set up station coordinates for distance/bearing calculation
         let station_coords = {
@@ -1794,6 +1930,8 @@ impl super::ApplicationCoordinator {
         let relay_pending_gain_save = pending_gain_save.clone();
         let relay_gain_mutation_tx = gain_mutation_tx.clone();
         let relay_gain_frequency = self.operating_frequency_hz.clone();
+        let relay_tx_drive = self.tx_drive.clone();
+        let relay_drive_split_tx_hz = self.split_tx_frequency_hz();
         let watchlist_pins = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let relay_watchlist_pins = watchlist_pins.clone();
         let watchlist_write_tx = cmd_config_write_tx.clone();
@@ -1807,6 +1945,7 @@ impl super::ApplicationCoordinator {
             tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
         >::new();
         let relay_live_config = self.config.clone();
+        let relay_meter_capability = self.message_bus.tx_meter_capability.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -1827,6 +1966,9 @@ impl super::ApplicationCoordinator {
                     pending_gain_save: relay_pending_gain_save,
                     gain_mutation_tx: relay_gain_mutation_tx,
                     gain_frequency: relay_gain_frequency,
+                    tx_drive: relay_tx_drive,
+                    drive_split_tx_hz: relay_drive_split_tx_hz,
+                    meter_capability: relay_meter_capability,
                     station_lookup: relay_station_lookup,
                     station_coords,
                     our_callsign: our_callsign_for_relay,
@@ -2059,6 +2201,11 @@ impl super::ApplicationCoordinator {
         // in this relay loop, which must stay free of synchronous disk
         // I/O -- see `config_write_is_toml`'s doc comment in main.rs).
         let cmd_config_write_is_toml = self.config_write_is_toml;
+        let cmd_tx_drive_path = self.tx_drive_config_path.clone();
+        let cmd_tx_drive_is_toml = !pancetta_config::path_is_json_format(&cmd_tx_drive_path);
+        let cmd_tx_drive = self.tx_drive.clone();
+        let drive_save_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let drive_save_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
         // serializes every targeted-write persist call to
         // `cmd_config_path` -- SelectDevice, SelectRig, SaveRigBookmark,
@@ -2099,6 +2246,7 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let cmd_calibration_until = Arc::new(tokio::sync::RwLock::new(None));
         // PAN-341: shared context for the extracted TX-policy command
         // handlers (`g` cycle, Shift+Q), so the match arms and the unit
         // tests drive the exact same production path.
@@ -2110,7 +2258,19 @@ impl super::ApplicationCoordinator {
             tx_halt: cmd_tx_halt.clone(),
             cq_active: cmd_cq_active.clone(),
             tune_until: cmd_tune_until.clone(),
+            calibration_until: cmd_calibration_until.clone(),
             tui_msg_tx: cmd_tui_msg_tx.clone(),
+        };
+        let cmd_calibration_ctx = CalibrationCmdCtx {
+            bus: cmd_message_bus.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            tx_restart_inhibit: cmd_tx_restart_inhibit.clone(),
+            drive: cmd_tx_drive.clone(),
+            tune_until: cmd_tune_until.clone(),
+            calibration_until: cmd_calibration_until.clone(),
+            operating_frequency_hz: cmd_operating_freq_hz.clone(),
+            split_tx_hz: cmd_split_tx_hz.clone(),
+            status_tx: cmd_tui_msg_tx.clone(),
         };
         // Fox-mode flag (shared with the QSO component). The ToggleFoxMode
         // relay arm reads the current value and sends `SetFoxMode { on: !current }`
@@ -2127,8 +2287,6 @@ impl super::ApplicationCoordinator {
         // `RigConfigUpdate` so the TUI can tell a reply that predates its
         // latest submit.
         let cmd_rig_select_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        const TUNE_DURATION_SECS: u32 = 12;
-        const TUNE_TONE_HZ: f64 = 1500.0;
         drop(gain_mutation_tx);
         let cmd_handle = tokio::spawn(async move {
             // Push the available audio devices to the TUI once at startup so
@@ -2261,7 +2419,29 @@ impl super::ApplicationCoordinator {
                 });
             }
 
+            let mut last_drive_band =
+                pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                    cmd_operating_freq_hz.load(Ordering::Acquire),
+                    cmd_split_tx_hz.load(Ordering::Acquire),
+                ));
             while !cmd_shutdown.load(Ordering::Acquire) {
+                let current_drive_band = pancetta_core::Band::from_frequency(
+                    pancetta_qso::qso_manager::effective_tx_dial(
+                        cmd_operating_freq_hz.load(Ordering::Acquire),
+                        cmd_split_tx_hz.load(Ordering::Acquire),
+                    ),
+                );
+                if current_drive_band != last_drive_band {
+                    last_drive_band = current_drive_band;
+                    let selected = cmd_tx_drive.snapshot_for_band(current_drive_band);
+                    let _ =
+                        cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                            db: selected.db,
+                            ceiling_db: cmd_tx_drive.ceiling_db(),
+                            mode: selected.mode,
+                            available: selected.available,
+                        });
+                }
                 // CQ is now TRANSMITTED by a real CallingCq QSO owned by the
                 // QSO component (StartCq → QsoManager::start_cq_manual, which
                 // keep-calls every slot and auto-sequences the exchange to
@@ -2300,6 +2480,154 @@ impl super::ApplicationCoordinator {
 
                 match tui_cmd_rx.try_recv() {
                     Ok(cmd) => match cmd {
+                        pancetta_tui::tui_runner::TuiCommand::AdjustTxDrive { delta_db } => {
+                            if cmd_tx_drive.auto_enabled() {
+                                let band = pancetta_core::Band::from_frequency(
+                                    pancetta_qso::qso_manager::effective_tx_dial(
+                                        cmd_operating_freq_hz.load(Ordering::Relaxed),
+                                        cmd_split_tx_hz.load(Ordering::Relaxed),
+                                    ),
+                                );
+                                if band.is_none() {
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX drive".into(),
+                                            status: "TX drive needs a known TX band".into(),
+                                            level: pancetta_core::DiagnosticLevel::Warn,
+                                        },
+                                    );
+                                    continue;
+                                }
+                                let snapshot = cmd_tx_drive.adjust_band(band, delta_db);
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                        db: snapshot.db,
+                                        ceiling_db: cmd_tx_drive.ceiling_db(),
+                                        mode: snapshot.mode,
+                                        available: snapshot.available,
+                                    },
+                                );
+                                queue_tx_drive_save(
+                                    cmd_session_record.clone(),
+                                    cmd_session_state_path.clone(),
+                                    cmd_tx_drive.clone(),
+                                    cmd_tui_msg_tx.clone(),
+                                );
+                                continue;
+                            }
+                            let old = cmd_tx_drive.get();
+                            let db = cmd_tx_drive.adjust(delta_db);
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                    db,
+                                    ceiling_db: cmd_tx_drive.ceiling_db(),
+                                    mode: pancetta_core::tx_drive_mode::TxDriveMode::Manual,
+                                    available: false,
+                                },
+                            );
+                            if db != old {
+                                drive_save_dirty.store(true, Ordering::Release);
+                                cmd_config.write().await.audio.levels.output_gain_db = db;
+                            }
+                            if drive_save_dirty.load(Ordering::Acquire) {
+                                let path = cmd_tx_drive_path.clone();
+                                let is_toml = cmd_tx_drive_is_toml;
+                                let (respond, response) = tokio::sync::oneshot::channel();
+                                let submitted = cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                    work: Box::new(move || {
+                                        let target = resolve_config_write_target(&path)?;
+                                        pancetta_config::Config::save_output_gain_db(
+                                            &target, is_toml, db,
+                                        )
+                                    }),
+                                    respond,
+                                });
+                                let generation =
+                                    drive_save_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                                let latest = drive_save_generation.clone();
+                                let dirty = drive_save_dirty.clone();
+                                let echo = cmd_tui_msg_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = if submitted.is_ok() {
+                                        response.await.unwrap_or_else(|_| {
+                                            Err(pancetta_config::ConfigError::Validation(
+                                                "TX drive config write worker closed".into(),
+                                            ))
+                                        })
+                                    } else {
+                                        Err(pancetta_config::ConfigError::Validation(
+                                            "TX drive config write worker closed".into(),
+                                        ))
+                                    };
+                                    if result.is_ok()
+                                        && latest.load(Ordering::Acquire) == generation
+                                    {
+                                        dirty.store(false, Ordering::Release);
+                                    }
+                                    if let Err(error) = result {
+                                        warn!("Could not save TX drive: {error}");
+                                        if latest.load(Ordering::Acquire) == generation {
+                                            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "TX drive".into(),
+                                                status: "TX drive changed for this session only. Could not save TX drive.".into(),
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                            });
+                                            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                                                ts: chrono::Utc::now(),
+                                                target: "tx.drive",
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                                text: "TX drive changed for this session only. Could not save TX drive.".into(),
+                                                qso_id: None,
+                                                callsign: None,
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleTxDriveMode => {
+                            if !cmd_tx_drive.auto_enabled() {
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX drive".into(),
+                                        status: "Auto drive is disabled in config".into(),
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                    },
+                                );
+                                continue;
+                            }
+                            let band = pancetta_core::Band::from_frequency(
+                                pancetta_qso::qso_manager::effective_tx_dial(
+                                    cmd_operating_freq_hz.load(Ordering::Relaxed),
+                                    cmd_split_tx_hz.load(Ordering::Relaxed),
+                                ),
+                            );
+                            if band.is_none() {
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX drive".into(),
+                                        status: "TX drive needs a known TX band".into(),
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                    },
+                                );
+                                continue;
+                            }
+                            let snapshot = cmd_tx_drive.toggle_band(band);
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                    db: snapshot.db,
+                                    ceiling_db: cmd_tx_drive.ceiling_db(),
+                                    mode: snapshot.mode,
+                                    available: snapshot.available,
+                                },
+                            );
+                            queue_tx_drive_save(
+                                cmd_session_record.clone(),
+                                cmd_session_state_path.clone(),
+                                cmd_tx_drive.clone(),
+                                cmd_tui_msg_tx.clone(),
+                            );
+                        }
                         pancetta_tui::tui_runner::TuiCommand::SendMessage {
                             text,
                             frequency_offset,
@@ -3255,6 +3583,7 @@ impl super::ApplicationCoordinator {
                             cmd_abort_current_tx.store(true, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
+                            *cmd_calibration_until.write().await = None;
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
                                 ComponentId::Qso,
@@ -3274,6 +3603,16 @@ impl super::ApplicationCoordinator {
                                 let guard = cmd_tune_until.read().await;
                                 matches!(*guard, Some(t) if t > now)
                             };
+                            if !active
+                                && cmd_calibration_until.read().await.is_some_and(|t| t > now)
+                            {
+                                let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "TX".to_string(),
+                                    status: "Can't tune — drive calibration is running (press h to halt)".to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                });
+                                continue;
+                            }
                             if active {
                                 info!("TUI ToggleTune: aborting in-flight tune (F4)");
                                 cmd_abort_current_tx.store(true, Ordering::Release);
@@ -3326,6 +3665,9 @@ impl super::ApplicationCoordinator {
                                         Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
                                 }
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::StartDriveCalibration => {
+                            start_drive_calibration(&cmd_calibration_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleAutonomous => {
                             // Batch 93: operator pressed `a`. Flip the SAME
@@ -4663,6 +5005,37 @@ struct ClusterSpotRelay {
 
 /// PAN-291: the TUI message for a TX meter bus message, or `None` for any
 /// other rig-control message. Readings pass through unchanged.
+fn queue_tx_drive_save(
+    record: Arc<std::sync::Mutex<super::session_state::SessionRecord>>,
+    path: Option<std::path::PathBuf>,
+    drive: Arc<super::tx_drive::TxDrive>,
+    echo: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            super::session_state::persist_tx_drive_current(&record, &path, &drive)
+        })
+        .await;
+        if let Ok(Err(error)) = result {
+            tracing::warn!("Could not save TX drive: {error}");
+            let notice = "TX drive changed for this session only. Could not save TX drive.";
+            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX drive".into(),
+                status: notice.into(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                ts: chrono::Utc::now(),
+                target: "tx.drive",
+                level: pancetta_core::DiagnosticLevel::Warn,
+                text: format!("{notice} {error}"),
+                qso_id: None,
+                callsign: None,
+            });
+        }
+    });
+}
+
 fn tx_meter_tui_message(
     msg: &crate::message_bus::RigControlMessage,
 ) -> Option<pancetta_tui::tui_runner::TuiMessage> {
@@ -4675,6 +5048,34 @@ fn tx_meter_tui_message(
         ),
         _ => None,
     }
+}
+
+/// PAN-439: the TUI drive readout for a worker's `TxDriveState` report. A
+/// report whose band differs from the current split-aware TX band is dropped
+/// (`None`, an unknown dial's station-wide fallback, matches only `None`);
+/// otherwise the live selection is sent, so a late report cannot replace a
+/// newer band-change, F7/F8 or F9 echo.
+fn live_tx_drive_message(
+    report_band: Option<pancetta_core::Band>,
+    drive: &super::tx_drive::TxDrive,
+    operating_hz: &std::sync::atomic::AtomicU64,
+    split_tx_hz: &std::sync::atomic::AtomicU64,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    let live_band =
+        pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+            operating_hz.load(Ordering::Acquire),
+            split_tx_hz.load(Ordering::Acquire),
+        ));
+    if report_band != live_band {
+        return None;
+    }
+    let selected = drive.snapshot_for_band(live_band);
+    Some(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+        db: selected.db,
+        ceiling_db: drive.ceiling_db(),
+        mode: selected.mode,
+        available: selected.available,
+    })
 }
 
 /// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
@@ -4725,7 +5126,7 @@ fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
 /// (see the note at its spawn, and `TxPolicyCmdCtx` for the same pattern).
 struct RelayDecodeCtx<'a> {
     last_grids: &'a mut RelayCache<(String, String), String>,
-    last_rank_inputs: &'a mut RelayCache<String, RankInputs>,
+    last_rank_inputs: &'a mut RelayCache<(String, bool), RankInputs>,
     station_coords: Option<(f64, f64)>,
     lookup: &'a crate::priority_evaluator::CachedStationLookup,
     scorer: &'a pancetta_qso::PriorityScorer,
@@ -4789,9 +5190,25 @@ fn decoded_view_for_relay(
         decoded_msg.snr_db,
         dial_mhz,
     );
+    // PAN-381: an external (WSJT-X UDP) decode shows the mode its glyph
+    // named, not pancetta's own protocol mode, and is tagged for display.
+    // Everything above — enrichment and the display rank — is the same
+    // code path a native decode takes.
+    let (mode, external) = match relayed.origin {
+        super::pipeline::DecodeOrigin::WsjtxUdp { mode } => (mode, true),
+        super::pipeline::DecodeOrigin::Native => (
+            pancetta_config::OperatingMode::from_u8(ctx.protocol_mode),
+            false,
+        ),
+    };
+
     if let Some(call) = call_sign.as_deref() {
+        // PAN-381: native and WSJT-X inputs are kept apart. The TUI leaves a
+        // row pancetta heard itself untouched by a WSJT-X decode, so each
+        // QSO-outcome rescore names its origin and the TUI applies it only
+        // to a row of that origin (`App::refresh_local_rank_from`).
         ctx.last_rank_inputs.insert(
-            rank_inputs_key(call),
+            (rank_inputs_key(call), external),
             RankInputs {
                 grid: grid_square.clone(),
                 snr_db: decoded_msg.snr_db,
@@ -4803,8 +5220,7 @@ fn decoded_view_for_relay(
     pancetta_tui::DecodedMessageView {
         timestamp: chrono::Utc::now(),
         frequency: dial_mhz,
-        mode: super::mode_str(pancetta_config::OperatingMode::from_u8(ctx.protocol_mode))
-            .to_string(),
+        mode: super::mode_str(mode).to_string(),
         snr: decoded_msg.snr_db as i32,
         delta_time: decoded_msg.time_offset as f32,
         delta_freq: decoded_msg.frequency_offset as f32,
@@ -4822,6 +5238,7 @@ fn decoded_view_for_relay(
         priority_score,
         priority_factors,
         is_own_tx: false,
+        external,
     }
 }
 
@@ -5752,6 +6169,7 @@ mod tui_relay_tests {
             let relayed = crate::coordinator::pipeline::RelayedDecode {
                 message,
                 dial_hz: 14_074_000,
+                origin: crate::coordinator::pipeline::DecodeOrigin::Native,
             };
             let mut last_grids = super::RelayCache::default();
             let mut last_rank_inputs = super::RelayCache::default();
@@ -5942,6 +6360,7 @@ mod tui_relay_tests {
                     priority_score,
                     priority_factors,
                     is_own_tx: false,
+                    external: false,
                 })
                 .await
                 .unwrap();
@@ -6039,6 +6458,7 @@ mod tui_relay_tests {
         crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 14_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         }
     }
 
@@ -6819,6 +7239,7 @@ mod tui_relay_tests {
             priority_score,
             priority_factors,
             is_own_tx: false,
+            external: false,
         })
         .await
         .unwrap();
@@ -6827,7 +7248,7 @@ mod tui_relay_tests {
 
         let mut last_inputs = super::RelayCache::default();
         last_inputs.insert(
-            "K1ABC/P".to_owned(),
+            ("K1ABC/P".to_owned(), false),
             super::RankInputs {
                 grid: Some("FN42".into()),
                 snr_db: -3.0,
@@ -6846,6 +7267,7 @@ mod tui_relay_tests {
             callsign,
             score,
             factors,
+            ..
         }) = refreshes.into_iter().next()
         else {
             panic!("a decoded station's QSO outcome must rescore its row");
@@ -6874,7 +7296,7 @@ mod tui_relay_tests {
         let mut last_inputs = super::RelayCache::default();
         for (call, dial_mhz) in [("6W/IK2HKT", 7.074), ("<6W/IK2HKT>", 14.074)] {
             last_inputs.insert(
-                super::rank_inputs_key(call),
+                (super::rank_inputs_key(call), false),
                 super::RankInputs {
                     grid: None,
                     snr_db: -8.0,
@@ -7577,10 +7999,12 @@ mod tui_relay_tests {
         let old_band = crate::coordinator::pipeline::RelayedDecode {
             message: message.clone(),
             dial_hz: 7_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
         let new_band = crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 14_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
 
         assert_eq!(decode_view_dial_mhz(&old_band), 7.074);
@@ -7603,6 +8027,7 @@ mod tui_relay_tests {
         let unknown_dial = crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 0,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
 
         assert_eq!(decode_view_dial_mhz(&unknown_dial), 14.074);
@@ -9082,6 +9507,160 @@ mod tui_relay_tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
+    async fn calibration_fixture(
+        auto_enabled: bool,
+        capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    ) -> (
+        super::CalibrationCmdCtx,
+        crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        crossbeam_channel::Receiver<ComponentMessage>,
+    ) {
+        let bus = MessageBus::new(32).unwrap();
+        let (_, tx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        *bus.tx_meter_capability.lock().unwrap() = capability;
+        let mut config = pancetta_config::Config::default();
+        config.audio.auto_drive.enabled = auto_enabled;
+        let (status_tx, status) = crossbeam_channel::bounded(32);
+        let ctx = super::CalibrationCmdCtx {
+            bus,
+            tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxPolicy::Full.as_u8(),
+            )),
+            tx_restart_inhibit: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            drive: Arc::new(super::super::tx_drive::TxDrive::from_config(&config)),
+            tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+            calibration_until: Arc::new(tokio::sync::RwLock::new(None)),
+            operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+            split_tx_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            status_tx,
+        };
+        (ctx, status, tx)
+    }
+
+    fn alc_capability() -> pancetta_core::tx_meter::TxMeterCapability {
+        pancetta_core::tx_meter::TxMeterCapability {
+            alc: true,
+            ..Default::default()
+        }
+    }
+
+    fn status_text(
+        rx: &crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+    ) -> String {
+        match rx.try_recv().unwrap() {
+            pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. } => status,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_when_the_rig_reports_no_alc() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(Default::default())).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — this rig does not report ALC over CAT"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_capability_is_unknown() {
+        let (ctx, status, tx) = calibration_fixture(true, None).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — waiting for the rig's meter capability"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_tx_policy_blocks_tx() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        ctx.tx_policy
+            .store(pancetta_core::TxPolicy::Disabled.as_u8(), Ordering::Release);
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — TX is DISABLED (press g to re-enable)"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_a_tune_is_running() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        *ctx.tune_until.write().await =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(status_text(&status), "Can't calibrate — a tune is running");
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_already_running() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        *ctx.calibration_until.write().await =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Drive calibration already running (press h to halt)"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_without_auto_drive() {
+        let (ctx, status, tx) = calibration_fixture(false, Some(alc_capability())).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — set [audio.auto_drive] enabled = true first"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_start_sends_the_request_and_arms_the_deadline() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        let before = tokio::time::Instant::now();
+        super::start_drive_calibration(&ctx).await;
+        assert!(matches!(
+            tx.try_recv().unwrap().message_type,
+            MessageType::DriveCalibrationRequest {
+                tone_offset_hz: 1500.0
+            }
+        ));
+        assert!(ctx
+            .calibration_until
+            .read()
+            .await
+            .is_some_and(|t| t >= before + std::time::Duration::from_secs(12)));
+        assert_eq!(
+            status_text(&status),
+            "Calibrating TX drive on 20 m — stepping up from the floor until ALC onset (h halts)"
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_start_does_not_arm_if_request_dropped() {
+        let (mut ctx, status, _tx) = calibration_fixture(true, Some(alc_capability())).await;
+        let replacement = MessageBus::new(1).unwrap();
+        *replacement.tx_meter_capability.lock().unwrap() = Some(alc_capability());
+        ctx.bus = replacement; // No transmitter route: checked delivery returns false.
+        super::start_drive_calibration(&ctx).await;
+        assert!(ctx.calibration_until.read().await.is_none());
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — transmitter is unavailable"
+        );
+    }
+
     struct PolicyFixture {
         ctx: TxPolicyCmdCtx,
         tui: crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
@@ -9121,6 +9700,9 @@ mod tui_relay_tests {
             tx_halt,
             cq_active,
             tune_until,
+            calibration_until: Arc::new(tokio::sync::RwLock::new(Some(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(12),
+            ))),
             tui_msg_tx: tui_tx,
         };
         PolicyFixture {
@@ -9199,6 +9781,10 @@ mod tui_relay_tests {
                     assert!(!f.ctx.cq_active.load(Ordering::Relaxed), "step {step} cq");
                     assert!(f.ctx.tune_until.read().await.is_none(), "step {step} tune");
                     assert!(
+                        f.ctx.calibration_until.read().await.is_none(),
+                        "step {step} calibration"
+                    );
+                    assert!(
                         drain(&f.qso).iter().any(|m| matches!(
                             m.message_type,
                             MessageType::QsoMessage(QsoMessage::StopCq)
@@ -9225,6 +9811,7 @@ mod tui_relay_tests {
             assert!(!f.ctx.tx_halt.autonomous_enabled.load(Ordering::Acquire));
             assert!(!f.ctx.cq_active.load(Ordering::Relaxed));
             assert!(f.ctx.tune_until.read().await.is_none());
+            assert!(f.ctx.calibration_until.read().await.is_none());
             assert_eq!(
                 tui_policy_updates(&f),
                 vec![pancetta_core::TxPolicy::Disabled]
@@ -9565,3 +10152,11 @@ pub(super) fn record_tui_failure(
 #[cfg(test)]
 #[path = "tui_relay/tests/waterfall_session_tests.rs"]
 mod waterfall_session_tests;
+
+#[cfg(test)]
+#[path = "tui_relay/tests/external_decode_tests.rs"]
+mod external_decode_tests;
+
+#[cfg(test)]
+#[path = "tui_relay/tests/auto_drive_tests.rs"]
+mod auto_drive_tests;

@@ -23,8 +23,8 @@ r09 |│  ##:##:## -##  +#.#  +###   !#Y#J        ---   ---    CQ #Y#J JD##     
 r09 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+8 DarkGray/White/- 11+1 Black/White/- 12+4 Red/White/BOLD 16+14 Black/White/- 30+12 Magenta/White/BOLD|UNDERLINED 42+14 Black/White/- 56+23 Blue/White/BOLD 79+1 Magenta/White/BOLD
 r10 |│  ##:##:## -#   +#.#  +###   +VK#XX       ---   ---    CQ VK#XX QH##          │|
 r10 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+8 DarkGray/White/- 11+1 Black/White/- 12+4 Black/Yellow/- 16+14 Black/White/- 30+12 Red/White/BOLD|UNDERLINED 42+14 Black/White/- 56+23 Blue/White/BOLD 79+1 Magenta/White/BOLD
-r11 |│  ##:##:## +#   +#.#  +###   JA#ABC       ---   ---    CQ DX JA#ABC PM##      │|
-r11 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+8 DarkGray/White/- 11+1 Black/White/- 12+4 Blue/White/- 16+14 Black/White/- 30+12 Black/White/BOLD 42+14 Black/White/- 56+23 Blue/White/BOLD 79+1 Magenta/White/BOLD
+r11 |│  ##:##:## +#   +#.#  +###   JA#ABC       ---   ---    EXT CQ DX JA#ABC PM##  │|
+r11 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+8 DarkGray/White/- 11+1 Black/White/- 12+4 Blue/White/- 16+14 Black/White/- 30+12 Black/White/BOLD 42+14 Black/White/- 56+4 Blue/White/BOLD|ITALIC 60+19 Blue/White/BOLD 79+1 Magenta/White/BOLD
 r12 |│                                                                              │|
 r12 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r13 |│                                                                              │|

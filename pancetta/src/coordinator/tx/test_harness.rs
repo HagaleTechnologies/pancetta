@@ -6,6 +6,9 @@ pub struct WorkerHarness {
     coordinator: ApplicationCoordinator,
     outcomes: super::qso::HarnessOutcomes,
     pub bus: MessageBus,
+    pub ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
+    pub before_ptt_gate: Arc<tokio::sync::Notify>,
+    pub cross_time_state: Arc<pancetta_qso::CrossTimeState>,
     pub active_tx_qsos: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     pub active_tx_offsets: Arc<std::sync::RwLock<std::collections::HashMap<String, f64>>>,
     pub tx_policy: Arc<std::sync::atomic::AtomicU8>,
@@ -18,6 +21,9 @@ pub struct WorkerHarness {
     pub operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     pub split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     pub remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    /// The worker's Fox-admitted QSO keys (PAN-386), so a scenario can admit
+    /// Fox streams the way the coordinator's Fox mode does.
+    pub fox_admitted_qsos: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 
     pub hamlib: crossbeam_channel::Receiver<ComponentMessage>,
     pub audio: crossbeam_channel::Receiver<ComponentMessage>,
@@ -31,6 +37,21 @@ impl WorkerHarness {
         config: pancetta_config::Config,
         home: std::path::PathBuf,
         arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+    ) -> Self {
+        Self::new_with_utc_clock(
+            config,
+            home,
+            arm_clock,
+            pancetta_core::time::system_utc_clock(),
+        )
+        .await
+    }
+
+    pub async fn new_with_utc_clock(
+        config: pancetta_config::Config,
+        home: std::path::PathBuf,
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+        utc_clock: pancetta_core::time::UtcClock,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
@@ -69,13 +90,13 @@ impl WorkerHarness {
         let autonomous = Arc::new(bus.durable_inbox(ComponentId::Autonomous).await.unwrap());
         let tui = bus.get_or_create_channel(ComponentId::Tui).await.unwrap().1;
         coordinator
-            .start_transmitter_component_with_clock(
-                arm_clock,
-                pancetta_core::time::system_utc_clock(),
-            )
+            .start_transmitter_component_with_clock(arm_clock, utc_clock)
             .await
             .unwrap();
         Self {
+            ptt_sync_gate: coordinator.ptt_sync_gate.clone(),
+            before_ptt_gate: coordinator.tx_before_ptt_gate.clone(),
+            cross_time_state: coordinator.cross_time_state.clone(),
             active_tx_qsos: coordinator.active_tx_qsos.clone(),
             active_tx_offsets: coordinator.active_tx_offsets.clone(),
             tx_policy: coordinator.tx_policy.clone(),
@@ -88,6 +109,7 @@ impl WorkerHarness {
             operating_frequency_hz: coordinator.operating_frequency_hz.clone(),
             split_tx_frequency_hz: coordinator.split_tx_frequency_hz.clone(),
             remote_tx_arm: coordinator.remote_tx_arm.clone(),
+            fox_admitted_qsos: coordinator.fox_admitted_qsos.clone(),
             outcomes: Default::default(),
             coordinator,
             bus,
@@ -101,6 +123,9 @@ impl WorkerHarness {
 
     pub fn wire_manager(&self, manager: &mut pancetta_qso::QsoManager) {
         let c = &self.coordinator;
+        self.coordinator
+            .qso_manager_watch
+            .send_replace(Some(manager.clone()));
         manager.set_dial_frequency_source(c.operating_frequency_hz.clone());
         manager.set_split_tx_frequency_source(c.split_tx_frequency_hz.clone());
         manager.set_tx_freq_mode_source(c.tx_freq_mode.clone());

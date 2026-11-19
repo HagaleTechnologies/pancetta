@@ -108,12 +108,15 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 |---|---|
 | `adif_backup.rs` | Changed startup ADIF snapshots and independent retention. |
 | `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
+| `alerts/` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
 | `audio.rs` | Audio component startup. |
 | `audio/` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
 | `audio_recovery/` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
 | `autonomous/` | Autonomous operator component. |
+| `band_hop.rs` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
+| `band_hop/` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
 | `config_reload.rs` | Applying saved config edits: live security fields, restart list. |
 | `contest.rs` | Durable contest scoring refresh. |
@@ -130,10 +133,13 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `health/` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
+| `n1mm_udp.rs` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
+| `n1mm_udp/` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
 | `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
+| `qso/` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso_filter.rs` | QSO partner band-collapse filtering (hb-229). |
 | `qso_upload_status.rs` | Registry of per-QSO upload results for the TUI (PAN-344). |
 | `raw_capture.rs` | Timed raw 48 kHz capture, one WAV per FT8 slot (PAN-393). |
@@ -156,9 +162,12 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tui_relay/` | TUI relay and command forwarding. |
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
+| `tx_drive.rs` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
+| `tx_drive/` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
+| `tx_meter/` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `util.rs` | Linear resampling for WAV playback. |
@@ -179,7 +188,7 @@ ft8_to_tui_tx    ->  ft8_to_tui_rx     (RelayedDecode, bounded 500)
 waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, bounded 100)
 ```
 
-**`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs}`) speaks
+**`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs,ingest.rs}`) speaks
 the WSJT-X-compatible UDP protocol for GridTracker/JTAlert/logger interop, following the
 same disabled-drain / enabled-task lifecycle as `psk_reporter.rs`. It taps into the rest
 of the coordinator additively, in three places: an FT8-decode fan-out tap in `ft8.rs`
@@ -191,9 +200,15 @@ QSO into `QSOLogged(5)` + `LoggedADIF(12)`; and an inbound-dispatch gate on the 
 socket processes `Reply`/`HaltTx`/`Replay` requests only after they pass the fail-closed
 source/consent checks described in `docs/DECISIONS/remote-operation.md` (a GridTracker
 double-click becomes a `QsoMessage::StartQso { remote_origin: true }`, which routes
-through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses). None of
-these taps touch an existing `→Tui` send path — `pancetta-tui` behavior stays
-byte-identical whether or not `[network.wsjtx_udp]` is enabled.
+through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses). A fourth
+piece, the PAN-381 decode listener (`pancetta/src/coordinator/wsjtx_udp/ingest.rs`), binds
+a separate receive-only loopback socket on `decode_listen`, learns a same-host WSJT-X's
+dial from its `Status(1)` datagrams and turns each live `Decode(2)` into a `RelayedDecode`
+tagged `DecodeOrigin::WsjtxUdp`. The outbound taps touch no existing `→Tui` send path.
+The decode listener is the one exception: when `accept_decodes = true` it sends only on a
+clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous, PSKReporter
+and the remote gateway never see its decodes), and with it off `pancetta-tui` behavior
+stays byte-identical whether or not `[network.wsjtx_udp]` is enabled.
 
 ---
 
@@ -236,7 +251,7 @@ avoid QRM from active signals, maintain minimum spacing between simultaneous TX 
 prefer clear channels, align with band segment conventions. Enables parallel QSOs
 within a single 15-second slot.
 
-### TX Slot Scheduler (`pancetta/src/coordinator/tx.rs`)
+### TX Slot Scheduler (`pancetta/src/coordinator/tx/worker.rs`)
 
 `TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
 (or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and

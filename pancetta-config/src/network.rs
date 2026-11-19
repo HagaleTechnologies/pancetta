@@ -242,7 +242,9 @@ pub struct QrzXmlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WsjtxUdpConfig {
-    /// Master enable. Off ⇒ no socket is bound and nothing is emitted.
+    /// Companion-broadcast switch (pancetta in the WSJT-X role). Off ⇒ that
+    /// socket is not bound and nothing is emitted. The decode listener has its
+    /// own switch, `accept_decodes`.
     pub enabled: bool,
     /// Destination `host:port` — unicast (e.g. "192.168.1.20:2237") or a
     /// multicast group (e.g. "224.0.0.73:2237").
@@ -265,6 +267,12 @@ pub struct WsjtxUdpConfig {
     /// For multicast destinations: hosts allowed to send requests. Empty ⇒
     /// all requests refused (and logged). Unicast infers the peer host.
     pub allowed_request_hosts: Vec<String>,
+    /// Listen on `decode_listen` for a same-host WSJT-X's Decode/Status
+    /// datagrams; display and scoring only, never transmit. Independent of
+    /// `enabled`. Restart required. (PAN-381)
+    pub accept_decodes: bool,
+    /// Loopback `address:port` WSJT-X's UDP Server is pointed at. (PAN-381)
+    pub decode_listen: String,
 }
 
 impl Default for WsjtxUdpConfig {
@@ -278,6 +286,8 @@ impl Default for WsjtxUdpConfig {
             accept_udp_requests: false,
             allow_tx_initiation: false,
             allowed_request_hosts: Vec::new(),
+            accept_decodes: false,
+            decode_listen: "127.0.0.1:2238".to_string(),
         }
     }
 }
@@ -298,18 +308,39 @@ impl ConfigSection for WsjtxUdpConfig {
                 });
             }
         }
+        // PAN-381 decode listener: independent of `enabled`, validated only
+        // when it will bind.
+        if self.accept_decodes {
+            let listen = self
+                .decode_listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "network.wsjtx_udp.decode_listen".to_string(),
+                    value: self.decode_listen.clone(),
+                })?;
+            if !listen.ip().to_canonical().is_loopback() {
+                return Err(ConfigError::Validation(format!(
+                    "network.wsjtx_udp.decode_listen {listen} is not a loopback address; the decode listener accepts only a same-host WSJT-X, so bind to 127.0.0.1 or [::1]"
+                )));
+            }
+            if listen.port() == 0 {
+                return Err(ConfigError::Validation(
+                    "network.wsjtx_udp.decode_listen needs a fixed port (got 0) so WSJT-X can be pointed at it".to_string(),
+                ));
+            }
+            if let Ok(destination) = self.destination.parse::<std::net::SocketAddr>() {
+                if destination == listen {
+                    return Err(ConfigError::Validation(format!(
+                        "network.wsjtx_udp.decode_listen must differ from network.wsjtx_udp.destination ({destination}), or pancetta would receive its own datagrams"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.destination = other.destination;
-        self.multicast_interface = other.multicast_interface;
-        self.multicast_ttl = other.multicast_ttl;
-        self.instance_id = other.instance_id;
-        self.accept_udp_requests = other.accept_udp_requests;
-        self.allow_tx_initiation = other.allow_tx_initiation;
-        self.allowed_request_hosts = other.allowed_request_hosts;
+        *self = other;
     }
 }
 
@@ -429,11 +460,7 @@ impl ConfigSection for RemoteGatewayConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.bind_addr = other.bind_addr;
-        self.auth_token = other.auth_token;
-        self.allowed_origins = other.allowed_origins;
-        self.allow_network_exposure = other.allow_network_exposure;
+        *self = other;
     }
 }
 
@@ -2391,3 +2418,7 @@ tx_allow_list = ["client-key-1", "client-key-2"]
         }
     }
 }
+
+#[cfg(test)]
+#[path = "network/tests/wsjtx_decode_ingest_tests.rs"]
+mod wsjtx_decode_ingest_tests;

@@ -216,6 +216,8 @@ pub enum OsdInput {
     OffsetSubtracted(f32),
 }
 
+/// Decoder configuration: sample rate, protocol, decode passes and the
+/// tuning knobs of the candidate search, LDPC and OSD stages.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8Config {
@@ -2691,6 +2693,11 @@ pub struct Ft8Decoder {
     /// Pre-computed FFT plan for symbol extraction (sps-length)
     symbol_fft: std::sync::Arc<dyn rustfft::Fft<f64>>,
 
+    /// Reused full-window Hilbert plans and Gaussian kernel for subtraction.
+    hilbert_fft: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    hilbert_ifft: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    gfsk_kernel_prefix: Vec<f64>,
+
     /// Pre-computed Hann window for symbol extraction (sps-length)
     symbol_window: Vec<f64>,
 
@@ -2886,6 +2893,29 @@ impl Ft8Decoder {
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
         let mut planner = FftPlanner::<f64>::new();
         let symbol_fft = planner.plan_fft_forward(sps);
+        let reference_len = protocol_params.num_symbols * sps;
+        let hilbert_fft = planner.plan_fft_forward(reference_len);
+        let hilbert_ifft = planner.plan_fft_inverse(reference_len);
+        let bt = match protocol_params.modulation {
+            crate::protocol::ModulationType::Gfsk { bt } => bt,
+            crate::protocol::ModulationType::Cpfsk => crate::modulator::DEFAULT_BT,
+        };
+        let sigma = (2.0_f64.ln()).sqrt() / (2.0 * std::f64::consts::PI * bt) * sps as f64;
+        let half = (3.0 * sigma).ceil() as usize;
+        let mut kernel = Vec::with_capacity(2 * half + 1);
+        let mut sum = 0.0;
+        for j in 0..=2 * half {
+            let t = (j as f64 - half as f64) / sigma;
+            let value = (-0.5 * t * t).exp();
+            kernel.push(value);
+            sum += value;
+        }
+        let mut gfsk_kernel_prefix = Vec::with_capacity(kernel.len() + 1);
+        gfsk_kernel_prefix.push(0.0);
+        for value in kernel {
+            gfsk_kernel_prefix
+                .push(gfsk_kernel_prefix.last().copied().unwrap_or(0.0) + value / sum);
+        }
         let pi2 = 2.0 * std::f64::consts::PI;
         let symbol_window: Vec<f64> = if config.fine_fft_rect_window {
             vec![1.0; sps]
@@ -2939,6 +2969,9 @@ impl Ft8Decoder {
             message_parser,
             ldpc_decoder,
             symbol_fft,
+            hilbert_fft,
+            hilbert_ifft,
+            gfsk_kernel_prefix,
             symbol_window,
             symbol_fft_buffer,
             spectrogram_fft,
@@ -4944,8 +4977,8 @@ impl Ft8Decoder {
             // Subtraction is paid for only while the next pass can still
             // fit: each message is checked against the same
             // `pass_floor_cost` the next pass's gate uses, before it is
-            // subtracted. Its cost scales with decode count (time-varying
-            // subtraction measured ~140 ms/message on a 2-core host) and
+            // subtracted. Its cost scales with decode count (PAN-370
+            // subtraction measures 35 ms/message on a 2-core host) and
             // cannot be predicted up front, so PAN-165 moved the check from
             // once per pass to once per message: the worst-case overrun is
             // one message, not a whole busy window's worth (which ran
@@ -5538,9 +5571,8 @@ impl Ft8Decoder {
     /// consistent with the existing `subtract_signal` path which also only
     /// searches/aligns at whole-sample resolution.
     ///
-    /// [BIT-EXACT]: new, presently-**unused** function — not called from any
-    /// decode path. W4.2 (audio-domain subtraction) and W4.3 (real
-    /// multipass) are the intended future callers.
+    /// Slow reference kept for Path B and numerical comparison with the
+    /// segment-wise Max-subtraction synthesis.
     ///
     /// Compiled in every build, like `crate::modulator::Ft8Modulator`
     /// itself (PAN-331).
@@ -5583,6 +5615,88 @@ impl Ft8Decoder {
         })
     }
 
+    /// Synthesize the same Gaussian reference using segment sums in place of
+    /// the modulator's full convolution. The window is shorter than a symbol.
+    fn generate_gfsk_reference_fast(
+        &self,
+        symbols: &[u8],
+        pp: &ProtocolParams,
+        sample_rate: u32,
+        frequency_hz: f64,
+        time_offset_samples: f64,
+    ) -> Ft8Result<GfskReference> {
+        use crate::modulator::{Ft8Modulator, PulseShape, DEFAULT_TX_POWER};
+        use crate::protocol::ModulationType;
+        let bt = match pp.modulation {
+            ModulationType::Gfsk { bt } => bt,
+            ModulationType::Cpfsk => crate::modulator::DEFAULT_BT,
+        };
+        let mut modulator = Ft8Modulator::with_pulse_shape(
+            sample_rate,
+            frequency_hz,
+            DEFAULT_TX_POWER,
+            PulseShape::Gaussian { bt },
+        )?;
+        if symbols.iter().any(|&symbol| symbol >= pp.num_tones as u8) {
+            return Err(Ft8Error::SignalProcessingError(format!(
+                "Invalid symbol value (must be 0-{})",
+                pp.num_tones - 1
+            )));
+        }
+        let max_frequency = crate::modulator::MAX_FREQUENCY_DEVIATION;
+        if frequency_hz < 200.0
+            || frequency_hz + (pp.num_tones as f64 - 1.0) * pp.tone_spacing > max_frequency
+        {
+            return Err(Ft8Error::SignalProcessingError(format!(
+                "Frequency {} Hz would exceed deviation limits",
+                frequency_hz
+            )));
+        }
+        let trajectory = self.fast_gfsk_trajectory(symbols, pp, sample_rate, frequency_hz);
+        let samples = modulator.modulate_from_trajectory(&trajectory, pp)?;
+        Ok(GfskReference {
+            samples,
+            start_sample: time_offset_samples.round() as isize,
+        })
+    }
+
+    fn fast_gfsk_trajectory(
+        &self,
+        symbols: &[u8],
+        pp: &ProtocolParams,
+        sample_rate: u32,
+        frequency_hz: f64,
+    ) -> Vec<f64> {
+        let spacing = pp.tone_spacing;
+        let sps = pp.samples_per_symbol(sample_rate);
+        let total = symbols.len() * sps;
+        let half = (self.gfsk_kernel_prefix.len() - 2) / 2;
+        let kernel_total = *self.gfsk_kernel_prefix.last().unwrap();
+        let frequencies: Vec<f64> = symbols
+            .iter()
+            .map(|&symbol| frequency_hz + symbol as f64 * spacing)
+            .collect();
+        let mut trajectory = Vec::with_capacity(total);
+        for i in 0..total {
+            let left = i.saturating_sub(half);
+            let right = (i + half).min(total - 1);
+            let first = left / sps;
+            if first == right / sps {
+                trajectory.push(frequencies[first] * kernel_total);
+            } else {
+                let boundary = (first + 1) * sps;
+                let split = (boundary + half)
+                    .saturating_sub(i)
+                    .min(self.gfsk_kernel_prefix.len() - 1);
+                let weight = self.gfsk_kernel_prefix[split];
+                trajectory.push(
+                    frequencies[first] * weight + frequencies[first + 1] * (kernel_total - weight),
+                );
+            }
+        }
+        trajectory
+    }
+
     /// Task W4.2: derive the analytic-signal quadrature companion of a
     /// REAL reference waveform via an FFT-domain Hilbert transform —
     /// zero the negative-frequency bins, double the positive-frequency
@@ -5610,6 +5724,21 @@ impl Ft8Decoder {
         let fft = planner.plan_fft_forward(n);
         let ifft = planner.plan_fft_inverse(n);
 
+        Self::hilbert_quadrature_with_plans(real_signal, &fft, &ifft)
+    }
+
+    fn hilbert_quadrature_with_plans(
+        real_signal: &[f64],
+        fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
+        ifft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
+    ) -> Vec<f64> {
+        let n = real_signal.len();
+        if n < 2 {
+            return vec![0.0; n];
+        }
+        if fft.len() != n || ifft.len() != n {
+            return Self::hilbert_quadrature(real_signal);
+        }
         let mut buf: Vec<Complex<f64>> =
             real_signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
         fft.process(&mut buf);
@@ -5681,8 +5810,35 @@ impl Ft8Decoder {
             time_offset_samples,
         )
         .ok()?;
+        let i: Vec<f64> = gfsk_ref
+            .samples
+            .iter()
+            .map(|&sample| sample as f64)
+            .collect();
+        let q = Self::hilbert_quadrature(&i);
+        Some((i, q))
+    }
+
+    fn build_gfsk_iq_pair_fast(
+        &self,
+        symbols: &[u8],
+        pp: &ProtocolParams,
+        sample_rate: u32,
+        frequency_hz: f64,
+        time_offset_samples: f64,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        let gfsk_ref = self
+            .generate_gfsk_reference_fast(
+                symbols,
+                pp,
+                sample_rate,
+                frequency_hz,
+                time_offset_samples,
+            )
+            .ok()?;
         let recon_i: Vec<f64> = gfsk_ref.samples.iter().map(|&s| s as f64).collect();
-        let recon_q = Self::hilbert_quadrature(&recon_i);
+        let recon_q =
+            Self::hilbert_quadrature_with_plans(&recon_i, &self.hilbert_fft, &self.hilbert_ifft);
         Some((recon_i, recon_q))
     }
 
@@ -5820,6 +5976,81 @@ impl Ft8Decoder {
         }
 
         (amp_i_t, amp_q_t)
+    }
+
+    /// Frequency shift a synthesized complex reference without repeating its phase walk.
+    fn rotate_iq_pair(
+        ri: &[f64],
+        rq: &[f64],
+        delta_hz: f64,
+        sample_rate: u32,
+    ) -> (Vec<f64>, Vec<f64>) {
+        if delta_hz == 0.0 {
+            return (ri.to_vec(), rq.to_vec());
+        }
+        let angle = 2.0 * std::f64::consts::PI * delta_hz / sample_rate as f64;
+        let (step_s, step_c) = angle.sin_cos();
+        let (mut c, mut si) = (1.0f64, 0.0f64);
+        let mut oi = Vec::with_capacity(ri.len());
+        let mut oq = Vec::with_capacity(rq.len());
+        for (index, (&i, &q)) in ri.iter().zip(rq).enumerate() {
+            oi.push(i * c - q * si);
+            oq.push(i * si + q * c);
+            let next_c = c * step_c - si * step_s;
+            si = c * step_s + si * step_c;
+            c = next_c;
+            if index % 8192 == 8191 {
+                let magnitude = c.hypot(si);
+                c /= magnitude;
+                si /= magnitude;
+            }
+        }
+        (oi, oq)
+    }
+
+    fn reference_prefix(ri: &[f64], rq: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut ii = Vec::with_capacity(ri.len() + 1);
+        let mut qq = Vec::with_capacity(ri.len() + 1);
+        let mut iq = Vec::with_capacity(ri.len() + 1);
+        ii.push(0.0);
+        qq.push(0.0);
+        iq.push(0.0);
+        for (&i, &q) in ri.iter().zip(rq) {
+            ii.push(ii.last().unwrap() + i * i);
+            qq.push(qq.last().unwrap() + q * q);
+            iq.push(iq.last().unwrap() + i * q);
+        }
+        (ii, qq, iq)
+    }
+
+    fn correlation_energy_prefix(
+        audio: &[f32],
+        audio_start: usize,
+        ri: &[f64],
+        rq: &[f64],
+        reference_offset: usize,
+        len: usize,
+        prefix: &(Vec<f64>, Vec<f64>, Vec<f64>),
+    ) -> f64 {
+        let mut ai = 0.0;
+        let mut aq = 0.0;
+        for index in 0..len {
+            let a = audio[audio_start + index] as f64;
+            ai += a * ri[reference_offset + index];
+            aq += a * rq[reference_offset + index];
+        }
+        let end = reference_offset + len;
+        let ii = prefix.0[end] - prefix.0[reference_offset];
+        let qq = prefix.1[end] - prefix.1[reference_offset];
+        let iq = prefix.2[end] - prefix.2[reference_offset];
+        let det = ii * qq - iq * iq;
+        if det.abs() > 1e-12 {
+            let fit_i = (ai * qq - aq * iq) / det;
+            let fit_q = (aq * ii - ai * iq) / det;
+            fit_i * fit_i + fit_q * fit_q
+        } else {
+            0.0
+        }
     }
 
     /// Compute the correlation energy (amplitude^2) of a CPFSK signal at given
@@ -6079,9 +6310,16 @@ impl Ft8Decoder {
         let mut best_freq = nominal_freq;
         let mut best_time = nominal_time;
 
+        let nominal_pair = gen_iq(symbols, nominal_freq);
         for di in -3i32..=3 {
             let try_freq = nominal_freq + di as f64 * 0.5;
-            let (ri, rq) = gen_iq(symbols, try_freq);
+            let (ri, rq) = Self::rotate_iq_pair(
+                &nominal_pair.0,
+                &nominal_pair.1,
+                di as f64 * 0.5,
+                SAMPLE_RATE,
+            );
+            let prefix = Self::reference_prefix(&ri, &rq);
             for dt in -4i32..=4 {
                 let try_time = nominal_time + dt as isize * 120;
                 let recon_start = try_time.max(0) as usize;
@@ -6091,8 +6329,15 @@ impl Ft8Decoder {
                 if sig_len == 0 {
                     continue;
                 }
-                let energy =
-                    Self::correlation_energy(audio, recon_start, &ri, &rq, recon_offset, sig_len);
+                let energy = Self::correlation_energy_prefix(
+                    audio,
+                    recon_start,
+                    &ri,
+                    &rq,
+                    recon_offset,
+                    sig_len,
+                    &prefix,
+                );
                 if energy > best_energy {
                     best_energy = energy;
                     best_freq = try_freq;
@@ -6102,7 +6347,12 @@ impl Ft8Decoder {
         }
 
         // Now subtract at the best frequency/time
-        let (recon_i, recon_q) = gen_iq(symbols, best_freq);
+        let (recon_i, recon_q) = Self::rotate_iq_pair(
+            &nominal_pair.0,
+            &nominal_pair.1,
+            best_freq - nominal_freq,
+            SAMPLE_RATE,
+        );
         let recon_start = best_time.max(0) as usize;
         let recon_offset = (recon_start as isize - best_time) as usize;
         let signal_len =
@@ -6130,7 +6380,7 @@ impl Ft8Decoder {
             // Passing the real `best_time` here (as an earlier revision
             // did) was misleading dead-weight plumbing; `0.0` makes the
             // no-effect explicit. See `build_gfsk_iq_pair`'s doc.
-            if let Some((gfsk_i, gfsk_q)) = Self::build_gfsk_iq_pair(
+            if let Some((gfsk_i, gfsk_q)) = self.build_gfsk_iq_pair_fast(
                 symbols,
                 &self.protocol_params,
                 SAMPLE_RATE,
@@ -6278,6 +6528,7 @@ impl Ft8Decoder {
         let tone_spacing = TONE_SPACING;
         let sidelobe_scale = 0.15 * 0.9; // 15% sidelobe × 0.9 conservative factor
 
+        let nominal_pair = Self::generate_cpfsk_iq(symbols, base_freq, sps, TONE_SPACING);
         // For each sidelobe offset (+1 and -1 tone spacing)
         for &freq_offset in &[tone_spacing, -tone_spacing] {
             let shifted_freq = base_freq + freq_offset;
@@ -6286,7 +6537,7 @@ impl Ft8Decoder {
             }
 
             let (recon_i, recon_q) =
-                Self::generate_cpfsk_iq(symbols, shifted_freq, sps, TONE_SPACING);
+                Self::rotate_iq_pair(&nominal_pair.0, &nominal_pair.1, freq_offset, SAMPLE_RATE);
             let recon_start = nominal_time.max(0) as usize;
             let recon_offset = (recon_start as isize - nominal_time) as usize;
             let signal_len = (total_len.saturating_sub(recon_offset))
@@ -26922,7 +27173,7 @@ mod bessel_fallback_tests {
             let ft4 = ProtocolParams::ft4();
             #[cfg(feature = "ft2")]
             let ft2 = ProtocolParams::ft2();
-            let mut cases = vec![
+            let cases = vec![
                 DecodeContext {
                     bessel_fallback_enabled: false,
                     ..ctx
@@ -31374,3 +31625,7 @@ mod fft_fallback_budget_tests {
         assert_eq!(attempts, 400);
     }
 }
+
+#[cfg(test)]
+#[path = "decoder/tests/subtraction_cost_tests.rs"]
+mod subtraction_cost_tests;

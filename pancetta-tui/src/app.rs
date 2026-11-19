@@ -224,6 +224,10 @@ pub struct DecodedMessageView {
     /// full exchange text is already in `message`. Test-default false.
     #[serde(default)]
     pub is_own_tx: bool,
+    /// `true` when this decode came from a same-host WSJT-X over UDP
+    /// (PAN-381), not pancetta's receiver. Display only. Test-default false.
+    #[serde(default)]
+    pub external: bool,
 }
 
 /// One entry in the last-10-QSOs history panel (#165).
@@ -455,6 +459,39 @@ pub enum SpotSource {
     Network,
     /// Seen locally AND in network
     Both,
+    /// Heard only through a same-host WSJT-X's UDP decodes (PAN-381)
+    External,
+    /// Heard through WSJT-X's UDP decodes AND in network (PAN-381)
+    ExternalNetwork,
+}
+
+impl SpotSource {
+    /// The source a row takes after a decode of its station arrives
+    /// (PAN-381). A native decode upgrades an external row to `Local` or
+    /// `Both`; an external decode never downgrades `Local` or `Both`.
+    pub fn after_decode(self, external: bool) -> SpotSource {
+        match (self, external) {
+            (SpotSource::Local, _) => SpotSource::Local,
+            (SpotSource::Both, _) => SpotSource::Both,
+            (SpotSource::External, false) => SpotSource::Local,
+            (SpotSource::External, true) => SpotSource::External,
+            (SpotSource::Network, false) => SpotSource::Both,
+            (SpotSource::Network, true) => SpotSource::ExternalNetwork,
+            (SpotSource::ExternalNetwork, false) => SpotSource::Both,
+            (SpotSource::ExternalNetwork, true) => SpotSource::ExternalNetwork,
+        }
+    }
+
+    /// The source a row takes after a network spot of its station merges
+    /// in (PAN-381): a locally heard row becomes `Both`, an externally
+    /// heard row `ExternalNetwork`.
+    pub fn after_network_spot(self) -> SpotSource {
+        match self {
+            SpotSource::Local | SpotSource::Both => SpotSource::Both,
+            SpotSource::External | SpotSource::ExternalNetwork => SpotSource::ExternalNetwork,
+            SpotSource::Network => SpotSource::Network,
+        }
+    }
 }
 
 impl std::fmt::Display for SpotSource {
@@ -463,6 +500,8 @@ impl std::fmt::Display for SpotSource {
             SpotSource::Local => write!(f, "RX"),
             SpotSource::Network => write!(f, "NET"),
             SpotSource::Both => write!(f, "RX+N"),
+            SpotSource::External => write!(f, "EXT"),
+            SpotSource::ExternalNetwork => write!(f, "EX+N"),
         }
     }
 }
@@ -1674,6 +1713,12 @@ pub struct App {
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on. `None` until announced.
     pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    /// Station-confirmed TX audio drive and its configured ceiling, in dB.
+    pub tx_drive: Option<(f32, f32)>,
+    /// Selected band drive mode, supplied by the coordinator.
+    pub tx_drive_mode: Option<pancetta_core::tx_drive_mode::TxDriveMode>,
+    /// Whether the rig currently reports usable ALC for Auto drive.
+    pub tx_drive_available: bool,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -2015,6 +2060,9 @@ impl App {
             tx_meter: None,
             tx_meter_at: None,
             tx_meter_capability: None,
+            tx_drive: None,
+            tx_drive_mode: None,
+            tx_drive_available: false,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
@@ -2105,9 +2153,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/tui_state.json`; `None` if the home directory can't be resolved.
+    /// The real `<data-dir>/tui_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_tui_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("tui_state.json"))
     }
 
     /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
@@ -2199,10 +2248,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/session_state.json`; `None` if the home
-    /// directory can't be resolved.
+    /// The real `<data-dir>/session_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_session_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("session_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("session_state.json"))
     }
 
     /// Test-only: point [`Self::session_state_path`] at `path` for the
@@ -2639,6 +2688,12 @@ impl App {
             // local decode actually knows about and leave network metadata
             // intact.
             match self.dx_stations.get_mut(call_sign) {
+                // PAN-381: pancetta's own receiver heard this station. A
+                // WSJT-X decode (possibly another receiver or band) leaves
+                // that row, and its call target, as pancetta heard it.
+                Some(entry)
+                    if message.external
+                        && matches!(entry.source, SpotSource::Local | SpotSource::Both) => {}
                 Some(entry) => {
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
@@ -2656,11 +2711,10 @@ impl App {
                     entry.slot_parity = message.slot_parity;
                     // A station previously known only from the network is
                     // now also heard locally → upgrade to Both. A
-                    // local-only station stays Local.
-                    entry.source = match entry.source {
-                        SpotSource::Network | SpotSource::Both => SpotSource::Both,
-                        SpotSource::Local => SpotSource::Local,
-                    };
+                    // local-only station stays Local. PAN-381: a native
+                    // decode upgrades an external row; an external decode
+                    // never downgrades a locally heard one.
+                    entry.source = entry.source.clone().after_decode(message.external);
                     // Keep the latest observation from each source, so ranks can fall.
                     entry.local_rank = Some(local_rank);
                     entry.refresh_priority_score();
@@ -2689,7 +2743,11 @@ impl App {
                             priority_score: local_rank.score,
                             local_rank: Some(local_rank),
                             network_rank: None,
-                            source: SpotSource::Local,
+                            source: if message.external {
+                                SpotSource::External
+                            } else {
+                                SpotSource::Local
+                            },
                             entity_name: None,
                             // PAN-284: resolved once, here; frames read it.
                             offline_entity: pancetta_core::dxcc::entity_for_callsign(call_sign),
@@ -3504,6 +3562,7 @@ impl App {
             priority_score: None,
             priority_factors: None,
             is_own_tx: true,
+            external: false,
         });
         // Same highlight-preservation bump `add_decoded_message` does
         // (app.rs:1598-1600) — a push_back makes a new row-0, so a
@@ -3986,6 +4045,31 @@ impl App {
             .map(str::to_string)
     }
 
+    /// Apply a relay rescore only to a row whose rank came from the same
+    /// decode origin (PAN-381): native inputs rescore an `RX` or `RX+N` row,
+    /// same-host WSJT-X inputs an `EXT` or `EX+N` row. A WSJT-X decode never
+    /// updates a row pancetta heard itself, so its inputs never rescore one,
+    /// and a row rebuilt from WSJT-X decodes after a band change is not
+    /// rescored from another band's native inputs.
+    pub fn refresh_local_rank_from(
+        &mut self,
+        callsign: &str,
+        score: u32,
+        factors: PriorityFactors,
+        external: bool,
+    ) {
+        let Some(entry) = self.dx_stations.get(dx_row_call(callsign)) else {
+            return;
+        };
+        let row_external = matches!(
+            entry.source,
+            SpotSource::External | SpotSource::ExternalNetwork
+        );
+        if row_external == external {
+            self.refresh_local_rank(callsign, score, factors);
+        }
+    }
+
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
     /// with that station ended (PAN-94), and rescore its cqdx spot with the
     /// same history so a stale network score cannot keep the row up. Keeps
@@ -4466,8 +4550,9 @@ impl App {
     /// This is the same notion of "directed at us" the Callers panel uses
     /// (`is_directed_at_us`), filtered to a single callsign. `decoded_messages`
     /// is push-back (oldest→newest) so we walk it in reverse and take the first
-    /// match. Used by [`Self::resolve_space_action`] to decide whether Space
-    /// should answer a CQ (grid) or reply at the correct exchange step.
+    /// match. [`Self::resolve_space_action`] uses the same predicate, minus
+    /// any WSJT-X decode PAN-435 refuses, to decide whether Space should
+    /// answer a CQ (grid) or reply at the correct exchange step.
     pub fn last_directed_at_us_from(&self, callsign: &str) -> Option<&DecodedMessageView> {
         self.decoded_messages.iter().rev().find(|m| {
             m.is_directed_at_us
@@ -4519,7 +4604,22 @@ impl App {
     pub fn resolve_space_action(&self) -> Option<SpaceAction> {
         let callsign = self.focused_callsign()?;
 
-        if let Some(msg) = self.last_directed_at_us_from(&callsign) {
+        // PAN-435: refuse the selected row before looking up older replies
+        // for the same callsign.
+        if let Some(message) = self.focused_external_row_refusal(&callsign) {
+            return Some(SpaceAction::Refused { message });
+        }
+
+        // A reply on the current dial also needs a compatible decode when
+        // the focused row itself came from another source.
+        let directed = self.decoded_messages.iter().rev().find(|m| {
+            m.is_directed_at_us
+                && m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&callsign))
+                && self.external_decode_refusal(m).is_none()
+        });
+        if let Some(msg) = directed {
             let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
             // Reply on the passband where we actually heard them, on their slot
             // parity if we know it — mirrors the Callers-Enter reply target.
@@ -4554,7 +4654,12 @@ impl App {
                 .selected_dx_hunter_row()
                 .filter(|r| pancetta_core::callsign::callsigns_match(&r.call_sign, &callsign))
             {
-                if let (None, Some(rf)) = (row.audio_offset_hz, row.spot_rf_hz) {
+                // PAN-381: an `EX+N` row's offset came from a same-host
+                // WSJT-X, possibly on another dial; pancetta never heard it,
+                // so it is still called at the spot's own dial.
+                let heard_locally =
+                    row.audio_offset_hz.is_some() && row.source != SpotSource::ExternalNetwork;
+                if let (false, Some(rf)) = (heard_locally, row.spot_rf_hz) {
                     return Some(
                         match crate::spot_call::resolve_spot_call(
                             rf,
@@ -4606,6 +4711,90 @@ impl App {
             frequency,
             dx_parity,
         })
+    }
+
+    /// PAN-435: the status line refusing Space or a directed reply on a
+    /// decode a same-host WSJT-X sent (PAN-381) whose band or mode differs
+    /// from pancetta's live dial and mode; `None` for a native decode or a
+    /// WSJT-X decode on pancetta's own band and mode. Pancetta's band is the
+    /// operating frequency's, and a rig readback that names another band
+    /// also refuses, because the readback lags a band key and the rig
+    /// transmits on its own dial. A band `pancetta_core::Band` cannot name
+    /// refuses, because a match cannot be shown.
+    pub fn external_decode_refusal(&self, msg: &DecodedMessageView) -> Option<String> {
+        if !msg.external {
+            return None;
+        }
+        let call = msg.call_sign.as_deref().unwrap_or("this station");
+        self.external_origin_refusal(call, band_from_mhz(msg.frequency), &msg.mode)
+    }
+
+    /// PAN-435: [`Self::external_decode_refusal`] for the row under the
+    /// focused panel's cursor, when that row is `callsign` and was heard only
+    /// through WSJT-X. An `EX+N` row with a network frequency keeps its
+    /// existing spot-call path and uses the spot's dial.
+    fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
+        let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                let displayed = self.displayed_messages();
+                let msg = displayed.get(self.band_activity_scroll)?;
+                if !msg.call_sign.as_deref().is_some_and(same) {
+                    return None;
+                }
+                self.external_decode_refusal(msg)
+            }
+            ActivePanel::DxHunter => {
+                let row = self
+                    .selected_dx_hunter_row()
+                    .filter(|r| same(&r.call_sign))?;
+                match row.source {
+                    SpotSource::External => {}
+                    SpotSource::ExternalNetwork if row.spot_rf_hz.is_none() => {}
+                    _ => return None,
+                }
+                self.external_origin_refusal(&row.call_sign, row.band, &row.mode)
+            }
+            ActivePanel::Callers => self
+                .selected_caller()
+                .filter(|m| m.call_sign.as_deref().is_some_and(same))
+                .and_then(|m| self.external_decode_refusal(m)),
+            _ => None,
+        }
+    }
+
+    /// PAN-435: refuse unless WSJT-X's `band` and `mode` are pancetta's live
+    /// band and mode.
+    fn external_origin_refusal(
+        &self,
+        callsign: &str,
+        band: Option<pancetta_core::Band>,
+        mode: &str,
+    ) -> Option<String> {
+        let ours = band_from_mhz(self.station_info.operating_frequency);
+        let rig = self.radio_frequency.and_then(band_from_mhz);
+        let rig_agrees = rig.is_none() || rig == ours;
+        let ours_mode = self.station_info.mode.as_str();
+        if band.is_some()
+            && band == ours
+            && rig_agrees
+            && mode.trim().eq_ignore_ascii_case(ours_mode.trim())
+        {
+            return None;
+        }
+        let rig_note = match rig {
+            Some(r) if !rig_agrees => format!(" (rig reads {r})"),
+            _ => String::new(),
+        };
+        let name = |b: Option<pancetta_core::Band>| {
+            b.map_or_else(|| "an unknown band".to_string(), |b| b.to_string())
+        };
+        Some(format!(
+            "Can't work {callsign}. WSJT-X heard it on {} {mode}. Pancetta is on {} \
+             {ours_mode}{rig_note}.",
+            name(band),
+            name(ours),
+        ))
     }
 
     // === Callers panel ====================================================
@@ -5226,10 +5415,9 @@ impl App {
                     pinned: false,
                 });
 
-            // If already exists from local decode, upgrade source
-            if entry.source == SpotSource::Local {
-                entry.source = SpotSource::Both;
-            }
+            // If already exists from a local (or PAN-381 external) decode,
+            // upgrade source
+            entry.source = entry.source.clone().after_network_spot();
             // Always update network metadata
             entry.rarity_tier = Some(spot.rarity_tier.clone());
             entry.reporter_count = Some(spot.reporter_count);
@@ -6385,6 +6573,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
         let score = app.calculate_dx_priority(&message).score;
         // ATNO + needed -> PriorityTier::Atno -> display range 5000-5999
@@ -6517,7 +6706,7 @@ mod tests {
         assert_eq!(App::home_session_state_path(), expected);
     }
 
-    fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
+    pub(super) fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
             timestamp: chrono::Utc::now(),
             frequency: 14_074_000.0,
@@ -6539,6 +6728,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -11763,3 +11953,7 @@ mod tests {
 #[cfg(test)]
 #[path = "app/tests/waterfall_panel_focus_tests.rs"]
 mod waterfall_panel_focus_tests;
+
+#[cfg(test)]
+#[path = "app/tests/external_decode_tests.rs"]
+mod external_decode_tests;

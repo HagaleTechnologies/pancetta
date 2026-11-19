@@ -384,19 +384,33 @@ fn first_backup_delay(period: Duration) -> Duration {
 }
 
 /// A relative `backup_directory` is anchored next to an absolute database
-/// path (`~/.pancetta/backups` for `~/.pancetta/qso.db`), or at the fixed
-/// state directory `~/.pancetta` when the database path is relative or has
-/// no directory (`:memory:`) — never relative to the process cwd (PAN-126).
-/// An absolute directory is used as-is. Only a home-less environment keeps
-/// the relative path.
+/// path (`~/.pancetta/backups` for `~/.pancetta/qso.db`), or at the process
+/// data directory (PAN-376: `--data-dir`, else `~/.pancetta`) when the
+/// database path is relative or has no directory (`:memory:`) — never
+/// relative to the process cwd (PAN-126). An absolute directory is used
+/// as-is. Only a home-less environment keeps the relative path.
 fn resolve_backup_directory(dir: &Path, database_path: &Path) -> PathBuf {
+    resolve_backup_directory_in(
+        dir,
+        database_path,
+        pancetta_core::data_dir::try_current().as_deref(),
+    )
+}
+
+/// [`resolve_backup_directory`] with the data directory passed in, so the
+/// fallback is testable without the process-wide data directory.
+fn resolve_backup_directory_in(
+    dir: &Path,
+    database_path: &Path,
+    data_dir: Option<&Path>,
+) -> PathBuf {
     if dir.is_absolute() {
         return dir.to_path_buf();
     }
     match database_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() && parent.is_absolute() => parent.join(dir),
-        _ => match dirs::home_dir() {
-            Some(home) => home.join(".pancetta").join(dir),
+        _ => match data_dir {
+            Some(data_dir) => data_dir.join(dir),
             None => dir.to_path_buf(),
         },
     }
@@ -916,6 +930,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_relative_database_backs_up_under_the_data_dir() {
+        // PAN-376: with `--data-dir D` and a relative (or `:memory:`)
+        // database, a relative backup directory lands in `D`, not
+        // `~/.pancetta`.
+        let data_dir = std::env::temp_dir().join("pancetta-40m");
+        for db in [":memory:", "qso.db"] {
+            assert_eq!(
+                resolve_backup_directory_in(Path::new("backups"), Path::new(db), Some(&data_dir)),
+                data_dir.join("backups"),
+                "database = {db}"
+            );
+        }
+        // An absolute database directory still wins over the data directory.
+        let abs_db = std::env::temp_dir().join("elsewhere").join("qso.db");
+        assert_eq!(
+            resolve_backup_directory_in(Path::new("backups"), &abs_db, Some(&data_dir)),
+            std::env::temp_dir().join("elsewhere").join("backups")
+        );
+        // No data directory at all keeps the relative path.
+        assert_eq!(
+            resolve_backup_directory_in(Path::new("backups"), Path::new("qso.db"), None),
+            PathBuf::from("backups")
+        );
+    }
+
     #[tokio::test]
     async fn test_backup_loop_does_not_back_up_at_startup() {
         // sophon 2026-10-07 / 2026-10-15: the first `interval()` tick fired
@@ -1021,6 +1061,7 @@ mod tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,

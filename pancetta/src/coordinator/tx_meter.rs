@@ -17,6 +17,100 @@ use tracing::{debug, warn};
 use super::swr_guard::to_tui;
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
+/// Keyed CAT ticks for the currently active drive sweep.
+#[derive(Debug, Default)]
+pub(crate) struct DriveCalibrationReads {
+    pub(crate) ticks: std::sync::Mutex<Vec<(Instant, Option<f32>)>>,
+}
+
+/// Samples belonging to one acknowledged, played FT waveform.
+#[derive(Debug, Default)]
+pub(crate) struct TxDriveAttempt {
+    auto: bool,
+    band: Option<pancetta_core::Band>,
+    confirmed: std::sync::atomic::AtomicBool,
+    started: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+    invalidated: std::sync::atomic::AtomicBool,
+    samples: std::sync::Mutex<Vec<TxMeterReading>>,
+}
+
+impl TxDriveAttempt {
+    pub(crate) fn new(auto: bool, band: Option<pancetta_core::Band>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            auto,
+            band,
+            ..Self::default()
+        })
+    }
+    pub(crate) fn confirm(&self) {
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn started(&self) {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn suppress_warn_only(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.auto
+            && self.confirmed.load(Acquire)
+            && self.started.load(Acquire)
+            && self.active.load(Acquire)
+    }
+    pub(crate) fn stop(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// Playback ended: later meter reads (the unkey tail) are not part of
+    /// the burst. Unlike [`Self::stop`] this keeps the warn-only suppression
+    /// until Hamlib acknowledges the PTT-off.
+    pub(crate) fn close_sampling(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// Abnormal teardown (PTT watchdog): the burst yields no summary.
+    pub(crate) fn invalidate(&self) {
+        self.invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.stop();
+    }
+    /// Key-down confirmed, playback started and neither stopped nor closed.
+    pub(crate) fn sampling(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.confirmed.load(Acquire)
+            && self.started.load(Acquire)
+            && self.active.load(Acquire)
+            && !self.closed.load(Acquire)
+    }
+    pub(crate) fn sample(&self, reading: TxMeterReading) {
+        if self.sampling() {
+            if let Ok(mut samples) = self.samples.lock() {
+                samples.push(reading);
+            }
+        }
+    }
+    pub(crate) fn finish(&self) -> Vec<TxMeterReading> {
+        self.summary().unwrap_or_default()
+    }
+    /// The burst's samples, or `None` when the attempt cannot train drive:
+    /// key-down unconfirmed, playback never started, or invalidated. `None`
+    /// is not "no ALC": the caller must not report it to the controller.
+    pub(crate) fn summary(&self) -> Option<Vec<TxMeterReading>> {
+        self.stop();
+        if !self.confirmed.load(std::sync::atomic::Ordering::Acquire)
+            || !self.started.load(std::sync::atomic::Ordering::Acquire)
+            || self.invalidated.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(self.samples.lock().map(|s| s.clone()).unwrap_or_default())
+    }
+}
+
 /// Bound on the once-per-session `tx_meter_levels` capability probe.
 pub(crate) const TX_METER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Consecutive keyed ALC readings above the limit that raise the warning.
@@ -119,6 +213,7 @@ pub(crate) struct AlcGuard {
     previous_high: Option<f32>,
     /// Already reported in this keyed episode.
     reported: bool,
+    last_ptt_epoch: u64,
 }
 
 impl AlcGuard {
@@ -142,7 +237,14 @@ impl AlcGuard {
             run: 0,
             previous_high: None,
             reported: false,
+            last_ptt_epoch: 0,
         }
+    }
+
+    pub(crate) fn reset_episode(&mut self) {
+        self.run = 0;
+        self.previous_high = None;
+        self.reported = false;
     }
 
     /// The limit the TUI should show, only while the warning is on.
@@ -193,8 +295,9 @@ pub(crate) fn overdrive_alert(max_alc: f32) -> String {
 /// The Shift+D and headless log detail.
 pub(crate) fn overdrive_detail(readings: [f32; 2], max_alc: f32) -> String {
     format!(
-        "ALC read {:.2} then {:.2} while transmitting, above max_alc {:.2}. Reduce audio drive: \
-         lower the computer's sound-card output level or the rig's USB/DATA input level until \
+        "ALC read {:.2} then {:.2} while transmitting, above max_alc {:.2}. \
+         Press F7 to reduce TX audio drive by 1 dB for the next transmission. \
+         If needed, lower the computer's sound-card output level or the rig's USB/DATA input level until \
          ALC stays at or below the limit. TX continues. Set [rig.power_control.protection] \
          alc_overdrive_warning = false to silence this warning",
         readings[0], readings[1], max_alc
@@ -203,13 +306,43 @@ pub(crate) fn overdrive_detail(readings: [f32; 2], max_alc: f32) -> String {
 
 /// One poll tick of TX metering. Best-effort like every meter read: it never
 /// affects poll_ok. Reads only while keyed.
-pub(crate) async fn tx_meter_poll_step(
+pub(crate) async fn tx_meter_poll_step_with_dial(
     rig: &(dyn pancetta_hamlib::RigControl + Send + Sync),
     plan: &TxMeterPlan,
     guard: &mut AlcGuard,
     keyed: bool,
     bus: &MessageBus,
+    rx_dial_hz: &std::sync::atomic::AtomicU64,
+    split_tx_hz: &std::sync::atomic::AtomicU64,
 ) {
+    let effective_band = || {
+        pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+            rx_dial_hz.load(std::sync::atomic::Ordering::Acquire),
+            split_tx_hz.load(std::sync::atomic::Ordering::Acquire),
+        ))
+    };
+    let band_before = effective_band();
+    if !keyed {
+        if let Ok(mut slot) = bus.active_tx_drive_attempt.lock() {
+            if let Some(attempt) = slot.take() {
+                attempt.stop();
+            }
+        }
+    }
+    let epoch = bus.gain_tx_epoch.load(std::sync::atomic::Ordering::Acquire);
+    if epoch != guard.last_ptt_epoch {
+        guard.reset_episode();
+        guard.last_ptt_epoch = epoch;
+    }
+    // PAN-439: only an attempt whose waveform was already playing when the
+    // reads began may take them; a read that started before playback is not
+    // part of the burst even if playback starts while it runs.
+    let episode = bus
+        .active_tx_drive_attempt
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .filter(|attempt| attempt.sampling());
     let alc = if keyed {
         let started = Instant::now();
         let alc = if plan.alc {
@@ -237,6 +370,21 @@ pub(crate) async fn tx_meter_poll_step(
             "TX meter reads"
         );
         if alc.is_some() || forward_power.is_some() {
+            if let Some(attempt) = episode {
+                let current = bus
+                    .active_tx_drive_attempt
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                if current
+                    .as_ref()
+                    .is_some_and(|active| std::sync::Arc::ptr_eq(active, &attempt))
+                    && band_before == effective_band()
+                    && attempt.band == band_before
+                {
+                    attempt.sample(TxMeterReading { forward_power, alc });
+                }
+            }
             let _ = bus
                 .send_message(ComponentMessage::new(
                     ComponentId::Hamlib,
@@ -255,7 +403,41 @@ pub(crate) async fn tx_meter_poll_step(
     } else {
         None
     };
-    act(guard.observe(keyed, alc), bus).await;
+    if keyed {
+        if let Some(sink) = bus
+            .active_drive_calibration
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            if let Ok(mut ticks) = sink.ticks.lock() {
+                ticks.push((Instant::now(), alc));
+            }
+        }
+    }
+    let warning = guard.observe(keyed, alc);
+    if !bus
+        .active_tx_drive_attempt
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .as_ref()
+        .is_some_and(|attempt| attempt.suppress_warn_only())
+    {
+        act(warning, bus).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn tx_meter_poll_step(
+    rig: &(dyn pancetta_hamlib::RigControl + Send + Sync),
+    plan: &TxMeterPlan,
+    guard: &mut AlcGuard,
+    keyed: bool,
+    bus: &MessageBus,
+) {
+    let unknown = std::sync::atomic::AtomicU64::new(0);
+    tx_meter_poll_step_with_dial(rig, plan, guard, keyed, bus, &unknown, &unknown).await;
 }
 
 /// Carry out an ALC guard decision. Warn-only: it never touches TX.
@@ -398,9 +580,10 @@ mod tests {
         );
         assert_eq!(
             overdrive_detail([0.81, 0.84], 0.5),
-            "ALC read 0.81 then 0.84 while transmitting, above max_alc 0.50. Reduce audio \
-             drive: lower the computer's sound-card output level or the rig's USB/DATA input \
-             level until ALC stays at or below the limit. TX continues. Set \
+            "ALC read 0.81 then 0.84 while transmitting, above max_alc 0.50. Press F7 to \
+             reduce TX audio drive by 1 dB for the next transmission. If needed, lower the \
+             computer's sound-card output level or the rig's USB/DATA input level until ALC \
+             stays at or below the limit. TX continues. Set \
              [rig.power_control.protection] alc_overdrive_warning = false to silence this \
              warning"
         );
@@ -505,6 +688,8 @@ mod tests {
         levels: Levels,
         scripts: Mutex<HashMap<TxMeter, VecDeque<Result<f32>>>>,
         reads: Mutex<HashMap<TxMeter, usize>>,
+        /// Marks this attempt's playback as started during the next read.
+        start_on_read: Mutex<Option<std::sync::Arc<TxDriveAttempt>>>,
     }
 
     impl MeterRig {
@@ -520,6 +705,7 @@ mod tests {
                 levels,
                 scripts: Mutex::new(HashMap::new()),
                 reads: Mutex::new(HashMap::new()),
+                start_on_read: Mutex::new(None),
             }
         }
 
@@ -603,6 +789,9 @@ mod tests {
         }
         async fn get_tx_meter(&self, meter: TxMeter) -> Result<f32> {
             *self.reads.lock().unwrap().entry(meter).or_insert(0) += 1;
+            if let Some(attempt) = self.start_on_read.lock().unwrap().take() {
+                attempt.started();
+            }
             self.scripts
                 .lock()
                 .unwrap()
@@ -672,6 +861,24 @@ mod tests {
         alc: true,
         forward_power: Some(TxMeter::ForwardPowerWatts),
     };
+
+    #[tokio::test]
+    async fn keyed_poll_feeds_calibration_valid_and_missing_alc_ticks() {
+        let ib = inboxes().await;
+        let rig = MeterRig::new(Levels::Fail).await;
+        rig.script(TxMeter::Alc, vec![Ok(0.12), Err(anyhow!("no ALC"))]);
+        let sink = std::sync::Arc::new(DriveCalibrationReads::default());
+        *ib.bus.active_drive_calibration.lock().unwrap() = Some(sink.clone());
+        let mut guard = guard_with(0.5);
+        let plan = TxMeterPlan {
+            alc: true,
+            forward_power: None,
+        };
+        tx_meter_poll_step(&rig, &plan, &mut guard, true, &ib.bus).await;
+        tx_meter_poll_step(&rig, &plan, &mut guard, true, &ib.bus).await;
+        let values: Vec<_> = sink.ticks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+        assert_eq!(values, vec![Some(0.12), None]);
+    }
 
     #[tokio::test]
     async fn step_keyed_reads_each_planned_meter_once_and_sends_one_reading() {
@@ -859,5 +1066,66 @@ mod tests {
     #[test]
     fn keyed_poll_interval_gives_two_readings_per_second() {
         assert!(super::super::hamlib::HAMLIB_POLL_INTERVAL <= Duration::from_millis(500));
+    }
+    #[test]
+    fn rekey_rearms_without_an_idle_poll() {
+        let protection = PowerProtectionConfig::default();
+        let mut guard = AlcGuard::new(&protection);
+        assert_eq!(guard.observe(true, Some(0.8)), AlcAction::None);
+        assert!(matches!(
+            guard.observe(true, Some(0.9)),
+            AlcAction::ReportOverdrive { .. }
+        ));
+        guard.reset_episode();
+        assert_eq!(guard.observe(true, Some(0.8)), AlcAction::None);
+        assert!(matches!(
+            guard.observe(true, Some(0.9)),
+            AlcAction::ReportOverdrive { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_poll_cannot_update_a_new_burst() {
+        let band = pancetta_core::Band::from_frequency(14_074_000);
+        let old = TxDriveAttempt::new(true, band);
+        old.confirm();
+        old.started();
+        old.stop();
+        old.sample(TxMeterReading {
+            alc: Some(0.8),
+            forward_power: None,
+        });
+        assert!(old.finish().is_empty());
+        let new = TxDriveAttempt::new(true, band);
+        new.confirm();
+        new.started();
+        new.sample(TxMeterReading {
+            alc: Some(0.2),
+            forward_power: None,
+        });
+        assert_eq!(new.finish().len(), 1);
+    }
+
+    // PAN-439: resolves to `tx_meter/tests/drive_attempt_tests.rs` and shares
+    // this module's `MeterRig` fixture.
+    #[path = "drive_attempt_tests.rs"]
+    mod drive_attempt_tests;
+
+    #[test]
+    fn preplay_and_invalidated_bursts_do_not_train() {
+        let band = pancetta_core::Band::from_frequency(14_074_000);
+        let attempt = TxDriveAttempt::new(true, band);
+        attempt.confirm();
+        attempt.sample(TxMeterReading {
+            alc: Some(0.8),
+            forward_power: None,
+        });
+        assert!(attempt.finish().is_empty());
+        attempt.started();
+        attempt.sample(TxMeterReading {
+            alc: Some(0.8),
+            forward_power: None,
+        });
+        assert!(attempt.finish().is_empty());
     }
 }

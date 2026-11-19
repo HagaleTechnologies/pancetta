@@ -1382,9 +1382,21 @@ async fn maybe_auto_resend_73(
 /// Whether a completed QSO is stashed for `maybe_auto_resend_73`. Only manual
 /// completions are; a Hound completion never is, because in the Fox/Hound
 /// procedure the Fox's RR73 ends the contact and a Hound sends no 73 (PAN-259).
+/// A Fox-role completion never is either: the Fox's RR73 already closed it
+/// and a WSJT-X Hound sends no 73 back (PAN-386).
 fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
-    metadata.initiated_by == pancetta_qso::CallInitiation::Manual && !metadata.hound
+    metadata.initiated_by == pancetta_qso::CallInitiation::Manual
+        && !metadata.hound
+        && !metadata.fox
 }
+
+#[cfg(test)]
+#[path = "qso/tests/fox_slot_tests.rs"]
+mod fox_slot_tests;
+
+#[cfg(test)]
+#[path = "qso/tests/upload_subscriber_startup_tests.rs"]
+mod upload_subscriber_startup_tests;
 
 /// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
 /// frame. Only touches the entry this call committed (same completed QSO,
@@ -2349,15 +2361,39 @@ async fn maybe_answer_caller(
     // multi-TX bundle when the coalescer folds them together. A genuine
     // no-op (byte-identical) when nothing is within MIN_TX_SEPARATION_HZ —
     // `deconflict_offset` returns the input unchanged in that case.
-    let active = qso_manager.active_tx_offsets().await;
-    let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
-    if tx_off != frequency_hz {
+    //
+    // PAN-386: an FT8 Fox answers on its own lowest free 60 Hz slot in
+    // 300-900 Hz instead (WSJT-X `foxgen.f90`), and hears the Hound at its
+    // calling frequency (`partner_freq`). FT4/FT2 Fox mode keeps Tx=Rx.
+    let fox_slots =
+        snap.fox_mode && pancetta_qso::fox_slots_apply(&qso_manager.config().active_mode);
+    let (tx_off, partner_freq) = if fox_slots {
+        let (fox_offsets, other_offsets) = qso_manager.active_tx_offsets_by_fox_role().await;
+        let Some(slot) = pancetta_qso::fox_slot_offset(&fox_offsets, &other_offsets) else {
+            info!(
+                target: "qso",
+                "Not auto-answering {}: no free Fox slot in 300-900 Hz", answer.their_call
+            );
+            return;
+        };
         info!(
             target: "qso",
-            "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
-            frequency_hz, tx_off, active.len()
+            "Fox answer slot: caller_freq={:.0} → tx_off={:.0} Hz ({} Fox stream(s))",
+            frequency_hz, slot, fox_offsets.len()
         );
-    }
+        (slot, Some(frequency_hz))
+    } else {
+        let active = qso_manager.active_tx_offsets().await;
+        let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
+        if tx_off != frequency_hz {
+            info!(
+                target: "qso",
+                "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
+                frequency_hz, tx_off, active.len()
+            );
+        }
+        (tx_off, partner_freq)
+    };
 
     match qso_manager
         .respond_to_caller(
@@ -2393,6 +2429,11 @@ async fn maybe_answer_caller(
             // mode was turned off during the awaits since.
             if snap.fox_mode {
                 record_fox_admitted(fox_admitted_qsos, &qso_id);
+                // PAN-386: an FT8 Fox answer is a Fox-role stream, pinned to
+                // its slot and completed by the Hound's R-report.
+                if fox_slots {
+                    qso_manager.mark_fox_role(qso_id).await;
+                }
             }
             emit_status(
                 message_bus,
@@ -2778,6 +2819,7 @@ mod pan6_diagnostic_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
         }
@@ -3499,6 +3541,7 @@ mod ap_ranking_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
         }
@@ -3574,6 +3617,8 @@ impl super::ApplicationCoordinator {
         // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
         let station_power_watts = config.station.power_watts;
         let attribution_comment = config.logging.attribution_comment;
+        // PAN-382: snapshot `[logging]` for the N1MM contactinfo gate below.
+        let logging_cfg = config.logging.clone();
         // Snapshot the opt-in QSO-upload settings. Only when at least one is
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
@@ -3696,6 +3741,16 @@ impl super::ApplicationCoordinator {
         // the operator's real log?" gate consults. Read once here; both the
         // upload subscriber and the LOCAL ADIF/DB writers below take it.
         let replay_mode = self.replay_mode();
+        // PAN-382: N1MM contactinfo UDP destination, `None` when the key is
+        // unset and always under `--replay` (replayed QSOs are not real
+        // contacts, so no socket is ever bound).
+        let n1mm_destination = super::n1mm_udp::n1mm_udp_destination(&logging_cfg, replay_mode);
+        if replay_mode && logging_cfg.n1mm_udp_destination().is_some() {
+            info!("Replay mode: N1MM contactinfo UDP suppressed -- replayed QSOs are not real contacts");
+        }
+        if let Some(dest) = n1mm_destination {
+            info!("N1MM contactinfo UDP enabled (destination: {dest})");
+        }
         // PAN-41 round 3: test-only override for where the replay-history-seed
         // read (below) and the non-replay writers look for `~/.pancetta` --
         // always `None` in production (see the field's own doc comment).
@@ -3736,8 +3791,9 @@ impl super::ApplicationCoordinator {
                 &upload_our_callsign,
                 &lotw_cfg,
             );
-            let path = pancetta_home(&pancetta_home_override)
-                .join(".pancetta")
+            // PAN-376: the outbox lives in the data directory.
+            let path = super::data_dir_for(pancetta_home_override.as_deref())
+                .unwrap_or_else(pancetta_core::data_dir::current)
                 .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
             let schedule = pancetta_dx::upload_outbox::RetrySchedule::new(
                 retry_cfg.max_attempts,
@@ -3996,6 +4052,21 @@ impl super::ApplicationCoordinator {
             }));
         }
 
+        // The local logbook and upload receivers are taken before the manager
+        // is published below. Both consumers start inside the spawned task,
+        // the upload subscriber only after the startup index rebuild and
+        // logger open. A QSO completed through the published manager in that
+        // window waits in these receivers instead of missing the logbook of
+        // record or the upload queue. Replay opens no logbook, so it takes no
+        // ADIF receiver.
+        let adif_events = (!replay_mode).then(|| qso_manager.subscribe());
+        let upload_events = upload_enabled.then(|| qso_manager.subscribe());
+
+        // PAN-382: queue completions before publishing the manager. The
+        // emitter starts after local log setup, which can await disk I/O.
+        let n1mm_subscription =
+            n1mm_destination.map(|destination| (destination, qso_manager.subscribe()));
+
         // PAN-72 critical-finding fix: also publish the fresh handle onto
         // the watch channel so the (not respawned on a Qso-only restart)
         // Autonomous task's drain can pick up this brand-new manager
@@ -4074,13 +4145,16 @@ impl super::ApplicationCoordinator {
                 // own doc comment) -- tests point it at an isolated temp dir so
                 // the replay-history-seed read below (and, outside replay, the
                 // real writers) never touch the operator's actual `~/.pancetta`.
-                let pancetta_home = pancetta_home(&pancetta_home_override);
+                // PAN-376: otherwise the logbook lives in the data directory
+                // (`--data-dir`, else `~/.pancetta`).
+                let data_dir = super::data_dir_for(pancetta_home_override.as_deref())
+                    .unwrap_or_else(pancetta_core::data_dir::current);
 
-                // Rebuildable SQLite index at ~/.pancetta/qso.db.
-                let db_path = pancetta_home.join(".pancetta").join("qso.db");
+                // Rebuildable SQLite index at <data-dir>/qso.db.
+                let db_path = data_dir.join("qso.db");
 
-                // ADIF source of truth at ~/.pancetta/qsos.adi.
-                let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
+                // ADIF source of truth at <data-dir>/qsos.adi.
+                let adif_path = data_dir.join("qsos.adi");
 
                 // Both LOCAL source-of-truth writers (ADIF appender + SQLite
                 // index) live behind one helper so the `--replay` suppression
@@ -4094,7 +4168,8 @@ impl super::ApplicationCoordinator {
                 // before this point: the decode/command loops below have not
                 // started yet.
                 qso_lookup.reset_display_history();
-                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
+                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers_with(
+                    adif_events,
                     replay_mode,
                     &adif_path,
                     &db_path,
@@ -4117,18 +4192,36 @@ impl super::ApplicationCoordinator {
                 // a QRZ lookup in flight
                 // and keeps queuing completions until `stop_upload_outbox`
                 // asks it to finish (PAN-232).
-                if upload_enabled {
+                if let Some(upload_events) = upload_events {
                     start_qso_upload_subscriber(
                         upload_outbox.clone(),
                         qrz_xml_cfg.clone(),
                         station_power_watts,
                         attribution_comment,
-                        qso_manager.subscribe(),
+                        upload_events,
                         shutdown.clone(),
                         qso_lookup.clone(),
                         qrz_xml_base_url.clone(),
                         qso_upload_statuses_for_subscriber.clone(),
                     );
+                }
+
+                // PAN-382: N1MM Logger+ contactinfo UDP, one datagram per
+                // `QsoCompleted`, built from the same ADIF record as
+                // `qsos.adi`. `n1mm_destination` is `None` under `--replay`.
+                // The receiver also holds completions from startup. The task
+                // ends when this manager's event channel closes, never on the shutdown flag
+                // (the PAN-232/PAN-274 rule), so a QSO that completes after
+                // the flag is set is still broadcast. Shutdown does not wait
+                // for it: a UDP send has nothing to flush.
+                if let Some((destination, events)) = n1mm_subscription {
+                    // Detached: the task ends on its own when the channel closes.
+                    drop(super::n1mm_udp::start_n1mm_udp_emitter(
+                        destination,
+                        station_power_watts,
+                        attribution_comment,
+                        events,
+                    ));
                 }
 
                 // History is initialized before decode/command loops or readiness.
@@ -6781,11 +6874,14 @@ impl super::ApplicationCoordinator {
 
                                                 // Start the repeating Fox CQ (same as manual `c`):
                                                 // CallingCq QSO re-emits CQ every slot under the
-                                                // manual watchdog until a Hound answers.
-                                                // Use 1500 Hz (FT8 passband centre) as the default
-                                                // Fox CQ audio offset; tx_parity = None (Fox
-                                                // picks its own slot via the self-parity fallback).
-                                                const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
+                                                // manual watchdog until a Hound answers;
+                                                // tx_parity = None (Fox picks its own slot via the
+                                                // self-parity fallback). PAN-386: in FT8 the CQ
+                                                // takes the lowest free 60 Hz Fox slot in
+                                                // 300-900 Hz (WSJT-X `foxgen.f90`) and is a
+                                                // Fox-role stream; FT4/FT2 keep 1500 Hz (passband
+                                                // centre), the legacy geometry.
+                                                const LEGACY_FOX_CQ_OFFSET_HZ: f64 = 1500.0;
                                                 // PAN-76: a Hound that converts the Fox CQ
                                                 // skips maybe_answer_caller's cap. Start no
                                                 // CQ while a Fox CQ is still calling, or while
@@ -6824,11 +6920,33 @@ impl super::ApplicationCoordinator {
                                                     };
                                                     emit_status(&message_bus, status, pancetta_core::DiagnosticLevel::Warn).await;
                                                 } else {
-                                                    match qso_manager
-                                                        .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
-                                                        .await
-                                                    {
-                                                        Ok(qso_id) => {
+                                                    let fox_slots = pancetta_qso::fox_slots_apply(
+                                                        &qso_manager.config().active_mode,
+                                                    );
+                                                    let cq_offset: Result<f64, String> = if fox_slots {
+                                                        let (fox_offsets, other_offsets) = qso_manager
+                                                            .active_tx_offsets_by_fox_role()
+                                                            .await;
+                                                        pancetta_qso::fox_slot_offset(
+                                                            &fox_offsets,
+                                                            &other_offsets,
+                                                        )
+                                                        .ok_or_else(|| {
+                                                            "no free Fox slot in 300-900 Hz".to_string()
+                                                        })
+                                                    } else {
+                                                        Ok(LEGACY_FOX_CQ_OFFSET_HZ)
+                                                    };
+                                                    let started = match cq_offset {
+                                                        Ok(cq_offset) => qso_manager
+                                                            .start_cq_manual(cq_offset, None, false, None)
+                                                            .await
+                                                            .map(|qso_id| (qso_id, cq_offset))
+                                                            .map_err(|e| e.to_string()),
+                                                        Err(e) => Err(e),
+                                                    };
+                                                    match started {
+                                                        Ok((qso_id, cq_offset)) => {
                                                             // PAN-76: a Hound answering within 15 Hz
                                                             // of the CQ converts this QSO into its
                                                             // exchange, so it counts as Fox-admitted.
@@ -6836,10 +6954,13 @@ impl super::ApplicationCoordinator {
                                                                 &fox_admitted_qsos,
                                                                 &qso_id,
                                                             );
+                                                            if fox_slots {
+                                                                qso_manager.mark_fox_role(qso_id).await;
+                                                            }
                                                             info!(
                                                                 "Fox mode ON — CQ started: {} \
                                                                  ({:.0} Hz, up to {} streams)",
-                                                                qso_id, FOX_CQ_OFFSET_HZ, n
+                                                                qso_id, cq_offset, n
                                                             );
                                                             emit_status(
                                                                 &message_bus,
@@ -7160,6 +7281,7 @@ mod secondary_decoder_hint_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
@@ -9171,6 +9293,7 @@ mod snapshot_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
@@ -10985,15 +11108,6 @@ fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bo
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
 }
 
-/// The directory holding `.pancetta/`: the test-only override, else the home
-/// directory, else the working directory.
-fn pancetta_home(override_: &Option<std::path::PathBuf>) -> std::path::PathBuf {
-    override_
-        .clone()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
 /// Whether the per-QSO logbook upload subscriber should run at all: at least
 /// one target must be enabled, AND `--replay` must not be active.
 ///
@@ -11611,6 +11725,40 @@ async fn start_local_qso_log_writers(
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
     LocalIndex,
 ) {
+    start_local_qso_log_writers_with(
+        None,
+        replay,
+        adif_path,
+        db_path,
+        station_power_watts,
+        attribution_comment,
+        database_settings,
+        qso_manager,
+        adif_subscribers,
+    )
+    .await
+}
+
+/// [`start_local_qso_log_writers`] with the ADIF writer's receiver already
+/// taken (`Some`), so it holds every completion since the caller subscribed;
+/// `None` subscribes here, before the index work.
+// Startup settings and subscriber handles are passed together.
+#[allow(clippy::too_many_arguments)]
+async fn start_local_qso_log_writers_with(
+    adif_events: Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
+    replay: bool,
+    adif_path: &std::path::Path,
+    db_path: &std::path::Path,
+    station_power_watts: u32,
+    attribution_comment: bool,
+    database_settings: &pancetta_config::DatabaseConfig,
+    qso_manager: &pancetta_qso::QsoManager,
+    adif_subscribers: &AdifSubscribers,
+) -> (
+    Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
+    Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
+    LocalIndex,
+) {
     if replay {
         info!(
             "--replay: local QSO log writes suppressed — neither {} nor {} is \
@@ -11630,7 +11778,7 @@ async fn start_local_qso_log_writers(
     // Subscribe before the index work below: a QSO that completes while a
     // large log replays waits in this receiver and is appended once the
     // writer opens, instead of missing the logbook of record.
-    let adif_events = qso_manager.subscribe();
+    let adif_events = adif_events.unwrap_or_else(|| qso_manager.subscribe());
 
     // Before either writer below creates a file: opening the writers first
     // made a legacy-only `qso.db` look stale (wiped by the rebuild) and a
@@ -12058,6 +12206,7 @@ mod adif_subscriber_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
             },
@@ -12380,6 +12529,7 @@ mod cqdx_upload_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
@@ -12818,6 +12968,7 @@ mod qrz_enrichment_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
@@ -14298,6 +14449,7 @@ mod replay_history_seed_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
@@ -17255,7 +17407,7 @@ mod respond_to_caller_admission_tests {
     /// The real Qso component for K5ARH with `max_concurrent_qsos = 1`, its
     /// event forwarder proven subscribed (readiness probe, then the probe QSO
     /// failed and gone from `active_tx_qsos`), and a Tui channel to observe.
-    async fn pan76_station() -> (
+    pub(super) async fn pan76_station() -> (
         ApplicationCoordinator,
         pancetta_qso::QsoManager,
         crossbeam_channel::Receiver<ComponentMessage>,
@@ -17316,7 +17468,7 @@ mod respond_to_caller_admission_tests {
         (coordinator, manager, tui_rx)
     }
 
-    async fn pan76_set_fox_mode(
+    pub(super) async fn pan76_set_fox_mode(
         coordinator: &ApplicationCoordinator,
         tui_rx: &crossbeam_channel::Receiver<ComponentMessage>,
         on: bool,
@@ -17436,7 +17588,7 @@ mod respond_to_caller_admission_tests {
                     grid: Some("FN31".to_string()),
                 },
                 "K5ARH W1AAA FN31".to_string(),
-                1505.0,
+                305.0,
                 Some(-10.0),
             )
             .await
@@ -17517,7 +17669,7 @@ mod respond_to_caller_admission_tests {
         assert_eq!(cap, 1, "Fox mode is off, so the base cap is back to 1");
         let result = pan76_coalesce(
             &coordinator,
-            pan76_request(&hound_ids[0], "W1AAA K5ARH -10", 1505.0),
+            pan76_request(&hound_ids[0], "W1AAA K5ARH -10", 305.0),
             vec![
                 pan76_request(&hound_ids[1], "W2BBB K5ARH -12", 1200.0),
                 pan76_request(&hound_ids[2], "W3CCC K5ARH -08", 1800.0),
@@ -17799,7 +17951,7 @@ mod respond_to_caller_admission_tests {
                     grid: Some("FN31".to_string()),
                 },
                 "K5ARH W1AAA FN31".to_string(),
-                1505.0,
+                305.0,
                 Some(-10.0),
             )
             .await
@@ -20795,3 +20947,7 @@ impl HarnessOutcomes {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "qso/tests/n1mm_udp_wiring_tests.rs"]
+mod n1mm_udp_wiring_tests;
