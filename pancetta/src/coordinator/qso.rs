@@ -3791,8 +3791,9 @@ impl super::ApplicationCoordinator {
                 &upload_our_callsign,
                 &lotw_cfg,
             );
-            let path = pancetta_home(&pancetta_home_override)
-                .join(".pancetta")
+            // PAN-376: the outbox lives in the data directory.
+            let path = super::data_dir_for(pancetta_home_override.as_deref())
+                .unwrap_or_else(pancetta_core::data_dir::current)
                 .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
             let schedule = pancetta_dx::upload_outbox::RetrySchedule::new(
                 retry_cfg.max_attempts,
@@ -4144,13 +4145,16 @@ impl super::ApplicationCoordinator {
                 // own doc comment) -- tests point it at an isolated temp dir so
                 // the replay-history-seed read below (and, outside replay, the
                 // real writers) never touch the operator's actual `~/.pancetta`.
-                let pancetta_home = pancetta_home(&pancetta_home_override);
+                // PAN-376: otherwise the logbook lives in the data directory
+                // (`--data-dir`, else `~/.pancetta`).
+                let data_dir = super::data_dir_for(pancetta_home_override.as_deref())
+                    .unwrap_or_else(pancetta_core::data_dir::current);
 
-                // Rebuildable SQLite index at ~/.pancetta/qso.db.
-                let db_path = pancetta_home.join(".pancetta").join("qso.db");
+                // Rebuildable SQLite index at <data-dir>/qso.db.
+                let db_path = data_dir.join("qso.db");
 
-                // ADIF source of truth at ~/.pancetta/qsos.adi.
-                let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
+                // ADIF source of truth at <data-dir>/qsos.adi.
+                let adif_path = data_dir.join("qsos.adi");
 
                 // Both LOCAL source-of-truth writers (ADIF appender + SQLite
                 // index) live behind one helper so the `--replay` suppression
@@ -11102,15 +11106,6 @@ mod completed_tx_grace_tests {
 /// subscriber never fires unless the operator opts in.
 fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bool {
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
-}
-
-/// The directory holding `.pancetta/`: the test-only override, else the home
-/// directory, else the working directory.
-fn pancetta_home(override_: &Option<std::path::PathBuf>) -> std::path::PathBuf {
-    override_
-        .clone()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Whether the per-QSO logbook upload subscriber should run at all: at least

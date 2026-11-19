@@ -116,10 +116,10 @@ impl TierCache {
     }
 }
 
-/// Default cache path: `~/.pancetta/tier_cache.json`. Returns None if
-/// the home directory cannot be located.
+/// Default cache path: `<data-dir>/tier_cache.json` (PAN-376: `--data-dir`,
+/// else `~/.pancetta`). Returns None if no data directory can be located.
 pub(crate) fn default_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".pancetta").join("tier_cache.json"))
+    pancetta_core::data_dir::try_current().map(|d| d.join("tier_cache.json"))
 }
 
 /// Read and parse the cache file. Returns `None` on any error: missing

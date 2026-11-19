@@ -285,7 +285,7 @@ pub struct Ft8Decoder {
 **Per-crate documentation policy.** Each crate's `lib.rs` declares one of:
 
 - `#![deny(missing_docs)]` — every public item must be documented.
-  Currently: `pancetta-hamlib`.
+  Currently: `pancetta-ft8`, `pancetta-hamlib` and `pancetta-protocol`.
 - `#![warn(missing_docs)]` — undocumented items emit warnings; CI
   surfaces them but doesn't fail. Currently: `pancetta-core`.
 - `#![allow(missing_docs)] // TODO: documentation pass pending` — opt-in

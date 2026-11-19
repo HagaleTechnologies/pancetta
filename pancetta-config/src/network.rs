@@ -340,16 +340,7 @@ impl ConfigSection for WsjtxUdpConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.destination = other.destination;
-        self.multicast_interface = other.multicast_interface;
-        self.multicast_ttl = other.multicast_ttl;
-        self.instance_id = other.instance_id;
-        self.accept_udp_requests = other.accept_udp_requests;
-        self.allow_tx_initiation = other.allow_tx_initiation;
-        self.allowed_request_hosts = other.allowed_request_hosts;
-        self.accept_decodes = other.accept_decodes;
-        self.decode_listen = other.decode_listen;
+        *self = other;
     }
 }
 
@@ -469,11 +460,7 @@ impl ConfigSection for RemoteGatewayConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.bind_addr = other.bind_addr;
-        self.auth_token = other.auth_token;
-        self.allowed_origins = other.allowed_origins;
-        self.allow_network_exposure = other.allow_network_exposure;
+        *self = other;
     }
 }
 

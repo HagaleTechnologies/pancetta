@@ -37,6 +37,7 @@ sample_rate = 48000
 
 [audio.levels]
 input_gain_db = 0.0
+output_gain_ceiling_db = 0.0
 output_gain_db = 0.0
 peak_clip_db = -1.0
 peak_warning_db = -6.0
@@ -111,7 +112,7 @@ q_factor = 1.0
 auto_record = false
 bit_depth = "int16"
 compression_level = 5
-directory = "~/Documents/Pancetta/Recordings"
+directory = ""
 filename_pattern = "pancetta_%Y%m%d_%H%M%S"
 format = "wav"
 max_length_minutes = 60

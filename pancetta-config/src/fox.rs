@@ -64,7 +64,7 @@ impl ConfigSection for FoxConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.max_streams = other.max_streams;
+        *self = other;
     }
 }
 

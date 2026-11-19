@@ -17,6 +17,7 @@ pub struct DecodeConfig {
     pub budget_ms: u64,
 }
 
+/// How a decode pass spreads candidate work across threads.
 #[derive(Debug, Clone, Copy)]
 pub enum Parallelism {
     /// Single-threaded decode (for debugging, testing, low-power devices)
@@ -57,6 +58,7 @@ pub struct BudgetTracker {
 }
 
 impl BudgetTracker {
+    /// Start a tracker whose deadline is `budget_ms` milliseconds from now.
     pub fn new(budget_ms: u64) -> Self {
         Self {
             deadline: Instant::now() + Duration::from_millis(budget_ms),

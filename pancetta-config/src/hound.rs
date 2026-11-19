@@ -113,10 +113,7 @@ impl ConfigSection for HoundConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.call_min_hz = other.call_min_hz;
-        self.call_max_hz = other.call_max_hz;
-        self.response_min_hz = other.response_min_hz;
-        self.response_max_hz = other.response_max_hz;
+        *self = other;
     }
 }
 

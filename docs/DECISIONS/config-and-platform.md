@@ -10,8 +10,27 @@ Several hand-written `ConfigSection::merge_with` impls silently dropped fields a
 - `NetworkConfig::merge_with` only copied `psk_reporter`/`wspr`/`dx_cluster`/`web_api`/`proxy` — `tls`, `rate_limiting`, `reliability`, `cqdx`, `clublog`, `qrz_logbook`, `lotw`, `eqsl`, `qrz_xml`, `remote_gateway`, `station_agent` were never merged. Fixed in `pancetta-config/src/network.rs`; regression test `merge_with_carries_over_every_opt_in_integration`.
 - `StationConfig::merge_with` never merged `tx_late_max_ms`/`tx_self_parity`/`ptt_lead_ms` — these drive the live TX-slot scheduler and PTT keying lead time in `coordinator/tx.rs`, so an operator customizing any of the three via config would always get the compiled-in defaults (8000ms / Auto / 80ms) instead. Fixed in `pancetta-config/src/station.rs`; regression test `merge_with_carries_over_tx_timing_fields`.
 - Also closed `AudioConfig.bit_depth` (`pancetta-config/src/audio.rs`) opportunistically — currently unused elsewhere in the codebase, so not user-impacting today, but the same latent bug.
-- **Audited and left alone (real gaps, but currently inert — nothing in the codebase reads these fields, so they don't affect behavior today):** `UiConfig` (`typography`/`colors`/`panels`/`accessibility`/`animations`/`toolbars`/`status_bar`/`keyboard`/`logging`/`spectrum`, plus most of `WindowConfig`) and `CatInterfaceConfig` (`data_bits`/`stop_bits`/`parity`/`flow_control`/`timeout_ms`/`protocol`/`termination`/`response_timeout_ms`/`retry_count` — only `port`/`baud_rate`/`enabled` are actually wired to hamlib). Worth fixing if/when any of these get wired up; not worth the churn while they're dead config.
-- **Process gap:** nothing enforces that a new `NetworkConfig`/`StationConfig`/etc. field gets a `merge_with` line — this class of bug can recur. A macro-derived or reflection-based merge (or a test that diffs struct fields against merge_with via `serde_json::to_value` round-tripping) would close this structurally. (A structural `merge_with` guardrail test per `ConfigSection` is planned — not yet implemented; see `pancetta-config` `merge_with_*` for the existing regression tests.)
+- **Audited and left alone (real gaps, but currently inert — nothing in the codebase reads these fields, so they don't affect behavior today):** `UiConfig` (`typography`/`colors`/`panels`/`accessibility`/`animations`/`toolbars`/`status_bar`/`keyboard`/`logging`/`spectrum`, plus most of `WindowConfig`) and `CatInterfaceConfig` (`data_bits`/`stop_bits`/`parity`/`flow_control`/`timeout_ms`/`protocol`/`termination`/`response_timeout_ms`/`retry_count` — only `port`/`baud_rate`/`enabled` are actually wired to hamlib). Worth fixing if/when any of these get wired up; not worth the churn while they're dead config. These were closed later: both types now carry every field, and the guards named below enforce it.
+- **Process gap (closed).** Nothing enforced that a new field got a `merge_with` line, so this class of bug could recur. Two structural tests in `pancetta-config` now close it. `merge_guard::merge_with_carries_every_field` (`pancetta-config/src/lib.rs`) merges a fully non-default source into `Default` for every section and fails when a serialized field reverts. `merge_rules_tests::populated_base_merge_follows_each_fields_rule` (PAN-371, `pancetta-config/src/lib/tests/merge_rules_tests.rs`) merges a populated, an emptied and a cleared overlay into a populated base, per section and through `Config::merge_with`, and fails when any field's rule changes. The field-specific `merge_with_*` regression tests stay.
+
+## Merge rules: plain copy unless listed (PAN-371, 2026-11-18)
+
+A section whose fields all merge by replacement merges with `*self = other;`. The eleven field-by-field copies (`FoxConfig`, `DatabaseConfig`, `WsjtxUdpConfig`, `RemoteGatewayConfig`, `AutonomousConfig`, `ContestScoringConfig`, `HoundConfig`, `DuplicateCheckingConfig`, `TxPlacementConfig`, `DecoderConfig`, `LoggingConfig`) assigned every field of their struct unconditionally, so the change kept every merge result. They join `AlertsConfig`, `WatchlistConfig` and the nested audio and rig wrappers. A field added to one of these structs needs no merge line.
+
+Six section merges and `Config::merge_with` keep per-field code, and `pancetta-config/src/lib/tests/merge_rules_tests.rs` lists each rule:
+
+- `StationConfig`, `AudioConfig`, `RigConfig` and `CatInterfaceConfig` keep the base when the overlay holds an empty string, zero or empty list (`SkipEmpty`), replace an `Option` only when the overlay has `Some` (`SkipNone`), and extend their custom maps (`Extend`).
+- `UiConfig` keeps the base `theme` and `layout` when the overlay's is empty, ORs `accessibility.high_contrast`, and extends `custom_widgets`.
+- `NetworkConfig` extends `custom_services`.
+- `Config::merge_with` replaces `contest` only when the overlay has one. The base keeps its `metadata`, appends the overlay's `sources` and stamps `last_modified`.
+
+The `SkipEmpty` rules exist for the environment source. `load_from_environment` starts from `Config::default()` and blanks thirteen fields (the nine with a `PANCETTA_*` variable, plus `qth` and the three zones) so the merge keeps the file's values. Every other field keeps its default, so whenever one `PANCETTA_*` variable is set, every replace-rule section and every `SkipEmpty` field it does not blank (such as `rig.model`, `audio.buffer_size` and `station.tx_late_max_ms`) reverts to its default. PAN-371 kept that behaviour; PAN-460 tracks the fix in the environment source.
+
+Rejected: a derive macro, which needs a proc-macro crate for about a dozen impls, and a default `ConfigSection::merge_with`, which would let a new section that needs a sentinel compile without anyone choosing its rule.
+
+Adding a field to a replace section needs nothing. Adding a field with another rule to a section with per-field code needs the merge line and a row in that type's rule table. Adding a section needs an `assert_carries_all` call in `merge_guard` and an `assert_rules` case in `merge_rules_tests`; the test's check that its section list matches `Config`'s keys fails until the `assert_rules` case exists.
+
+To verify section coverage (PAN-371 AC6), run `cargo test -p pancetta-config --lib merge_rules_tests`. The populated-base test checks the list against the keys serialized by `Config::default()`, excluding metadata, and exercises the optional contest section separately. A second test, `config_merge_keeps_base_metadata_and_appends_sources`, checks metadata. To verify that the guard catches a missing delegation, remove `self.fox.merge_with(other.fox);` from `Config::merge_with` in a disposable checkout and rerun the command. The populated-base test should fail on `/fox/max_streams`. Restore the delegation and both tests should pass. [Merge rule tests](../../pancetta-config/src/lib/tests/merge_rules_tests.rs) · [Config merge](../../pancetta-config/src/lib.rs)
 
 ## Hardware-tier auto-classification
 
@@ -714,11 +733,9 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
 - `directory` is honored, and pancetta expands a leading `~` itself: the
   config loader never expands `~` inside values (`loader.rs` tests). Empty
   means `~/.pancetta/recordings`.
-- The `directory` default stays `~/Documents/Pancetta/Recordings`, and
-  `defaults.toml` is unchanged. The station corpus offload (magazzino
-  `clients/pancetta-wav-offload.sh`) reads `~/.pancetta/recordings`, so a
-  corpus station sets `directory` explicitly. sophon did so on 2026-10-16,
-  before this shipped.
+- PAN-125 kept `~/Documents/Pancetta/Recordings` as the default. Corpus
+  stations set `directory` to `~/.pancetta/recordings` for offload. PAN-376
+  made an omitted directory use the station's data directory.
 - The cap stays a hardcoded 10 GB. The other `[audio.recording]` keys stay
   unread. Restart-required like every non-live key — including across DSP
   supervisor restarts, because the running config snapshot is patched only
@@ -1342,6 +1359,80 @@ Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
 receive a release-candidate notice. They require a real, matching CHANGELOG
 section; there is no Unreleased fallback. The operator still publishes the
 draft. macOS signing and notarization remain PAN-265.
+
+## Separate data directories and the instance lock (PAN-376, 2026-11-18)
+
+A global `--data-dir <DIR>` flag moves all station state out of
+`~/.pancetta`. A live station locks `<data-dir>/pancetta.lock`, so two
+stations cannot share one logbook. Without the flag the data directory
+is still `~/.pancetta`.
+
+1. Flag only, `global = true`, `value_name = "DIR"`. There is no
+   `PANCETTA_DATA_DIR` variable. The ticket names the flag, the macOS
+   responsibility relaunch forwards argv unchanged, and a service unit
+   puts the flag in its command line.
+2. The default is unchanged. `pancetta_core::data_dir` keeps the resolved
+   flag in a process-wide `OnceLock`, set only when the flag is given.
+   Without it, `try_current()` returns `<home>/.pancetta` (home from
+   `dirs::home_dir()`, then `$HOME`) and `current()` adds the old
+   `./.pancetta` fallback. Each resolver keeps its old no-home behaviour.
+   A process-wide value replaces one process-global input (`HOME`) with
+   another that defaults to the same value, so it reaches the TUI's static
+   path functions and `MessageExchange::new` without a new argument
+   through every `ApplicationCoordinator::new` call site.
+3. With `--data-dir` and no `--config`, config discovery searches only the
+   data directory, plus embedded defaults and `PANCETTA_*` overrides. This
+   applies at startup, on reload, in de-brick recovery and in
+   `config --validate`. Merging the usual six places would let a 40 m
+   station silently read the 20 m station's `~/.pancetta/pancetta.toml`.
+   With `--config`, the file is read as before.
+4. An explicit config value still wins over the data directory for
+   `key_dir`, `audit_log_path`, `[audio.recording] directory` and
+   `adif_backup_directory`. `~` inside a config value still expands
+   against the home directory. With recording enabled, an omitted or empty
+   directory uses `<data-dir>/recordings`.
+5. `Config::write_secure_atomic*` re-hardens the process data directory to
+   0700 on Unix, as it did for `~/.pancetta` alone. A custom directory
+   holds the same secrets.
+6. The lock is `pancetta.lock` plus `pancetta.pid`. `File::try_lock` takes
+   an OS lock that the station holds for the whole of `async_main`, and
+   the pid goes into a sibling file through `Config::write_secure_atomic`
+   right after the lock is taken. Windows locks are mandatory, so a
+   refused process cannot read the locked file; it reads the sibling.
+   `pancetta.lock` is never deleted, because deleting a lock file lets two
+   processes lock different inodes. There is no pid-liveness probe: the
+   OS releases the lock on exit or crash, and the next station overwrites
+   the stale pid. A refused process that races the holder's first
+   milliseconds may print the previous pid or `pid unknown`; that is
+   accepted.
+7. Only a live station takes the lock: no subcommand or `run`, without
+   `--wav` or `--replay`. It is taken in `async_main` after the
+   `import-confirmations` early return and before `init_logging`, so a
+   refused process writes nothing to the running station's log and the
+   TUI never takes the terminal. `main()` resolves and stores the flag
+   before `responsibility::prepare`, in memory only, so a bad value fails
+   like other flag errors before any macOS relaunch. `import` beside a
+   running station is PAN-214's tested behaviour, and replay never writes
+   the logbook. `import` keeps the per-write `qsos.adi.lock` and never
+   takes the instance lock, which settles the question PAN-204 raised.
+8. The coordinator's `pancetta_home_override` stays a test-only home.
+   `coordinator::data_dir_for(home_override)` returns `<home>/.pancetta`
+   under it, else the process data directory, so the 30 or so test sites
+   that set it need no change. The worked-call filter now honours the
+   override too.
+9. Unit tests never set the `OnceLock`. Only dedicated integration-test
+   binaries with exactly one `#[test]` set it, so threaded `cargo test`
+   and per-process nextest runs both stay correct.
+10. When `--data-dir` was given, the `config --validate` setup hint and the
+    `identity` pair hint print `pancetta --data-dir <D> ...`, so a copied
+    command acts on the same station.
+11. `pancetta-agent` stays free of workspace-crate dependencies.
+    `default_audit_path()` becomes `audit_path_in(data_dir)` and callers
+    pass `pancetta_core::data_dir::current()`.
+
+Out of scope: keeping two stations off one rig, audio device or listener
+port; moving data between directories; Windows and macOS qualification of
+the lock and paths (CI compiles both, Linux CI runs the tests).
 
 ## Build identity and shell completions (PAN-377, 2026-11-18)
 

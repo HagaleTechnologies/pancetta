@@ -8,6 +8,7 @@
 //! internal PascalCase serialization; `wire_serde` helpers re-map them to the
 //! schema's camelCase values without modifying core.
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 /// Wire protocol version. Bump on any incompatible change; clients negotiate
 /// it in the `Hello`/`Welcome` handshake.

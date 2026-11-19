@@ -425,7 +425,7 @@ pub struct RecordingConfig {
 
     /// Where recordings go; created if missing. A leading `~` is expanded
     /// by pancetta itself (the loader never expands values); `~user` is not.
-    /// Empty means `~/.pancetta/recordings`.
+    /// Omitted or empty means `<data-dir>/recordings`.
     pub directory: String,
 
     /// File naming pattern. Not read yet (recordings are always named
@@ -465,6 +465,9 @@ pub struct AudioLevelsConfig {
 
     /// Output level adjustment in dB
     pub output_gain_db: f32,
+
+    /// Highest selectable TX audio drive in dB, relative to the 0.5 baseline.
+    pub output_gain_ceiling_db: f32,
 
     /// Peak level warning threshold in dB
     pub peak_warning_db: f32,
@@ -655,7 +658,7 @@ impl Default for RecordingConfig {
             sample_rate: 44100,
             max_length_minutes: 60,
             raw_capture_minutes: 0,
-            directory: "~/Documents/Pancetta/Recordings".to_string(),
+            directory: String::new(),
             filename_pattern: "pancetta_%Y%m%d_%H%M%S".to_string(),
             compression_level: 5,
         }
@@ -667,6 +670,7 @@ impl Default for AudioLevelsConfig {
         Self {
             input_gain_db: 0.0,
             output_gain_db: 0.0,
+            output_gain_ceiling_db: 0.0,
             peak_warning_db: -6.0,
             peak_clip_db: -1.0,
             rms_target_db: -20.0,
@@ -688,6 +692,20 @@ impl Default for MeterBallisticsConfig {
 
 impl ConfigSection for AudioConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        if !self.levels.output_gain_ceiling_db.is_finite()
+            || !(-20.0..=5.0).contains(&self.levels.output_gain_ceiling_db)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_ceiling_db".into(),
+                value: self.levels.output_gain_ceiling_db.to_string(),
+            });
+        }
+        if !self.levels.output_gain_db.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_db".into(),
+                value: self.levels.output_gain_db.to_string(),
+            });
+        }
         // Validate sample rate
         if ![
             8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000, 176400, 192000,
@@ -812,6 +830,10 @@ impl AudioLevelsConfig {
         *self = other;
     }
 }
+
+#[cfg(test)]
+#[path = "audio/tests/tx_drive_tests.rs"]
+mod tx_drive_tests;
 
 #[cfg(test)]
 // rationale: test-only builder structs assigned field-by-field after

@@ -52,17 +52,18 @@
 
 - **cqdx `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API** — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
 
-- **`pancetta-research` has no CI coverage** — every workspace job passes
-  `--exclude pancetta-research` (`.github/workflows/ci.yml:98,188,191,194`) and the crate is
-  absent from `default-members` (`Cargo.toml:17-29`), so the cross-platform lane's bare
-  `cargo check` skips it too. Only `cargo fmt --all` (`ci.yml:113`) touches it. Consequence:
-  a dependency bump that breaks the crate goes green without ever compiling it — dependabot
-  PR #211 did exactly this, bumping `rand` 0.8→0.10 while leaving `rand_distr` at 0.4 and
-  editing zero source files, and passing every check. Any future bump touching this crate
-  must be verified locally and the output pasted into the PR; that is the only evidence
-  available. Decide separately whether a `cargo check -p pancetta-research` lane is worth
-  the CI minutes — the crate is excluded by deliberate design (`AGENTS.md`), so this is an
-  architecture decision, not a bug. (Surfaced by PAN-1, 2026-07-29.)
+- ~~**`pancetta-research` has no CI coverage**~~ — resolved 2026-11-18 by PAN-372.
+  Other Rust lanes exclude the crate (`.github/workflows/ci.yml:401,490,495,574,577,687`),
+  and it remains outside `default-members` (`Cargo.toml:18-31`).
+  The formatting lane also touches its source (`ci.yml:422`). Dependabot PR #211 exposed a
+  dependency bump that broke the crate while required CI stayed green. The
+  non-required, path-filtered Research Check now runs
+  `cargo check -p pancetta-research --all-targets` with default and `research-eval`
+  features when the crate or its inputs change: `pancetta-research/**`,
+  `pancetta-ft8/**`, `pancetta-qso/**`, `pancetta-dsp/**`, root `Cargo.toml`,
+  `Cargo.lock`, `rust-toolchain.toml`, and the ft8_lib gitlink. A failure reports
+  red but never gates a merge. Local `scripts/check.sh` remains the primary
+  drift guard. (Surfaced by PAN-1, 2026-07-29.)
 
 - ~~**~25 duplicated `gaussian_noise` Box-Muller helpers** in `pancetta-research/examples/`~~ —
   fixed 2026-07-31: consolidated into `pancetta_research::noise::gaussian_noise`, all 25
@@ -92,16 +93,17 @@
     move under the gate (`apply_tx_offset_switch` takes `qsos` before `ptt_sync_gate`); closing
     it needs the QSO task to arbitrate the QSY, for example a request/ack through its message loop.
 
-## Missing-docs lint status (verified 2026-07-17)
+## Missing-docs lint status (verified 2026-11-18)
 
 Per-crate `#![...(missing_docs)]` levels, dropped from CLAUDE.md's "Documentation Policy" section
 to keep that section to a policy statement rather than a point-in-time status list:
 
 - `pancetta-core`: `#![warn(missing_docs)]`
+- `pancetta-ft8`: `#![deny(missing_docs)]` (PAN-373)
 - `pancetta-hamlib`: `#![deny(missing_docs)]`
-- `pancetta-protocol`: no `missing_docs` attribute set (defaults to allow)
+- `pancetta-protocol`: `#![deny(missing_docs)]` (PAN-373)
 - All other crates (`pancetta`, `pancetta-agent`, `pancetta-audio`, `pancetta-dsp`, `pancetta-config`,
-  `pancetta-qso`, `pancetta-dx`, `pancetta-cqdx`, `pancetta-tui`, `pancetta-ft8`, `pancetta-research`):
+  `pancetta-qso`, `pancetta-dx`, `pancetta-cqdx`, `pancetta-tui`, `pancetta-research`):
   `#![allow(missing_docs)]` with a `// TODO: documentation pass pending` comment.
 
 Switch each crate to `warn`/`deny` as its doc coverage lands.

@@ -281,14 +281,14 @@ impl Default for Config {
     }
 }
 
-/// Whether `parent` is the default application-owned `~/.pancetta`
-/// directory, as opposed to an arbitrary custom `--config` parent this
-/// crate doesn't own. `home_dir` is taken explicitly (rather than calling
-/// `dirs::home_dir()` internally) purely for testability -- the real home
-/// directory can't be faked in a test process; production code always
-/// passes `dirs::home_dir()`.
-fn is_default_app_dir(parent: &std::path::Path, home_dir: Option<&std::path::Path>) -> bool {
-    home_dir.map(|h| h.join(".pancetta")).as_deref() == Some(parent)
+/// Whether `parent` is the application-owned data directory (`~/.pancetta`,
+/// or the `--data-dir` directory, PAN-376), as opposed to an arbitrary custom
+/// `--config` parent this crate doesn't own. `app_dir` is taken explicitly
+/// (rather than reading the process data directory internally) purely for
+/// testability; production code passes
+/// `pancetta_core::data_dir::try_current()`.
+fn is_app_data_dir(parent: &std::path::Path, app_dir: Option<&std::path::Path>) -> bool {
+    app_dir == Some(parent)
 }
 
 /// Push the `[ui] theme` load warning (PAN-387) when the label is unknown.
@@ -310,6 +310,27 @@ fn append_band_plan_warning(config: &Config, warnings: &mut Vec<String>) {
 }
 
 impl Config {
+    /// Bound a finite legacy TX gain after all config layers have merged.
+    /// Invalid values remain untouched so validation can name the field.
+    pub fn clamp_tx_drive(&mut self) -> Option<String> {
+        let levels = &mut self.audio.levels;
+        if !levels.output_gain_db.is_finite()
+            || !levels.output_gain_ceiling_db.is_finite()
+            || !(-20.0..=5.0).contains(&levels.output_gain_ceiling_db)
+        {
+            return None;
+        }
+        let raw = levels.output_gain_db;
+        let applied = raw.clamp(-20.0, levels.output_gain_ceiling_db);
+        if raw == applied {
+            return None;
+        }
+        levels.output_gain_db = applied;
+        Some(format!(
+            "audio.levels.output_gain_db {raw} dB is outside the selectable range; using {applied} dB"
+        ))
+    }
+
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
@@ -323,12 +344,57 @@ impl Config {
     /// A discovered config file that fails to load is an error
     /// ([`ConfigError::FileLoad`]), never a warning.
     pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
+        let (config, warnings, _) = Self::load_default_with_warnings_and_files()?;
+        Ok((config, warnings))
+    }
+
+    /// Load the effective config and report its contributing files in
+    /// precedence order, so live targeted writes can use the source that won.
+    pub fn load_default_with_warnings_and_files() -> ConfigResult<(Self, Vec<String>, Vec<PathBuf>)>
+    {
         let loader = ConfigLoader::new()?;
         let config = loader.load()?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
         append_band_plan_warning(&config, &mut warnings);
+        Ok((config, warnings, loader.loaded_files()))
+    }
+
+    /// Like [`load_default_with_warnings`](Self::load_default_with_warnings),
+    /// but the only config search directory is `dir` (PAN-376: `pancetta
+    /// --data-dir DIR` without `--config`). Embedded defaults and `PANCETTA_*`
+    /// environment overrides still apply.
+    pub fn load_from_dir_with_warnings(dir: &std::path::Path) -> ConfigResult<(Self, Vec<String>)> {
+        let (config, warnings, _) = Self::load_from_dir_with_warnings_and_files(dir)?;
         Ok((config, warnings))
+    }
+
+    /// Load from one directory and report its contributing files in precedence order.
+    pub fn load_from_dir_with_warnings_and_files(
+        dir: &std::path::Path,
+    ) -> ConfigResult<(Self, Vec<String>, Vec<PathBuf>)> {
+        let loader = ConfigLoader::with_search_paths(vec![dir.to_path_buf()])?;
+        let config = loader.load()?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
+        Ok((config, warnings, loader.loaded_files()))
+    }
+
+    /// Like [`load_default_unvalidated`](Self::load_default_unvalidated), but
+    /// the only config search directory is `dir` (PAN-376).
+    pub fn load_from_dir_unvalidated(dir: &std::path::Path) -> ConfigResult<(Self, LoadReport)> {
+        let loader = ConfigLoader::with_search_paths(vec![dir.to_path_buf()])?;
+        let config = loader.load_merged()?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
+        let report = LoadReport {
+            files: loader.loaded_files(),
+            searched: loader.search_paths().to_vec(),
+            warnings,
+        };
+        Ok((config, report))
     }
 
     /// Discover and merge the config files on the default search path
@@ -376,7 +442,11 @@ impl Config {
     /// Load configuration from a specific file
     pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
-        loader.load_from_file(path)
+        let mut config = loader.load_from_file(path)?;
+        if let Some(warning) = config.clamp_tx_drive() {
+            tracing::warn!("{warning}");
+        }
+        Ok(config)
     }
 
     /// Load configuration from a specific file, additionally returning any
@@ -389,8 +459,12 @@ impl Config {
         path: P,
     ) -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
-        let config = loader.load_from_file(path)?;
+        let mut config = loader.load_from_file(path)?;
         let mut warnings = loader.load_warnings();
+        if let Some(warning) = config.clamp_tx_drive() {
+            tracing::warn!("{warning}");
+            warnings.push(warning);
+        }
         append_theme_warning(&config, &mut warnings);
         append_band_plan_warning(&config, &mut warnings);
         Ok((config, warnings))
@@ -470,7 +544,8 @@ impl Config {
     /// On Unix the temporary sibling is created `0o600` (owner-only from the
     /// first byte) and the rename preserves that mode, so every file this
     /// writes is owner-only. A parent directory this method just created —
-    /// or the default application-owned `~/.pancetta` directory — is forced
+    /// or the application-owned data directory (`~/.pancetta`, or the
+    /// `--data-dir` directory, PAN-376) — is forced
     /// to `0o700` (best effort); a pre-existing custom parent is left at
     /// whatever mode its owner intended. On non-Unix the per-user ACL
     /// restricts access; the write is still atomic (temp + rename).
@@ -513,7 +588,12 @@ impl Config {
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
                 {
-                    if !parent_existed || is_default_app_dir(parent, dirs::home_dir().as_deref()) {
+                    if !parent_existed
+                        || is_app_data_dir(
+                            parent,
+                            pancetta_core::data_dir::try_current().as_deref(),
+                        )
+                    {
                         use std::os::unix::fs::PermissionsExt;
                         // Best-effort. Ignore failure — the 0600 file is
                         // the real guarantee.
@@ -870,6 +950,43 @@ impl Config {
                 .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Save only the selected TX audio drive. The caller serializes this with
+    /// other config writes and resolves any symlink before entering here.
+    pub fn save_output_gain_db(path: &std::path::Path, is_toml: bool, db: f32) -> ConfigResult<()> {
+        if !db.is_finite() || !(-20.0..=5.0).contains(&db) {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_db".into(),
+                value: db.to_string(),
+            });
+        }
+        if is_toml {
+            let mut doc = Self::read_edit_doc(path)?;
+            let levels = Self::edit_table_at(doc.as_item_mut(), &["audio", "levels"], "")?
+                .as_table_like_mut()
+                .expect("edit_table_at returns a table");
+            Self::set_edit_leaf(levels, "output_gain_db", &toml::Value::Float(db as f64))?;
+            Self::write_secure_atomic(path, &doc.to_string())
+        } else {
+            let mut doc: serde_json::Value = match std::fs::read_to_string(path) {
+                Ok(contents) => serde_json::from_str(&contents)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(e.into()),
+            };
+            let mut parent = &mut doc;
+            for key in ["audio", "levels"] {
+                let map = parent.as_object_mut().ok_or_else(|| {
+                    ConfigError::Validation(format!("[{key}] parent in config is not an object"))
+                })?;
+                parent = map.entry(key).or_insert_with(|| serde_json::json!({}));
+            }
+            let map = parent.as_object_mut().ok_or_else(|| {
+                ConfigError::Validation("[audio.levels] in config is not an object".into())
+            })?;
+            map.insert("output_gain_db".into(), serde_json::json!(db));
+            Self::write_secure_atomic(path, &serde_json::to_string_pretty(&doc)?)
         }
     }
 
@@ -1385,23 +1502,24 @@ mod tests {
     /// alone when it already existed. `home_dir` is passed explicitly
     /// since `dirs::home_dir()` can't be faked in a test process.
     #[test]
-    fn is_default_app_dir_matches_only_the_dot_pancetta_child_of_home() {
+    fn is_app_data_dir_matches_only_the_app_data_dir() {
         let home = std::path::Path::new("/home/operator");
+        let app_dir = home.join(".pancetta");
         assert!(
-            is_default_app_dir(&home.join(".pancetta"), Some(home)),
+            is_app_data_dir(&home.join(".pancetta"), Some(&app_dir)),
             "the default app-owned directory must be recognized"
         );
         assert!(
-            !is_default_app_dir(&home.join("shared-configs"), Some(home)),
+            !is_app_data_dir(&home.join("shared-configs"), Some(&app_dir)),
             "a different directory under home must NOT be treated as app-owned"
         );
         assert!(
-            !is_default_app_dir(std::path::Path::new("/srv/shared"), Some(home)),
+            !is_app_data_dir(std::path::Path::new("/srv/shared"), Some(&app_dir)),
             "an unrelated custom directory must NOT be treated as app-owned"
         );
         assert!(
-            !is_default_app_dir(&home.join(".pancetta"), None),
-            "with no resolvable home dir, nothing can be recognized as the default"
+            !is_app_data_dir(&home.join(".pancetta"), None),
+            "with no resolvable data dir, nothing can be recognized as app-owned"
         );
     }
 
@@ -1972,16 +2090,21 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "lib/tests/data_dir_hardening_tests.rs"]
+mod data_dir_hardening_tests;
+
 /// Structural guardrail against the "field silently dropped by `merge_with`"
 /// bug class (see the 2026-07-05 CLAUDE.md entry and the
 /// `merge_with_carries_over_*` regression tests in network.rs / station.rs).
 ///
-/// Every `ConfigSection::merge_with` is a hand-maintained list of
-/// `self.field = other.field` lines, so a field added to a config struct later
-/// is trivially forgotten — the parse and validation passes both succeed and
+/// A `ConfigSection::merge_with` that is not a plain `*self = other` is a
+/// hand-maintained list of per-field lines, so a field added to its struct
+/// later is easily forgotten. The parse and validation passes both succeed and
 /// only the *merge* silently reverts the field to its compiled-in default. The
 /// field-specific regression tests only guard the fields someone thought to
-/// list; this test is structural.
+/// list; this test is structural. `merge_rules_tests` (PAN-371) pins what each
+/// field does when the base is populated.
 ///
 /// For each config type we build a *fully non-default* instance by serializing
 /// its `Default`, then perturbing every scalar leaf to a different, non-empty,
@@ -2000,7 +2123,7 @@ mod merge_guard {
     use std::collections::HashSet;
 
     #[derive(Clone)]
-    enum Seg {
+    pub(super) enum Seg {
         Key(String),
         Idx(usize),
     }
@@ -2008,7 +2131,7 @@ mod merge_guard {
     /// Collect paths to every scalar (bool / number / string) leaf. `null` and
     /// empty containers carry no type information, so they're skipped here and
     /// handled via the per-type `overrides` instead.
-    fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
+    pub(super) fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
         match v {
             Value::Object(m) => {
                 for (k, val) in m {
@@ -2029,7 +2152,7 @@ mod merge_guard {
         }
     }
 
-    fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    pub(super) fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
         let mut cur = root;
         for seg in path {
             cur = match seg {
@@ -2040,7 +2163,7 @@ mod merge_guard {
         Some(cur)
     }
 
-    fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
+    pub(super) fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
         let mut cur = root;
         for (i, seg) in path.iter().enumerate() {
             let last = i + 1 == path.len();
@@ -2065,11 +2188,44 @@ mod merge_guard {
         }
     }
 
+    /// Which probe values `build_source_probed` writes. `Base` is the
+    /// default-base guard's probe. `Overlay` (PAN-371) differs from `Base` at
+    /// every string and number leaf and leaves booleans at their default, so a
+    /// populated base and a populated overlay disagree wherever they can.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Probe {
+        Base,
+        Overlay,
+    }
+
     /// A different, non-empty, non-zero value for a scalar leaf. Non-zero /
     /// non-empty matters because several `merge_with` impls skip empty/zero
     /// `other` values, so a zero would be legitimately ignored and mask a real
     /// drop. Numbers stay within their original type's range.
-    fn perturb_scalar(v: &Value) -> Value {
+    fn perturb_scalar(v: &Value, probe: Probe) -> Value {
+        if probe == Probe::Overlay {
+            return match v {
+                Value::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        Value::from(if u <= 2 { u + 3 } else { u - 2 })
+                    } else if let Some(i) = n.as_i64() {
+                        Value::from(if (0..=2).contains(&i) { i + 3 } else { i - 2 })
+                    } else if let Some(f) = n.as_f64() {
+                        Value::from(if f == 0.0 {
+                            3.0
+                        } else if f > 0.0 {
+                            f + 2.0
+                        } else {
+                            f - 2.0
+                        })
+                    } else {
+                        v.clone()
+                    }
+                }
+                Value::String(_) => Value::String("MERGE_GUARD_OVERLAY".to_string()),
+                other => other.clone(),
+            };
+        }
         match v {
             Value::Bool(b) => Value::Bool(!b),
             Value::Number(n) => {
@@ -2103,6 +2259,14 @@ mod merge_guard {
     where
         T: Default + Serialize + DeserializeOwned,
     {
+        build_source_probed(overrides, Probe::Base)
+    }
+
+    /// `build_source` with a chosen probe (PAN-371 populated-base guard).
+    pub(super) fn build_source_probed<T>(overrides: &[(&str, Value)], probe: Probe) -> T
+    where
+        T: Default + Serialize + DeserializeOwned,
+    {
         let mut working = serde_json::to_value(T::default()).expect("serialize default");
         let override_keys: HashSet<&str> = overrides.iter().map(|(k, _)| *k).collect();
         {
@@ -2124,7 +2288,7 @@ mod merge_guard {
                 }
             }
             let cur = get_path(&working, path).expect("path exists");
-            let candidate = perturb_scalar(cur);
+            let candidate = perturb_scalar(cur, probe);
             if &candidate == cur {
                 continue;
             }
@@ -2329,3 +2493,7 @@ mod merge_guard {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lib/tests/merge_rules_tests.rs"]
+mod merge_rules_tests;

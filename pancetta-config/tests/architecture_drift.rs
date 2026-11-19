@@ -178,6 +178,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
             "Station-wide TX halt shared by emergency stop and SWR trip.",
         ),
         (
+            "tx_drive",
+            "Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438).",
+        ),
+        (
             "tx_log",
             "Durable TX log, one JSON line per keyed frame (PAN-122).",
         ),

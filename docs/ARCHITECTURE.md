@@ -162,6 +162,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tui_relay/` | TUI relay and command forwarding. |
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
+| `tx_drive.rs` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
@@ -248,7 +249,7 @@ avoid QRM from active signals, maintain minimum spacing between simultaneous TX 
 prefer clear channels, align with band segment conventions. Enables parallel QSOs
 within a single 15-second slot.
 
-### TX Slot Scheduler (`pancetta/src/coordinator/tx.rs`)
+### TX Slot Scheduler (`pancetta/src/coordinator/tx/worker.rs`)
 
 `TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
 (or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and

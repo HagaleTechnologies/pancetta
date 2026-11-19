@@ -561,25 +561,29 @@ impl TxFrameLog {
     }
 }
 
-/// `<home>/.pancetta/tx-log.jsonl`, where home is `home_override` (tests),
-/// else the user's home directory, else `.`. Under `cfg(test)` with no
-/// override the fallback is a per-process temp dir, never the real home.
+/// `<data-dir>/tx-log.jsonl`. With `home_override` (tests) the data
+/// directory is `<home>/.pancetta`; otherwise it is the process data
+/// directory (PAN-376: `--data-dir`, else `~/.pancetta`, else
+/// `./.pancetta`). Under `cfg(test)` with no override the fallback is a
+/// per-process temp dir, never the real home.
 pub(crate) fn tx_log_path(home_override: Option<&Path>) -> PathBuf {
-    let home = match home_override {
-        Some(home) => home.to_path_buf(),
-        None => default_home(),
+    let data_dir = match home_override {
+        Some(home) => home.join(pancetta_core::data_dir::DEFAULT_DIR_NAME),
+        None => default_data_dir(),
     };
-    home.join(".pancetta").join(TX_LOG_FILE_NAME)
+    data_dir.join(TX_LOG_FILE_NAME)
 }
 
 #[cfg(not(test))]
-fn default_home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+fn default_data_dir() -> PathBuf {
+    pancetta_core::data_dir::current()
 }
 
 #[cfg(test)]
-fn default_home() -> PathBuf {
-    std::env::temp_dir().join(format!("pancetta-test-home-{}", std::process::id()))
+fn default_data_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("pancetta-test-home-{}", std::process::id()))
+        .join(pancetta_core::data_dir::DEFAULT_DIR_NAME)
 }
 
 #[cfg(test)]
