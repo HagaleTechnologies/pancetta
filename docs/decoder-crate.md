@@ -184,7 +184,7 @@ so run the dry-run first and stop at any surprise.
 2. On the commit to publish (a `main` merge commit), run
    `git submodule update --init` and confirm `git status` is clean.
 3. Run `cargo publish --dry-run -p pancetta-core -p pancetta-ft8`. Expect
-   "Packaged 39 files" for `pancetta-core`, "Packaged 74 files" for
+   "Packaged 39 files" for `pancetta-core`, "Packaged 76 files" for
    `pancetta-ft8`, two "aborting upload due to dry run" lines and one
    `warning: ignoring ...` line for each test, bench and example target the
    `include` whitelists leave out of the packages. Each of those warnings ends

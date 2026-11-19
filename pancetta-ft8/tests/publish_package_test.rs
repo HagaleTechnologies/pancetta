@@ -106,6 +106,8 @@ fn package_contains_the_c_decoder_sources_and_licenses() {
         "assets/neural_osd_weights.provenance.json",
         "src/lib.rs",
         "examples/decode_cycle.rs",
+        // PAN-369: embedded by src/tier_probe.rs (include_bytes!).
+        "tests/fixtures/wav/basicft8/live_now.wav",
     ];
     // The C list mirrors the files `build.rs` compiles (build.rs:12-23),
     // plus the ft8_lib license.
@@ -145,7 +147,7 @@ fn package_contains_the_c_decoder_sources_and_licenses() {
 
 #[test]
 fn package_ships_only_whitelisted_paths() {
-    const EXACT: [&str; 12] = [
+    const EXACT: [&str; 13] = [
         ".cargo_vcs_info.json",
         "Cargo.lock",
         "Cargo.toml",
@@ -157,6 +159,7 @@ fn package_ships_only_whitelisted_paths() {
         "build.rs",
         "mingw_stpcpy_shim.h",
         "examples/decode_cycle.rs",
+        "tests/fixtures/wav/basicft8/live_now.wav",
         "vendor/ft8_lib/LICENSE",
     ];
     const PREFIXES: [&str; 5] = [

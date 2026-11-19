@@ -30,6 +30,8 @@ include = [
     "/build.rs",
     "/mingw_stpcpy_shim.h",
     "/examples/decode_cycle.rs",
+    # PAN-369: src/tier_probe.rs embeds this off-air window with include_bytes!.
+    "/tests/fixtures/wav/basicft8/live_now.wav",
     "/README.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",

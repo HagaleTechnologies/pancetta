@@ -1376,7 +1376,8 @@ draft. macOS signing and notarization remain PAN-265.
   alone.
 - **Vendored ft8_lib through an `include` whitelist, no `build.rs` fetch.**
   The C that `build.rs` compiles is about 0.2 MB, and the package is about
-  790 KB. A fetch would add a network dependency and a checksum to maintain,
+  1.1 MB (it also carries the 360 KB `basicft8/live_now.wav` that
+  `src/tier_probe.rs` embeds since PAN-369). A fetch would add a network dependency and a checksum to maintain,
   and docs.rs builds have no network. The whitelist fails closed: a new
   large file in the submodule cannot slip in, and the unlicensed WSJT-X
   files under `vendor/ft8_lib/ft4_ft8_public/` stay out of an
