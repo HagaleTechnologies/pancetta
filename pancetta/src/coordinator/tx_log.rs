@@ -594,17 +594,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    #[cfg(unix)]
-    #[test]
-    fn first_tx_log_batch_creates_owner_only_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(TX_LOG_FILE_NAME);
-        append_batch(&path, RotationPolicy::default(), &[rec("CQ N0CALL FN20")]).unwrap();
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
-    }
-
-    fn rec(text: &str) -> TxFrameRecord {
+    pub(super) fn rec(text: &str) -> TxFrameRecord {
         TxFrameRecord::new(
             chrono::Utc::now(),
             pancetta_ft8::Protocol::Ft8,
@@ -1090,3 +1080,7 @@ mod tests {
         assert_eq!(read_records(&path), vec![crash_record()]);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "tx_log/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;

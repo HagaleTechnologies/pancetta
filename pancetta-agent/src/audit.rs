@@ -1038,28 +1038,14 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[cfg(unix)]
-    #[test]
-    fn first_audit_entry_creates_owner_only_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let tp = TempPath::new("private");
-        let log = AuditLog::new(tp.path().clone());
-        log.append(&ev(1000, AuditKind::Armed, Some("N0CALL"), "armed"))
-            .unwrap();
-        assert_eq!(
-            std::fs::metadata(tp.path()).unwrap().permissions().mode() & 0o077,
-            0
-        );
-    }
-
     // Deterministic unique suffix for temp files — NOT a clock, NOT random.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// A tempfile path (and its archives) with automatic cleanup on drop.
-    struct TempPath(PathBuf);
+    pub(super) struct TempPath(PathBuf);
 
     impl TempPath {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             let path =
@@ -1069,7 +1055,7 @@ mod tests {
             tp.cleanup();
             tp
         }
-        fn path(&self) -> &PathBuf {
+        pub(super) fn path(&self) -> &PathBuf {
             &self.0
         }
         fn slot(&self, n: usize) -> PathBuf {
@@ -1130,7 +1116,7 @@ mod tests {
         log.shared.faults.lock().unwrap().push((op, skip));
     }
 
-    fn ev(ts: i64, kind: AuditKind, op: Option<&str>, detail: &str) -> AuditEvent {
+    pub(super) fn ev(ts: i64, kind: AuditKind, op: Option<&str>, detail: &str) -> AuditEvent {
         AuditEvent {
             ts_unix_ms: ts,
             kind,
@@ -2075,3 +2061,7 @@ mod tests {
         assert!(p.starts_with(&data_dir), "path = {}", p.display());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "audit/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;

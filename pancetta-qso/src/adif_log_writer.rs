@@ -479,34 +479,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn first_live_open_creates_owner_only_logbook() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("qsos.adi");
-        let _writer = AdifLogWriter::open(&path).await.unwrap();
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
-            0
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn first_import_creates_owner_only_logbook() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("qsos.adi");
-        let block =
-            prepare_import_block(&path, &AdifProcessor::new(), &[imported_record()]).unwrap();
-        write_import_block(&path, &block).unwrap();
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
-            0
-        );
-    }
-
     #[test]
     fn replacement_checks_bytes_and_preserves_append_handle() {
         let dir = tempdir().unwrap();
@@ -696,7 +668,7 @@ mod tests {
     }
 
     /// An imported contact as another logger wrote it.
-    fn imported_record() -> AdifRecord {
+    pub(super) fn imported_record() -> AdifRecord {
         let adif = "<CALL:5>K1ABC <QSO_DATE:8>20240102 <TIME_ON:4>0815 <MODE:3>FT8 \
                     <BAND:3>40M <QSL_RCVD:1>Y <APP_N1MM_ID:4>1234 \
                     <COMMENT:9>from N1MM <EOR>\n";
@@ -1038,3 +1010,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "adif_log_writer/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;

@@ -531,31 +531,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[cfg(unix)]
-    #[test]
-    fn save_cache_is_private_and_ignores_planted_tmp_symlink() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("tier_cache.json");
-        let planted = path.with_extension("json.tmp");
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, "untouched").unwrap();
-        symlink(&victim, &planted).unwrap();
-        let cache = make_cache("fast");
-        save_cache(&path, &cache);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(std::fs::read_to_string(victim).unwrap(), "untouched");
-        assert!(std::fs::symlink_metadata(planted)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(load_cache(&path).unwrap().tier, cache.tier);
-    }
-
-    fn make_cache(tier: &str) -> TierCache {
+    pub(super) fn make_cache(tier: &str) -> TierCache {
         TierCache {
             schema_version: CACHE_SCHEMA_VERSION,
             cpu_model: "Apple M4".to_string(),
@@ -737,3 +713,7 @@ mod tests {
     // call at the end of `initialize`), which reads it live at re-seed
     // time via `probe_completion_should_reseed_budget`, tested above.
 }
+
+#[cfg(all(test, unix))]
+#[path = "tier/tests/private_atomic_save_tests.rs"]
+mod private_atomic_save_tests;
