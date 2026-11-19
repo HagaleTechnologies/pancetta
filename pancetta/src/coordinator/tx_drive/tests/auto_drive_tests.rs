@@ -99,6 +99,32 @@ fn missing_samples_do_not_break_high_run_but_a_valid_low_sample_does() {
 }
 
 #[test]
+fn flat_power_threshold_scales_with_the_configured_step() {
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    config.audio.auto_drive.start_db = -6.0;
+    config.audio.auto_drive.step_up_db = 0.1;
+    let drive = TxDrive::from_config(&config);
+    // A proportional transmitter returns each 0.1 dB step in full; the
+    // climb must keep running past the two comparisons a fixed 0.5 dB
+    // flat threshold would latch on.
+    let mut watts = 10.0_f32;
+    for step in 0..3 {
+        let decision = burst(
+            &drive,
+            &[reading(Some(0.02), Some(ForwardPower::Watts(watts)))],
+        );
+        assert!(
+            matches!(decision, DriveDecision::Changed(_)),
+            "step {step}: proportional power must keep the climb: {decision:?}"
+        );
+        watts *= 10.0_f32.powf(0.1 / 10.0);
+    }
+    let climbed = drive.snapshot_for_band(Some(Band::Band20m)).db;
+    assert!((climbed - (-5.7)).abs() < 1e-4, "climbed to {climbed}");
+}
+
+#[test]
 fn incompatible_power_units_break_flat_streak() {
     let drive = controller(-4.0);
     let clean = |power| [reading(Some(0.02), Some(power))];

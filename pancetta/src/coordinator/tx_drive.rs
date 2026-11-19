@@ -53,7 +53,16 @@ struct PowerSample {
 struct PendingPower {
     baseline: PowerSample,
     context: DriveContext,
+    /// The drive increase separating the baseline burst from the next one.
+    step_db: f32,
 }
+
+/// A drive step counts as flat when its measured forward-power gain is
+/// below this fraction of the step's own dB: a proportional transmitter
+/// returns the whole step, a saturated one returns none. Scaling with the
+/// applied step keeps a configured `step_up_db` below 0.5 dB from latching
+/// flat on a proportional transmitter.
+const FLAT_POWER_STEP_FRACTION: f32 = 0.5;
 
 #[derive(Debug, Clone)]
 struct BandDrive {
@@ -424,7 +433,7 @@ impl TxDrive {
             match power {
                 Some(now) if pending.context == context && pending.baseline.watts == now.watts => {
                     let gain_db = 10.0 * (now.value / pending.baseline.value).log10();
-                    if gain_db < 0.5 {
+                    if gain_db < pending.step_db * FLAT_POWER_STEP_FRACTION {
                         state.flat_streak += 1;
                         if state.flat_streak >= 2 {
                             state.flat_hold = true;
@@ -444,10 +453,16 @@ impl TxDrive {
         if state.flat_hold || state.db >= self.ceiling_db {
             return DriveDecision::Held;
         }
-        state.db = (state.db + self.step_up_db).min(self.ceiling_db);
+        let next_db = (state.db + self.step_up_db).min(self.ceiling_db);
+        let step_db = next_db - state.db;
+        state.db = next_db;
         self.persistence_generation.fetch_add(1, Ordering::AcqRel);
         if let Some(baseline) = power {
-            state.pending_power = Some(PendingPower { baseline, context });
+            state.pending_power = Some(PendingPower {
+                baseline,
+                context,
+                step_db,
+            });
         }
         DriveDecision::Changed(state.db)
     }
