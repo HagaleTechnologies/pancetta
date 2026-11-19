@@ -608,12 +608,7 @@ impl AuditLog {
         if !wrote {
             // Nothing to record: prove the active file is reachable again.
             self.check(AuditOp::Open)
-                .and_then(|()| {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&self.path)
-                })
+                .and_then(|()| crate::keys::perms::open_append_private(&self.path))
                 .map_err(|e| AuditError::io(AuditOp::Open, &e))?;
         }
         Ok(())
@@ -864,12 +859,7 @@ impl AuditLog {
         }
         let mut f = self
             .check(AuditOp::Open)
-            .and_then(|()| {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-            })
+            .and_then(|()| crate::keys::perms::open_append_private(&self.path))
             .map_err(|e| AuditError::io(AuditOp::Open, &e))?;
         let result = self
             .write_record(&mut f, line)
@@ -1047,6 +1037,20 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn first_audit_entry_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tp = TempPath::new("private");
+        let log = AuditLog::new(tp.path().clone());
+        log.append(&ev(1000, AuditKind::Armed, Some("N0CALL"), "armed"))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(tp.path()).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
 
     // Deterministic unique suffix for temp files — NOT a clock, NOT random.
     static COUNTER: AtomicU64 = AtomicU64::new(0);

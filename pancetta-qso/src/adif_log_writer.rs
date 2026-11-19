@@ -134,15 +134,17 @@ impl AdifLogWriter {
                 }
             }
 
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .map_err(|source| AdifLogError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&path).await.map_err(|source| AdifLogError::Io {
+                path: path.clone(),
+                source,
+            })?;
 
             if !already_exists {
                 let header = processor.generate_header();
@@ -354,11 +356,14 @@ pub fn write_import_block(path: &Path, block: &ImportBlock) -> AdifLogResult<()>
         }
     }
     // Only a block for a new logbook may create the file.
-    let mut file = std::fs::OpenOptions::new()
-        .create(expected == 0)
-        .append(true)
-        .open(path)
-        .map_err(io)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(expected == 0).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).map_err(io)?;
     let found = file.metadata().map_err(io)?.len();
     if found != expected {
         return Err(AdifLogError::LogbookMoved {
@@ -473,6 +478,34 @@ mod tests {
     use crate::states::{GridSquares, QsoMetadata, SignalReports};
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_live_open_creates_owner_only_logbook() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        let _writer = AdifLogWriter::open(&path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_import_creates_owner_only_logbook() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        let block =
+            prepare_import_block(&path, &AdifProcessor::new(), &[imported_record()]).unwrap();
+        write_import_block(&path, &block).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
 
     #[test]
     fn replacement_checks_bytes_and_preserves_append_handle() {

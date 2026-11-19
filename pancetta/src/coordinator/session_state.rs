@@ -603,12 +603,9 @@ struct SessionRecordOnDisk<'a> {
     waterfall_gain_db_config_at_save: Option<f32>,
 }
 
-/// Atomically write the record: create the parent directory, write a tmp
-/// sibling, rename over the target.
+/// Atomically write through a random, exclusive 0600 sibling, so a planted
+/// predictable temp symlink cannot redirect the record.
 pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let on_disk = SessionRecordOnDisk {
         tx_drive_by_band: &record.tx_drive_by_band,
         tx_freq_mode: record.tx_freq_mode.map(|m| m.label()),
@@ -622,10 +619,10 @@ pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
         waterfall_gain_db_config_at_save: record.waterfall_gain_db.map(|c| c.config_at_save),
     };
     let text = serde_json::to_string(&on_disk)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    pancetta_config::Config::write_secure_atomic(path, &text).map_err(|e| match e {
+        pancetta_config::ConfigError::Io(e) => e,
+        other => std::io::Error::other(other),
+    })
 }
 
 /// Apply one live mutation to the shared record and rewrite the file
@@ -733,6 +730,42 @@ pub(crate) fn effective_waterfall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/session_state.json");
+        save(&path, &SessionRecord::default()).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_ignores_a_planted_tmp_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session_state.json");
+        let planted = path.with_extension("json.tmp");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        symlink(&victim, &planted).unwrap();
+        let record = SessionRecord {
+            tx_freq_mode: Some(TxFreqMode::Auto),
+            ..Default::default()
+        };
+        save(&path, &record).unwrap();
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "untouched");
+        assert!(std::fs::symlink_metadata(planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(load(&path), SessionLoad::Record(record));
+    }
 
     /// Write a session file into a fresh temp dir and return its path
     /// (PAN-194 discipline: every state path in tests resolves a temp dir,
@@ -1042,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_a_tmp_sibling_then_renames_with_no_leftovers() {
+    fn save_replaces_the_target_atomically_with_no_temp_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".pancetta").join("session_state.json");
         save(
@@ -1321,10 +1354,8 @@ mod tests {
         // took effect (the shared record updated) and the call returned.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session_state.json");
-        // A directory AT the path: create_dir_all succeeds (parent exists),
-        // the tmp write lands at session_state.json.tmp, and the rename
-        // fails because the target is a non-empty dir — or the write itself
-        // fails; either way save errors and must be swallowed.
+        // A directory at the target makes the atomic persist fail;
+        // the persistence error must be swallowed.
         std::fs::create_dir(&path).unwrap();
         let record = shared_record(SessionRecord::default());
         persist_session_choice(

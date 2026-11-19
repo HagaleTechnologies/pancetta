@@ -173,12 +173,15 @@ pub(crate) fn append_batch(
         }
     }
 
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
     let mut file = ActiveFile {
-        file: OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?,
+        file: opts.open(path)?,
         path,
     };
     append_whole_lines(&mut file, &buf)?;
@@ -590,6 +593,16 @@ fn default_data_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    #[test]
+    fn first_tx_log_batch_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TX_LOG_FILE_NAME);
+        append_batch(&path, RotationPolicy::default(), &[rec("CQ N0CALL FN20")]).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+    }
 
     fn rec(text: &str) -> TxFrameRecord {
         TxFrameRecord::new(

@@ -155,31 +155,15 @@ pub(crate) fn load_cache(path: &Path) -> Option<TierCache> {
 /// log at `warn!` but do not propagate. Creates parent directory if
 /// missing.
 pub(crate) fn save_cache(path: &Path, cache: &TierCache) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!("tier cache: failed to create {}: {}", parent.display(), e);
-            return;
-        }
-    }
-    let json = match serde_json::to_vec_pretty(cache) {
+    let json = match serde_json::to_string_pretty(cache) {
         Ok(j) => j,
         Err(e) => {
             warn!("tier cache: serialize failed: {}", e);
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        warn!("tier cache: write to {} failed: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        warn!(
-            "tier cache: rename {} → {} failed: {}",
-            tmp.display(),
-            path.display(),
-            e
-        );
+    if let Err(e) = pancetta_config::Config::write_secure_atomic(path, &json) {
+        warn!("tier cache: write to {} failed: {}", path.display(), e);
     }
 }
 
@@ -546,6 +530,30 @@ pub(crate) async fn initialize(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn save_cache_is_private_and_ignores_planted_tmp_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tier_cache.json");
+        let planted = path.with_extension("json.tmp");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        symlink(&victim, &planted).unwrap();
+        let cache = make_cache("fast");
+        save_cache(&path, &cache);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "untouched");
+        assert!(std::fs::symlink_metadata(planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(load_cache(&path).unwrap().tier, cache.tier);
+    }
 
     fn make_cache(tier: &str) -> TierCache {
         TierCache {
