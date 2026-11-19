@@ -28,7 +28,7 @@ if ! [[ $max_percent =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "max_percent must be a non-negative number, got '$max_percent'" >&2
   usage
 fi
-command -v jq >/dev/null || { echo "::error::jq is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "::error::python3 is required" >&2; exit 1; }
 
 shopt -s globstar nullglob
 status=0
@@ -89,67 +89,74 @@ for id in "${current_ids[@]}"; do
   fi
 done
 
-# mean_of <estimates.json>: print .mean.point_estimate, or fail with a reason.
-# -e makes jq exit 4 when the file holds no JSON document at all (zero-byte
-# or whitespace-only): such a file must fail the run, never read as a 0 ns
-# mean (an empty current run "improves" every benchmark by 100 %, and an
-# empty seed self-check would store an empty baseline).
-mean_of() {
-  local value code=0
-  value=$(jq -er '(try .mean.point_estimate catch null) as $m
-    | if ($m | type) == "number" and ($m | isinfinite | not) and ($m | isnan | not) and $m > 0
-      then $m
-      else error("mean.point_estimate is \($m | tojson), want a finite positive number")
-      end' "$1") || code=$?
-  if (( code == 4 )); then
-    echo "$1 holds no JSON document" >&2
-    return 1
-  fi
-  if (( code != 0 )); then
-    return "$code"
-  fi
-  printf '%s\n' "$value"
+# Compare one benchmark. Exit 3 for a regression or 1 for invalid estimates.
+compare() {
+  python3 - "$@" <<'PYTHON'
+import json
+import sys
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
+from math import inf
+from pathlib import Path
+
+
+def reject_constant(token):
+    raise ValueError(f"{token} is not a JSON number")
+
+
+def mean_of(path, kind):
+    try:
+        document = Path(path).read_text(encoding="utf-8")
+        if not document.strip(" \t\n\r"):
+            raise ValueError("holds no JSON document")
+        estimate = json.loads(
+            document, parse_float=Decimal, parse_int=Decimal,
+            parse_constant=reject_constant,
+        )["mean"]["point_estimate"]
+        if not isinstance(estimate, Decimal) or not 0 < float(estimate) < inf:
+            raise ValueError("mean.point_estimate must be a finite positive number")
+        return estimate
+    except (OSError, ValueError, InvalidOperation, KeyError, TypeError, RecursionError) as error:
+        reason = " ".join(str(error).splitlines())
+        print(f"::error::{benchmark_id}: invalid {kind} estimates {path}: {reason}")
+        return None
+
+
+def format_mean(mean):
+    return format(mean, ".2f").rstrip("0").rstrip(".")
+
+
+benchmark_id, baseline_path, current_path, max_percent = sys.argv[1:]
+baseline = mean_of(baseline_path, "baseline")
+current = mean_of(current_path, "current")
+if baseline is None or current is None:
+    sys.exit(1)
+
+# Keep the comparison exact, including JSON numbers in scientific notation.
+# The rounded percentage below is for the report only.
+regressed = Fraction(current) * 100 > Fraction(baseline) * (100 + Fraction(Decimal(max_percent)))
+change = (current - baseline) * 100 / baseline
+print(f"{benchmark_id}: baseline {format_mean(baseline)} ns, "
+      f"current {format_mean(current)} ns ({change:+.2f}%)")
+sys.exit(3 if regressed else 0)
+PYTHON
 }
 
 regressed=0
 compared=0
 for id in "${baseline_ids[@]}"; do
   [[ -n ${current_files[$id]+set} ]] || continue
-  valid=1
-  if ! baseline_mean=$(mean_of "${baseline_files[$id]}" 2>&1); then
-    echo "::error::$id: invalid baseline estimates ${baseline_files[$id]}: ${baseline_mean//$'\n'/ }"
-    valid=0
-  fi
-  if ! current_mean=$(mean_of "${current_files[$id]}" 2>&1); then
-    echo "::error::$id: invalid current estimates ${current_files[$id]}: ${current_mean//$'\n'/ }"
-    valid=0
-  fi
-  if (( !valid )); then
-    status=1
-    continue
-  fi
-  # Floating-point compare and format in awk: prints "<verdict>\t<line>".
-  result=$(awk -v id="$id" -v b="$baseline_mean" -v c="$current_mean" -v m="$max_percent" '
-    function fmt(x,  s) { s = sprintf("%.2f", x); sub(/\.?0+$/, "", s); return s }
-    BEGIN {
-      b += 0; c += 0; m += 0
-      verdict = (c * 100 > b * (100 + m)) ? "regressed" : "ok"
-      printf "%s\t%s: baseline %s ns, current %s ns (%+.2f%%)\n", verdict, id, fmt(b), fmt(c), (c - b) * 100 / b
-    }')
-  verdict=${result%%$'\t'*}
-  echo "${result#*$'\t'}"
-  compared=$((compared + 1))
-  case $verdict in
-    ok) ;;
-    regressed)
+  result=0
+  compare "$id" "${baseline_files[$id]}" "${current_files[$id]}" "$max_percent" || result=$?
+  case $result in
+    0) compared=$((compared + 1)) ;;
+    3)
       echo "::error::REGRESSION $id exceeds +${max_percent}%"
+      compared=$((compared + 1))
       regressed=$((regressed + 1))
       status=1
       ;;
-    *)
-      echo "::error::$id: comparison produced no verdict"
-      status=1
-      ;;
+    *) status=1 ;;
   esac
 done
 

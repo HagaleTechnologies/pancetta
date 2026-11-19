@@ -707,16 +707,16 @@ when any benchmark mean is more than 15 % above the reference stored on that
 machine. Timings are only comparable on the same hardware, so the reference
 lives on the bench host and nowhere else.
 
-Live activation is still pending: no host is registered under the
-`ft8-bench` label yet and no baseline has been seeded. Until both are done,
-no runner picks up the scheduled run.
+Live activation still requires a runner with the `ft8-bench` label and
+an initial baseline. Once the runner is registered, it can pick up
+scheduled jobs. Comparisons fail until the baseline has been seeded.
 
 ### Register the bench host
 
 1. Pick one quiet Linux machine that runs nothing else while it benches:
    no other runners, desktop sessions or cron jobs that load the CPU. Turn off
    CPU frequency boosting if you can, so results stay stable.
-2. Install the build prerequisites: `git`, `jq`, a C compiler (the
+2. Install the build prerequisites: `git`, `python3`, a C compiler (the
    `pancetta-ft8` build script compiles the vendored `ft8_lib` C sources) and
    `curl` (the toolchain step installs `rustup` and the pinned Rust version
    if they are missing).
@@ -770,11 +770,23 @@ the baseline lacks, or when an estimate is unreadable or not a positive
 number. If no baseline exists at the expected path, the run fails and asks
 for a seed. The schedule never writes the baseline.
 
-To reproduce a comparison by hand on the host:
+To reproduce a comparison by hand, run this from the checkout on the
+bench host as the runner service user. Set `baseline_revision` to the
+workflow's `BASELINE_REVISION`.
 
-```sh
-CRITERION_HOME=$(mktemp -d) cargo bench -p pancetta-ft8
-bash scripts/ci/check-criterion-regression.sh <baseline-dir> "$CRITERION_HOME" 15
+```bash
+(
+  set -e
+  baseline_revision=v1
+  version_line=$(rustc --version)
+  rust_version=$(awk '{print $2}' <<<"$version_line")
+  baseline_dir="${XDG_STATE_HOME:-$HOME/.local/state}/pancetta/ft8-bench/$rust_version/$baseline_revision"
+  CRITERION_HOME=$(mktemp -d)
+  export CRITERION_HOME
+  trap 'rm -rf -- "$CRITERION_HOME"' EXIT
+  cargo bench -p pancetta-ft8
+  bash scripts/ci/check-criterion-regression.sh "$baseline_dir" "$CRITERION_HOME" 15
+)
 ```
 
 The comparator's own tests run offline with

@@ -58,6 +58,19 @@ passes_at_limit() {
   # The limit defaults to 15 % when no third argument is given.
   run_gate "$d/base" "$d/cur"
   expect_code 0 "115 vs 100, default limit" || return 1
+
+  # These means are exactly 15% apart in decimal. Binary floating-point
+  # cross-products round differently and can make this look above the limit.
+  bench "$d/base" basic_decode/example "$(mean 100000000.004)"
+  bench "$d/cur" basic_decode/example "$(mean 115000000.00460)"
+  run_gate "$d/base" "$d/cur"
+  expect_code 0 "exact decimal limit" || return 1
+  expect_out "(+15.00%)" "exact decimal limit" || return 1
+
+  bench "$d/cur" basic_decode/example "$(mean 1.15000000004600001e8)"
+  run_gate "$d/base" "$d/cur"
+  expect_code 1 "just above decimal limit" || return 1
+  expect_out "REGRESSION basic_decode/example exceeds +15%" "just above decimal limit" || return 1
 }
 
 fails_above_limit() {
@@ -142,11 +155,20 @@ fails_on_missing_or_invalid_estimates() {
   done <<EOF
 malformed JSON|{"mean":{"point_estimate":
 missing mean field|{"median":{"point_estimate":100}}
+multiple JSON documents|$(mean 100) $(mean 116)
 zero mean|$(mean 0)
 negative mean|$(mean -5)
 non-numeric mean|$(mean '"fast"')
 null mean|$(mean null)
 EOF
+
+  # The workflow compares the candidate tree to itself before seeding.
+  d=$(new_case)
+  bench "$d/cur" basic_decode/example "$(mean 100) $(mean 116)"
+  run_gate "$d/cur" "$d/cur"
+  expect_code 1 "seed with multiple JSON documents" || return 1
+  expect_out "basic_decode/example: invalid baseline estimates" "seed with multiple JSON documents" || return 1
+  expect_out "basic_decode/example: invalid current estimates" "seed with multiple JSON documents" || return 1
 
   # An estimates.json holding no JSON document at all (zero-byte or
   # whitespace-only) must fail on either side, never read as a 0 ns mean:
