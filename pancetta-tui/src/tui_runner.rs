@@ -575,6 +575,8 @@ pub enum TuiCommand {
     /// Coordinator owns the tone-active state; the TUI just sends the
     /// toggle.
     ToggleTune,
+    /// Start a one-shot Tune carrier calibration; h halts it.
+    StartDriveCalibration,
     /// Adjust station TX audio drive by one signed dB step.
     AdjustTxDrive { delta_db: i8 },
     /// Toggle Auto or Manual TX drive on the effective TX band.
@@ -2567,6 +2569,16 @@ impl TuiRunner {
                     };
                 } else {
                     self.message_tx.send(TuiCommand::ToggleTune)?;
+                }
+            }
+            Action::CalibrateTxDrive => {
+                if !app.tx_policy.allows_any_tx() {
+                    app.set_local_status(
+                        "Can't calibrate — TX is DISABLED (press g to re-enable)".to_string(),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    );
+                } else {
+                    self.message_tx.send(TuiCommand::StartDriveCalibration)?;
                 }
             }
             Action::FindClearOffset => {
@@ -7383,6 +7395,24 @@ mod key_tests {
             "Shift+T must not emit ToggleTune while TX is Disabled"
         );
         assert!(app.read().await.status_message().contains("Can't tune"));
+    }
+
+    #[tokio::test]
+    async fn shift_c_emits_start_drive_calibration_only_when_tx_allowed() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::StartDriveCalibration)
+        ));
+        app.write().await.tx_policy = pancetta_core::TxPolicy::Disabled;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app
+            .read()
+            .await
+            .status_message()
+            .contains("Can't calibrate"));
     }
 
     // === PAN-21: global `k` abort ===================================

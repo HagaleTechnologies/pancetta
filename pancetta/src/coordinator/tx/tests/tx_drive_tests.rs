@@ -669,3 +669,74 @@ async fn bundle_burst_steps_drive_once_with_one_key_down() {
     let (next, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
     assert_waveform_db(&next, -3.5, "burst after the bundle");
 }
+
+#[test]
+fn calibrate_band_seeds_auto_establishes_and_bumps_generation() {
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let drive = TxDrive::from_config(&config);
+    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
+    let prior = drive.snapshot_for_band(Some(band));
+    let selected = drive.calibrate_band(band, -3.0);
+    assert_eq!(selected.db, -3.0);
+    assert_eq!(selected.mode, pancetta_core::TxDriveMode::Auto);
+    assert_ne!(selected.generation, prior.generation);
+    assert!(drive.needs_persist());
+    assert_eq!(drive.restored_map_with_generation().0["20m"].db, -3.0);
+}
+
+#[test]
+fn a_stale_burst_summary_cannot_undo_calibration() {
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let drive = TxDrive::from_config(&config);
+    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
+    let old = drive.snapshot_for_band(Some(band));
+    drive.calibrate_band(band, -3.0);
+    let result = drive.complete(
+        old,
+        &[],
+        DriveContext {
+            rig_generation: 0,
+            ft_mode: 0,
+            stream_count: 1,
+        },
+    );
+    assert_eq!(result, DriveDecision::Stale);
+    assert_eq!(drive.snapshot_for_band(Some(band)).db, -3.0);
+}
+
+#[tokio::test]
+async fn calibrated_drive_scales_the_next_real_burst() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use std::sync::atomic::Ordering;
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
+    let harness = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+        coordinator
+            .tx_drive
+            .restore_map(&std::collections::HashMap::from([(
+                "20m".to_string(),
+                saved(-8.0),
+            )]));
+    })
+    .await;
+    harness.coordinator.tx_drive.calibrate_band(band, -3.0);
+    let audio_rx = audio_receiver(&harness).await;
+    let (samples, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&samples, -3.0, "first burst after calibration");
+}
+
+#[test]
+fn calibrate_band_clamps_to_configured_bounds() {
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let drive = TxDrive::from_config(&config);
+    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
+    assert_eq!(drive.calibrate_band(band, -40.0).db, -20.0);
+    assert_eq!(drive.calibrate_band(band, 20.0).db, 0.0);
+}

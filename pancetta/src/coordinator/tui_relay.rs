@@ -705,8 +705,104 @@ pub(crate) struct TxPolicyCmdCtx {
     pub(crate) cq_active: Arc<std::sync::atomic::AtomicBool>,
     /// Tune-tone deadline, cleared on every halt-to-Disabled path.
     pub(crate) tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    pub(crate) calibration_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
     /// Best-effort TUI echo channel (bounded; headless sends are dropped).
     pub(crate) tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+const TUNE_DURATION_SECS: u32 = 12;
+const TUNE_TONE_HZ: f64 = 1500.0;
+
+struct CalibrationCmdCtx {
+    bus: crate::message_bus::MessageBus,
+    tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    tx_restart_inhibit: Arc<std::sync::atomic::AtomicU32>,
+    drive: Arc<super::tx_drive::TxDrive>,
+    tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    calibration_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
+    split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
+    status_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+async fn start_drive_calibration(ctx: &CalibrationCmdCtx) {
+    let now = tokio::time::Instant::now();
+    let running = ctx.calibration_until.read().await.is_some_and(|t| t > now);
+    let tuning = ctx.tune_until.read().await.is_some_and(|t| t > now);
+    let policy = pancetta_core::TxPolicy::from_u8(ctx.tx_policy.load(Ordering::Acquire));
+    let capability = *ctx.bus.tx_meter_capability.lock().unwrap();
+    let refusal = calibration_refusal(
+        running,
+        tuning,
+        !policy.allows_any_tx() || ctx.tx_restart_inhibit.load(Ordering::Acquire) != 0,
+        capability,
+        ctx.drive.auto_enabled(),
+    );
+    if let Some(reason) = refusal {
+        let _ = ctx
+            .status_tx
+            .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX".to_string(),
+                status: reason.to_string(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+        return;
+    }
+    let msg = ComponentMessage::new(
+        ComponentId::Tui,
+        ComponentId::Ft8Transmitter,
+        MessageType::DriveCalibrationRequest {
+            tone_offset_hz: TUNE_TONE_HZ,
+        },
+        Instant::now(),
+    );
+    if matches!(ctx.bus.send_message_checked(msg).await, Ok(true)) {
+        *ctx.calibration_until.write().await =
+            Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
+        let band =
+            pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                ctx.operating_frequency_hz.load(Ordering::Acquire),
+                ctx.split_tx_hz.load(Ordering::Acquire),
+            ));
+        let label = band.map_or_else(|| "this band".to_string(), |b| b.name().replace('m', " m"));
+        let _ = ctx.status_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+            component: "TX".to_string(),
+            status: format!("Calibrating TX drive on {label} — stepping up from the floor until ALC onset (h halts)"),
+            level: pancetta_core::DiagnosticLevel::Info,
+        });
+    } else {
+        let _ = ctx
+            .status_tx
+            .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX".to_string(),
+                status: "Can't calibrate — transmitter is unavailable".to_string(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+    }
+}
+
+fn calibration_refusal(
+    running: bool,
+    tuning: bool,
+    policy_blocked: bool,
+    capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    auto_drive_enabled: bool,
+) -> Option<&'static str> {
+    if running {
+        Some("Drive calibration already running (press h to halt)")
+    } else if tuning {
+        Some("Can't calibrate — a tune is running")
+    } else if policy_blocked {
+        Some("Can't calibrate — TX is DISABLED (press g to re-enable)")
+    } else if capability.is_none() {
+        Some("Can't calibrate — waiting for the rig's meter capability")
+    } else if capability.is_some_and(|c| !c.alc) {
+        Some("Can't calibrate — this rig does not report ALC over CAT")
+    } else if !auto_drive_enabled {
+        Some("Can't calibrate — set [audio.auto_drive] enabled = true first")
+    } else {
+        None
+    }
 }
 
 /// `TuiCommand::CycleTxPolicy` (`g`): cycle Full → RespondOnly → Disabled →
@@ -734,6 +830,7 @@ pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
         ctx.abort_current_tx.store(true, Ordering::Release);
         ctx.cq_active.store(false, Ordering::Relaxed);
         *ctx.tune_until.write().await = None;
+        *ctx.calibration_until.write().await = None;
         let msg = ComponentMessage::new(
             ComponentId::Tui,
             ComponentId::Qso,
@@ -780,6 +877,7 @@ pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
     ctx.tx_halt.halt();
     ctx.cq_active.store(false, Ordering::Relaxed);
     *ctx.tune_until.write().await = None;
+    *ctx.calibration_until.write().await = None;
     let _ = ctx
         .tui_msg_tx
         .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
@@ -824,6 +922,7 @@ struct TuiRelayLoop {
     /// PAN-439: live drive state and split TX dial for worker drive reports.
     tx_drive: Arc<super::tx_drive::TxDrive>,
     drive_split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
+    meter_capability: Arc<std::sync::Mutex<Option<pancetta_core::tx_meter::TxMeterCapability>>>,
     station_lookup: Arc<crate::priority_evaluator::CachedStationLookup>,
     station_coords: Option<(f64, f64)>,
     our_callsign: String,
@@ -1226,6 +1325,9 @@ impl RelayDriverHost for TuiRelayLoop {
             ) => {
                 // PAN-291: real keyed power/ALC reads and the session's meter
                 // plan, forwarded verbatim to the Shift+S panel.
+                if let crate::message_bus::RigControlMessage::TxMeterCapability(capability) = &msg {
+                    *self.meter_capability.lock().unwrap() = Some(*capability);
+                }
                 if let Some(tui_msg) = tx_meter_tui_message(&msg) {
                     let _ = tui_msg_tx_relay.send(tui_msg);
                 }
@@ -1843,6 +1945,7 @@ impl super::ApplicationCoordinator {
             tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
         >::new();
         let relay_live_config = self.config.clone();
+        let relay_meter_capability = self.message_bus.tx_meter_capability.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -1865,6 +1968,7 @@ impl super::ApplicationCoordinator {
                     gain_frequency: relay_gain_frequency,
                     tx_drive: relay_tx_drive,
                     drive_split_tx_hz: relay_drive_split_tx_hz,
+                    meter_capability: relay_meter_capability,
                     station_lookup: relay_station_lookup,
                     station_coords,
                     our_callsign: our_callsign_for_relay,
@@ -2142,6 +2246,7 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let cmd_calibration_until = Arc::new(tokio::sync::RwLock::new(None));
         // PAN-341: shared context for the extracted TX-policy command
         // handlers (`g` cycle, Shift+Q), so the match arms and the unit
         // tests drive the exact same production path.
@@ -2153,7 +2258,19 @@ impl super::ApplicationCoordinator {
             tx_halt: cmd_tx_halt.clone(),
             cq_active: cmd_cq_active.clone(),
             tune_until: cmd_tune_until.clone(),
+            calibration_until: cmd_calibration_until.clone(),
             tui_msg_tx: cmd_tui_msg_tx.clone(),
+        };
+        let cmd_calibration_ctx = CalibrationCmdCtx {
+            bus: cmd_message_bus.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            tx_restart_inhibit: cmd_tx_restart_inhibit.clone(),
+            drive: cmd_tx_drive.clone(),
+            tune_until: cmd_tune_until.clone(),
+            calibration_until: cmd_calibration_until.clone(),
+            operating_frequency_hz: cmd_operating_freq_hz.clone(),
+            split_tx_hz: cmd_split_tx_hz.clone(),
+            status_tx: cmd_tui_msg_tx.clone(),
         };
         // Fox-mode flag (shared with the QSO component). The ToggleFoxMode
         // relay arm reads the current value and sends `SetFoxMode { on: !current }`
@@ -2170,8 +2287,6 @@ impl super::ApplicationCoordinator {
         // `RigConfigUpdate` so the TUI can tell a reply that predates its
         // latest submit.
         let cmd_rig_select_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        const TUNE_DURATION_SECS: u32 = 12;
-        const TUNE_TONE_HZ: f64 = 1500.0;
         drop(gain_mutation_tx);
         let cmd_handle = tokio::spawn(async move {
             // Push the available audio devices to the TUI once at startup so
@@ -3468,6 +3583,7 @@ impl super::ApplicationCoordinator {
                             cmd_abort_current_tx.store(true, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
+                            *cmd_calibration_until.write().await = None;
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
                                 ComponentId::Qso,
@@ -3487,6 +3603,16 @@ impl super::ApplicationCoordinator {
                                 let guard = cmd_tune_until.read().await;
                                 matches!(*guard, Some(t) if t > now)
                             };
+                            if !active
+                                && cmd_calibration_until.read().await.is_some_and(|t| t > now)
+                            {
+                                let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "TX".to_string(),
+                                    status: "Can't tune — drive calibration is running (press h to halt)".to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                });
+                                continue;
+                            }
                             if active {
                                 info!("TUI ToggleTune: aborting in-flight tune (F4)");
                                 cmd_abort_current_tx.store(true, Ordering::Release);
@@ -3539,6 +3665,9 @@ impl super::ApplicationCoordinator {
                                         Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
                                 }
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::StartDriveCalibration => {
+                            start_drive_calibration(&cmd_calibration_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleAutonomous => {
                             // Batch 93: operator pressed `a`. Flip the SAME
@@ -9378,6 +9507,160 @@ mod tui_relay_tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
+    async fn calibration_fixture(
+        auto_enabled: bool,
+        capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    ) -> (
+        super::CalibrationCmdCtx,
+        crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        crossbeam_channel::Receiver<ComponentMessage>,
+    ) {
+        let bus = MessageBus::new(32).unwrap();
+        let (_, tx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        *bus.tx_meter_capability.lock().unwrap() = capability;
+        let mut config = pancetta_config::Config::default();
+        config.audio.auto_drive.enabled = auto_enabled;
+        let (status_tx, status) = crossbeam_channel::bounded(32);
+        let ctx = super::CalibrationCmdCtx {
+            bus,
+            tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxPolicy::Full.as_u8(),
+            )),
+            tx_restart_inhibit: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            drive: Arc::new(super::super::tx_drive::TxDrive::from_config(&config)),
+            tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+            calibration_until: Arc::new(tokio::sync::RwLock::new(None)),
+            operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+            split_tx_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            status_tx,
+        };
+        (ctx, status, tx)
+    }
+
+    fn alc_capability() -> pancetta_core::tx_meter::TxMeterCapability {
+        pancetta_core::tx_meter::TxMeterCapability {
+            alc: true,
+            ..Default::default()
+        }
+    }
+
+    fn status_text(
+        rx: &crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+    ) -> String {
+        match rx.try_recv().unwrap() {
+            pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. } => status,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_when_the_rig_reports_no_alc() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(Default::default())).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — this rig does not report ALC over CAT"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_capability_is_unknown() {
+        let (ctx, status, tx) = calibration_fixture(true, None).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — waiting for the rig's meter capability"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_tx_policy_blocks_tx() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        ctx.tx_policy
+            .store(pancetta_core::TxPolicy::Disabled.as_u8(), Ordering::Release);
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — TX is DISABLED (press g to re-enable)"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_a_tune_is_running() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        *ctx.tune_until.write().await =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(status_text(&status), "Can't calibrate — a tune is running");
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_while_already_running() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        *ctx.calibration_until.write().await =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Drive calibration already running (press h to halt)"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_refuses_without_auto_drive() {
+        let (ctx, status, tx) = calibration_fixture(false, Some(alc_capability())).await;
+        super::start_drive_calibration(&ctx).await;
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — set [audio.auto_drive] enabled = true first"
+        );
+        assert!(tx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calibration_start_sends_the_request_and_arms_the_deadline() {
+        let (ctx, status, tx) = calibration_fixture(true, Some(alc_capability())).await;
+        let before = tokio::time::Instant::now();
+        super::start_drive_calibration(&ctx).await;
+        assert!(matches!(
+            tx.try_recv().unwrap().message_type,
+            MessageType::DriveCalibrationRequest {
+                tone_offset_hz: 1500.0
+            }
+        ));
+        assert!(ctx
+            .calibration_until
+            .read()
+            .await
+            .is_some_and(|t| t >= before + std::time::Duration::from_secs(12)));
+        assert_eq!(
+            status_text(&status),
+            "Calibrating TX drive on 20 m — stepping up from the floor until ALC onset (h halts)"
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_start_does_not_arm_if_request_dropped() {
+        let (mut ctx, status, _tx) = calibration_fixture(true, Some(alc_capability())).await;
+        let replacement = MessageBus::new(1).unwrap();
+        *replacement.tx_meter_capability.lock().unwrap() = Some(alc_capability());
+        ctx.bus = replacement; // No transmitter route: checked delivery returns false.
+        super::start_drive_calibration(&ctx).await;
+        assert!(ctx.calibration_until.read().await.is_none());
+        assert_eq!(
+            status_text(&status),
+            "Can't calibrate — transmitter is unavailable"
+        );
+    }
+
     struct PolicyFixture {
         ctx: TxPolicyCmdCtx,
         tui: crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
@@ -9417,6 +9700,9 @@ mod tui_relay_tests {
             tx_halt,
             cq_active,
             tune_until,
+            calibration_until: Arc::new(tokio::sync::RwLock::new(Some(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(12),
+            ))),
             tui_msg_tx: tui_tx,
         };
         PolicyFixture {
@@ -9495,6 +9781,10 @@ mod tui_relay_tests {
                     assert!(!f.ctx.cq_active.load(Ordering::Relaxed), "step {step} cq");
                     assert!(f.ctx.tune_until.read().await.is_none(), "step {step} tune");
                     assert!(
+                        f.ctx.calibration_until.read().await.is_none(),
+                        "step {step} calibration"
+                    );
+                    assert!(
                         drain(&f.qso).iter().any(|m| matches!(
                             m.message_type,
                             MessageType::QsoMessage(QsoMessage::StopCq)
@@ -9521,6 +9811,7 @@ mod tui_relay_tests {
             assert!(!f.ctx.tx_halt.autonomous_enabled.load(Ordering::Acquire));
             assert!(!f.ctx.cq_active.load(Ordering::Relaxed));
             assert!(f.ctx.tune_until.read().await.is_none());
+            assert!(f.ctx.calibration_until.read().await.is_none());
             assert_eq!(
                 tui_policy_updates(&f),
                 vec![pancetta_core::TxPolicy::Disabled]
