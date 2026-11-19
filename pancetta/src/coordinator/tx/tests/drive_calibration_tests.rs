@@ -137,6 +137,89 @@ async fn calibration_steps_from_the_floor_and_saves_one_step_below_first_onset()
         .is_none());
 }
 
+/// Codex P1 on #724: the saved drive is consumed by FT frames at
+/// `FT_NORMALIZED_PEAK` with ceiling-dependent reservation, so the
+/// calibration carrier must peak identically at the same drive. At the
+/// default ceiling 0 dB a 0.5-peak carrier is 5.6 dB cooler than FT at the
+/// same drive, which would leave the next FT burst above ALC onset.
+#[tokio::test]
+async fn calibration_carrier_rides_the_ft_drive_scale() {
+    let mut config = Config::default();
+    config.audio.auto_drive.enabled = true;
+    let h = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+    })
+    .await;
+    *h.coordinator
+        .message_bus
+        .tx_meter_capability
+        .lock()
+        .unwrap() = Some(TxMeterCapability {
+        alc: true,
+        forward_power: false,
+        alc_limit: None,
+    });
+    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
+    let audio = h
+        .coordinator
+        .message_bus
+        .get_or_create_channel(ComponentId::Audio)
+        .await
+        .unwrap()
+        .1;
+    request(&h).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut levels = Vec::new();
+    let mut off = 0;
+    while Instant::now() < deadline && off == 0 {
+        while let Ok(msg) = h.hamlib_rx.try_recv() {
+            if let MessageType::RigControl(RigControlMessage::SetPtt { state }) = msg.message_type {
+                if !state {
+                    off += 1;
+                }
+            }
+        }
+        while let Ok(msg) = audio.try_recv() {
+            if let MessageType::AudioOutput { samples, .. } = msg.message_type {
+                if samples.is_empty() {
+                    continue;
+                }
+                // Measure the segment on the FT drive scale: an FT frame at
+                // drive d peaks at FT_NORMALIZED_PEAK scaled by `apply`.
+                let peak = samples.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+                let db =
+                    (20.0 * (peak / super::super::tx_drive::FT_NORMALIZED_PEAK).log10()).round();
+                levels.push(db);
+                let sink = h
+                    .coordinator
+                    .message_bus
+                    .active_drive_calibration
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap();
+                sink.ticks.lock().unwrap().push((
+                    Instant::now() + Duration::from_millis(200),
+                    Some(if db >= -2.0 { 0.11 } else { 0.01 }),
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(off, 1);
+    // The first segment at the −20 dB floor must peak like an FT frame at
+    // −20 dB (0.95 × 10^(−20/20)), not like the 0.5-peak tune carrier.
+    assert_eq!(levels.first(), Some(&-20.0), "{levels:?}");
+    // The knee the rig reports is already on the FT drive scale, so one dB
+    // below the first −2 dB onset is saved as-is.
+    assert_eq!(
+        h.coordinator.tx_drive.snapshot_for_band(Some(band)).db,
+        -3.0
+    );
+}
+
 #[tokio::test]
 async fn drive_calibration_is_hard_muted_under_disabled_policy() {
     let h = station().await;

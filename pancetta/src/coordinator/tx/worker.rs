@@ -7324,11 +7324,14 @@ impl super::super::ApplicationCoordinator {
                                     };
                                     // Generate a continuous sine wave
                                     // (single tone, zero-bandwidth on air).
-                                    // Amplitude 0.5 — operator manages rig
-                                    // power. WSJT-X uses peak amplitude;
-                                    // we run gentler so a forgotten rig
-                                    // power setting is less likely to
-                                    // overdrive.
+                                    // The carrier rides the FT drive scale:
+                                    // it peaks at FT_NORMALIZED_PEAK and is
+                                    // reserved exactly like an FT frame, so
+                                    // the drive whose ALC first reaches onset
+                                    // here is the drive the next FT burst
+                                    // plays at. A cooler tune-style carrier
+                                    // would leave the saved value several dB
+                                    // hot for FT at ceilings below +5.
 
                                     let omega = 2.0 * std::f64::consts::PI * tone_offset_hz
                                         / sample_rate as f64;
@@ -7513,7 +7516,7 @@ impl super::super::ApplicationCoordinator {
                                         let mut samples: Vec<f32> = (0..count)
                                             .map(|i| {
                                                 (((sample_index + i) as f64) * omega).sin() as f32
-                                                    * 0.5
+                                                    * super::super::tx_drive::FT_NORMALIZED_PEAK
                                             })
                                             .collect();
                                         sample_index += count;
@@ -7521,7 +7524,7 @@ impl super::super::ApplicationCoordinator {
                                             &mut samples,
                                             level,
                                             ceiling,
-                                            false,
+                                            true,
                                         );
                                         let sent = message_bus
                                             .send_message_checked(ComponentMessage::new(
