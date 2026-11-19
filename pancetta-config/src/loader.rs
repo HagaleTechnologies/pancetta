@@ -264,7 +264,7 @@ impl ConfigLoader {
 
         // Home directory
         if let Some(home_dir) = dirs::home_dir() {
-            paths.push(home_dir.join(".pancetta"));
+            paths.extend(pancetta_core::data_dir::default_for_home(Some(&home_dir)));
             paths.push(home_dir.join(".config").join("pancetta"));
         }
 
@@ -304,6 +304,10 @@ impl ConfigLoader {
     /// Load configuration from all sources using hierarchical merging
     pub fn load(&self) -> ConfigResult<Config> {
         let (mut config, sources) = self.load_merged_with_sources()?;
+
+        if let Some(warning) = config.clamp_tx_drive() {
+            self.push_load_warning(warning);
+        }
 
         // Validate the final configuration
         config.validate()?;
@@ -1139,6 +1143,10 @@ impl Default for ConfigManager {
         Self::new().unwrap()
     }
 }
+
+#[cfg(test)]
+#[path = "loader/tests/data_dir_discovery_tests.rs"]
+mod data_dir_discovery_tests;
 
 #[cfg(test)]
 mod tests {

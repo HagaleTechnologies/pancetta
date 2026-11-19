@@ -49,7 +49,10 @@ pub enum PulseShape {
     Rectangular,
     /// Gaussian pulse shaping with configurable BT product
     /// BT=2.0 is the FT8 standard (close to rectangular but with smooth transitions)
-    Gaussian { bt: f64 },
+    Gaussian {
+        /// Gaussian filter bandwidth-time product (BT).
+        bt: f64,
+    },
 }
 
 /// FT8 audio modulator for generating transmission signals
@@ -186,14 +189,22 @@ impl Ft8Modulator {
         }
 
         let sps = params.samples_per_symbol(self.sample_rate);
-        let total_samples = params.total_samples(self.sample_rate);
 
         // Build per-sample frequency trajectory
         let freq_trajectory =
             self.build_frequency_trajectory_generic(symbols, total_frequency, tone_spacing, sps);
 
+        self.modulate_from_trajectory(&freq_trajectory, params)
+    }
+
+    /// Render an already smoothed trajectory with the same TX phase, ramps and dither.
+    pub(crate) fn modulate_from_trajectory(
+        &mut self,
+        freq_trajectory: &[f64],
+        _params: &ProtocolParams,
+    ) -> Ft8Result<Vec<f32>> {
         // Generate audio from frequency trajectory via phase accumulation
-        let mut audio_samples = Vec::with_capacity(total_samples);
+        let mut audio_samples = Vec::with_capacity(freq_trajectory.len());
         self.phase_accumulator = 0.0;
 
         let ramp_samples = (self.sample_rate as f64 * 0.005) as usize;
@@ -377,7 +388,7 @@ impl Ft8Modulator {
     }
 
     /// Build per-sample frequency trajectory for any protocol.
-    fn build_frequency_trajectory_generic(
+    pub(crate) fn build_frequency_trajectory_generic(
         &self,
         symbols: &[u8],
         base_freq: f64,

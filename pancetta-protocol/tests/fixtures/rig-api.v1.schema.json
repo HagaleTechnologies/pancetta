@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dispensa.hagale/contracts/rig/rig-api.v1.schema.json",
+  "title": "Rig API v1 (inner, trust-model-agnostic)",
+  "description": "The inner rig-control wire surface served by pancetta's remote_gateway and consumed by cqdx/panino. Carried by the ADR-0002 relay envelope (encrypted under E2E, or as-is under a trusted relay) — these inner shapes are stable regardless of that open decision. Field casing is camelCase (locked, ADR-0003). v1.",
+  "x-status": "v1.4 AMENDED 2026-10-14 (Q-0071, pancetta authored for PAN-99, panino concurred): added optional hello.gatewayToken for pancetta's local-gateway leg only. Additive: protocolVersion stays 1, a token-less hello serializes as before, old consumers still parse. Prior amendment: v1.3 AMENDED 2026-07-24 (Q-0026, pancetta authored, shipped pancetta PR #201): added a new placement serverEvent (slices: ranked {offsetHz, score, clearFirst, clearSecond} candidates; openness: per-bin 0-3 code; binHz; range) for the TX-placement/openness instrument. offsetHz is baseband/audio-passband (NOT RF-absolute, unlike spectrum's binStartHz) — combine with the frequency serverEvent's dial Hz for an absolute value, same convention pancetta's own local TUI uses. Sourced from the same allocator state the autonomous decision path uses (single-scorer invariant) — no independent computation. Additive: no existing field changed; old consumers still parse. Not carried in stateSnapshot (event-only, same choice Q-0024's spectrum event made). panino has not scheduled a consumer yet (Q-0026, 2026-07-04 answer) — this amendment ships the server side only. Prior amendment: v1.2 2026-07-22 (Q-0024, pancetta authored, shipped): added a new spectrum serverEvent (binStartHz RF-absolute, binWidthHz, magsDb raw pre-normalization dB, monotone-per-session seq, timestamp) for panino's live waterfall panel. Additive: no existing field changed; old consumers still parse. Not carried in stateSnapshot (event-only; consumers key off seq and tolerate gaps). Prior amendment: v1.1 2026-07-06 (Q-0027, pancetta authored, shipped): added optional stateSnapshot.mode (station operating mode FT8/FT4/FT2, absent \u21d2 FT8) + a new mode serverEvent for live updates. Additive: old snapshots/consumers still parse. Prior amendment: 2026-07-02 (Q-0019 #5, cqdx authored, shipped cqdx PR #144): added optional hello.capabilityToken — read/qsy authorization is rooted in the E2E identity + this agent-verified token, never in relay admission. Additive (v1): old hellos still parse, but an agent following this amendment serves them nothing scoped.",
+  "$defs": {
+    "slotParity": { "type": "string", "enum": ["even", "odd"] },
+    "responseStep": {
+      "type": "string",
+      "description": "Exchange-ladder rung to open at when answering a caller.",
+      "enum": ["grid", "report", "reportAck", "rr73", "seventyThree"]
+    },
+    "txPolicy": { "type": "string", "enum": ["full", "respondOnly", "disabled"] },
+
+    "placementSlice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offsetHz", "score", "clearFirst", "clearSecond"],
+      "properties": {
+        "offsetHz": { "type": "number", "description": "Baseband/audio-passband offset (NOT RF-absolute) — combine with the frequency serverEvent's dial Hz for an absolute value." },
+        "score": { "type": "number" },
+        "clearFirst": { "type": "boolean", "description": "No decode activity within 50 Hz in the First (even) slot across retained history." },
+        "clearSecond": { "type": "boolean", "description": "No decode activity within 50 Hz in the Second (odd) slot across retained history." }
+      }
+    },
+    "placementFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slices", "openness", "binHz", "range"],
+      "properties": {
+        "slices": { "type": "array", "items": { "$ref": "#/$defs/placementSlice" }, "description": "Top-N ranked candidates, sorted by score descending." },
+        "openness": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 3 }, "description": "Per-bin openness code across the full allocation range: 0=busy-both, 1=second-only-clear, 2=first-only-clear, 3=clear-both." },
+        "binHz": { "type": "number", "description": "Bin width in Hz (matches the allocator's step_hz)." },
+        "range": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "Allocation range [min, max] in Hz (baseband, same convention as offsetHz)." }
+      }
+    },
+
+    "spectrumFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binStartHz", "binWidthHz", "magsDb", "seq", "timestamp"],
+      "properties": {
+        "binStartHz": { "type": "number", "description": "RF-absolute Hz of bin 0 (dial + audio bin offset)." },
+        "binWidthHz": { "type": "number" },
+        "magsDb": { "type": "array", "items": { "type": "number" }, "description": "Raw, pre-normalization dB, one value per bin." },
+        "seq": { "type": "integer", "minimum": 0, "description": "Monotone per session; consumers detect drops." },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "dxRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callSign", "frequencyHz", "mode", "snr", "workedBefore", "needed", "atno", "priority", "lastSeen", "source"],
+      "properties": {
+        "callSign": { "type": "string" },
+        "gridSquare": { "type": ["string", "null"] },
+        "frequencyHz": { "type": "number" },
+        "mode": { "type": "string" },
+        "snr": { "type": "integer" },
+        "distanceKm": { "type": ["number", "null"] },
+        "bearing": { "type": ["number", "null"] },
+        "workedBefore": { "type": "boolean" },
+        "needed": { "type": "boolean" },
+        "atno": { "type": "boolean" },
+        "priority": { "type": "integer", "minimum": 0 },
+        "entityName": { "type": ["string", "null"] },
+        "rarityTier": { "type": ["string", "null"] },
+        "audioOffsetHz": { "type": ["integer", "null"] },
+        "slotParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] },
+        "lastSeen": { "type": "string", "format": "date-time" },
+        "source": { "type": "string", "enum": ["local", "network", "both"] }
+      }
+    },
+
+    "qsoProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qsoId", "theirCallsign", "state", "frequencyHz", "ladderLabels", "ladderOurs", "ladderIndex", "nowLine", "nextLine", "startedAt"],
+      "properties": {
+        "qsoId": { "type": "string" },
+        "theirCallsign": { "type": "string" },
+        "state": { "type": "string" },
+        "frequencyHz": { "type": "number" },
+        "txParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] },
+        "ladderLabels": { "type": "array", "items": { "type": "string" } },
+        "ladderOurs": { "type": "array", "items": { "type": "boolean" } },
+        "ladderIndex": { "type": "integer", "minimum": 0 },
+        "nowLine": { "type": "string" },
+        "nextLine": { "type": "string" },
+        "lastTxText": { "type": ["string", "null"] },
+        "lastRxText": { "type": ["string", "null"] },
+        "reportSent": { "type": ["integer", "null"] },
+        "reportReceived": { "type": ["integer", "null"] },
+        "dxLastActivity": { "type": ["string", "null"] },
+        "startedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "pendingCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callsign", "waitedSecs"],
+      "properties": {
+        "callsign": { "type": "string" },
+        "dxParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] },
+        "waitedSecs": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "decodedView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "frequencyHz", "snr", "deltaTime", "deltaFreq", "message", "isDirectedAtUs", "workedBefore", "needed", "atno"],
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "frequencyHz": { "type": "number" },
+        "snr": { "type": "integer" },
+        "deltaTime": { "type": "number" },
+        "deltaFreq": { "type": "number" },
+        "callSign": { "type": ["string", "null"] },
+        "gridSquare": { "type": ["string", "null"] },
+        "message": { "type": "string" },
+        "slotParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] },
+        "isDirectedAtUs": { "type": "boolean" },
+        "workedBefore": { "type": "boolean" },
+        "needed": { "type": "boolean" },
+        "atno": { "type": "boolean" },
+        "priorityScore": { "type": ["integer", "null"] }
+      }
+    },
+
+    "clientCommand": {
+      "description": "client -> server. TX-capable commands (callStation/answerCaller/startCq) are gated by the ADR-0002 armed-capability path before they reach the rig; v1 read-only gateway accepts but does not execute them.",
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "vfo", "frequencyHz"], "properties": { "cmd": { "const": "setFrequency" }, "vfo": { "type": "integer" }, "frequencyHz": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "enabled", "txFrequencyHz"], "properties": { "cmd": { "const": "setSplit" }, "enabled": { "type": "boolean" }, "txFrequencyHz": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "callsign", "frequencyHz"], "properties": { "cmd": { "const": "callStation" }, "callsign": { "type": "string" }, "frequencyHz": { "type": "integer" }, "dxParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "callsign", "frequencyHz", "step"], "properties": { "cmd": { "const": "answerCaller" }, "callsign": { "type": "string" }, "frequencyHz": { "type": "integer" }, "dxParity": { "oneOf": [{ "$ref": "#/$defs/slotParity" }, { "type": "null" }] }, "step": { "$ref": "#/$defs/responseStep" }, "snr": { "type": ["number", "null"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "frequencyOffsetHz"], "properties": { "cmd": { "const": "startCq" }, "frequencyOffsetHz": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd"], "properties": { "cmd": { "const": "stopCq" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd"], "properties": { "cmd": { "const": "takeControl" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd"], "properties": { "cmd": { "const": "releaseControl" } } },
+        { "type": "object", "additionalProperties": false, "required": ["cmd", "armed"], "properties": { "cmd": { "const": "setTransmitArmed" }, "armed": { "type": "boolean" } } }
+      ]
+    },
+
+    "serverEvent": {
+      "description": "server -> client.",
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["event", "decoded"], "properties": { "event": { "const": "decoded" }, "decoded": { "$ref": "#/$defs/decodedView" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "rows"], "properties": { "event": { "const": "dxHunter" }, "rows": { "type": "array", "items": { "$ref": "#/$defs/dxRow" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "qsos", "pending"], "properties": { "event": { "const": "activeQsos" }, "qsos": { "type": "array", "items": { "$ref": "#/$defs/qsoProgress" } }, "pending": { "type": "array", "items": { "$ref": "#/$defs/pendingCall" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "vfo", "frequencyHz"], "properties": { "event": { "const": "frequency" }, "vfo": { "type": "integer" }, "frequencyHz": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "txHz"], "properties": { "event": { "const": "split" }, "txHz": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "mode"], "properties": { "event": { "const": "mode" }, "mode": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "dbOverS9"], "properties": { "event": { "const": "signalStrength" }, "dbOverS9": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "spectrum"], "properties": { "event": { "const": "spectrum" }, "spectrum": { "$ref": "#/$defs/spectrumFrame" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "placement"], "properties": { "event": { "const": "placement" }, "placement": { "$ref": "#/$defs/placementFrame" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "active"], "properties": { "event": { "const": "txStatus" }, "active": { "type": "boolean" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "policy"], "properties": { "event": { "const": "txPolicy" }, "policy": { "$ref": "#/$defs/txPolicy" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "controlHeldByMe", "transmitArmed"], "properties": { "event": { "const": "controlState" }, "controlHeldByMe": { "type": "boolean" }, "transmitArmed": { "type": "boolean" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "component", "status"], "properties": { "event": { "const": "status" }, "component": { "type": "string" }, "status": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["event", "component", "message"], "properties": { "event": { "const": "error" }, "component": { "type": "string" }, "message": { "type": "string" } } }
+      ]
+    },
+
+    "stateSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frequencyHz", "splitTxHz", "txPolicy", "dxHunter", "activeQsos", "pendingCalls", "recentDecodes"],
+      "properties": {
+        "frequencyHz": { "type": "integer" },
+        "splitTxHz": { "type": "integer" },
+        "txPolicy": { "$ref": "#/$defs/txPolicy" },
+        "mode": { "type": "string", "description": "Station-wide active operating mode (\"FT8\"/\"FT4\"/\"FT2\"). Added in v1.1 (Q-0027). Optional for back-compat: absent means \"FT8\"." },
+        "dxHunter": { "type": "array", "items": { "$ref": "#/$defs/dxRow" } },
+        "activeQsos": { "type": "array", "items": { "$ref": "#/$defs/qsoProgress" } },
+        "pendingCalls": { "type": "array", "items": { "$ref": "#/$defs/pendingCall" } },
+        "recentDecodes": { "type": "array", "items": { "$ref": "#/$defs/decodedView" } }
+      }
+    },
+
+    "hello": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "clientName", "clientVersion"],
+      "properties": {
+        "protocolVersion": { "type": "integer" },
+        "clientName": { "type": "string" },
+        "clientVersion": { "type": "string" },
+        "capabilityToken": { "type": "string", "description": "Compact JWS of the cqdx capabilityToken (contracts/auth/e2e-auth.v1 $defs.capabilityToken). Optional on the wire for v1 back-compat, but REQUIRED at runtime for any scoped action: the station agent MUST verify it against its PINNED IdP keys (pinned at pairing, never fetched live) — checking aud == its own agentKeyId, clientKeyId == the E2E-bound client identity, and exp/nbf — and MUST enforce per-action scopes (status ⊂ qsy ⊂ tx: welcome/snapshot/status reads require the status tier; setFrequency/setSplit require qsy; TX commands additionally require an active txArm). Authorization MUST be rooted in the Noise-authenticated client static → clientKeyId → authorization edge — NEVER in relay admission (the relay envelope's src is relay-forgeable if the relay is compromised). A hello with no/invalid/mismatched token receives an error event and is served nothing scoped; txArm remains independently gated by its own carried token + client-signed grant (this field does not replace it)." },
+        "gatewayToken": { "type": "string", "description": "Local-gateway leg only (Q-0071, PAN-99): the station's configured shared secret, sent in the first hello on a pancetta local-gateway connection. Never sent over the relay, where capabilityToken and the Noise identity proof govern access. Omitted when absent." }
+      }
+    },
+    "welcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "serverVersion", "snapshot"],
+      "properties": { "protocolVersion": { "type": "integer" }, "serverVersion": { "type": "string" }, "snapshot": { "$ref": "#/$defs/stateSnapshot" } }
+    },
+
+    "clientFrame": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["frame", "hello"], "properties": { "frame": { "const": "hello" }, "hello": { "$ref": "#/$defs/hello" } } },
+        { "type": "object", "additionalProperties": false, "required": ["frame", "command"], "properties": { "frame": { "const": "command" }, "command": { "$ref": "#/$defs/clientCommand" } } }
+      ]
+    },
+    "serverFrame": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["frame", "welcome"], "properties": { "frame": { "const": "welcome" }, "welcome": { "$ref": "#/$defs/welcome" } } },
+        { "type": "object", "additionalProperties": false, "required": ["frame", "event"], "properties": { "frame": { "const": "event" }, "event": { "$ref": "#/$defs/serverEvent" } } }
+      ]
+    }
+  },
+
+  "oneOf": [{ "$ref": "#/$defs/clientFrame" }, { "$ref": "#/$defs/serverFrame" }]
+}

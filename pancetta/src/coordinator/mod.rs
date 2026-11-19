@@ -21,6 +21,7 @@ mod alerts;
 mod audio;
 mod audio_recovery;
 mod autonomous;
+mod band_hop;
 mod clock_monitor;
 mod config_reload;
 mod desense;
@@ -33,6 +34,7 @@ mod gain_sweep_runtime;
 mod hamlib;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
+mod n1mm_udp;
 mod pipeline;
 mod psk_reporter;
 mod qrz_lookup;
@@ -56,9 +58,10 @@ mod swr_guard;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_drive;
 mod tx_halt;
 mod tx_log;
-mod tx_meter;
+pub(crate) mod tx_meter;
 mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;
@@ -952,6 +955,19 @@ pub(crate) fn operator_present_now(last_input_ms: &std::sync::atomic::AtomicU64)
     now_ms.saturating_sub(last) < OPERATOR_PRESENCE_WINDOW.as_millis() as u64
 }
 
+/// PAN-376: the data directory station state lives in.
+///
+/// Under the test-only `pancetta_home_override` (a test **home**) it is
+/// `<home>/.pancetta`, so the in-process test seams keep their meaning;
+/// otherwise it is the process data directory (`--data-dir`, else
+/// `~/.pancetta`). `None` only with no override, no `--data-dir` and no home.
+pub(crate) fn data_dir_for(home_override: Option<&std::path::Path>) -> Option<PathBuf> {
+    match home_override {
+        Some(home) => Some(home.join(pancetta_core::data_dir::DEFAULT_DIR_NAME)),
+        None => pancetta_core::data_dir::try_current(),
+    }
+}
+
 use anyhow::{Context, Result};
 use pancetta_config::Config;
 use pancetta_ft8::Ft8Config;
@@ -1357,6 +1373,8 @@ pub struct ApplicationCoordinator {
     /// this path is absolute but symlinks are not resolved until each TUI
     /// write runs, so a repointed link sends saves to its current target.
     pub(crate) config_path: PathBuf,
+    pub(crate) tx_drive: Arc<tx_drive::TxDrive>,
+    pub(crate) tx_drive_config_path: PathBuf,
 
     /// PAN-62 review round 2 (Codex P1): whether `config_path` is TOML
     /// (the targeted setters `SelectDevice`/`SelectRig`/`SaveRigBookmark`/
@@ -1369,8 +1387,10 @@ pub struct ApplicationCoordinator {
     /// a stalled filesystem must never suspend those.
     pub(crate) config_write_is_toml: bool,
 
-    /// PAN-41 round 3: test-only override for the `~/.pancetta` directory
-    /// `start_qso_component` otherwise always derives from `dirs::home_dir()`
+    /// PAN-41 round 3: test-only home override for the data directory
+    /// `start_qso_component` otherwise always derives from the process data
+    /// directory (PAN-376: `--data-dir`, else `~/.pancetta`; see
+    /// [`data_dir_for`])
     /// -- including under `--replay`, whose own documented contract is to
     /// still *read* the real ADIF/index for duplicate/DX-Hunter history
     /// seeding (only writes are suppressed). Without this, an in-process
@@ -1656,8 +1676,8 @@ pub struct ApplicationCoordinator {
     pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
 
     /// Test handshake after waveform construction, immediately before the gate wait.
-    #[cfg(test)]
-    tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) tx_before_ptt_gate: Arc<tokio::sync::Notify>,
 
     /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
     /// and the key-down when armed.
@@ -2193,6 +2213,11 @@ fn degradation_message(id: ComponentId) -> &'static str {
 }
 
 impl ApplicationCoordinator {
+    /// Select the config source that receives live TX drive updates.
+    pub fn set_tx_drive_config_path(&mut self, path: PathBuf) {
+        self.tx_drive_config_path = path;
+    }
+
     /// Create a new application coordinator
     // rationale: the coordinator constructor takes many independent dependencies;
     // a builder/params struct would relocate the same fields without simplifying.
@@ -2218,6 +2243,7 @@ impl ApplicationCoordinator {
         info!("Initializing Application Coordinator");
 
         let id = uuid::Uuid::new_v4();
+        let tx_drive = Arc::new(tx_drive::TxDrive::from_config(&config));
         let startup_time = Instant::now();
 
         // Create message bus with high-performance configuration
@@ -2281,7 +2307,9 @@ impl ApplicationCoordinator {
                 .audit_log_path
                 .clone()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(pancetta_agent::audit::default_audit_path),
+                .unwrap_or_else(|| {
+                    pancetta_agent::audit::audit_path_in(&pancetta_core::data_dir::current())
+                }),
         );
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
@@ -2306,6 +2334,7 @@ impl ApplicationCoordinator {
                 None => session_state::SessionLoad::Missing,
             },
         );
+        tx_drive.restore_map(&session_startup.record.tx_drive_by_band);
         let session_report = session_state::startup_report(&session_startup);
         if let Some(reason) = &session_startup.ignored_reason {
             warn!("Session: saved choices ignored ({reason}); using defaults");
@@ -2527,7 +2556,9 @@ impl ApplicationCoordinator {
             headless,
             wav_path,
             replay_path,
+            tx_drive_config_path: config_path.clone(),
             config_path,
+            tx_drive,
             config_write_is_toml,
             pancetta_home_override: pancetta_home,
             // PAN-270: the coordinator-owned session record (canonical from
@@ -2595,7 +2626,7 @@ impl ApplicationCoordinator {
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
             tx_frame_log: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-harness"))]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
@@ -2792,6 +2823,29 @@ impl ApplicationCoordinator {
                 });
                 self.named_task_handles
                     .push((ComponentId::DxCluster, wrapped));
+                // PAN-385: the all-band needed-activity poll feeds the band
+                // hopper's needed trigger, so it runs only when that is on.
+                let opportunity_candidates = {
+                    let config = self.config.read().await;
+                    let hopping = &config.autonomous.band_hopping;
+                    (hopping.enabled && hopping.needed_activity)
+                        .then(|| band_hop::opportunity_candidate_bands(&config.autonomous))
+                };
+                if let Some(candidates) = opportunity_candidates {
+                    let opportunity_handle = bridge.spawn_opportunity_poller(
+                        self.shutdown_signal.clone(),
+                        self.last_decode_timestamp.clone(),
+                        candidates,
+                    );
+                    let wrapped = tokio::spawn(async move {
+                        opportunity_handle.await.map_err(|e| {
+                            anyhow::anyhow!("cqdx opportunity poller join error: {}", e)
+                        })?;
+                        Ok(())
+                    });
+                    self.named_task_handles
+                        .push((ComponentId::DxCluster, wrapped));
+                }
                 self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);
@@ -2814,8 +2868,11 @@ impl ApplicationCoordinator {
         // now enough to flip into strict mode immediately.
         const COLD_START_THRESHOLD: usize = 5;
         {
-            let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
-            let seed_path = dirs::home_dir().map(|h| h.join(".pancetta").join("callsign_seed.txt"));
+            // PAN-376: the worked-call history lives in the data directory
+            // (and honours the test-only home override).
+            let fp_data_dir = data_dir_for(self.pancetta_home_override.as_deref());
+            let adif_path = fp_data_dir.as_ref().map(|d| d.join("qsos.adi"));
+            let seed_path = fp_data_dir.as_ref().map(|d| d.join("callsign_seed.txt"));
             let adif_count = adif_path
                 .as_ref()
                 .filter(|p| p.exists())
@@ -4198,9 +4255,9 @@ mod tests {
         let coordinator = build_coordinator(config).await;
         assert_eq!(
             coordinator.audit_log().path(),
-            &pancetta_agent::audit::default_audit_path(),
+            &pancetta_agent::audit::audit_path_in(&pancetta_core::data_dir::current()),
             "with no configured path, the shared AuditLog must fall back to \
-             the standard default path"
+             the standard default path in the data directory"
         );
     }
 
@@ -5751,3 +5808,7 @@ mod active_qso_freq_tests {
 #[cfg(test)]
 #[path = "tests/waterfall_session_restore_tests.rs"]
 mod waterfall_session_restore_tests;
+
+#[cfg(test)]
+#[path = "tests/data_dir_tests.rs"]
+mod data_dir_tests;

@@ -135,6 +135,70 @@ pub(crate) fn tx_meter_text(row: TxMeterRow) -> String {
     }
 }
 
+/// Legacy display helper for tests that exercise meter formatting alone.
+#[cfg(test)]
+pub(crate) fn tx_meter_text_with_drive(row: TxMeterRow, drive: Option<(f32, f32)>) -> String {
+    tx_meter_text_with_drive_state(row, drive, None, false)
+}
+
+/// Render the selected band's drive and its automatic-control availability.
+pub(crate) fn tx_meter_text_with_drive_state(
+    row: TxMeterRow,
+    drive: Option<(f32, f32)>,
+    mode: Option<pancetta_core::tx_drive_mode::TxDriveMode>,
+    available: bool,
+) -> String {
+    use pancetta_core::tx_drive_mode::TxDriveMode;
+    let mut meter = tx_meter_text(row);
+    if mode == Some(TxDriveMode::Auto) {
+        // Auto handles an eligible overdrive after the burst; the old manual
+        // instruction would contradict the automatic response.
+        meter = meter.replace(", reduce audio drive", "");
+    }
+    let drive = match drive {
+        Some((db, ceiling)) => {
+            let ceiling = (db - ceiling).abs() < 0.0001;
+            let status = match mode {
+                Some(TxDriveMode::Auto)
+                    if !available
+                        || matches!(row, TxMeterRow::NeedsCat | TxMeterRow::NotReported)
+                        || matches!(
+                            row,
+                            TxMeterRow::Live {
+                                reading: TxMeterReading { alc: None, .. },
+                                ..
+                            }
+                        ) =>
+                {
+                    "auto unavailable"
+                }
+                Some(TxDriveMode::Auto) if ceiling => "auto, ceiling",
+                Some(TxDriveMode::Auto) => "auto",
+                Some(TxDriveMode::Manual) if ceiling => "manual, ceiling",
+                Some(TxDriveMode::Manual) => "manual",
+                None if ceiling => "ceiling",
+                None => "",
+            };
+            if status.is_empty() {
+                format!("drive {} dB", format_drive_db(db))
+            } else {
+                format!("drive {} dB ({status})", format_drive_db(db))
+            }
+        }
+        None => "drive pending".to_string(),
+    };
+    meter.replacen("TX meter: ", &format!("TX meter: {drive}, "), 1)
+}
+
+fn format_drive_db(db: f32) -> String {
+    let value = if db.fract() == 0.0 {
+        format!("{db:.0}")
+    } else {
+        format!("{db}")
+    };
+    value.replace('-', "−")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

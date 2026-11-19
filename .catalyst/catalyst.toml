@@ -28,6 +28,10 @@ name = "libudev-dev"
 [[environment.system_packages]]
 name = "pkg-config"
 
+# Completion tests load the generated script in zsh.
+[[environment.system_packages]]
+name = "zsh"
+
 # Catalyst's runner exports GIT_CONFIG_KEY_n overrides (remote.origin.url and
 # remote.origin.fetch = this ticket's branch) to every git process, so the
 # submodule clone behind `submodules = true` fetches pancetta instead of
@@ -46,10 +50,11 @@ cache_key_files = ["Cargo.lock"]
 
 [[environment.verify]]
 name = "check-workspace"
-run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "check", "--workspace", "--exclude", "pancetta-research"]
+# PAN-85: disable incremental artifacts only in the 20 GiB Catalyst slot.
+run = ["env", "CARGO_INCREMENTAL=0", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "check", "--workspace", "--exclude", "pancetta-research"]
 timeout_seconds = 1800
 
 [[environment.verify]]
 name = "test-workspace"
-run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
+run = ["env", "CARGO_INCREMENTAL=0", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
 timeout_seconds = 3300

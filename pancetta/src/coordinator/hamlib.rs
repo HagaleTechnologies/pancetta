@@ -2143,6 +2143,7 @@ impl super::ApplicationCoordinator {
         // doc comment.
         let hamlib_command_in_flight_for_polling = self.hamlib_command_in_flight.clone();
         let split_tx_hz_for_polling = self.split_tx_frequency_hz();
+        let operating_frequency_hz_for_polling = self.operating_frequency_hz.clone();
         let split_tx_hz_for_startup = self.split_tx_frequency_hz();
         // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
         // rig state is applied". The message loop's own SetFrequency/
@@ -2389,6 +2390,8 @@ impl super::ApplicationCoordinator {
                     // warning, on the same keyed tick as SWR.
                     let mut alc_guard = super::tx_meter::AlcGuard::new(&swr_protection);
                     let mut tx_meter_plan: Option<super::tx_meter::TxMeterPlan> = None;
+                    // A new rig session must not inherit the previous rig's ALC capability.
+                    *message_bus.tx_meter_capability.lock().unwrap() = None;
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -2611,14 +2614,14 @@ impl super::ApplicationCoordinator {
                                             rig_for_polling.as_ref(),
                                         )
                                         .await;
+                                        let capability = plan.capability(alc_guard.alc_limit());
+                                        *message_bus.tx_meter_capability.lock().unwrap() = Some(capability);
                                         let _ = message_bus
                                             .send_message(ComponentMessage::new(
                                                 ComponentId::Hamlib,
                                                 ComponentId::Tui,
                                                 MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::TxMeterCapability(
-                                                        plan.capability(alc_guard.alc_limit()),
-                                                    ),
+                                                    crate::message_bus::RigControlMessage::TxMeterCapability(capability),
                                                 ),
                                                 Instant::now(),
                                             ))
@@ -2640,12 +2643,14 @@ impl super::ApplicationCoordinator {
                                     )
                                     .await;
                                     if let Some(plan) = tx_meter_plan.as_ref() {
-                                        super::tx_meter::tx_meter_poll_step(
+                                        super::tx_meter::tx_meter_poll_step_with_dial(
                                             rig_for_polling.as_ref(),
                                             plan,
                                             &mut alc_guard,
                                             keyed,
                                             &message_bus,
+                                            &operating_frequency_hz_for_polling,
+                                            &split_tx_hz_for_polling,
                                         )
                                         .await;
                                     }
@@ -2739,6 +2744,8 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             RigPollTransition::PollingFailed => {
+                                tx_meter_plan = None;
+                                *message_bus.tx_meter_capability.lock().unwrap() = None;
                                 warn!(
                                     "Rig polling has failed {} consecutive times -- rigctld may have crashed. \
                                      Check rigctld process and restart Pancetta if needed.",
@@ -2780,6 +2787,8 @@ impl super::ApplicationCoordinator {
                 let ptt_active_watchdog = ptt_active.clone();
                 let ptt_off_unconfirmed_watchdog = ptt_off_unconfirmed.clone();
                 let ptt_off_confirmations_watchdog = ptt_off_confirmations.clone();
+                let drive_attempt_watchdog =
+                    message_bus_for_connect.active_tx_drive_attempt.clone();
                 // PAN-19 round-16 review (Codex P1): same reasoning as the
                 // poll task's own guard above -- see that comment.
                 let hamlib_command_loop_ready_for_watchdog = hamlib_command_loop_ready.clone();
@@ -2827,6 +2836,17 @@ impl super::ApplicationCoordinator {
                             let overdue = on_since.elapsed()
                                 > Duration::from_secs(PTT_SAFETY_TIMEOUT_SECS);
                             if overdue || unkey_failed {
+                                // PAN-439: a burst the watchdog cuts short never
+                                // trains drive. (A rejected unkey is reported after
+                                // the worker's delivered release, so this cannot
+                                // undo a burst the worker already completed.)
+                                if overdue {
+                                    if let Ok(mut slot) = drive_attempt_watchdog.lock() {
+                                        if let Some(attempt) = slot.take() {
+                                            attempt.invalidate();
+                                        }
+                                    }
+                                }
                                 if overdue {
                                     error!(
                                         "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds -- forcing OFF",
@@ -3450,6 +3470,29 @@ impl super::ApplicationCoordinator {
                                                     "rig set_ptt {} OK",
                                                     if *state { "ON" } else { "OFF" }
                                                 );
+                                                if *state {
+                                                    if let Ok(mut slot) = message_bus_for_connect
+                                                        .active_tx_drive_attempt
+                                                        .lock()
+                                                    {
+                                                        if let Some(old) = slot.take() {
+                                                            old.stop();
+                                                        }
+                                                        if let Some(attempt) =
+                                                            message.tx_drive_attempt.as_ref()
+                                                        {
+                                                            attempt.confirm();
+                                                            *slot = Some(attempt.clone());
+                                                        }
+                                                    }
+                                                } else if let Ok(mut slot) = message_bus_for_connect
+                                                    .active_tx_drive_attempt
+                                                    .lock()
+                                                {
+                                                    if let Some(attempt) = slot.take() {
+                                                        attempt.stop();
+                                                    }
+                                                }
                                                 if !*state {
                                                     if let Some(d) = drain.as_mut() {
                                                         d.unkey_confirmed = true;
@@ -10179,6 +10222,30 @@ mod pan291_tx_meter_tests {
             pancetta_core::TxPolicy::Full
         );
         assert_eq!(s.rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+    }
+
+    #[test]
+    fn disabled_auto_keeps_warn_only_and_gain() {
+        let mut config = Config::default();
+        config.audio.auto_drive.enabled = false;
+        config.audio.levels.output_gain_db = -4.0;
+        let drive = super::super::tx_drive::TxDrive::from_config(&config);
+        let mut guard = super::super::tx_meter::AlcGuard::new(&config.rig.power_control.protection);
+        assert_eq!(
+            guard.observe(true, Some(0.8)),
+            super::super::tx_meter::AlcAction::None
+        );
+        assert!(matches!(
+            guard.observe(true, Some(0.9)),
+            super::super::tx_meter::AlcAction::ReportOverdrive { .. }
+        ));
+        assert_eq!(drive.get(), -4.0);
+        assert_eq!(
+            drive
+                .snapshot_for_band(pancetta_core::Band::from_frequency(14_074_000))
+                .db,
+            -4.0
+        );
     }
 
     #[tokio::test]

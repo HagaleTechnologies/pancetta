@@ -115,6 +115,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `audio_recovery/` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
 | `autonomous/` | Autonomous operator component. |
+| `band_hop.rs` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
+| `band_hop/` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
 | `config_reload.rs` | Applying saved config edits: live security fields, restart list. |
 | `contest.rs` | Durable contest scoring refresh. |
@@ -131,6 +133,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `health/` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
+| `n1mm_udp.rs` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
+| `n1mm_udp/` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
@@ -158,9 +162,12 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tui_relay/` | TUI relay and command forwarding. |
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
+| `tx_drive.rs` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
+| `tx_drive/` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
+| `tx_meter/` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `upload_outbox/` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
@@ -245,7 +252,7 @@ avoid QRM from active signals, maintain minimum spacing between simultaneous TX 
 prefer clear channels, align with band segment conventions. Enables parallel QSOs
 within a single 15-second slot.
 
-### TX Slot Scheduler (`pancetta/src/coordinator/tx.rs`)
+### TX Slot Scheduler (`pancetta/src/coordinator/tx/worker.rs`)
 
 `TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
 (or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and

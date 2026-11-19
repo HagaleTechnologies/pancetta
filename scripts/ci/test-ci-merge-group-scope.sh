@@ -54,19 +54,38 @@ Dir.mktmpdir('pan172-scope-') do |dir|
   end
 end
 lanes = %w[clippy fmt workspace-check workspace-tests deny cross-platform-check]
+# PAN-367: `verified` is changes.outputs.merge_group_verified (push-only; empty
+# on every other event). Rows 1-6 reproduce the pre-PAN-367 behaviour; rows 7-11
+# pin the new one: only the two heavy lanes honour the verified output, and
+# schedule/workflow_dispatch ignore it entirely.
 [
-  ['merge_group', '', 'true', false, false], ['merge_group', '', 'false', true, false],
-  ['merge_group', '', '', true, false], ['pull_request', 'false', '', false, false],
-  ['pull_request', 'true', '', true, true], ['push', 'false', '', false, false],
-  ['schedule', '', '', true, true], ['workflow_dispatch', '', '', true, true]
-].each do |event, code, notes, rust, cross|
+  ['merge_group', '', 'true',  '',      false, false, false],
+  ['merge_group', '', 'false', '',      true,  true,  false],
+  ['merge_group', '', '',      '',      true,  true,  false],
+  ['pull_request', 'false', '', '',     false, false, false],
+  ['pull_request', 'true',  '', '',     true,  true,  true],
+  ['push', 'false', '', '',             false, false, false],
+  ['push', 'true',  '', '',             true,  true,  false],
+  ['push', 'true',  '', 'true',         true,  false, false],
+  ['push', 'true',  '', 'false',        true,  true,  false],
+  ['schedule', '', '', 'true',          true,  true,  true],
+  ['workflow_dispatch', '', '', 'true', true,  true,  true]
+].each do |event, code, notes, verified, cheap, heavy, cross|
   lanes.each do |lane|
     expr = jobs.fetch(lane).fetch('if').sub('always() &&', '')
     expr = expr.gsub("needs.changes.outputs.code == 'true'", (code == 'true').to_s)
+    expr = expr.gsub("needs.changes.outputs.merge_group_verified != 'true'", (verified != 'true').to_s)
     expr = expr.gsub("needs.changes.outputs.merge_group_notes_only != 'true'", (notes != 'true').to_s)
     expr = expr.gsub(/github.event_name == '([^']+)'/) { (event == Regexp.last_match(1)).to_s }
     raise "unknown term: #{expr}" unless expr.gsub(/true|false|&&|\|\||[()!\s]/, '').empty?
-    raise "#{lane}/#{event}/#{notes}" unless eval(expr) == (lane == 'cross-platform-check' ? cross : rust)
+    want = if lane == 'cross-platform-check'
+             cross
+           elsif %w[workspace-check workspace-tests].include?(lane)
+             heavy
+           else
+             cheap
+           end
+    raise "#{lane}/#{event}/#{notes}/#{verified}" unless eval(expr) == want
     count += 1
   end
 end

@@ -1713,6 +1713,12 @@ pub struct App {
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on. `None` until announced.
     pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    /// Station-confirmed TX audio drive and its configured ceiling, in dB.
+    pub tx_drive: Option<(f32, f32)>,
+    /// Selected band drive mode, supplied by the coordinator.
+    pub tx_drive_mode: Option<pancetta_core::tx_drive_mode::TxDriveMode>,
+    /// Whether the rig currently reports usable ALC for Auto drive.
+    pub tx_drive_available: bool,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -2054,6 +2060,9 @@ impl App {
             tx_meter: None,
             tx_meter_at: None,
             tx_meter_capability: None,
+            tx_drive: None,
+            tx_drive_mode: None,
+            tx_drive_available: false,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
@@ -2144,9 +2153,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/tui_state.json`; `None` if the home directory can't be resolved.
+    /// The real `<data-dir>/tui_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_tui_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("tui_state.json"))
     }
 
     /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
@@ -2238,10 +2248,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/session_state.json`; `None` if the home
-    /// directory can't be resolved.
+    /// The real `<data-dir>/session_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_session_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("session_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("session_state.json"))
     }
 
     /// Test-only: point [`Self::session_state_path`] at `path` for the

@@ -3617,6 +3617,8 @@ impl super::ApplicationCoordinator {
         // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
         let station_power_watts = config.station.power_watts;
         let attribution_comment = config.logging.attribution_comment;
+        // PAN-382: snapshot `[logging]` for the N1MM contactinfo gate below.
+        let logging_cfg = config.logging.clone();
         // Snapshot the opt-in QSO-upload settings. Only when at least one is
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
@@ -3739,6 +3741,16 @@ impl super::ApplicationCoordinator {
         // the operator's real log?" gate consults. Read once here; both the
         // upload subscriber and the LOCAL ADIF/DB writers below take it.
         let replay_mode = self.replay_mode();
+        // PAN-382: N1MM contactinfo UDP destination, `None` when the key is
+        // unset and always under `--replay` (replayed QSOs are not real
+        // contacts, so no socket is ever bound).
+        let n1mm_destination = super::n1mm_udp::n1mm_udp_destination(&logging_cfg, replay_mode);
+        if replay_mode && logging_cfg.n1mm_udp_destination().is_some() {
+            info!("Replay mode: N1MM contactinfo UDP suppressed -- replayed QSOs are not real contacts");
+        }
+        if let Some(dest) = n1mm_destination {
+            info!("N1MM contactinfo UDP enabled (destination: {dest})");
+        }
         // PAN-41 round 3: test-only override for where the replay-history-seed
         // read (below) and the non-replay writers look for `~/.pancetta` --
         // always `None` in production (see the field's own doc comment).
@@ -3779,8 +3791,9 @@ impl super::ApplicationCoordinator {
                 &upload_our_callsign,
                 &lotw_cfg,
             );
-            let path = pancetta_home(&pancetta_home_override)
-                .join(".pancetta")
+            // PAN-376: the outbox lives in the data directory.
+            let path = super::data_dir_for(pancetta_home_override.as_deref())
+                .unwrap_or_else(pancetta_core::data_dir::current)
                 .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
             let schedule = pancetta_dx::upload_outbox::RetrySchedule::new(
                 retry_cfg.max_attempts,
@@ -4049,6 +4062,11 @@ impl super::ApplicationCoordinator {
         let adif_events = (!replay_mode).then(|| qso_manager.subscribe());
         let upload_events = upload_enabled.then(|| qso_manager.subscribe());
 
+        // PAN-382: queue completions before publishing the manager. The
+        // emitter starts after local log setup, which can await disk I/O.
+        let n1mm_subscription =
+            n1mm_destination.map(|destination| (destination, qso_manager.subscribe()));
+
         // PAN-72 critical-finding fix: also publish the fresh handle onto
         // the watch channel so the (not respawned on a Qso-only restart)
         // Autonomous task's drain can pick up this brand-new manager
@@ -4127,13 +4145,16 @@ impl super::ApplicationCoordinator {
                 // own doc comment) -- tests point it at an isolated temp dir so
                 // the replay-history-seed read below (and, outside replay, the
                 // real writers) never touch the operator's actual `~/.pancetta`.
-                let pancetta_home = pancetta_home(&pancetta_home_override);
+                // PAN-376: otherwise the logbook lives in the data directory
+                // (`--data-dir`, else `~/.pancetta`).
+                let data_dir = super::data_dir_for(pancetta_home_override.as_deref())
+                    .unwrap_or_else(pancetta_core::data_dir::current);
 
-                // Rebuildable SQLite index at ~/.pancetta/qso.db.
-                let db_path = pancetta_home.join(".pancetta").join("qso.db");
+                // Rebuildable SQLite index at <data-dir>/qso.db.
+                let db_path = data_dir.join("qso.db");
 
-                // ADIF source of truth at ~/.pancetta/qsos.adi.
-                let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
+                // ADIF source of truth at <data-dir>/qsos.adi.
+                let adif_path = data_dir.join("qsos.adi");
 
                 // Both LOCAL source-of-truth writers (ADIF appender + SQLite
                 // index) live behind one helper so the `--replay` suppression
@@ -4183,6 +4204,24 @@ impl super::ApplicationCoordinator {
                         qrz_xml_base_url.clone(),
                         qso_upload_statuses_for_subscriber.clone(),
                     );
+                }
+
+                // PAN-382: N1MM Logger+ contactinfo UDP, one datagram per
+                // `QsoCompleted`, built from the same ADIF record as
+                // `qsos.adi`. `n1mm_destination` is `None` under `--replay`.
+                // The receiver also holds completions from startup. The task
+                // ends when this manager's event channel closes, never on the shutdown flag
+                // (the PAN-232/PAN-274 rule), so a QSO that completes after
+                // the flag is set is still broadcast. Shutdown does not wait
+                // for it: a UDP send has nothing to flush.
+                if let Some((destination, events)) = n1mm_subscription {
+                    // Detached: the task ends on its own when the channel closes.
+                    drop(super::n1mm_udp::start_n1mm_udp_emitter(
+                        destination,
+                        station_power_watts,
+                        attribution_comment,
+                        events,
+                    ));
                 }
 
                 // History is initialized before decode/command loops or readiness.
@@ -11067,15 +11106,6 @@ mod completed_tx_grace_tests {
 /// subscriber never fires unless the operator opts in.
 fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bool {
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
-}
-
-/// The directory holding `.pancetta/`: the test-only override, else the home
-/// directory, else the working directory.
-fn pancetta_home(override_: &Option<std::path::PathBuf>) -> std::path::PathBuf {
-    override_
-        .clone()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Whether the per-QSO logbook upload subscriber should run at all: at least
@@ -20926,3 +20956,7 @@ impl HarnessOutcomes {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "qso/tests/n1mm_udp_wiring_tests.rs"]
+mod n1mm_udp_wiring_tests;

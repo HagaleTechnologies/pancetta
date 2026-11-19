@@ -63,8 +63,7 @@ impl ConfigSection for TxPlacementConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.auto_repark = other.auto_repark;
-        self.repark_min_score_gain = other.repark_min_score_gain;
+        *self = other;
     }
 }
 

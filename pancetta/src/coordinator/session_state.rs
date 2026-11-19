@@ -103,6 +103,8 @@ const WATERFALL_GAIN_BASELINE_TOLERANCE_DB: f32 = 0.001;
 /// `Eq` is not derived because the waterfall gain is an `f32`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SessionRecord {
+    /// Learned drive and operator mode for each canonical TX band.
+    pub(crate) tx_drive_by_band: std::collections::HashMap<String, super::tx_drive::SavedTxDrive>,
     /// Last live TX-frequency mode choice (`f` toggle / `o` set-clear).
     pub(crate) tx_freq_mode: Option<TxFreqMode>,
     /// Last live decode-effort choice (`e` cycle) with its config baseline.
@@ -181,7 +183,7 @@ impl StartupChoices {
 
 /// One live mutation to persist: exactly the field the keystroke changed, so
 /// a mode-only press never refreshes the effort record's config baseline.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SessionChoiceUpdate {
     TxFreqMode(TxFreqMode),
     DecodeEffort {
@@ -304,11 +306,13 @@ fn parse_waterfall_gain(value: &serde_json::Value, path: &Path) -> Option<Waterf
     }
 }
 
-/// Path of the session state file: `<home>/.pancetta/session_state.json`.
-/// `home_override` is the test-only override (the coordinator's
-/// `pancetta_home` parameter, mirroring `qso.rs`'s `pancetta_home_override`);
-/// `None` in production resolves the real home directory. `None` is returned
-/// only when neither resolves — no home, no persistence, defaults apply.
+/// Path of the session state file: `<data-dir>/session_state.json`.
+/// `home_override` is the test-only home override (the coordinator's
+/// `pancetta_home` parameter, mirroring `qso.rs`'s `pancetta_home_override`)
+/// and resolves to `<home>/.pancetta`; `None` in production resolves the
+/// process data directory (PAN-376: `--data-dir`, else `~/.pancetta`).
+/// `None` is returned only when neither resolves — no home, no persistence,
+/// defaults apply.
 ///
 /// Test builds (`#[cfg(test)]`) never resolve the real home (PAN-194
 /// discipline, same as `pancetta-tui`'s `tui_state_path`): without an
@@ -318,13 +322,8 @@ fn parse_waterfall_gain(value: &serde_json::Value, path: &Path) -> Option<Waterf
 /// never write to it either.
 pub(crate) fn session_state_path(home_override: Option<&Path>) -> Option<PathBuf> {
     #[cfg(test)]
-    if home_override.is_none() {
-        return None;
-    }
-    let base = home_override
-        .map(Path::to_path_buf)
-        .or_else(dirs::home_dir)?;
-    Some(base.join(".pancetta").join("session_state.json"))
+    let home_override = Some(home_override?);
+    Some(super::data_dir_for(home_override)?.join("session_state.json"))
 }
 
 /// Read and strictly parse the session file. `NotFound` is
@@ -413,6 +412,28 @@ pub(crate) fn load(path: &Path) -> SessionLoad {
     // display preference can never discard the saved TX mode and effort.
     record.waterfall_palette = parse_waterfall_palette(&value, path);
     record.waterfall_gain_db = parse_waterfall_gain(&value, path);
+    if let Some(map) = value.get("tx_drive_by_band").and_then(|v| v.as_object()) {
+        for (name, entry) in map {
+            if name
+                .parse::<pancetta_core::Band>()
+                .ok()
+                .filter(|b| !matches!(b, pancetta_core::Band::Custom(_, _)))
+                .is_none()
+            {
+                warn!("Session: ignoring invalid TX drive band {name}");
+                continue;
+            }
+            if let Ok(choice) =
+                serde_json::from_value::<super::tx_drive::SavedTxDrive>(entry.clone())
+            {
+                if choice.db.is_finite() {
+                    record.tx_drive_by_band.insert(name.clone(), choice);
+                    continue;
+                }
+            }
+            warn!("Session: ignoring invalid TX drive entry for {name}");
+        }
+    }
     SessionLoad::Record(record)
 }
 
@@ -493,6 +514,7 @@ pub(crate) fn resolve(
                 superseded_saved_waterfall: superseded_waterfall,
                 ignored_reason: None,
                 record: SessionRecord {
+                    tx_drive_by_band: record.tx_drive_by_band,
                     tx_freq_mode: record.tx_freq_mode,
                     decode_effort: canonical,
                     waterfall_palette: kept_palette,
@@ -566,6 +588,8 @@ fn join_list(items: &[String]) -> String {
 /// unset, so a record without them is byte-for-byte the PAN-270 format.
 #[derive(serde::Serialize)]
 struct SessionRecordOnDisk<'a> {
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    tx_drive_by_band: &'a std::collections::HashMap<String, super::tx_drive::SavedTxDrive>,
     tx_freq_mode: Option<&'a str>,
     decode_effort: Option<&'a str>,
     decode_effort_config_at_save: Option<&'a str>,
@@ -586,6 +610,7 @@ pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let on_disk = SessionRecordOnDisk {
+        tx_drive_by_band: &record.tx_drive_by_band,
         tx_freq_mode: record.tx_freq_mode.map(|m| m.label()),
         decode_effort: record.decode_effort.map(|c| c.choice.label()),
         decode_effort_config_at_save: record.decode_effort.map(|c| c.config_at_save.label()),
@@ -663,6 +688,27 @@ pub(crate) fn persist_session_choice(
             path.display()
         );
     }
+}
+
+/// Write the controller's current map, rather than a snapshot captured by an
+/// earlier task. Several completed bursts may queue saves concurrently; the
+/// record lock serializes them and each task reads the newest drive state.
+pub(crate) fn persist_tx_drive_current(
+    record: &Arc<std::sync::Mutex<SessionRecord>>,
+    path: &Option<PathBuf>,
+    drive: &super::tx_drive::TxDrive,
+) -> std::io::Result<()> {
+    let mut guard = record.lock().unwrap_or_else(|e| e.into_inner());
+    let (map, generation) = drive.restored_map_with_generation();
+    guard.tx_drive_by_band = map;
+    let result = match path {
+        Some(path) => save(path, &guard),
+        None => Ok(()),
+    };
+    if result.is_ok() {
+        drive.mark_persisted(generation);
+    }
+    result
 }
 
 /// The effective waterfall palette and gain (PAN-389): each a kept saved
@@ -1319,3 +1365,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_state/tests/waterfall_choice_tests.rs"]
 mod waterfall_choice_tests;
+
+#[cfg(test)]
+#[path = "session_state/tests/auto_drive_tests.rs"]
+mod auto_drive_tests;

@@ -175,10 +175,7 @@ impl ConfigSection for DecoderConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.effort = other.effort;
-        self.budget_ms = other.budget_ms;
-        self.extended_capture_window_enabled = other.extended_capture_window_enabled;
-        self.ap_eval_mode = other.ap_eval_mode;
+        *self = other;
     }
 }
 

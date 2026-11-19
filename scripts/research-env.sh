@@ -138,16 +138,39 @@ cmd_guard_ci() {
             "research/corpus"
         )
         for term in "${forbidden[@]}"; do
-            # A reference is forbidden UNLESS it is the sanctioned exclusion form
-            # (`--exclude pancetta-research`, which is precisely how CI keeps the
-            # local-only research crate out of `--workspace` builds) or a comment
-            # explaining it. Filter those allowed forms out before flagging.
-            local matches
-            # `|| true`: an empty filter result (grep exit 1) is the SUCCESS
-            # case here and must not trip the script's `set -e`.
-            matches=$(grep -rIn "$term" "${REPO_ROOT}/.github/workflows" 2>/dev/null \
-                | grep -v -- '--exclude pancetta-research' \
-                | grep -vE ':[0-9]+:[[:space:]]*#' || true)
+            # PAN-372 sanctions exactly four in-workflow forms: the two
+            # compile-only check commands, the path-filter list entry, and
+            # the `--exclude` flag every other Rust lane carries. Each
+            # sanctioned form excuses only its own occurrence: strip the
+            # sanctioned text from a candidate line and keep the line only
+            # if the forbidden term survives, so a line that pairs an
+            # allowed form with a forbidden research reference (an allowed
+            # check && a research test run, say) still trips the guard.
+            local matches=""
+            local line content trimmed rest
+            # `|| true`: an empty grep result (exit 1) is the SUCCESS case
+            # here and must not trip the script's `set -e`.
+            while IFS= read -r line; do
+                # grep -rIn emits `path:lineno:content`.
+                content=${line#*:*:}
+                read -r trimmed <<< "$content"
+                # Whole-line comments stay allowed.
+                if [[ "$trimmed" == "#"* ]]; then
+                    continue
+                fi
+                # The path exception must be the full filter list entry.
+                if [[ "$trimmed" == "- 'pancetta-research/**'" ]]; then
+                    continue
+                fi
+                rest=$content
+                rest=${rest//--exclude pancetta-research/}
+                rest=${rest//cargo check -p pancetta-research --all-targets --features research-eval/}
+                rest=${rest//cargo check -p pancetta-research --all-targets/}
+                if [[ "$rest" != *"$term"* ]]; then
+                    continue
+                fi
+                matches+="$line"$'\n'
+            done < <(grep -rIn "$term" "${REPO_ROOT}/.github/workflows" 2>/dev/null || true)
             if [ -n "$matches" ]; then
                 echo "FORBIDDEN reference in .github/workflows:"
                 echo "$matches" | head -5

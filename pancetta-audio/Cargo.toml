@@ -13,7 +13,6 @@ publish.workspace = true
 # Use workspace dependencies for consistency
 cpal = { workspace = true }
 ringbuf = { workspace = true }
-instant = { workspace = true }
 atomic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

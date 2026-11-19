@@ -3,20 +3,24 @@
 #
 # GATE MODEL (2026-06-28): GitHub CI (.github/workflows/ci.yml) is the
 # AUTHORITATIVE gate. Its heavy lanes (full workspace tests, examples build,
-# cargo-deny, cross-platform) run on every PR *and* every push to main, so
-# `main` is comprehensively gated regardless of how a change lands. This script
-# is therefore a FAST local PRE-FLIGHT, not a full CI mirror.
+# cargo-deny, cross-platform) run on every PR *and* every push to main —
+# except a push whose commit a merge-group CI run already verified at both
+# heavy lanes, which skips them (PAN-367: the merge queue fast-forwards main
+# onto the already-tested tree; a cache-key-input change still runs them; see
+# docs/DECISIONS/config-and-platform.md). `main` is therefore comprehensively
+# gated regardless of how a change lands. This script is a FAST local
+# PRE-FLIGHT, not a full CI mirror.
 #
 #   - As a pre-push HOOK (auto-detected): runs the FAST lane — fmt + clippy +
-#     research-guard + `cargo check --workspace --examples` (compile/API-drift,
-#     incl. the CI-excluded pancetta-research examples) + cargo-deny. ~5 min.
+#     research-guard + `cargo check --workspace --all-targets` (compile/API-drift,
+#     incl. pancetta-research examples) + cargo-deny. ~5 min.
 #     The full test RUN is left to CI (it runs on the resulting push/PR).
 #   - Run MANUALLY with no args for the FULL lane (adds the workspace test run)
 #     when you want local certainty before a big/risky change.
 #
-# The one thing CI does NOT cover is pancetta-research (local-only harness,
-# excluded from CI). The always-on `cargo check --workspace --examples` here is
-# its cheap drift guard — it type-checks the research example call-sites so a
+# CI type-checks pancetta-research in the non-required Research Check lane.
+# The always-on `cargo check --workspace --all-targets` here remains the
+# local drift guard: it type-checks the research example call-sites so a
 # decoder-API change can't silently break them (no codegen/linking of the dozens
 # of example binaries, which is what used to make this gate ~40 min).
 #
@@ -122,7 +126,7 @@ run "research guard-ci" ./scripts/research-env.sh --guard-ci
 # --- Compile / drift lane (always; cheap with `check`) ----------------------
 #
 # `cargo check --workspace --all-targets` type-checks every crate's lib/bins AND
-# all example AND **test** targets — including the CI-excluded pancetta-research
+# all example AND **test** targets — including pancetta-research
 # examples — so a struct/API change that breaks an example OR an integration-test
 # call-site is caught here. (Was `--examples`, which compiled examples but NOT the
 # `tests/` dirs — a `QsoManagerConfig` field added 2026-06-28 broke an integration
@@ -141,8 +145,10 @@ run "pancetta-ft8 default build, all targets (check)" cargo check -p pancetta-ft
 # --- Test lane (FULL only; CI runs this on every PR + main push) ------------
 #
 # The workspace test RUN is the expensive part. CI runs it authoritatively on
-# every PR and every push to main, so the hook (FAST) skips it; run the script
-# manually (no args / --full) when you want local certainty.
+# every PR and every push to main — a push whose commit a merge group already
+# verified at both heavy lanes skips it (PAN-367,
+# docs/DECISIONS/config-and-platform.md) — so the hook (FAST) skips it; run
+# the script manually (no args / --full) when you want local certainty.
 
 if [[ "$FAST" -eq 0 ]]; then
     run "workspace tests"   cargo test --workspace --features transmit

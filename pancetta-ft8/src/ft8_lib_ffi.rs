@@ -38,19 +38,32 @@ const _: () = assert!(std::mem::size_of::<ftx_callsign_hash_interface_t>() == 16
 // Raw FFI bindings
 // ============================================================================
 
+/// Mirrors ft8_lib's `ftx_message_t` (`vendor/ft8_lib/ft8/message.h`).
 #[repr(C)]
 pub struct ftx_message_t {
+    /// The 77-bit FTx payload packed into `FTX_PAYLOAD_LENGTH_BYTES` (10) bytes.
     pub payload: [u8; 10],
+    /// Hash value to be used in hash table and quick checking for duplicates
+    /// (`ftx_decode_candidate` stores the payload's calculated CRC here).
     pub hash: u16,
 }
 
+/// Mirrors ft8_lib's `ftx_candidate_t` (`vendor/ft8_lib/ft8/decode.h`): the
+/// position of a potential message start in time and frequency.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ftx_candidate_t {
+    /// Candidate sync score; higher score means higher likelihood. The sync
+    /// kernels average magnitude differences, so with a permissive `min_score`
+    /// the raw value can be negative.
     pub score: i16,
+    /// Index of the time block.
     pub time_offset: i16,
+    /// Index of the frequency bin.
     pub freq_offset: i16,
+    /// Index of the time subdivision used.
     pub time_sub: u8,
+    /// Index of the frequency subdivision used.
     pub freq_sub: u8,
 }
 
@@ -66,10 +79,17 @@ pub struct ftx_candidate_t {
 /// differently. Callers re-score every seed on pancetta's own spectrogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ft8LibSeed {
+    /// ft8_lib's integer sync score in 0.5 dB units, copied from
+    /// `ftx_candidate_t::score` (see the type docs: not a pancetta `sync_score`).
     pub score: i16,
+    /// Index of the time block, copied from `ftx_candidate_t::time_offset`.
     pub time_offset: i16,
+    /// Index of the frequency bin (relative to the monitor's `min_bin`),
+    /// copied from `ftx_candidate_t::freq_offset`.
     pub freq_offset: i16,
+    /// Index of the time subdivision, copied from `ftx_candidate_t::time_sub`.
     pub time_sub: u8,
+    /// Index of the frequency subdivision, copied from `ftx_candidate_t::freq_sub`.
     pub freq_sub: u8,
 }
 
@@ -86,98 +106,178 @@ pub struct Ft8LibSeed {
 /// Declared outside any `cfg` so the real and stub builds share one signature.
 #[derive(Debug, Clone, Default)]
 pub struct Ft8LibSeedSet {
+    /// The sync-search candidates ft8_lib found, in descending score order
+    /// (`ftx_find_candidates` heap-sorts before returning; the copy here
+    /// preserves that order).
     pub seeds: Vec<Ft8LibSeed>,
+    /// The monitor's `min_bin`: first FFT bin in the analysed frequency range.
     pub min_bin: i32,
+    /// The waterfall's number of time subdivisions per symbol.
     pub time_osr: i32,
+    /// The waterfall's number of frequency subdivisions per tone spacing.
     pub freq_osr: i32,
+    /// The waterfall's number of FFT bins, one per protocol tone spacing
+    /// (6.25 Hz for FT8, about 20.83 Hz for FT4).
     pub num_bins: i32,
+    /// The number of blocks (symbols) stored in the waterfall.
     pub num_blocks: i32,
+    /// The monitor's number of samples per symbol (block).
     pub block_size: i32,
+    /// The monitor's symbol period in seconds.
     pub symbol_period: f32,
 }
 
+/// Mirrors ft8_lib's `ftx_decode_status_t` (`vendor/ft8_lib/ft8/decode.h`):
+/// the status of the decoding steps for one candidate.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ftx_decode_status_t {
+    /// Frequency field; `ftx_decode_candidate` never writes it, so callers
+    /// derive the frequency from the candidate instead.
     pub freq: f32,
+    /// Time field; `ftx_decode_candidate` never writes it, so callers derive
+    /// the time offset from the candidate instead.
     pub time: f32,
+    /// Number of LDPC errors during decoding.
     pub ldpc_errors: i32,
+    /// CRC value recovered from the message; not written when LDPC fails.
     pub crc_extracted: u16,
+    /// CRC value calculated over the payload; not written when LDPC fails.
     pub crc_calculated: u16,
 }
 
+/// Mirrors ft8_lib's `ftx_protocol_t` (`vendor/ft8_lib/ft8/constants.h`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ftx_protocol_t {
+    /// FT4 (`FTX_PROTOCOL_FT4`, value 0).
     FTX_PROTOCOL_FT4 = 0,
+    /// FT8 (`FTX_PROTOCOL_FT8`, value 1).
     FTX_PROTOCOL_FT8 = 1,
 }
 
+/// Mirrors ft8_lib's `ftx_waterfall_t` (`vendor/ft8_lib/ft8/decode.h`): the
+/// stored waterfall data over a whole message slot, built with the default
+/// `uint8_t` magnitude elements (no `WATERFALL_USE_PHASE`).
 #[repr(C)]
 pub struct ftx_waterfall_t {
-    pub max_blocks: i32,          // offset 0
-    pub num_blocks: i32,          // offset 4
-    pub num_bins: i32,            // offset 8
-    pub time_osr: i32,            // offset 12
-    pub freq_osr: i32,            // offset 16
-    _pad0: u32,                   // offset 20 (padding for pointer alignment)
-    pub mag: *mut u8,             // offset 24
-    pub block_stride: i32,        // offset 32
+    /// Number of blocks (symbols) allocated in the `mag` array.
+    pub max_blocks: i32, // offset 0
+    /// Number of blocks (symbols) stored in the `mag` array.
+    pub num_blocks: i32, // offset 4
+    /// Number of FFT bins, in units of one protocol tone spacing (6.25 Hz for
+    /// FT8, about 20.83 Hz for FT4); independent of `freq_osr`.
+    pub num_bins: i32, // offset 8
+    /// Number of time subdivisions.
+    pub time_osr: i32, // offset 12
+    /// Number of frequency subdivisions.
+    pub freq_osr: i32, // offset 16
+    _pad0: u32, // offset 20 (padding for pointer alignment)
+    /// FFT magnitudes stored as `uint8_t[blocks][time_osr][freq_osr][num_bins]`.
+    pub mag: *mut u8, // offset 24
+    /// Helper value = `time_osr * freq_osr * num_bins`.
+    pub block_stride: i32, // offset 32
+    /// Indicates whether the waterfall is for FT4 or FT8.
     pub protocol: ftx_protocol_t, // offset 36
 } // total size: 40
 
+/// Mirrors ft8_lib's `monitor_config_t` (`vendor/ft8_lib/common/monitor.h`):
+/// configuration options for an FT4/FT8 monitor.
 #[repr(C)]
 pub struct monitor_config_t {
+    /// Lower frequency bound for analysis, in Hz.
     pub f_min: f32,
+    /// Upper frequency bound for analysis, in Hz.
     pub f_max: f32,
+    /// Sample rate in Hertz.
     pub sample_rate: i32,
+    /// Number of time subdivisions.
     pub time_osr: i32,
+    /// Number of frequency subdivisions.
     pub freq_osr: i32,
+    /// Protocol: FT4 or FT8.
     pub protocol: ftx_protocol_t,
 }
 
 // Opaque monitor struct — layout must match C exactly (112 bytes on 64-bit)
+/// Mirrors ft8_lib's `monitor_t` (`vendor/ft8_lib/common/monitor.h`): the
+/// FT4/FT8 monitor object that runs DSP on incoming audio and fills a
+/// waterfall. Built without `WATERFALL_USE_PHASE`, so it has no iFFT fields.
 #[repr(C)]
 pub struct monitor_t {
-    pub symbol_period: f32,              // offset 0
-    pub min_bin: i32,                    // offset 4
-    pub max_bin: i32,                    // offset 8
-    pub block_size: i32,                 // offset 12
-    pub subblock_size: i32,              // offset 16
-    pub nfft: i32,                       // offset 20
-    pub fft_norm: f32,                   // offset 24
-    _pad0: u32,                          // offset 28 (padding for pointer alignment)
-    pub window: *mut f32,                // offset 32
-    pub last_frame: *mut f32,            // offset 40
-    pub wf: ftx_waterfall_t,             // offset 48 (size 40)
-    pub max_mag: f32,                    // offset 88
-    _pad1: u32,                          // offset 92 (padding for pointer alignment)
+    /// FT4/FT8 symbol period in seconds.
+    pub symbol_period: f32, // offset 0
+    /// First FFT bin in the frequency range (begin).
+    pub min_bin: i32, // offset 4
+    /// First FFT bin outside the frequency range (end).
+    pub max_bin: i32, // offset 8
+    /// Number of samples per symbol (block).
+    pub block_size: i32, // offset 12
+    /// Analysis shift size (number of samples).
+    pub subblock_size: i32, // offset 16
+    /// FFT size.
+    pub nfft: i32, // offset 20
+    /// FFT normalization factor.
+    pub fft_norm: f32, // offset 24
+    _pad0: u32, // offset 28 (padding for pointer alignment)
+    /// Window function for STFT analysis (`nfft` samples), owned by C.
+    pub window: *mut f32, // offset 32
+    /// Current STFT analysis frame (`nfft` samples), owned by C.
+    pub last_frame: *mut f32, // offset 40
+    /// Waterfall object.
+    pub wf: ftx_waterfall_t, // offset 48 (size 40)
+    /// Maximum detected magnitude (debug stats).
+    pub max_mag: f32, // offset 88
+    _pad1: u32, // offset 92 (padding for pointer alignment)
+    /// Work area required by Kiss FFT, owned by C.
     pub fft_work: *mut std::ffi::c_void, // offset 96
-    pub fft_cfg: *mut std::ffi::c_void,  // offset 104
+    /// Kiss FFT housekeeping object (`kiss_fftr_cfg`), owned by C.
+    pub fft_cfg: *mut std::ffi::c_void, // offset 104
 } // total size: 112
 
+/// Mirrors ft8_lib's `ftx_message_rc_t` (`vendor/ft8_lib/ft8/message.h`): the
+/// result code of message encode and decode calls.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ftx_message_rc_t {
+    /// Success.
     FTX_MESSAGE_RC_OK = 0,
+    /// The first callsign could not be packed or unpacked.
     FTX_MESSAGE_RC_ERROR_CALLSIGN1 = 1,
+    /// The second callsign could not be packed or unpacked.
     FTX_MESSAGE_RC_ERROR_CALLSIGN2 = 2,
+    /// The callsign suffix is invalid.
     FTX_MESSAGE_RC_ERROR_SUFFIX = 3,
+    /// The grid or report field is invalid.
     FTX_MESSAGE_RC_ERROR_GRID = 4,
+    /// The message type is invalid or unsupported.
     FTX_MESSAGE_RC_ERROR_TYPE = 5,
 }
 
+/// Mirrors ft8_lib's `ftx_callsign_hash_interface_t`
+/// (`vendor/ft8_lib/ft8/message.h`): the callbacks ft8_lib uses to resolve
+/// and record hashed callsigns.
 #[repr(C)]
 pub struct ftx_callsign_hash_interface_t {
+    /// Called when a callsign is looked up by its 22/12/10 bit hash code.
+    /// `hash_type` is an `ftx_callsign_hash_type_t` value.
     pub lookup_hash:
         Option<unsafe extern "C" fn(hash_type: i32, hash: u32, callsign: *mut c_char) -> bool>,
+    /// Called when a callsign should be hashed and stored (by its 22, 12 and
+    /// 10 bit hash codes).
     pub save_hash: Option<unsafe extern "C" fn(callsign: *const c_char, n22: u32)>,
 }
 
 /// FTX_MAX_MESSAGE_FIELDS = 3
+///
+/// Mirrors ft8_lib's `ftx_message_offsets_t` (`vendor/ft8_lib/ft8/message.h`):
+/// parallel arrays describing the fields of a decoded message text. Both
+/// arrays end where `offsets[i] < 0`.
 #[repr(C)]
 pub struct ftx_message_offsets_t {
+    /// Field type of each field, as `ftx_field_t` enum values.
     pub types: [i32; 3], // ftx_field_t enum values
+    /// Character offset of each field in the decoded text.
     pub offsets: [i16; 3],
 }
 
@@ -185,8 +285,16 @@ pub struct ftx_message_offsets_t {
 #[cfg(not(ft8lib_stub))]
 unsafe extern "C" {
     // Encoding
+    /// Binds ft8_lib's `ft8_encode` (`vendor/ft8_lib/ft8/encode.h`): generates
+    /// the FT8 tone sequence from a 10-byte (77-bit) payload into `FT8_NN` (79)
+    /// bytes of tones encoded as 0..7.
     pub fn ft8_encode(payload: *const u8, tones: *mut u8);
+    /// Binds ft8_lib's `ftx_message_init` (`vendor/ft8_lib/ft8/message.h`):
+    /// zero-fills `msg`.
     pub fn ftx_message_init(msg: *mut ftx_message_t);
+    /// Binds ft8_lib's `ftx_message_encode` (`vendor/ft8_lib/ft8/message.h`):
+    /// packs a text message, trying the standard, then the non-standard, then
+    /// the free-text encoding.
     pub fn ftx_message_encode(
         msg: *mut ftx_message_t,
         hash_if: *mut ftx_callsign_hash_interface_t,
@@ -194,6 +302,9 @@ unsafe extern "C" {
     ) -> ftx_message_rc_t;
 
     // Decoding
+    /// Binds ft8_lib's `ftx_find_candidates` (`vendor/ft8_lib/ft8/decode.h`):
+    /// localizes the top `num_candidates` Costas-sync candidates scoring at
+    /// least `min_score` into `heap`, and returns how many it filled.
     pub fn ftx_find_candidates(
         power: *const ftx_waterfall_t,
         num_candidates: i32,
@@ -201,6 +312,11 @@ unsafe extern "C" {
         min_score: i32,
     ) -> i32;
 
+    /// Binds ft8_lib's `ftx_decode_candidate` (`vendor/ft8_lib/ft8/decode.h`):
+    /// extracts bit probabilities, runs the LDPC decoder with at most
+    /// `max_iterations` and checks the CRC. Returns true on success.
+    /// `status.ldpc_errors` is always written; the CRC fields only once LDPC
+    /// succeeds.
     pub fn ftx_decode_candidate(
         power: *const ftx_waterfall_t,
         cand: *const ftx_candidate_t,
@@ -209,6 +325,9 @@ unsafe extern "C" {
         status: *mut ftx_decode_status_t,
     ) -> bool;
 
+    /// Binds ft8_lib's `ftx_message_decode` (`vendor/ft8_lib/ft8/message.h`):
+    /// unpacks `msg` into NUL-terminated text in `message` and fills the field
+    /// `offsets`.
     pub fn ftx_message_decode(
         msg: *const ftx_message_t,
         hash_if: *mut ftx_callsign_hash_interface_t,
@@ -217,9 +336,19 @@ unsafe extern "C" {
     ) -> ftx_message_rc_t;
 
     // Monitor (audio → waterfall)
+    /// Binds ft8_lib's `monitor_init` (`vendor/ft8_lib/common/monitor.h`):
+    /// computes the DSP parameters from `cfg` and allocates the monitor's
+    /// window, frame, FFT and waterfall buffers.
     pub fn monitor_init(me: *mut monitor_t, cfg: *const monitor_config_t);
+    /// Binds ft8_lib's `monitor_process` (`vendor/ft8_lib/common/monitor.h`):
+    /// computes FFT magnitudes for one `block_size`-sample frame and appends
+    /// a block to the waterfall, doing nothing once it is full.
     pub fn monitor_process(me: *mut monitor_t, frame: *const f32);
+    /// Binds ft8_lib's `monitor_reset` (`vendor/ft8_lib/common/monitor.h`):
+    /// empties the waterfall and resets `max_mag`.
     pub fn monitor_reset(me: *mut monitor_t);
+    /// Binds ft8_lib's `monitor_free` (`vendor/ft8_lib/common/monitor.h`):
+    /// frees the buffers `monitor_init` allocated.
     pub fn monitor_free(me: *mut monitor_t);
 }
 
@@ -605,12 +734,15 @@ pub struct Ft8LibDisplayGrid {
     pub num_blocks: usize,
     /// Bins per freq-subrow (481 for the 0–3000 Hz FT8 monitor).
     pub num_bins: usize,
+    /// Time subdivisions per symbol (2 for the capture monitor).
     pub time_osr: usize,
+    /// Frequency subdivisions per tone spacing (2 for the capture monitor).
     pub freq_osr: usize,
     /// Monitor `min_bin` (0: the capture monitor spans DC up).
     pub min_bin: usize,
     /// FT8: 0.16 s; FT4: 1/12000*576 s. Sets the frequency grid.
     pub symbol_period: f32,
+    /// Audio sample rate in Hz (always 12000).
     pub sample_rate: usize,
     /// Samples per block (FT8: 1920).
     pub block_size: usize,
@@ -1189,16 +1321,19 @@ pub fn ft8lib_find_candidate_seeds(
 // the C dependency present (e.g. in CI or fresh checkouts without submodules).
 // ============================================================================
 
+/// Stub: always returns `None` when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
 pub fn ft8lib_encode(_message: &str) -> Option<[u8; 79]> {
     None
 }
 
+/// Stub: always returns `None` when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
 pub fn ft8lib_encode_payload(_message: &str) -> Option<[u8; 10]> {
     None
 }
 
+/// Stub: always returns `None` when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
 pub fn ft8lib_decode_payload(_payload: &[u8; 10]) -> Option<String> {
     None
@@ -1577,6 +1712,7 @@ mod seed_signature_tests {
     }
 }
 
+/// Stub: returns empty results when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
 pub fn ft8lib_decode_audio_protocol_with_parser(
     _samples: &[f32],
