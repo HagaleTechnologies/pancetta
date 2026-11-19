@@ -33,14 +33,15 @@ command -v jq >/dev/null || { echo "::error::jq is required" >&2; exit 1; }
 shopt -s globstar nullglob
 status=0
 
-# load <criterion-dir> <baseline|current>: fill <kind>_files (benchmark ID ->
-# estimates.json path) and <kind>_ids. Glob expansion is sorted, so the ID
-# list, and therefore the report, comes out in a stable order.
+# load <criterion-dir> <baseline|current>: fill the <kind>_files (benchmark
+# ID -> estimates.json path) and <kind>_ids arrays. Glob expansion is sorted,
+# so the ID list, and therefore the report, comes out in a stable order.
+# Bash cannot pass arrays to a function, so the target arrays are selected
+# here by kind; a nameref would only restate this and trip SC2034.
 declare -A baseline_files=() current_files=()
 baseline_ids=() current_ids=()
 load() {
   local dir=${1%/} kind=$2 f id
-  local -n files=${kind}_files ids=${kind}_ids
   if [[ ! -d $dir ]]; then
     echo "::error::$kind criterion directory $dir does not exist"
     status=1
@@ -55,17 +56,25 @@ load() {
       continue
     fi
     id=${id%/new/estimates.json}
-    # shellcheck disable=SC2034  # files is a nameref to the caller's array
-    files["$id"]=$f
-    ids+=("$id")
+    if [[ $kind == baseline ]]; then
+      baseline_files["$id"]=$f
+      baseline_ids+=("$id")
+    else
+      current_files["$id"]=$f
+      current_ids+=("$id")
+    fi
   done
-  if (( ${#ids[@]} == 0 )); then
-    echo "::error::no criterion estimates under $dir ($kind)"
-    status=1
-  fi
 }
 load "$baseline_dir" baseline
 load "$current_dir" current
+if (( ${#baseline_ids[@]} == 0 )); then
+  echo "::error::no criterion estimates under ${baseline_dir%/} (baseline)"
+  status=1
+fi
+if (( ${#current_ids[@]} == 0 )); then
+  echo "::error::no criterion estimates under ${current_dir%/} (current)"
+  status=1
+fi
 
 for id in "${baseline_ids[@]}"; do
   if [[ -z ${current_files[$id]+set} ]]; then
@@ -81,12 +90,25 @@ for id in "${current_ids[@]}"; do
 done
 
 # mean_of <estimates.json>: print .mean.point_estimate, or fail with a reason.
+# -e makes jq exit 4 when the file holds no JSON document at all (zero-byte
+# or whitespace-only): such a file must fail the run, never read as a 0 ns
+# mean (an empty current run "improves" every benchmark by 100 %, and an
+# empty seed self-check would store an empty baseline).
 mean_of() {
-  jq -r '(try .mean.point_estimate catch null) as $m
+  local value code=0
+  value=$(jq -er '(try .mean.point_estimate catch null) as $m
     | if ($m | type) == "number" and ($m | isinfinite | not) and ($m | isnan | not) and $m > 0
       then $m
       else error("mean.point_estimate is \($m | tojson), want a finite positive number")
-      end' "$1"
+      end' "$1") || code=$?
+  if (( code == 4 )); then
+    echo "$1 holds no JSON document" >&2
+    return 1
+  fi
+  if (( code != 0 )); then
+    return "$code"
+  fi
+  printf '%s\n' "$value"
 }
 
 regressed=0

@@ -2,7 +2,6 @@
 # PAN-369: offline tests for scripts/ci/check-criterion-regression.sh. Each
 # case builds miniature Criterion trees under a scratch directory and runs the
 # production script against them.
-# shellcheck disable=SC2317  # case functions are invoked indirectly by name
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gate="$here/../check-criterion-regression.sh"
@@ -148,6 +147,39 @@ negative mean|$(mean -5)
 non-numeric mean|$(mean '"fast"')
 null mean|$(mean null)
 EOF
+
+  # An estimates.json holding no JSON document at all (zero-byte or
+  # whitespace-only) must fail on either side, never read as a 0 ns mean:
+  # an empty current run would "improve" every benchmark by 100 %, and the
+  # seed self-check compares a tree with itself, so an empty baseline must
+  # fail to store too.
+  d=$(new_case)
+  bench "$d/base" basic_decode/example "$(mean 100)"
+  bench "$d/cur" basic_decode/example "$(mean 100)"
+  : >"$d/cur/basic_decode/example/new/estimates.json"
+  run_gate "$d/base" "$d/cur" 15
+  expect_code 1 "zero-byte current estimates" || return 1
+  expect_out "basic_decode/example: invalid current estimates" "zero-byte current estimates" || return 1
+  expect_out "holds no JSON document" "zero-byte current estimates" || return 1
+  expect_no_out "current 0 ns" "zero-byte current estimates" || return 1
+
+  local dir_side kind body
+  for dir_side in base cur; do
+    case $dir_side in
+      base) kind=baseline ;;
+      cur) kind=current ;;
+    esac
+    for body in "" "   "; do
+      d=$(new_case)
+      bench "$d/base" basic_decode/example "$(mean 100)"
+      bench "$d/cur" basic_decode/example "$(mean 100)"
+      printf '%s\n' "$body" >"$d/$dir_side/basic_decode/example/new/estimates.json"
+      run_gate "$d/base" "$d/cur" 15
+      expect_code 1 "whitespace-only $kind estimates" || return 1
+      expect_out "basic_decode/example: invalid $kind estimates" "whitespace-only $kind estimates" || return 1
+      expect_no_out "current 0 ns" "whitespace-only $kind estimates" || return 1
+    done
+  done
 }
 
 usage_errors_exit_2() {
@@ -191,10 +223,12 @@ workflow_runs_gate_weekly() {
   fi
   local compare
   compare=$(awk '/name: Compare against the stored baseline/{on=1} on && /name: Remove Criterion output/{on=0} on' "$wf")
-  local last
+  local last expected
   last=$(grep -v '^[[:space:]]*$' <<<"$compare" | tail -n 1 | sed 's/^[[:space:]]*//')
-  # shellcheck disable=SC2016  # the workflow's literal text, not an expansion
-  if [[ $last != 'bash scripts/ci/check-criterion-regression.sh "$BASELINE_DIR" "$CRITERION_HOME" 15' ]]; then
+  # The workflow's literal text: escaped dollars name the shell variables
+  # GitHub expands at run time, not ones this script expands.
+  expected="bash scripts/ci/check-criterion-regression.sh \"\$BASELINE_DIR\" \"\$CRITERION_HOME\" 15"
+  if [[ $last != "$expected" ]]; then
     echo "  exit propagation: compare step ends with '$last'" >&2
     return 1
   fi
@@ -204,15 +238,15 @@ workflow_runs_gate_weekly() {
   fi
 }
 
+# Each case is invoked by a literal call: an indirect dispatch through a
+# variable name hides the calls from shellcheck (SC2317) and from a reader.
 failed=0
-for t in workflow_runs_gate_weekly passes_at_limit fails_above_limit fails_when_second_benchmark_regresses \
-  prints_baseline_current_and_change fails_on_missing_or_invalid_estimates \
-  usage_errors_exit_2 honours_max_percent_argument; do
-  if "$t"; then
-    echo "ok $t"
-  else
-    echo "FAIL $t"
-    failed=1
-  fi
-done
+if workflow_runs_gate_weekly; then echo "ok workflow_runs_gate_weekly"; else echo "FAIL workflow_runs_gate_weekly"; failed=1; fi
+if passes_at_limit; then echo "ok passes_at_limit"; else echo "FAIL passes_at_limit"; failed=1; fi
+if fails_above_limit; then echo "ok fails_above_limit"; else echo "FAIL fails_above_limit"; failed=1; fi
+if fails_when_second_benchmark_regresses; then echo "ok fails_when_second_benchmark_regresses"; else echo "FAIL fails_when_second_benchmark_regresses"; failed=1; fi
+if prints_baseline_current_and_change; then echo "ok prints_baseline_current_and_change"; else echo "FAIL prints_baseline_current_and_change"; failed=1; fi
+if fails_on_missing_or_invalid_estimates; then echo "ok fails_on_missing_or_invalid_estimates"; else echo "FAIL fails_on_missing_or_invalid_estimates"; failed=1; fi
+if usage_errors_exit_2; then echo "ok usage_errors_exit_2"; else echo "FAIL usage_errors_exit_2"; failed=1; fi
+if honours_max_percent_argument; then echo "ok honours_max_percent_argument"; else echo "FAIL honours_max_percent_argument"; failed=1; fi
 exit "$failed"
