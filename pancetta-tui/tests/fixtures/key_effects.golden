@@ -18,6 +18,7 @@ empty/band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { 
 empty/band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/band | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -84,6 +85,7 @@ empty/qso | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { v
 empty/qso | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/qso | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/qso | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/qso | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -150,6 +152,7 @@ empty/callers | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency
 empty/callers | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/callers | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/callers | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/callers | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -216,6 +219,7 @@ empty/dx | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vf
 empty/dx | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/dx | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/dx | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/dx | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -282,6 +286,7 @@ empty/placement | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequen
 empty/placement | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/placement | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/placement | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/placement | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -346,6 +351,7 @@ empty/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequen
 empty/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/waterfall | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 empty/waterfall | Char('B') | none,shift | cmds=["SetWaterfallPalette { palette: Viridis }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: viridis"; waterfall_palette: Classic -> Viridis
+empty/waterfall | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 empty/waterfall | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/waterfall | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/waterfall | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -412,6 +418,7 @@ rich/band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { v
 rich/band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -479,6 +486,7 @@ rich/qso | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vf
 rich/qso | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/qso | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/qso | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/qso | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -546,6 +554,7 @@ rich/callers | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency 
 rich/callers | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/callers | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/callers | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/callers | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -613,6 +622,7 @@ rich/dx | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo
 rich/dx | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/dx | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/dx | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/dx | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -680,6 +690,7 @@ rich/placement | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequenc
 rich/placement | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/placement | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/placement | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/placement | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -746,6 +757,7 @@ rich/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequenc
 rich/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/waterfall | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/waterfall | Char('B') | none,shift | cmds=["SetWaterfallPalette { palette: Viridis }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: viridis"; waterfall_palette: Classic -> Viridis
+rich/waterfall | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/waterfall | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/waterfall | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/waterfall | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -813,6 +825,7 @@ rich/band/ext-off-band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["Set
 rich/band/ext-off-band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/ext-off-band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band/ext-off-band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/ext-off-band | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/band/ext-off-band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/ext-off-band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/ext-off-band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -880,6 +893,7 @@ rich/callers/ext-off-band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["
 rich/callers/ext-off-band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/callers/ext-off-band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/callers/ext-off-band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/callers/ext-off-band | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/callers/ext-off-band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/callers/ext-off-band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/callers/ext-off-band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -947,6 +961,7 @@ rich/callers/ext-on-band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["S
 rich/callers/ext-on-band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/callers/ext-on-band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/callers/ext-on-band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/callers/ext-on-band | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/callers/ext-on-band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/callers/ext-on-band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/callers/ext-on-band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -1014,6 +1029,7 @@ rich/band/zoomed | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFreque
 rich/band/zoomed | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/zoomed | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band/zoomed | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/zoomed | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/band/zoomed | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/zoomed | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -1082,6 +1098,7 @@ rich/band/stopped | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequ
 rich/band/stopped | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/stopped | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band/stopped | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/stopped | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/band/stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -1150,6 +1167,7 @@ rich/band/zoomed+stopped | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["S
 rich/band/zoomed+stopped | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/zoomed+stopped | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band/zoomed+stopped | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/zoomed+stopped | Char('C') | none,shift | cmds=["StartDriveCalibration"]
 rich/band/zoomed+stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/zoomed+stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed+stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -1218,6 +1236,7 @@ rich/band/tx-disabled | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetF
 rich/band/tx-disabled | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/tx-disabled | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
 rich/band/tx-disabled | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/tx-disabled | Char('C') | none,shift | status_message: "Pancetta TUI Ready" -> "Can't calibrate — TX is DISABLED (press g to re-enable)"
 rich/band/tx-disabled | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/tx-disabled | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/tx-disabled | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -2070,7 +2089,7 @@ rich/help | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 rich/help | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/help | Esc | none,shift,ctrl,alt,ctrl+shift | help_visible: true -> false
 rich/help | Down | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 1
-rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 56
+rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 58
 rich/help | PageDown | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 17
 rich/compose | Char(' ') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST "; tx_input_buffer: "CQ TEST" -> "CQ TEST "; tx_input_cursor: 7 -> 8
 rich/compose | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST!"; tx_input_buffer: "CQ TEST" -> "CQ TEST!"; tx_input_cursor: 7 -> 8

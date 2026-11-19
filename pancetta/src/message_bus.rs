@@ -493,6 +493,9 @@ pub enum MessageType {
         tone_offset_hz: f64,
     },
 
+    /// One-shot keyed drive sweep using live CAT ALC feedback.
+    DriveCalibrationRequest { tone_offset_hz: f64 },
+
     /// Persisted contest score, additive and local to the TUI.
     ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
 
@@ -1666,6 +1669,10 @@ pub struct MessageBus {
     pub(crate) split_observation_fence: Arc<SplitObservationFence>,
     pub(crate) active_tx_drive_attempt:
         Arc<std::sync::Mutex<Option<Arc<crate::coordinator::tx_meter::TxDriveAttempt>>>>,
+    pub(crate) active_drive_calibration:
+        Arc<std::sync::Mutex<Option<Arc<crate::coordinator::tx_meter::DriveCalibrationReads>>>>,
+    pub(crate) tx_meter_capability:
+        Arc<std::sync::Mutex<Option<pancetta_core::tx_meter::TxMeterCapability>>>,
     /// Configuration
     config: MessageBusConfig,
     /// Component channels
@@ -1699,6 +1706,8 @@ impl MessageBus {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
             active_tx_drive_attempt: Arc::new(std::sync::Mutex::new(None)),
+            active_drive_calibration: Arc::new(std::sync::Mutex::new(None)),
+            tx_meter_capability: Arc::new(std::sync::Mutex::new(None)),
             data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1721,6 +1730,8 @@ impl MessageBus {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
             active_tx_drive_attempt: Arc::new(std::sync::Mutex::new(None)),
+            active_drive_calibration: Arc::new(std::sync::Mutex::new(None)),
+            tx_meter_capability: Arc::new(std::sync::Mutex::new(None)),
             data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),

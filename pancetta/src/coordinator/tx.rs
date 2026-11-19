@@ -60,6 +60,10 @@ mod report;
 use report::*;
 pub(crate) use report::{emit_diagnostic, emit_diagnostic_full};
 
+mod drive_calibration;
+#[cfg(test)]
+#[path = "tx/tests/drive_calibration_tests.rs"]
+mod drive_calibration_tests;
 mod fox_multiplex;
 
 #[cfg(test)]
