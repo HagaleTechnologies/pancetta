@@ -1400,7 +1400,10 @@ draft. macOS signing and notarization remain PAN-265.
 - **`rust-version = "1.88"` with `#![deny(clippy::incompatible_msrv)]`.** Both
   libraries compile with 1.88.0 on the current lockfile. The deny makes CI's
   existing clippy step fail on any std API newer than 1.88. Without it, such
-  a use would only warn.
+  a use would only warn. PAN-315 later set every workspace member to the
+  workspace `rust-version` 1.98; these two crates are its only exception,
+  named in `scripts/ci/test-dependency-policy.py` (`cargo +1.88.0 check -p
+  pancetta-core -p pancetta-ft8` re-verified after the merge, 2026-11-19).
 - **README links pin the release tag.** A published README cannot change,
   and a `blob/main` link would drift away from the published version. The
   links use `blob/pancetta-ft8-v<version>/`, the version test updates them at
