@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-EXAMPLE="cargo run --release -p pancetta-research --example batch65_corpus_characterize --"
+EXAMPLE="cargo run --profile release-fast -p pancetta-research --example batch65_corpus_characterize --"
 
 # Curated manifests (relative to workspace root).
 for m in \
