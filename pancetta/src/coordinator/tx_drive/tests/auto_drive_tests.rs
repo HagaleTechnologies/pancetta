@@ -146,3 +146,52 @@ fn dirty_generation_tracks_first_valid_report_and_manual_changes() {
     drive.mark_persisted(generation);
     assert!(drive.needs_persist());
 }
+
+#[test]
+fn in_band_burst_settles_the_pending_power_comparison() {
+    let drive = controller(-4.0);
+    let at = |alc, w| [reading(Some(alc), Some(ForwardPower::Watts(w)))];
+    assert_eq!(burst(&drive, &at(0.02, 10.0)), DriveDecision::Changed(-3.5));
+    // In the target ALC band: held, but the +0.09 dB power gain is flat.
+    assert_eq!(burst(&drive, &at(0.20, 10.2)), DriveDecision::Held);
+    assert_eq!(burst(&drive, &at(0.02, 12.0)), DriveDecision::Changed(-3.0));
+    // Second flat step comparison (+0.04 dB) stops the climb.
+    assert_eq!(burst(&drive, &at(0.02, 12.1)), DriveDecision::Held);
+    assert_eq!(burst(&drive, &at(0.02, 12.1)), DriveDecision::Held);
+    assert_eq!(drive.snapshot_for_band(Some(Band::Band20m)).db, -3.0);
+}
+
+#[test]
+fn looked_up_bands_are_not_saved_until_trained_or_chosen() {
+    let drive = controller(-4.0);
+    let _ = drive.snapshot_for_band(Some(Band::Band15m));
+    assert_eq!(
+        burst(&drive, &[reading(Some(0.02), None)]),
+        DriveDecision::Changed(-3.5)
+    );
+    let (map, _) = drive.restored_map_with_generation();
+    assert!(map.contains_key("20m"), "{map:?}");
+    assert!(!map.contains_key("15m"), "{map:?}");
+    let _ = drive.adjust_band(Some(Band::Band40m), -1);
+    let _ = drive.toggle_band(Some(Band::Band17m));
+    let (map, _) = drive.restored_map_with_generation();
+    assert_eq!(map["40m"].mode, TxDriveMode::Manual);
+    assert_eq!(map["17m"].mode, TxDriveMode::Manual);
+    assert!(!map.contains_key("15m"), "{map:?}");
+}
+
+#[test]
+fn a_band_is_shown_available_until_a_burst_lacks_alc() {
+    let drive = controller(-6.0);
+    assert!(drive.snapshot_for_band(Some(Band::Band20m)).available);
+    assert_eq!(
+        burst(&drive, &[reading(None, Some(ForwardPower::Watts(40.0)))]),
+        DriveDecision::Unavailable
+    );
+    assert!(!drive.snapshot_for_band(Some(Band::Band20m)).available);
+    assert_eq!(
+        burst(&drive, &[reading(Some(0.2), None)]),
+        DriveDecision::Held
+    );
+    assert!(drive.snapshot_for_band(Some(Band::Band20m)).available);
+}

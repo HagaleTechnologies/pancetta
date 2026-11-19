@@ -821,6 +821,9 @@ struct TuiRelayLoop {
     gain_mutation_tx:
         tokio::sync::mpsc::UnboundedSender<(String, pancetta_config::rig::ReceiveGainPreset)>,
     gain_frequency: Arc<std::sync::atomic::AtomicU64>,
+    /// PAN-439: live drive state and split TX dial for worker drive reports.
+    tx_drive: Arc<super::tx_drive::TxDrive>,
+    drive_split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
     station_lookup: Arc<crate::priority_evaluator::CachedStationLookup>,
     station_coords: Option<(f64, f64)>,
     our_callsign: String,
@@ -1201,10 +1204,25 @@ impl RelayDriverHost for TuiRelayLoop {
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
             }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                band,
+                ..
+            }) => {
+                // PAN-439: a worker report is asynchronous and can trail a
+                // direct band-change, F7/F8 or F9 echo. Forward the live state
+                // of the current TX band, never the report's own payload.
+                if let Some(tui_msg) = live_tx_drive_message(
+                    band,
+                    &self.tx_drive,
+                    &self.gain_frequency,
+                    &self.drive_split_tx_hz,
+                ) {
+                    let _ = tui_msg_tx_relay.send(tui_msg);
+                }
+            }
             MessageType::RigControl(
                 msg @ (crate::message_bus::RigControlMessage::TxMeterResponse(_)
-                | crate::message_bus::RigControlMessage::TxMeterCapability(_)
-                | crate::message_bus::RigControlMessage::TxDriveState { .. }),
+                | crate::message_bus::RigControlMessage::TxMeterCapability(_)),
             ) => {
                 // PAN-291: real keyed power/ALC reads and the session's meter
                 // plan, forwarded verbatim to the Shift+S panel.
@@ -1706,8 +1724,7 @@ impl super::ApplicationCoordinator {
             db: initial_drive.db,
             ceiling_db: self.tx_drive.ceiling_db(),
             mode: initial_drive.mode,
-            available: initial_drive.available
-                || initial_drive.mode == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+            available: initial_drive.available,
         });
 
         // Set up station coordinates for distance/bearing calculation
@@ -1811,6 +1828,8 @@ impl super::ApplicationCoordinator {
         let relay_pending_gain_save = pending_gain_save.clone();
         let relay_gain_mutation_tx = gain_mutation_tx.clone();
         let relay_gain_frequency = self.operating_frequency_hz.clone();
+        let relay_tx_drive = self.tx_drive.clone();
+        let relay_drive_split_tx_hz = self.split_tx_frequency_hz();
         let watchlist_pins = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let relay_watchlist_pins = watchlist_pins.clone();
         let watchlist_write_tx = cmd_config_write_tx.clone();
@@ -1844,6 +1863,8 @@ impl super::ApplicationCoordinator {
                     pending_gain_save: relay_pending_gain_save,
                     gain_mutation_tx: relay_gain_mutation_tx,
                     gain_frequency: relay_gain_frequency,
+                    tx_drive: relay_tx_drive,
+                    drive_split_tx_hz: relay_drive_split_tx_hz,
                     station_lookup: relay_station_lookup,
                     station_coords,
                     our_callsign: our_callsign_for_relay,
@@ -2303,8 +2324,7 @@ impl super::ApplicationCoordinator {
                             db: selected.db,
                             ceiling_db: cmd_tx_drive.ceiling_db(),
                             mode: selected.mode,
-                            available: selected.available
-                                || selected.mode == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                            available: selected.available,
                         });
                 }
                 // CQ is now TRANSMITTED by a real CallingCq QSO owned by the
@@ -4897,19 +4917,36 @@ fn tx_meter_tui_message(
         crate::message_bus::RigControlMessage::TxMeterCapability(capability) => Some(
             pancetta_tui::tui_runner::TuiMessage::TxMeterCapability(*capability),
         ),
-        crate::message_bus::RigControlMessage::TxDriveState {
-            db,
-            ceiling_db,
-            mode,
-            available,
-        } => Some(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
-            db: *db,
-            ceiling_db: *ceiling_db,
-            mode: *mode,
-            available: *available,
-        }),
         _ => None,
     }
+}
+
+/// PAN-439: the TUI drive readout for a worker's `TxDriveState` report. A
+/// report whose band differs from the current split-aware TX band is dropped
+/// (`None`, an unknown dial's station-wide fallback, matches only `None`);
+/// otherwise the live selection is sent, so a late report cannot replace a
+/// newer band-change, F7/F8 or F9 echo.
+fn live_tx_drive_message(
+    report_band: Option<pancetta_core::Band>,
+    drive: &super::tx_drive::TxDrive,
+    operating_hz: &std::sync::atomic::AtomicU64,
+    split_tx_hz: &std::sync::atomic::AtomicU64,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    let live_band =
+        pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+            operating_hz.load(Ordering::Acquire),
+            split_tx_hz.load(Ordering::Acquire),
+        ));
+    if report_band != live_band {
+        return None;
+    }
+    let selected = drive.snapshot_for_band(live_band);
+    Some(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+        db: selected.db,
+        ceiling_db: drive.ceiling_db(),
+        mode: selected.mode,
+        available: selected.available,
+    })
 }
 
 /// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band

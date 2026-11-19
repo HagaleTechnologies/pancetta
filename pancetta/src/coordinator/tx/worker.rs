@@ -2985,6 +2985,28 @@ impl super::super::ApplicationCoordinator {
                                         .await;
 
                                         let live_timing_guard = ptt_sync_gate.lock().await;
+                                        // PAN-439: select drive and prepare the meter attempt before the
+                                        // final gates, so the per-band lock can never age their timing
+                                        // checks. The band read is under `ptt_sync_gate`, which spot-call
+                                        // QSY and band hops also hold.
+                                        let drive_snapshot = tx_drive.snapshot_for_band(
+                                            pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                            )),
+                                        );
+                                        let drive_context = super::super::tx_drive::DriveContext {
+                                            rig_generation: tx_drive_rig_generation
+                                                .load(Ordering::Acquire),
+                                            ft_mode: active_protocol_mode_atomic
+                                                .load(Ordering::Acquire),
+                                            stream_count: 1,
+                                        };
+                                        let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
+                                            drive_snapshot.mode
+                                                == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                            drive_snapshot.band,
+                                        );
                                         if is_autonomous_cq(
                                             qso_id.as_deref(),
                                             attempt_id,
@@ -3300,24 +3322,6 @@ impl super::super::ApplicationCoordinator {
                                         // PAN-202). The mid-TX poll remains a backstop.
                                         // PTT hardware is not asserted yet. Denial only unwinds the local
                                         // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                        let drive_snapshot = tx_drive.snapshot_for_band(
-                                            pancetta_core::Band::from_frequency(tx_log_dial_hz(
-                                                &operating_frequency_hz,
-                                                &split_tx_frequency_hz,
-                                            )),
-                                        );
-                                        let drive_context = super::super::tx_drive::DriveContext {
-                                            rig_generation: tx_drive_rig_generation
-                                                .load(Ordering::Acquire),
-                                            ft_mode: active_protocol_mode_atomic
-                                                .load(Ordering::Acquire),
-                                            stream_count: 1,
-                                        };
-                                        let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
-                                            drive_snapshot.mode
-                                                == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
-                                            drive_snapshot.band,
-                                        );
                                         let outcome = send_ptt_command_with_attempt(
                                             &message_bus,
                                             ComponentId::Ft8Transmitter,
@@ -4189,6 +4193,9 @@ impl super::super::ApplicationCoordinator {
                                         let success = audio_enqueued;
                                         let duration_ms = audio_duration_ms;
 
+                                        // PAN-439: playback has ended, so close burst sampling now; a meter
+                                        // poll during the unkey tail belongs to no waveform.
+                                        drive_attempt.close_sampling();
                                         // --- Step 9: De-assert PTT (with tail delay) ---
                                         // Plain interruptible_sleep (not _or_supersede): the
                                         // frame has already fully played by this point, so
@@ -4237,21 +4244,24 @@ impl super::super::ApplicationCoordinator {
                                         }
                                         let release = ptt_guard.release("Step 9 unkey").await;
                                         if success && release == PttRelease::Delivered {
-                                            let samples = drive_attempt.finish();
-                                            finish_auto_drive_burst(
-                                                &message_bus,
-                                                &tx_drive,
-                                                drive_snapshot,
-                                                &samples,
-                                                drive_context,
-                                                &tx_drive_session_record,
-                                                &tx_drive_session_path,
-                                                &operating_frequency_hz,
-                                                &split_tx_frequency_hz,
-                                                &tx_drive_rig_generation,
-                                                &active_protocol_mode_atomic,
-                                            )
-                                            .await;
+                                            // An unconfirmed, unplayed or watchdog-invalidated attempt has no
+                                            // summary and must not read as a burst without ALC.
+                                            if let Some(samples) = drive_attempt.summary() {
+                                                finish_auto_drive_burst(
+                                                    &message_bus,
+                                                    &tx_drive,
+                                                    drive_snapshot,
+                                                    &samples,
+                                                    drive_context,
+                                                    &tx_drive_session_record,
+                                                    &tx_drive_session_path,
+                                                    &operating_frequency_hz,
+                                                    &split_tx_frequency_hz,
+                                                    &tx_drive_rig_generation,
+                                                    &active_protocol_mode_atomic,
+                                                )
+                                                .await;
+                                            }
                                         }
 
                                         // --- Step 10: Send TransmitComplete ---
@@ -5955,6 +5965,21 @@ impl super::super::ApplicationCoordinator {
                                     }
 
                                     let live_timing_guard = ptt_sync_gate.lock().await;
+                                    // PAN-439: select drive and prepare the meter attempt before the
+                                    // final gates, so the per-band lock can never age their timing
+                                    // checks. The band read is under `ptt_sync_gate`, which spot-call
+                                    // QSY and band hops also hold.
+                                    let drive_snapshot = tx_drive.snapshot_for_band(
+                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                        )),
+                                    );
+                                    let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
+                                        drive_snapshot.mode
+                                            == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                        drive_snapshot.band,
+                                    );
                                     // --- Step 4d: final atomic pre-PTT gate ---
                                     // PAN-148 (Finding 1, PR #370 round 2): the
                                     // partial-staleness branch above emits per-item
@@ -6320,12 +6345,6 @@ impl super::super::ApplicationCoordinator {
                                     // PAN-202). The mid-TX poll remains a backstop.
                                     // PTT hardware is not asserted yet. Denial only unwinds the local
                                     // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                    let drive_snapshot = tx_drive.snapshot_for_band(
-                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
-                                            &operating_frequency_hz,
-                                            &split_tx_frequency_hz,
-                                        )),
-                                    );
                                     let drive_context = super::super::tx_drive::DriveContext {
                                         rig_generation: tx_drive_rig_generation
                                             .load(Ordering::Acquire),
@@ -6333,11 +6352,6 @@ impl super::super::ApplicationCoordinator {
                                             .load(Ordering::Acquire),
                                         stream_count: items.len(),
                                     };
-                                    let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
-                                        drive_snapshot.mode
-                                            == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
-                                        drive_snapshot.band,
-                                    );
                                     let outcome = send_ptt_command_with_attempt(
                                         &message_bus,
                                         ComponentId::Ft8Transmitter,
@@ -6833,6 +6847,9 @@ impl super::super::ApplicationCoordinator {
                                     let success = audio_enqueued;
                                     let duration_ms = audio_duration_ms;
 
+                                    // PAN-439: playback has ended, so close burst sampling now; a meter
+                                    // poll during the unkey tail belongs to no waveform.
+                                    drive_attempt.close_sampling();
                                     // --- Step 9: De-assert PTT (with tail delay) ---
                                     if interruptible_sleep(
                                         Duration::from_millis(50),
@@ -6880,21 +6897,24 @@ impl super::super::ApplicationCoordinator {
                                     }
                                     let release = ptt_guard.release("Multi-TX Step 9 unkey").await;
                                     if success && release == PttRelease::Delivered {
-                                        let samples = drive_attempt.finish();
-                                        finish_auto_drive_burst(
-                                            &message_bus,
-                                            &tx_drive,
-                                            drive_snapshot,
-                                            &samples,
-                                            drive_context,
-                                            &tx_drive_session_record,
-                                            &tx_drive_session_path,
-                                            &operating_frequency_hz,
-                                            &split_tx_frequency_hz,
-                                            &tx_drive_rig_generation,
-                                            &active_protocol_mode_atomic,
-                                        )
-                                        .await;
+                                        // An unconfirmed, unplayed or watchdog-invalidated attempt has no
+                                        // summary and must not read as a burst without ALC.
+                                        if let Some(samples) = drive_attempt.summary() {
+                                            finish_auto_drive_burst(
+                                                &message_bus,
+                                                &tx_drive,
+                                                drive_snapshot,
+                                                &samples,
+                                                drive_context,
+                                                &tx_drive_session_record,
+                                                &tx_drive_session_path,
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                                &tx_drive_rig_generation,
+                                                &active_protocol_mode_atomic,
+                                            )
+                                            .await;
+                                        }
                                     }
 
                                     // --- Step 10: Send TransmitComplete for each item ---

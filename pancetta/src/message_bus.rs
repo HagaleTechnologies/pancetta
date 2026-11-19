@@ -797,8 +797,11 @@ pub enum RigControlMessage {
     /// PAN-291: which TX meters this Hamlib session reads while keyed, and the
     /// ALC warning limit when the warning is on. Sent once per Hamlib session.
     TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
-    /// PAN-439 selected drive after a completed FT burst.
+    /// PAN-439 selected drive after a completed FT burst. `band` names the
+    /// TX band it belongs to; the TUI relay forwards the live state of the
+    /// current band instead of this payload, and drops it for another band.
     TxDriveState {
+        band: Option<pancetta_core::Band>,
         db: f32,
         ceiling_db: f32,
         mode: pancetta_core::tx_drive_mode::TxDriveMode,

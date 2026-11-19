@@ -25,6 +25,8 @@ pub(crate) struct TxDriveAttempt {
     confirmed: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
     active: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+    invalidated: std::sync::atomic::AtomicBool,
     samples: std::sync::Mutex<Vec<TxMeterReading>>,
 }
 
@@ -57,22 +59,49 @@ impl TxDriveAttempt {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
     }
-    pub(crate) fn sample(&self, reading: TxMeterReading) {
+    /// Playback ended: later meter reads (the unkey tail) are not part of
+    /// the burst. Unlike [`Self::stop`] this keeps the warn-only suppression
+    /// until Hamlib acknowledges the PTT-off.
+    pub(crate) fn close_sampling(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// Abnormal teardown (PTT watchdog): the burst yields no summary.
+    pub(crate) fn invalidate(&self) {
+        self.invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.stop();
+    }
+    /// Key-down confirmed, playback started and neither stopped nor closed.
+    pub(crate) fn sampling(&self) -> bool {
         use std::sync::atomic::Ordering::Acquire;
-        if self.confirmed.load(Acquire) && self.started.load(Acquire) && self.active.load(Acquire) {
+        self.confirmed.load(Acquire)
+            && self.started.load(Acquire)
+            && self.active.load(Acquire)
+            && !self.closed.load(Acquire)
+    }
+    pub(crate) fn sample(&self, reading: TxMeterReading) {
+        if self.sampling() {
             if let Ok(mut samples) = self.samples.lock() {
                 samples.push(reading);
             }
         }
     }
     pub(crate) fn finish(&self) -> Vec<TxMeterReading> {
+        self.summary().unwrap_or_default()
+    }
+    /// The burst's samples, or `None` when the attempt cannot train drive:
+    /// key-down unconfirmed, playback never started, or invalidated. `None`
+    /// is not "no ALC": the caller must not report it to the controller.
+    pub(crate) fn summary(&self) -> Option<Vec<TxMeterReading>> {
         self.stop();
         if !self.confirmed.load(std::sync::atomic::Ordering::Acquire)
             || !self.started.load(std::sync::atomic::Ordering::Acquire)
+            || self.invalidated.load(std::sync::atomic::Ordering::Acquire)
         {
-            return Vec::new();
+            return None;
         }
-        self.samples.lock().map(|s| s.clone()).unwrap_or_default()
+        Some(self.samples.lock().map(|s| s.clone()).unwrap_or_default())
     }
 }
 
@@ -299,11 +328,15 @@ pub(crate) async fn tx_meter_poll_step_with_dial(
         guard.reset_episode();
         guard.last_ptt_epoch = epoch;
     }
+    // PAN-439: only an attempt whose waveform was already playing when the
+    // reads began may take them; a read that started before playback is not
+    // part of the burst even if playback starts while it runs.
     let episode = bus
         .active_tx_drive_attempt
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
+        .and_then(|slot| slot.clone())
+        .filter(|attempt| attempt.sampling());
     let alc = if keyed {
         let started = Instant::now();
         let alc = if plan.alc {
@@ -637,6 +670,8 @@ mod tests {
         levels: Levels,
         scripts: Mutex<HashMap<TxMeter, VecDeque<Result<f32>>>>,
         reads: Mutex<HashMap<TxMeter, usize>>,
+        /// Marks this attempt's playback as started during the next read.
+        start_on_read: Mutex<Option<std::sync::Arc<TxDriveAttempt>>>,
     }
 
     impl MeterRig {
@@ -652,6 +687,7 @@ mod tests {
                 levels,
                 scripts: Mutex::new(HashMap::new()),
                 reads: Mutex::new(HashMap::new()),
+                start_on_read: Mutex::new(None),
             }
         }
 
@@ -735,6 +771,9 @@ mod tests {
         }
         async fn get_tx_meter(&self, meter: TxMeter) -> Result<f32> {
             *self.reads.lock().unwrap().entry(meter).or_insert(0) += 1;
+            if let Some(attempt) = self.start_on_read.lock().unwrap().take() {
+                attempt.started();
+            }
             self.scripts
                 .lock()
                 .unwrap()
@@ -1030,6 +1069,11 @@ mod tests {
         });
         assert_eq!(new.finish().len(), 1);
     }
+
+    // PAN-439: resolves to `tx_meter/tests/drive_attempt_tests.rs` and shares
+    // this module's `MeterRig` fixture.
+    #[path = "drive_attempt_tests.rs"]
+    mod drive_attempt_tests;
 
     #[test]
     fn preplay_and_invalidated_bursts_do_not_train() {

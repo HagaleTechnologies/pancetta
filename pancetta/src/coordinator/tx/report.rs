@@ -614,12 +614,17 @@ pub(super) async fn finish_auto_drive_burst(
         }
     }
     let selected = drive.snapshot_for_band(snapshot.band);
-    if selected.band == live_band && selected != snapshot {
+    // A burst without valid ALC always republishes, so the readout shows
+    // `auto unavailable` even when the band was already marked unavailable.
+    if selected.band == live_band
+        && (selected != snapshot || decision == DriveDecision::Unavailable)
+    {
         let _ = bus
             .send_message(ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
                 ComponentId::Tui,
                 MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                    band: selected.band,
                     db: selected.db,
                     ceiling_db: drive.ceiling_db(),
                     mode: selected.mode,
@@ -635,6 +640,7 @@ pub(super) async fn finish_auto_drive_burst(
         _ => None,
     };
     if let Some(alert) = alert {
+        let diagnostic = auto_drive_diagnostic(&alert, samples, drive.max_alc());
         let _ = bus
             .send_message(ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
@@ -654,7 +660,7 @@ pub(super) async fn finish_auto_drive_burst(
                 MessageType::DiagnosticEvent {
                     target: "tx.drive",
                     level: pancetta_core::DiagnosticLevel::Warn,
-                    text: alert,
+                    text: diagnostic,
                     qso_id: None,
                     callsign: None,
                 },
@@ -704,6 +710,27 @@ pub(super) async fn finish_auto_drive_burst(
                     .await;
             }
         });
+    }
+}
+
+/// Shift+D text for an Auto backoff or floor alert: the strip text plus the
+/// burst's peak valid ALC and the limit, e.g.
+/// `ALC high: drive −3 dB. Peak ALC 0.84 (limit 0.50).`
+pub(super) fn auto_drive_diagnostic(
+    alert: &str,
+    samples: &[pancetta_core::tx_meter::TxMeterReading],
+    max_alc: f32,
+) -> String {
+    let peak = samples
+        .iter()
+        .filter_map(|s| s.alc)
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .fold(None, |peak: Option<f32>, v| {
+            Some(peak.map_or(v, |p| p.max(v)))
+        });
+    match peak {
+        Some(peak) => format!("{alert}. Peak ALC {peak:.2} (limit {max_alc:.2})."),
+        None => format!("{alert}."),
     }
 }
 

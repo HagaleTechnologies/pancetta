@@ -74,7 +74,8 @@ impl BandDrive {
             db,
             mode,
             generation: 0,
-            available: false,
+            // Not yet known to lack ALC: a burst without valid ALC clears it.
+            available: true,
             established: false,
             last_context: None,
             flat_streak: 0,
@@ -229,6 +230,11 @@ impl TxDrive {
         self.auto_enabled
     }
 
+    /// The ALC limit Auto backs off above, shown with its diagnostics.
+    pub(crate) fn max_alc(&self) -> f32 {
+        self.max_alc
+    }
+
     pub(crate) fn warn_only_limit(&self) -> Option<f32> {
         self.warn_only_enabled.then_some(self.max_alc)
     }
@@ -278,6 +284,7 @@ impl TxDrive {
             .or_insert_with(|| BandDrive::new(self.start_db, TxDriveMode::Auto));
         state.db = (state.db + f32::from(step)).clamp(self.floor_db, self.ceiling_db);
         state.mode = TxDriveMode::Manual;
+        state.established = true;
         state.generation = state.generation.wrapping_add(1);
         state.clear_power();
         self.persistence_generation.fetch_add(1, Ordering::AcqRel);
@@ -294,18 +301,21 @@ impl TxDrive {
             .entry(band)
             .or_insert_with(|| BandDrive::new(self.start_db, TxDriveMode::Auto));
         state.mode = state.mode.toggle();
+        state.established = true;
         state.generation = state.generation.wrapping_add(1);
         state.clear_power();
         self.persistence_generation.fetch_add(1, Ordering::AcqRel);
         state.snapshot(Some(band))
     }
 
-    /// Capture the map and its generation under the same lock.
+    /// Capture the map and its generation under the same lock. A band only
+    /// looked up (display or key-down) but never trained, adjusted or toggled
+    /// is not saved, so a later `start_db` still applies to it.
     pub(crate) fn restored_map_with_generation(&self) -> (HashMap<String, SavedTxDrive>, u64) {
         let bands = self.bands.lock().unwrap_or_else(|e| e.into_inner());
         let map = bands
             .iter()
-            .filter(|(band, _)| !matches!(band, Band::Custom(_, _)))
+            .filter(|(band, state)| state.established && !matches!(band, Band::Custom(_, _)))
             .map(|(band, state)| {
                 (
                     band.name().to_string(),
@@ -406,9 +416,9 @@ impl TxDrive {
             self.persistence_generation.fetch_add(1, Ordering::AcqRel);
             return DriveDecision::Overdrive(state.db);
         }
-        if lone_high || peak >= self.onset {
-            return DriveDecision::Held;
-        }
+        // The first eligible burst after an upward step settles that step's
+        // power comparison, whatever its ALC band, so a later burst is never
+        // compared against an older baseline.
         let power = peak_power(samples);
         if let Some(pending) = state.pending_power.take() {
             match power {
@@ -427,6 +437,9 @@ impl TxDrive {
                     state.clear_power();
                 }
             }
+        }
+        if lone_high || peak >= self.onset {
+            return DriveDecision::Held;
         }
         if state.flat_hold || state.db >= self.ceiling_db {
             return DriveDecision::Held;

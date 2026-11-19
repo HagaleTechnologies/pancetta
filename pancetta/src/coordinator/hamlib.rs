@@ -2783,6 +2783,8 @@ impl super::ApplicationCoordinator {
                 let ptt_active_watchdog = ptt_active.clone();
                 let ptt_off_unconfirmed_watchdog = ptt_off_unconfirmed.clone();
                 let ptt_off_confirmations_watchdog = ptt_off_confirmations.clone();
+                let drive_attempt_watchdog =
+                    message_bus_for_connect.active_tx_drive_attempt.clone();
                 // PAN-19 round-16 review (Codex P1): same reasoning as the
                 // poll task's own guard above -- see that comment.
                 let hamlib_command_loop_ready_for_watchdog = hamlib_command_loop_ready.clone();
@@ -2830,6 +2832,17 @@ impl super::ApplicationCoordinator {
                             let overdue = on_since.elapsed()
                                 > Duration::from_secs(PTT_SAFETY_TIMEOUT_SECS);
                             if overdue || unkey_failed {
+                                // PAN-439: a burst the watchdog cuts short never
+                                // trains drive. (A rejected unkey is reported after
+                                // the worker's delivered release, so this cannot
+                                // undo a burst the worker already completed.)
+                                if overdue {
+                                    if let Ok(mut slot) = drive_attempt_watchdog.lock() {
+                                        if let Some(attempt) = slot.take() {
+                                            attempt.invalidate();
+                                        }
+                                    }
+                                }
                                 if overdue {
                                     error!(
                                         "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds -- forcing OFF",

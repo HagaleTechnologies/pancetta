@@ -226,107 +226,10 @@ fn overdrive_backs_off_the_next_burst_once() {
     assert_eq!(drive.snapshot_for_band(Some(band)).db, -3.0);
 }
 
-#[test]
-fn first_burst_uses_the_split_aware_tx_bands_drive() {
-    let drive = automatic_drive();
-    let twenty = pancetta_core::Band::from_frequency(14_074_000).unwrap();
-    let forty = pancetta_core::Band::from_frequency(7_074_000).unwrap();
-    drive.restore_map(&std::collections::HashMap::from([
-        (
-            twenty.name().to_string(),
-            super::super::tx_drive::SavedTxDrive {
-                db: -3.0,
-                mode: pancetta_core::tx_drive_mode::TxDriveMode::Auto,
-            },
-        ),
-        (
-            forty.name().to_string(),
-            super::super::tx_drive::SavedTxDrive {
-                db: -6.0,
-                mode: pancetta_core::tx_drive_mode::TxDriveMode::Auto,
-            },
-        ),
-    ]));
-    let band = pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
-        14_074_000, 7_074_000,
-    ));
-    assert_eq!(drive.snapshot_for_band(band).db, -6.0);
-}
-
-#[test]
-fn unlearned_band_starts_at_minus_six_and_ramps() {
-    let drive = automatic_drive();
-    let fifteen = pancetta_core::Band::from_frequency(21_074_000).unwrap();
-    let baseline = [0.0, 0.25, -0.5, 0.95];
-    let mut first = baseline;
-    apply(
-        &mut first,
-        drive.snapshot_for_band(Some(fifteen)).db,
-        drive.ceiling_db(),
-        true,
-    );
-    assert_db(&baseline, &first, -6.0);
-    completed_burst(&drive, fifteen, -6.0, &[alc_sample(0.01)]);
-    let mut second = baseline;
-    apply(
-        &mut second,
-        drive.snapshot_for_band(Some(fifteen)).db,
-        drive.ceiling_db(),
-        true,
-    );
-    assert_db(&baseline, &second, -5.5);
-}
-
-#[test]
-fn missing_or_invalid_alc_does_not_change_drive() {
-    let drive = automatic_drive();
-    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
-    completed_burst(&drive, band, -6.0, &[]);
-    assert_eq!(drive.snapshot_for_band(Some(band)).db, -6.0);
-    completed_burst(&drive, band, -6.0, &[alc_sample(f32::NAN)]);
-    assert_eq!(drive.snapshot_for_band(Some(band)).db, -6.0);
-}
-
-#[test]
-fn learned_drive_scales_the_first_worker_buffer_after_restart() {
-    let band = pancetta_core::Band::from_frequency(14_074_000).unwrap();
-    let first = automatic_drive();
-    first.restore_map(&std::collections::HashMap::from([(
-        band.name().to_string(),
-        super::super::tx_drive::SavedTxDrive {
-            db: -3.0,
-            mode: pancetta_core::tx_drive_mode::TxDriveMode::Auto,
-        },
-    )]));
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("session_state.json");
-    let record = std::sync::Arc::new(std::sync::Mutex::new(
-        super::super::session_state::SessionRecord::default(),
-    ));
-    super::super::session_state::persist_tx_drive_current(&record, &Some(path.clone()), &first)
-        .unwrap();
-    let loaded = match super::super::session_state::load(&path) {
-        super::super::session_state::SessionLoad::Record(record) => record,
-        other => panic!("unexpected session load {other:?}"),
-    };
-    let restarted = automatic_drive();
-    restarted.restore_map(&loaded.tx_drive_by_band);
-    let selected = restarted.snapshot_for_band(Some(band));
-    assert_eq!(selected.db, -3.0);
-    let baseline = [0.0, 0.25, -0.5, 0.95];
-    let mut first_buffer = baseline;
-    apply(&mut first_buffer, selected.db, restarted.ceiling_db(), true);
-    assert_db(&baseline, &first_buffer, -3.0);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_meter_summary_scales_the_next_real_worker_burst() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::{
-        await_completion, request, worker_harness_with,
-    };
-    use crate::message_bus::{ComponentId, MessageType, RigControlMessage};
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     let mut config = pancetta_config::Config::default();
     config.audio.auto_drive.enabled = true;
@@ -346,63 +249,16 @@ async fn clean_meter_summary_scales_the_next_real_worker_burst() {
             )]));
     })
     .await;
-    let (_, audio_rx) = harness
-        .coordinator
-        .message_bus
-        .get_or_create_channel(ComponentId::Audio)
-        .await
-        .unwrap();
-
-    async fn transmit(
-        h: &crate::coordinator::tx::pan115_worker_gate_tests::Harness,
-        audio_rx: &crossbeam_channel::Receiver<crate::message_bus::ComponentMessage>,
-        text: &str,
-        alc: &[f32],
-    ) -> (Vec<f32>, Vec<String>) {
-        request(h, text).await;
-        let (attempt, samples, playback) = tokio::time::timeout(Duration::from_secs(25), async {
-            let mut attempt = None;
-            let mut audio = None;
-            loop {
-                while let Ok(msg) = h.hamlib_rx.try_recv() {
-                    if matches!(
-                        msg.message_type,
-                        MessageType::RigControl(RigControlMessage::SetPtt { state: true })
-                    ) {
-                        attempt = msg.tx_drive_attempt;
-                    }
-                }
-                while let Ok(msg) = audio_rx.try_recv() {
-                    if let MessageType::AudioOutput {
-                        samples,
-                        playback_started,
-                        ..
-                    } = msg.message_type
-                    {
-                        audio = Some((samples, playback_started));
-                    }
-                }
-                if attempt.is_some() && audio.is_some() {
-                    let (samples, playback) = audio.take().unwrap();
-                    break (attempt.take().unwrap(), samples, playback);
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("worker sent one keyed waveform");
-        attempt.confirm();
-        playback.expect("audio ack").started(chrono::Utc::now());
-        for &level in alc {
-            attempt.sample(alc_sample(level));
-        }
-        let (completed, diagnostics, _) = await_completion(h, text, Duration::from_secs(20)).await;
-        assert_eq!(completed, Some(true));
-        (samples, diagnostics)
-    }
+    let audio_rx = audio_receiver(&harness).await;
 
     let (first, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.02]).await;
     let (second, diagnostics) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.8, 0.9]).await;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|text| text == "ALC high: drive −5.5 dB. Peak ALC 0.90 (limit 0.50)."),
+        "{diagnostics:?}"
+    );
     let peak = |samples: &[f32]| samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
     let gain_db = 20.0 * (peak(&second) / peak(&first)).log10();
     assert!(
@@ -421,4 +277,395 @@ async fn clean_meter_summary_scales_the_next_real_worker_burst() {
         (backoff_db + 2.0).abs() < 0.02,
         "overdrive backoff {backoff_db} dB"
     );
+}
+
+type WorkerHarness = crate::coordinator::tx::pan115_worker_gate_tests::Harness;
+
+/// One worker burst: request `text`, wait for its keyed waveform, confirm the
+/// key-down and start playback as Hamlib and Audio would, feed `alc` as the
+/// burst's meter samples (`None`: a read without ALC), then wait for the
+/// completion. Returns the waveform, TUI diagnostics and drive readouts.
+async fn transmit_readings(
+    h: &WorkerHarness,
+    audio_rx: &crossbeam_channel::Receiver<crate::message_bus::ComponentMessage>,
+    text: &str,
+    alc: &[Option<f32>],
+) -> (
+    Vec<f32>,
+    Vec<String>,
+    Vec<crate::message_bus::RigControlMessage>,
+) {
+    use crate::coordinator::tx::pan115_worker_gate_tests::request;
+    use crate::message_bus::{MessageType, RigControlMessage};
+    use std::time::{Duration, Instant};
+    request(h, text).await;
+    let (attempt, samples, playback) = tokio::time::timeout(Duration::from_secs(25), async {
+        let mut attempt = None;
+        let mut audio = None;
+        loop {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                if matches!(
+                    msg.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+                ) {
+                    attempt = msg.tx_drive_attempt;
+                }
+            }
+            while let Ok(msg) = audio_rx.try_recv() {
+                if let MessageType::AudioOutput {
+                    samples,
+                    playback_started,
+                    ..
+                } = msg.message_type
+                {
+                    audio = Some((samples, playback_started));
+                }
+            }
+            if attempt.is_some() && audio.is_some() {
+                let (samples, playback) = audio.take().unwrap();
+                break (attempt.take().unwrap(), samples, playback);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker sent one keyed waveform");
+    attempt.confirm();
+    playback.expect("audio ack").started(chrono::Utc::now());
+    for level in alc {
+        attempt.sample(pancetta_core::tx_meter::TxMeterReading {
+            alc: *level,
+            forward_power: None,
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut diagnostics = Vec::new();
+    let mut drive_states = Vec::new();
+    let mut completed = None;
+    while completed.is_none() && Instant::now() < deadline {
+        while let Ok(msg) = h.hamlib_rx.try_recv() {
+            drop(msg);
+        }
+        while let Ok(msg) = h.autonomous_rx.try_recv() {
+            if let MessageType::TransmitComplete {
+                success,
+                message_text,
+                ..
+            } = msg.message_type
+            {
+                if message_text == text {
+                    completed = Some(success);
+                }
+            }
+        }
+        // The worker publishes drive state before its completion report.
+        while let Ok(msg) = h.tui_rx.try_recv() {
+            match msg.message_type {
+                MessageType::DiagnosticEvent { text, .. } => diagnostics.push(text),
+                MessageType::RigControl(state @ RigControlMessage::TxDriveState { .. }) => {
+                    drive_states.push(state)
+                }
+                _ => (),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(completed, Some(true), "burst {text} completed");
+    (samples, diagnostics, drive_states)
+}
+
+async fn transmit(
+    h: &WorkerHarness,
+    audio_rx: &crossbeam_channel::Receiver<crate::message_bus::ComponentMessage>,
+    text: &str,
+    alc: &[f32],
+) -> (Vec<f32>, Vec<String>) {
+    let readings: Vec<Option<f32>> = alc.iter().copied().map(Some).collect();
+    let (samples, diagnostics, _) = transmit_readings(h, audio_rx, text, &readings).await;
+    (samples, diagnostics)
+}
+
+async fn audio_receiver(
+    h: &WorkerHarness,
+) -> crossbeam_channel::Receiver<crate::message_bus::ComponentMessage> {
+    h.coordinator
+        .message_bus
+        .get_or_create_channel(crate::message_bus::ComponentId::Audio)
+        .await
+        .unwrap()
+        .1
+}
+
+/// Drive of a real FT waveform relative to the modulator's normalized peak.
+fn waveform_db(samples: &[f32]) -> f32 {
+    let peak = samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+    20.0 * (peak / FT_NORMALIZED_PEAK).log10()
+}
+
+fn assert_waveform_db(samples: &[f32], expected: f32, what: &str) {
+    let measured = waveform_db(samples);
+    assert!(
+        (measured - expected).abs() < 0.1,
+        "{what}: {measured} dB, expected {expected} dB"
+    );
+}
+
+fn saved(db: f32) -> super::super::tx_drive::SavedTxDrive {
+    super::super::tx_drive::SavedTxDrive {
+        db,
+        mode: pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_burst_uses_the_split_aware_tx_bands_drive() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use std::sync::atomic::Ordering;
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    // An unlearned band would start at −10 dB, so −6 dB proves the 40 m entry.
+    config.audio.auto_drive.start_db = -10.0;
+    let harness = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+        coordinator
+            .tx_drive
+            .restore_map(&std::collections::HashMap::from([
+                ("20m".to_string(), saved(-3.0)),
+                ("40m".to_string(), saved(-6.0)),
+            ]));
+    })
+    .await;
+    let audio_rx = audio_receiver(&harness).await;
+    // In the 0.10..0.50 ALC band: each band holds its learned drive.
+    let (twenty, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&twenty, -3.0, "20 m burst");
+    harness
+        .coordinator
+        .operating_frequency_hz
+        .store(7_074_000, Ordering::Release);
+    let (forty, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&forty, -6.0, "first 40 m burst after the band change");
+    // RX back on 20 m with split TX on 40 m: the TX dial selects 40 m.
+    harness
+        .coordinator
+        .operating_frequency_hz
+        .store(14_074_000, Ordering::Release);
+    harness
+        .coordinator
+        .split_tx_frequency_hz()
+        .store(7_074_000, Ordering::Release);
+    let (split, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&split, -6.0, "first split burst transmitting on 40 m");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlearned_band_starts_at_minus_six_and_ramps() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use std::sync::atomic::Ordering;
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let harness = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(21_074_000, Ordering::Release);
+    })
+    .await;
+    let audio_rx = audio_receiver(&harness).await;
+    let (first, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.02]).await;
+    assert_waveform_db(&first, -6.0, "first 15 m burst");
+    let (second, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.02]).await;
+    assert_waveform_db(&second, -5.5, "second 15 m burst");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_or_invalid_alc_does_not_change_drive() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::message_bus::RigControlMessage;
+    use std::sync::atomic::Ordering;
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let harness = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+    })
+    .await;
+    let audio_rx = audio_receiver(&harness).await;
+    let unavailable = |states: &[RigControlMessage]| {
+        states.iter().any(|state| {
+            matches!(
+                state,
+                RigControlMessage::TxDriveState {
+                    available: false,
+                    mode: pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                    ..
+                }
+            )
+        })
+    };
+    // A meter read without ALC, then an invalid ALC value: no change, and
+    // each burst republishes Auto as unavailable.
+    let (first, _, states) = transmit_readings(&harness, &audio_rx, "CQ K5ARH EM10", &[None]).await;
+    assert_waveform_db(&first, -6.0, "first burst");
+    assert!(unavailable(&states), "{states:?}");
+    let (second, _, states) =
+        transmit_readings(&harness, &audio_rx, "CQ K5ARH EM10", &[Some(f32::NAN)]).await;
+    assert_waveform_db(&second, -6.0, "burst after no ALC");
+    assert!(unavailable(&states), "{states:?}");
+    let (third, _, _) = transmit_readings(&harness, &audio_rx, "CQ K5ARH EM10", &[]).await;
+    assert_waveform_db(&third, -6.0, "burst after invalid ALC");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_drive_scales_the_first_worker_buffer_after_restart() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_in_home;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let home = tempfile::tempdir().unwrap();
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    config.audio.auto_drive.start_db = -3.5;
+    let session = super::super::session_state::session_state_path(Some(home.path())).unwrap();
+    {
+        let harness = worker_harness_in_home(config.clone(), home.path().to_path_buf(), |c| {
+            c.operating_frequency_hz
+                .store(14_074_000, Ordering::Release);
+        })
+        .await;
+        let audio_rx = audio_receiver(&harness).await;
+        let (first, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.02]).await;
+        assert_waveform_db(&first, -3.5, "first 20 m burst before restart");
+        // The station learned −3 dB; wait for its save to land.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let super::super::session_state::SessionLoad::Record(record) =
+                super::super::session_state::load(&session)
+            {
+                if record.tx_drive_by_band.get("20m").map(|s| s.db) == Some(-3.0) {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "learned drive was not saved");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Restart: a new coordinator reads the same session home at startup.
+    let restarted = worker_harness_in_home(config, home.path().to_path_buf(), |c| {
+        c.operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+    })
+    .await;
+    let audio_rx = audio_receiver(&restarted).await;
+    let (first, _) = transmit(&restarted, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&first, -3.0, "first 20 m burst after restart");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundle_burst_steps_drive_once_with_one_key_down() {
+    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, RigControlMessage, TransmitRequestItem,
+        TxOrigin,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let mut config = pancetta_config::Config::default();
+    config.audio.auto_drive.enabled = true;
+    let harness = worker_harness_with(config, |coordinator| {
+        coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Release);
+        coordinator
+            .tx_drive
+            .restore_map(&std::collections::HashMap::from([(
+                "20m".to_string(),
+                saved(-4.0),
+            )]));
+    })
+    .await;
+    let audio_rx = audio_receiver(&harness).await;
+    let texts = ["CQ N0CALL FN20", "CQ N0CALL EN27"];
+    let item = |text: &str, offset: f64| TransmitRequestItem {
+        attempt_id: None,
+        message_text: text.to_string(),
+        frequency_offset: offset,
+        qso_id: None,
+        origin: TxOrigin::Local,
+        remote_client_key_id: None,
+    };
+    harness
+        .coordinator
+        .message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Autonomous,
+            ComponentId::Ft8Transmitter,
+            MessageType::MultiTransmitRequest {
+                items: vec![item(texts[0], 1000.0), item(texts[1], 1600.0)],
+                tx_parity: None,
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut key_downs = Vec::new();
+    let mut audio = Vec::new();
+    let mut completed = std::collections::HashSet::new();
+    let mut fed = false;
+    while completed.len() < texts.len() {
+        assert!(Instant::now() < deadline, "bundle did not complete");
+        while let Ok(msg) = harness.hamlib_rx.try_recv() {
+            if matches!(
+                msg.message_type,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+            ) {
+                key_downs.push(msg.tx_drive_attempt);
+            }
+        }
+        while let Ok(msg) = audio_rx.try_recv() {
+            if let MessageType::AudioOutput {
+                samples,
+                playback_started,
+                ..
+            } = msg.message_type
+            {
+                audio.push((samples, playback_started));
+            }
+        }
+        if !fed && !key_downs.is_empty() && !audio.is_empty() {
+            fed = true;
+            let attempt = key_downs[0]
+                .clone()
+                .expect("FT key-down carries an attempt");
+            attempt.confirm();
+            audio[0]
+                .1
+                .take()
+                .expect("audio ack")
+                .started(chrono::Utc::now());
+            attempt.sample(alc_sample(0.02));
+            attempt.sample(alc_sample(0.03));
+        }
+        while let Ok(msg) = harness.autonomous_rx.try_recv() {
+            if let MessageType::TransmitComplete {
+                success: true,
+                message_text,
+                ..
+            } = msg.message_type
+            {
+                completed.insert(message_text);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(key_downs.len(), 1, "one key-down for the bundle");
+    assert_eq!(audio.len(), 1, "one waveform for the bundle");
+    assert_waveform_db(&audio[0].0, -4.0, "bundle burst");
+    // Two items, one burst: exactly one +0.5 dB step.
+    let (next, _) = transmit(&harness, &audio_rx, "CQ K5ARH EM10", &[0.2]).await;
+    assert_waveform_db(&next, -3.5, "burst after the bundle");
 }
