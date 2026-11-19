@@ -2468,7 +2468,11 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
-        assert_carries_all::<LoggingConfig>("LoggingConfig", &[], |a, b| a.merge_with(b));
+        assert_carries_all::<LoggingConfig>(
+            "LoggingConfig",
+            &[("n1mm_udp", json!("127.0.0.1:12060"))],
+            |a, b| a.merge_with(b),
+        );
         assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
             a.merge_with(b)
         });

@@ -133,6 +133,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `health/` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
+| `n1mm_udp.rs` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
+| `n1mm_udp/` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |

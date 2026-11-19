@@ -34,6 +34,7 @@ mod gain_sweep_runtime;
 mod hamlib;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
+mod n1mm_udp;
 mod pipeline;
 mod psk_reporter;
 mod qrz_lookup;

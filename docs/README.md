@@ -12,6 +12,7 @@ working note loses.
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate relationships, component diagram, channel topology |
 | [CONFIG.md](CONFIG.md) | Configuration reference for `~/.pancetta/pancetta.toml` |
+| [INTEROP.md](INTEROP.md) | Logger compatibility for the WSJT-X UDP and N1MM contactinfo channels |
 | [RUNBOOK.md](RUNBOOK.md) | Operator procedures: modes, supervision, Phase 5 checklist |
 | [KEYBINDINGS.md](KEYBINDINGS.md) | Generated TUI keybinding reference (source: `pancetta-tui/src/keymap.rs`; drift-tested) |
 | [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md) | Generated supported-rig list with per-rig test status (source: `pancetta-hamlib/src/models.rs`; drift-tested) |

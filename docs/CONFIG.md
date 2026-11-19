@@ -796,21 +796,24 @@ without asking for it. See `docs/observability-diagnostics-plan.md`
 
 ---
 
-### `[logging]` — attribution comment in logged contacts
+### `[logging]` — attribution comment and N1MM UDP in logged contacts
 
 ```toml
 [logging]
 attribution_comment = false
+# n1mm_udp = "127.0.0.1:12060"
 ```
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `attribution_comment` | bool | `false` | Append the Pancetta/cqdx software attribution to new ADIF comments. |
+| `n1mm_udp` | string | absent | IP address and port that receives one N1MM Logger+ contactinfo datagram per logged QSO. Absent or blank: off. Hostnames are rejected. Never sent under --replay. See [INTEROP.md](INTEROP.md). |
 
-This covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads and WSJT-X LoggedADIF.
-Operator notes and the HOUND marker are always preserved. The cqdx.io JSON
-upload and `pancetta export` do not add attribution. Existing records are not
-rewritten. Changes require a restart.
+Attribution covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads, WSJT-X
+LoggedADIF and the N1MM contactinfo comment. Operator notes and the HOUND
+marker are always preserved. The cqdx.io JSON upload and `pancetta export` do
+not add attribution. Existing records are not rewritten. Both settings require
+a restart.
 
 ## `[network]` — external services
 

@@ -380,6 +380,8 @@ required. GridTracker's "Halt TX" button (`HaltTx`) is always honored
 once `accept_udp_requests = true`, independent of `allow_tx_initiation`
 — stopping TX doesn't need the same consent as starting it.
 
+What has been checked with each logger: [compatibility table](INTEROP.md).
+
 ### …feed WSJT-X's decodes into pancetta?
 
 If WSJT-X runs on the same machine as pancetta (for example as a second
