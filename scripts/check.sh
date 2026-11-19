@@ -3,9 +3,13 @@
 #
 # GATE MODEL (2026-06-28): GitHub CI (.github/workflows/ci.yml) is the
 # AUTHORITATIVE gate. Its heavy lanes (full workspace tests, examples build,
-# cargo-deny, cross-platform) run on every PR *and* every push to main, so
-# `main` is comprehensively gated regardless of how a change lands. This script
-# is therefore a FAST local PRE-FLIGHT, not a full CI mirror.
+# cargo-deny, cross-platform) run on every PR *and* every push to main —
+# except a push whose commit a merge-group CI run already verified at both
+# heavy lanes, which skips them (PAN-367: the merge queue fast-forwards main
+# onto the already-tested tree; a cache-key-input change still runs them; see
+# docs/DECISIONS/config-and-platform.md). `main` is therefore comprehensively
+# gated regardless of how a change lands. This script is a FAST local
+# PRE-FLIGHT, not a full CI mirror.
 #
 #   - As a pre-push HOOK (auto-detected): runs the FAST lane — fmt + clippy +
 #     research-guard + `cargo check --workspace --all-targets` (compile/API-drift,
@@ -141,8 +145,10 @@ run "pancetta-ft8 default build, all targets (check)" cargo check -p pancetta-ft
 # --- Test lane (FULL only; CI runs this on every PR + main push) ------------
 #
 # The workspace test RUN is the expensive part. CI runs it authoritatively on
-# every PR and every push to main, so the hook (FAST) skips it; run the script
-# manually (no args / --full) when you want local certainty.
+# every PR and every push to main — a push whose commit a merge group already
+# verified at both heavy lanes skips it (PAN-367,
+# docs/DECISIONS/config-and-platform.md) — so the hook (FAST) skips it; run
+# the script manually (no args / --full) when you want local certainty.
 
 if [[ "$FAST" -eq 0 ]]; then
     run "workspace tests"   cargo test --workspace --features transmit

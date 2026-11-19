@@ -1440,3 +1440,74 @@ the lock and paths (CI compiles both, Linux CI runs the tests).
 - The build script watches existing git `HEAD`, `refs/heads`, `packed-refs` and `reftable` paths. Missing watched paths make Cargo rebuild on every invocation. A HEAD move rebuilt `pancetta` once in 1m27s on the 32-core research container. Git location environment overrides are removed so a hook or outer command cannot redirect discovery away from the compiled sources.
 - Wire versions, user agents and cache keys retain bare semver. The generated zsh completion script is not checked in. It follows clap's live command tree, including global flags as `--help` lists them, and uses first-sentence descriptions. Only zsh is supported. Completions return before logging and config startup; broken pipes are tolerated.
 - No `vergen`, `clap_complete` or `clap_mangen` dependency is needed. The release gate `scripts/check-build-identity.sh` verifies the binary's identity against the checked-out commit and matrix target.
+
+## Merge-group-verified pushes skip the heavy lanes (PAN-367, 2026-11-19)
+
+Every merge through the native merge queue ran CI twice on a byte-identical
+tree: the `merge_group` run, then the `push` run GitHub fires 26-29 s later
+when the queue fast-forwards `main` to the group head (14 of 14 sampled
+commits had both runs on the same SHA). The push run spent ~95 of ~100
+runner-minutes on `Workspace Check` + `Workspace Tests` and averaged ~27 min
+wall clock; its two observed failures (a flaky workspace test, a rustup
+download timeout) were noise on trees the merge group had already passed.
+
+- **Mechanism.** The push run's `changes` job looks up
+  `actions/workflows/ci.yml/runs?head_sha=$SHA&event=merge_group&status=success`
+  (paginated; `event`/`head_sha`/`conclusion` re-checked in jq — a check-run
+  payload carries no `event`, so the ticket's single `commits/$SHA/check-runs`
+  call cannot separate the merge-group suite from the push suite), then the
+  matched run's jobs (`filter=latest`), and publishes
+  `merge_group_verified=true` + `merge_group_run=<id>` only when job
+  `Workspace Check` and at least one `Workspace Tests (n/4)` concluded
+  `success`. The run-level conclusion alone is not proof: a notes-only merge
+  group is green with every Rust lane skipped (PAN-172). A `::notice::` and a
+  step-summary line record `already verified in merge group <run_id> (<url>)`;
+  a non-skip push writes the reason instead, so every push explains itself.
+- **Lane set.** Only `workspace-check` and `workspace-tests` gain the
+  `merge_group_verified != 'true'` term (identical strings, as the nextest
+  guard requires). The ticket's "FT8 Tests" lane no longer exists (folded into
+  `workspace-check` by PAN-321) and `cross-platform-check` never ran on push.
+  Clippy, Format, Cargo Deny, Research Check, `research-scan-tests`,
+  `changes` and the `ci` aggregator still run on every push.
+- **Cache-warm exception.** A push that changes `**/Cargo.toml`,
+  `**/Cargo.lock`, `rust-toolchain.toml`, `.cargo/**` or
+  `.github/workflows/ci.yml` (paths-filter key `cache_inputs`) still runs both
+  lanes. The push run is the only writer of those two rust-cache generations
+  (all 17 live caches sit on `refs/heads/main`); skipping unconditionally
+  would leave PRs restoring stale generations after every manifest change
+  until the weekly schedule. 4 of 14 sampled pushes still run in full. This
+  is a deliberate deviation from a literal reading of the ticket's skip
+  scenario for those commits; the cost is ~25 min of wall clock on a push that
+  changes a manifest, the benefit is no silent PR-build regression for a week.
+- **Fail closed.** The lookup step runs only on `push`, has
+  `continue-on-error: true`, writes `verified=false` first, never uses
+  `set -e`, and every error path (gh failure on either call, unparseable
+  response, no matching run) appends its reason to the step summary and exits
+  0. The lanes' `!= 'true'` gate treats empty or failed output as "run".
+  `changes` stays out of the aggregator's `needs`, so this adds no new way
+  for the aggregator to go green without work (the pre-existing fail-open
+  when `changes` itself fails is unchanged and remains a separate follow-up).
+- **Dispatch/schedule by construction.** The step's `if` is
+  `github.event_name == 'push'`; every other event leaves the output empty
+  and its lanes' existing terms are untouched, so scheduled and manual runs
+  still test everything.
+- **Main Alert.** `main-alert.yml` is untouched (a credenza inlined copy;
+  change it there first). Its `workflow_run` contract — workflow name `CI`,
+  the push trigger, and `effective_success` requiring at least one non-skipped
+  job — accepts a verified-skip push run, because the cheap lanes, `changes`,
+  `research-scan-tests` and `ci` all still ran; a green skip-push closes an
+  open main-red issue exactly like today's notes-only green pushes (replayed
+  live against notes-only push run 44190682420 during research, and offline by
+  the guard).
+- **Measured saving.** ~95 of ~100 runner-minutes and ~25 min wall clock per
+  merged PR that skips (10 of the 14 sampled commits).
+
+Offline coverage: `scripts/ci/test-ci-merge-group-verified.sh` (stub-`gh`
+cases `verified`, `two-pages`, `notes-only-mg`, `no-run`, `gh-fails`,
+`jobs-fails`, `cache-inputs`, plus a Main Alert `effective_success` replay)
+and the widened matrix in `scripts/ci/test-ci-merge-group-scope.sh`. Live
+runner behaviour is post-merge observation: the first push after a
+non-manifest PR merge should show both heavy lanes skipped with the summary
+line present, and the first push after this change's own merge runs in full
+(it changes `.github/workflows/ci.yml`, a cache-key input — the exception
+exercising itself).
