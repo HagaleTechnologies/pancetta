@@ -58,8 +58,11 @@ use std::time::Duration;
 ///   multipass / OSD depth should be considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareTier {
+    /// Probe p95 below 400 ms.
     Fast,
+    /// Probe p95 from 400 ms up to, but not including, 1200 ms.
     Moderate,
+    /// Probe p95 of 1200 ms or more.
     Slow,
 }
 
@@ -156,11 +159,17 @@ pub fn recommend_actions(tier: HardwareTier) -> Vec<TierRecommendation> {
 pub struct TierProbeResult {
     /// Per-iteration sorted decode wall-clock samples.
     pub samples: Vec<Duration>,
+    /// Median decode time: the sample at the rounded 50th-percentile index of `samples`.
     pub p50: Duration,
+    /// 95th-percentile decode time; the value the tier is classified from.
     pub p95: Duration,
+    /// 99th-percentile decode time.
     pub p99: Duration,
+    /// Slowest sample, or zero when there are no samples.
     pub max: Duration,
+    /// Tier from `classify_tier` applied to `p95` in milliseconds.
     pub tier: HardwareTier,
+    /// Actions from `recommend_actions` for `tier`.
     pub recommendations: Vec<TierRecommendation>,
 }
 

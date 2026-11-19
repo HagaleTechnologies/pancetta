@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hello {
+    /// Protocol version the client speaks (see `PROTOCOL_VERSION`).
     pub protocol_version: u32,
+    /// Client application name, for example `"Panino"`.
     pub client_name: String,
+    /// Client application version string.
     pub client_version: String,
     /// Local-gateway credential; must match `[network.remote_gateway].auth_token`.
     /// Never sent over the relay. Omitted on the wire when absent.
@@ -45,8 +48,11 @@ impl std::fmt::Debug for Hello {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Welcome {
+    /// Protocol version the server speaks (`PROTOCOL_VERSION`).
     pub protocol_version: u32,
+    /// Server software version; pancetta sends its package version.
     pub server_version: String,
+    /// Full current state at connect time.
     pub snapshot: StateSnapshot,
 }
 
@@ -54,8 +60,11 @@ pub struct Welcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateSnapshot {
+    /// Rig dial frequency in Hz.
     pub frequency_hz: u64,
+    /// Split TX dial frequency in Hz, or 0 for simplex.
     pub split_tx_hz: u64,
+    /// Global TX policy.
     #[serde(with = "wire_serde::tx_policy")]
     pub tx_policy: TxPolicy,
     /// Station-wide active operating mode ("FT8"/"FT4"/"FT2"). Added in the
@@ -66,9 +75,13 @@ pub struct StateSnapshot {
     /// (absent ⇒ "FT8", matching Q-0009's stated additive semantics).
     #[serde(default = "default_mode_ft8")]
     pub mode: String,
+    /// DX Hunter rows.
     pub dx_hunter: Vec<DxRow>,
+    /// QSOs currently active.
     pub active_qsos: Vec<QsoProgress>,
+    /// Manual calls parked in the cross-parity queue, not yet started.
     pub pending_calls: Vec<PendingCall>,
+    /// Most recent decodes, oldest first; pancetta keeps the last 100.
     pub recent_decodes: Vec<DecodedView>,
 }
 
@@ -84,9 +97,15 @@ fn default_mode_ft8() -> String {
 #[serde(tag = "frame", rename_all = "camelCase")]
 pub enum ClientFrame {
     /// Opening handshake.
-    Hello { hello: Hello },
+    Hello {
+        /// The handshake payload.
+        hello: Hello,
+    },
     /// A `ClientCommand` relayed over the wire.
-    Command { command: ClientCommand },
+    Command {
+        /// The command payload.
+        command: ClientCommand,
+    },
 }
 
 impl ClientFrame {
@@ -109,9 +128,15 @@ impl ClientFrame {
 #[serde(tag = "frame", rename_all = "camelCase")]
 pub enum ServerFrame {
     /// Server's opening reply carrying a full state snapshot.
-    Welcome { welcome: Welcome },
+    Welcome {
+        /// The welcome payload.
+        welcome: Welcome,
+    },
     /// A `ServerEvent` pushed to the client.
-    Event { event: ServerEvent },
+    Event {
+        /// The event payload.
+        event: ServerEvent,
+    },
 }
 
 impl ServerFrame {

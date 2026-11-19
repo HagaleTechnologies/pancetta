@@ -10,8 +10,12 @@ use std::ops::Range;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Protocol {
+    /// FT8: 8-tone GFSK, 79 symbols, 6.25 Hz tone spacing, 15 s cycle.
     Ft8,
+    /// FT4: 4-tone GFSK, 105 symbols, 20.833 Hz tone spacing, 7.5 s cycle.
     Ft4,
+    /// FT2: 8-tone GFSK, 79 symbols, 25 Hz tone spacing, 3.2 s cycle
+    /// (behind the `ft2` feature).
     #[cfg(feature = "ft2")]
     Ft2,
 }
@@ -68,7 +72,10 @@ pub enum ModulationType {
     Cpfsk,
     /// Gaussian FSK with specified bandwidth-time product.
     /// FT8 uses `Gfsk { bt: 2.0 }`; FT4 uses `Gfsk { bt: 1.0 }`.
-    Gfsk { bt: f64 },
+    Gfsk {
+        /// Gaussian filter bandwidth-time product (BT).
+        bt: f64,
+    },
 }
 
 /// Complete set of protocol parameters that distinguish FT8/FT4/FT2.
@@ -131,8 +138,11 @@ static FT8_DATA_RANGES: [Range<usize>; 2] = [7..36, 43..72];
 
 /// FT4 uses four distinct Costas-like sync arrays (from kFT4_Costas_pattern)
 pub const FT4_COSTAS_0: [u8; 4] = [0, 1, 3, 2];
+/// Second FT4 sync array (`kFT4_Costas_pattern[1]`).
 pub const FT4_COSTAS_1: [u8; 4] = [1, 0, 2, 3];
+/// Third FT4 sync array (`kFT4_Costas_pattern[2]`).
 pub const FT4_COSTAS_2: [u8; 4] = [2, 3, 1, 0];
+/// Fourth FT4 sync array (`kFT4_Costas_pattern[3]`).
 pub const FT4_COSTAS_3: [u8; 4] = [3, 2, 0, 1];
 
 /// FT4 Costas arrays (four different patterns)

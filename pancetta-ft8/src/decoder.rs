@@ -216,6 +216,8 @@ pub enum OsdInput {
     OffsetSubtracted(f32),
 }
 
+/// Decoder configuration: sample rate, protocol, decode passes and the
+/// tuning knobs of the candidate search, LDPC and OSD stages.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8Config {

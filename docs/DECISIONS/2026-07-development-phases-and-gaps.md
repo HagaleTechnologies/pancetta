@@ -93,16 +93,17 @@
     move under the gate (`apply_tx_offset_switch` takes `qsos` before `ptt_sync_gate`); closing
     it needs the QSO task to arbitrate the QSY, for example a request/ack through its message loop.
 
-## Missing-docs lint status (verified 2026-07-17)
+## Missing-docs lint status (verified 2026-11-18)
 
 Per-crate `#![...(missing_docs)]` levels, dropped from CLAUDE.md's "Documentation Policy" section
 to keep that section to a policy statement rather than a point-in-time status list:
 
 - `pancetta-core`: `#![warn(missing_docs)]`
+- `pancetta-ft8`: `#![deny(missing_docs)]` (PAN-373)
 - `pancetta-hamlib`: `#![deny(missing_docs)]`
-- `pancetta-protocol`: no `missing_docs` attribute set (defaults to allow)
+- `pancetta-protocol`: `#![deny(missing_docs)]` (PAN-373)
 - All other crates (`pancetta`, `pancetta-agent`, `pancetta-audio`, `pancetta-dsp`, `pancetta-config`,
-  `pancetta-qso`, `pancetta-dx`, `pancetta-cqdx`, `pancetta-tui`, `pancetta-ft8`, `pancetta-research`):
+  `pancetta-qso`, `pancetta-dx`, `pancetta-cqdx`, `pancetta-tui`, `pancetta-research`):
   `#![allow(missing_docs)]` with a `// TODO: documentation pass pending` comment.
 
 Switch each crate to `warn`/`deny` as its doc coverage lands.
