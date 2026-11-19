@@ -104,6 +104,7 @@ objc2-av-foundation = { version = "0.3.2", default-features = false, features = 
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+pancetta-dx = { path = "../pancetta-dx", features = ["qrz-test-support"] }
 tokio = { version = "1.50", features = ["test-util"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }

@@ -85,7 +85,9 @@ pub struct QrzXmlClient {
 
 impl QrzXmlClient {
     fn http_builder() -> reqwest::ClientBuilder {
-        Client::builder().timeout(Duration::from_secs(QRZ_XML_TIMEOUT_SECS))
+        Client::builder()
+            .timeout(Duration::from_secs(QRZ_XML_TIMEOUT_SECS))
+            .https_only(true)
     }
 
     /// QRZ XML API base URL.
@@ -107,19 +109,55 @@ impl QrzXmlClient {
             base_url: Self::BASE_URL.to_string(),
             client: Self::http_builder()
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                .expect("QRZ HTTPS client configuration"),
             session_key: Mutex::new(None),
         }
     }
 
-    /// Point the client at another endpoint. Test and mock-server seam only:
-    /// production builds the client with [`new`](Self::new), which always uses
-    /// QRZ's HTTPS endpoint. `pub` so the coordinator's tests can drive a
-    /// failing server; hidden from rustdoc like `pancetta_qso::sim`.
+    /// Override the HTTPS endpoint. Invalid or plaintext URLs are rejected before use.
     #[doc(hidden)]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into();
+        let parsed = reqwest::Url::parse(&base_url).map_err(|_| Self::url_error())?;
+        if parsed.scheme() != "https" || parsed.host().is_none() {
+            return Err(Self::url_error());
+        }
+        self.base_url = base_url;
+        Ok(self)
+    }
+
+    fn url_error() -> DxError {
+        DxError::from(DxErrorInner::Configuration(
+            "QRZ XML base URL must use HTTPS".into(),
+        ))
+    }
+
+    /// Use a literal loopback HTTP fixture in test builds only.
+    #[cfg(any(test, feature = "qrz-test-support"))]
+    #[doc(hidden)]
+    pub fn with_mock_base_url(mut self, base_url: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into();
+        let parsed = reqwest::Url::parse(&base_url).map_err(|_| Self::url_error())?;
+        if parsed.scheme() != "http"
+            || !matches!(parsed.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+                && !matches!(parsed.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback())
+        {
+            return Err(Self::url_error());
+        }
+        let origin = parsed.origin();
+        self.client = Client::builder()
+            .timeout(Duration::from_secs(QRZ_XML_TIMEOUT_SECS))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.url().origin() == origin {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()?;
+        self.base_url = base_url;
+        Ok(self)
     }
 
     /// Look up a callsign, returning the parsed [`QrzLookup`].
@@ -181,22 +219,35 @@ impl QrzXmlClient {
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let body = crate::body::text_within(resp, QRZ_XML_MAX_BODY_BYTES).await?;
 
-        match parse_session(&body)? {
+        let parsed = parse_session(&body).map_err(|_| {
+            DxError::from(DxErrorInner::ExternalService(
+                "Malformed QRZ XML response".into(),
+            ))
+        })?;
+        match parsed {
             SessionResult::Key(key) => {
                 debug!(target: "dx.qrz", "QRZ authentication succeeded");
                 Ok(key)
             }
             SessionResult::Error(msg) => {
-                // `msg` is QRZ's own error text (e.g. "Username/password
-                // incorrect"), never our credentials.
+                // QRZ controls this text and may echo request credentials.
                 Err(DxError::from(DxErrorInner::ExternalService(format!(
-                    "QRZ authentication failed: {msg}"
+                    "QRZ authentication failed: {}",
+                    self.sanitize(&msg, &[])
                 ))))
             }
             SessionResult::None => Err(DxError::from(DxErrorInner::ExternalService(
                 "QRZ authentication returned no session key or error".to_string(),
             ))),
         }
+    }
+
+    fn sanitize(&self, message: &str, extra: &[&str]) -> String {
+        let mut secrets = vec![self.username.as_str(), self.password.as_str()];
+        secrets.extend_from_slice(extra);
+        let encoded: Vec<String> = secrets.iter().map(|s| urlencode(s)).collect();
+        secrets.extend(encoded.iter().map(String::as_str));
+        pancetta_core::error_redaction::sanitize_error_body(message, &secrets)
     }
 
     /// Perform a single lookup with the given session key.
@@ -209,13 +260,26 @@ impl QrzXmlClient {
 
         // A session error in the response (timeout/invalid) is surfaced as an
         // ExternalService error so `lookup` can decide whether to re-auth.
-        if let SessionResult::Error(msg) = parse_session(&body)? {
+        if let SessionResult::Error(msg) = parse_session(&body).map_err(|_| {
+            DxError::from(DxErrorInner::ExternalService(
+                "Malformed QRZ XML response".into(),
+            ))
+        })? {
+            let safe = if is_session_expired(&msg) {
+                "Session Timeout".to_string()
+            } else {
+                self.sanitize(&msg, &[key])
+            };
             return Err(DxError::from(DxErrorInner::ExternalService(format!(
-                "QRZ lookup error: {msg}"
+                "QRZ lookup error: {safe}"
             ))));
         }
 
-        let lookup = parse_callsign(&body)?;
+        let lookup = parse_callsign(&body).map_err(|_| {
+            DxError::from(DxErrorInner::ExternalService(
+                "Malformed QRZ XML response".into(),
+            ))
+        })?;
         if lookup == QrzLookup::default() {
             return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "QRZ returned no callsign data for '{callsign}'"
@@ -513,7 +577,8 @@ mod tests {
     #[test]
     fn client_constructs_with_base_url_override() {
         let c = QrzXmlClient::new("user", "pass", "pancetta-test")
-            .with_base_url("http://127.0.0.1:0/xml/current/");
+            .with_mock_base_url("http://127.0.0.1:0/xml/current/")
+            .unwrap();
         assert_eq!(c.username, "user");
         assert_eq!(c.agent, "pancetta-test");
         assert!(c.base_url.starts_with("http://127.0.0.1"));
@@ -571,7 +636,9 @@ mod tests {
     async fn auth_then_lookup_parses_fields() {
         // Request 1 = auth (returns Key), request 2 = lookup (returns Callsign).
         let (base, queries) = spawn_mock(vec![AUTH_OK, LOOKUP_OK]);
-        let client = QrzXmlClient::new("user", "pass", "pancetta-test").with_base_url(base);
+        let client = QrzXmlClient::new("user", "pass", "pancetta-test")
+            .with_mock_base_url(base)
+            .unwrap();
 
         let lookup = client.lookup("AA7BQ").await.unwrap();
         assert_eq!(lookup.call.as_deref(), Some("AA7BQ"));
@@ -595,7 +662,9 @@ mod tests {
         // Seed a (stale) cached session key, then: lookup#1 -> Session Timeout,
         // re-auth -> new Key, lookup#2 -> Callsign.
         let (base, queries) = spawn_mock(vec![SESSION_TIMEOUT, AUTH_OK, LOOKUP_OK]);
-        let client = QrzXmlClient::new("user", "pass", "pancetta-test").with_base_url(base);
+        let client = QrzXmlClient::new("user", "pass", "pancetta-test")
+            .with_mock_base_url(base)
+            .unwrap();
         *client.session_key.lock().await = Some("stale-key".to_string());
 
         let lookup = client.lookup("AA7BQ").await.unwrap();
@@ -614,7 +683,9 @@ mod tests {
     #[tokio::test]
     async fn bad_credentials_surface_as_error() {
         let (base, _queries) = spawn_mock(vec![AUTH_BAD_CREDS]);
-        let client = QrzXmlClient::new("user", "wrong", "pancetta-test").with_base_url(base);
+        let client = QrzXmlClient::new("user", "wrong", "pancetta-test")
+            .with_mock_base_url(base)
+            .unwrap();
         let err = client.lookup("AA7BQ").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("authentication failed"), "msg: {msg}");
@@ -634,7 +705,8 @@ mod tests {
 
     fn client_at(addr: std::net::SocketAddr) -> QrzXmlClient {
         QrzXmlClient::new("user", SECRET_PASSWORD, "pancetta-test")
-            .with_base_url(format!("http://{addr}/xml/current/"))
+            .with_mock_base_url(format!("http://{addr}/xml/current/"))
+            .unwrap()
     }
 
     /// A client that already holds a session key, so `lookup` goes straight to
@@ -774,3 +846,10 @@ mod tests {
 #[cfg(test)]
 #[path = "qrz_xml/tests/tls_security_tests.rs"]
 mod tls_security_tests;
+
+#[cfg(test)]
+#[path = "qrz_xml/tests/endpoint_scheme_tests.rs"]
+mod endpoint_scheme_tests;
+#[cfg(test)]
+#[path = "qrz_xml/tests/error_redaction_tests.rs"]
+mod error_redaction_tests;

@@ -115,6 +115,19 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
         );
         return;
     }
+    #[cfg(not(test))]
+    if let Some(url) = &ctx.base_url {
+        if let Err(err) = QrzXmlClient::new("", "", "validator").with_base_url(url) {
+            tracing::warn!(target: "dx.qrz", "{err}");
+            status(
+                &ctx.tx,
+                format!("{callsign} lookup failed"),
+                pancetta_core::DiagnosticLevel::Warn,
+            );
+            ctx.in_flight.store(false, Ordering::Release);
+            return;
+        }
+    }
     let guard = FlightGuard(ctx.in_flight.clone());
     let client = {
         let mut client = ctx.client.lock().await;
@@ -126,7 +139,15 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
                     format!("pancetta-{}", env!("CARGO_PKG_VERSION")),
                 );
                 Arc::new(if let Some(url) = &ctx.base_url {
-                    c.with_base_url(url)
+                    #[cfg(test)]
+                    {
+                        c.with_mock_base_url(url).expect("test QRZ endpoint")
+                    }
+                    #[cfg(not(test))]
+                    {
+                        c.with_base_url(url)
+                            .expect("QRZ endpoint validated before client construction")
+                    }
                 } else {
                     c
                 })
