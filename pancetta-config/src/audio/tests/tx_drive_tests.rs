@@ -1,6 +1,109 @@
 use crate::{Config, ConfigSection};
 
 #[test]
+fn auto_drive_defaults_round_trip_and_merge() {
+    let defaults = Config::default();
+    assert!(defaults.audio.auto_drive.enabled);
+    assert_eq!(defaults.audio.auto_drive.alc_onset, 0.10);
+    assert_eq!(defaults.audio.auto_drive.step_up_db, 0.5);
+    assert_eq!(defaults.audio.auto_drive.step_down_db, 2.0);
+    assert_eq!(defaults.audio.auto_drive.start_db, -6.0);
+    assert_eq!(defaults.audio.levels.output_gain_floor_db, -20.0);
+    let toml = toml::to_string(&defaults.audio).unwrap();
+    let json = serde_json::to_string(&defaults.audio).unwrap();
+    assert!(
+        toml::from_str::<crate::audio::AudioConfig>(&toml)
+            .unwrap()
+            .auto_drive
+            .enabled
+    );
+    assert!(
+        serde_json::from_str::<crate::audio::AudioConfig>(&json)
+            .unwrap()
+            .auto_drive
+            .enabled
+    );
+    let mut merged = crate::audio::AudioConfig::default();
+    let overlay = toml::from_str::<crate::audio::AudioConfig>(
+        "[auto_drive]\nenabled = false\nstep_up_db = 0.75\n",
+    )
+    .unwrap();
+    merged.merge_with(overlay);
+    assert!(!merged.auto_drive.enabled);
+    assert_eq!(merged.auto_drive.step_up_db, 0.75);
+}
+
+#[test]
+fn auto_drive_validates_limits_and_clamps_legacy_gain() {
+    let mut config = Config::default();
+    config.audio.levels.output_gain_floor_db = -10.0;
+    config.audio.levels.output_gain_db = -18.0;
+    config.clamp_tx_drive();
+    assert_eq!(config.audio.levels.output_gain_db, -10.0);
+    config.audio.auto_drive.alc_onset = 0.5;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("audio.auto_drive.alc_onset"));
+    config.audio.auto_drive.enabled = false;
+    assert!(config.validate().is_ok());
+    config.audio.levels.output_gain_floor_db = -21.0;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("output_gain_floor_db"));
+}
+
+#[test]
+fn auto_drive_rejects_nonfinite_and_nonpositive_controls() {
+    for (field, value) in [
+        ("alc_onset", f32::NAN),
+        ("step_up_db", 0.0),
+        ("step_down_db", -1.0),
+        ("start_db", f32::INFINITY),
+    ] {
+        let mut config = Config::default();
+        match field {
+            "alc_onset" => config.audio.auto_drive.alc_onset = value,
+            "step_up_db" => config.audio.auto_drive.step_up_db = value,
+            "step_down_db" => config.audio.auto_drive.step_down_db = value,
+            "start_db" => config.audio.auto_drive.start_db = value,
+            _ => unreachable!(),
+        }
+        assert!(config
+            .audio
+            .validate_section()
+            .unwrap_err()
+            .to_string()
+            .contains(field));
+    }
+}
+
+#[test]
+fn auto_drive_onset_uses_effective_rig_limit() {
+    let mut config = Config::default();
+    config.rig.power_control.protection.max_alc = 0.2;
+    config.audio.auto_drive.alc_onset = 0.2;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("alc_onset"));
+    config.audio.auto_drive.alc_onset = 0.19;
+    assert!(config.validate().is_ok());
+    config.rig.power_control.protection.alc_overdrive_warning = false;
+    config.rig.power_control.protection.max_alc = 2.0;
+    config.audio.auto_drive.alc_onset = 0.5;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("alc_onset"));
+}
+
+#[test]
 fn drive_validates_and_bounds_legacy_gain() {
     let mut config = Config::default();
     assert_eq!(config.audio.levels.output_gain_db, 0.0);

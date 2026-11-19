@@ -172,6 +172,13 @@ fn every_documented_config_snippet_loads_cleanly() {
         "GUIDE.md cross-machine UDP recipe not found"
     );
     assert!(
+        fenced
+            .iter()
+            .any(|s| s.origin.starts_with("docs/INTEROP.md")
+                && s.text.contains("n1mm_udp = \"127.0.0.1:12060\"")),
+        "docs/INTEROP.md N1MM recipe not found"
+    );
+    assert!(
         inline.iter().any(
             |s| s.origin.starts_with("README.md") && s.text == "[autonomous]\nenabled = true\n"
         ),

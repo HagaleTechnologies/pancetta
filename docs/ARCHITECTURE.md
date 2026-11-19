@@ -133,6 +133,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `health/` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
+| `n1mm_udp.rs` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
+| `n1mm_udp/` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
@@ -162,9 +164,11 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
 | `tx_drive.rs` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
+| `tx_drive/` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
+| `tx_meter/` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `util.rs` | Linear resampling for WAV playback. |

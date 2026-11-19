@@ -39,6 +39,7 @@ pub mod response_step;
 pub mod slot;
 pub mod slot_clock;
 pub mod solar;
+pub mod tx_drive_mode;
 pub mod tx_freq_mode;
 pub mod tx_meter;
 pub mod tx_policy;
@@ -48,6 +49,7 @@ pub mod utc_window;
 // Re-export core types at the crate root for convenience
 pub use diagnostic_level::DiagnosticLevel;
 pub use response_step::ResponseStep;
+pub use tx_drive_mode::TxDriveMode;
 pub use tx_freq_mode::TxFreqMode;
 pub use tx_policy::TxPolicy;
 pub use types::{Band, IaruRegion, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};

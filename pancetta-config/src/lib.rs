@@ -317,11 +317,13 @@ impl Config {
         if !levels.output_gain_db.is_finite()
             || !levels.output_gain_ceiling_db.is_finite()
             || !(-20.0..=5.0).contains(&levels.output_gain_ceiling_db)
+            || !levels.output_gain_floor_db.is_finite()
+            || !(-20.0..=levels.output_gain_ceiling_db).contains(&levels.output_gain_floor_db)
         {
             return None;
         }
         let raw = levels.output_gain_db;
-        let applied = raw.clamp(-20.0, levels.output_gain_ceiling_db);
+        let applied = raw.clamp(levels.output_gain_floor_db, levels.output_gain_ceiling_db);
         if raw == applied {
             return None;
         }
@@ -478,6 +480,20 @@ impl Config {
         self.station.validate_section()?;
         self.audio.validate_section()?;
         self.rig.validate_section()?;
+        if self.audio.auto_drive.enabled {
+            let configured = self.rig.power_control.protection.max_alc;
+            let limit = if configured.is_finite() && configured > 0.0 && configured < 1.0 {
+                configured
+            } else {
+                rig::DEFAULT_MAX_ALC
+            };
+            if self.audio.auto_drive.alc_onset >= limit {
+                return Err(ConfigError::InvalidValue {
+                    field: "audio.auto_drive.alc_onset".into(),
+                    value: self.audio.auto_drive.alc_onset.to_string(),
+                });
+            }
+        }
         self.ui.validate_section()?;
         self.network.validate_section()?;
         self.autonomous.validate_section()?;
@@ -2098,12 +2114,13 @@ mod data_dir_hardening_tests;
 /// bug class (see the 2026-07-05 CLAUDE.md entry and the
 /// `merge_with_carries_over_*` regression tests in network.rs / station.rs).
 ///
-/// Every `ConfigSection::merge_with` is a hand-maintained list of
-/// `self.field = other.field` lines, so a field added to a config struct later
-/// is trivially forgotten — the parse and validation passes both succeed and
+/// A `ConfigSection::merge_with` that is not a plain `*self = other` is a
+/// hand-maintained list of per-field lines, so a field added to its struct
+/// later is easily forgotten. The parse and validation passes both succeed and
 /// only the *merge* silently reverts the field to its compiled-in default. The
 /// field-specific regression tests only guard the fields someone thought to
-/// list; this test is structural.
+/// list; this test is structural. `merge_rules_tests` (PAN-371) pins what each
+/// field does when the base is populated.
 ///
 /// For each config type we build a *fully non-default* instance by serializing
 /// its `Default`, then perturbing every scalar leaf to a different, non-empty,
@@ -2122,7 +2139,7 @@ mod merge_guard {
     use std::collections::HashSet;
 
     #[derive(Clone)]
-    enum Seg {
+    pub(super) enum Seg {
         Key(String),
         Idx(usize),
     }
@@ -2130,7 +2147,7 @@ mod merge_guard {
     /// Collect paths to every scalar (bool / number / string) leaf. `null` and
     /// empty containers carry no type information, so they're skipped here and
     /// handled via the per-type `overrides` instead.
-    fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
+    pub(super) fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
         match v {
             Value::Object(m) => {
                 for (k, val) in m {
@@ -2151,7 +2168,7 @@ mod merge_guard {
         }
     }
 
-    fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    pub(super) fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
         let mut cur = root;
         for seg in path {
             cur = match seg {
@@ -2162,7 +2179,7 @@ mod merge_guard {
         Some(cur)
     }
 
-    fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
+    pub(super) fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
         let mut cur = root;
         for (i, seg) in path.iter().enumerate() {
             let last = i + 1 == path.len();
@@ -2187,11 +2204,44 @@ mod merge_guard {
         }
     }
 
+    /// Which probe values `build_source_probed` writes. `Base` is the
+    /// default-base guard's probe. `Overlay` (PAN-371) differs from `Base` at
+    /// every string and number leaf and leaves booleans at their default, so a
+    /// populated base and a populated overlay disagree wherever they can.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Probe {
+        Base,
+        Overlay,
+    }
+
     /// A different, non-empty, non-zero value for a scalar leaf. Non-zero /
     /// non-empty matters because several `merge_with` impls skip empty/zero
     /// `other` values, so a zero would be legitimately ignored and mask a real
     /// drop. Numbers stay within their original type's range.
-    fn perturb_scalar(v: &Value) -> Value {
+    fn perturb_scalar(v: &Value, probe: Probe) -> Value {
+        if probe == Probe::Overlay {
+            return match v {
+                Value::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        Value::from(if u <= 2 { u + 3 } else { u - 2 })
+                    } else if let Some(i) = n.as_i64() {
+                        Value::from(if (0..=2).contains(&i) { i + 3 } else { i - 2 })
+                    } else if let Some(f) = n.as_f64() {
+                        Value::from(if f == 0.0 {
+                            3.0
+                        } else if f > 0.0 {
+                            f + 2.0
+                        } else {
+                            f - 2.0
+                        })
+                    } else {
+                        v.clone()
+                    }
+                }
+                Value::String(_) => Value::String("MERGE_GUARD_OVERLAY".to_string()),
+                other => other.clone(),
+            };
+        }
         match v {
             Value::Bool(b) => Value::Bool(!b),
             Value::Number(n) => {
@@ -2225,6 +2275,14 @@ mod merge_guard {
     where
         T: Default + Serialize + DeserializeOwned,
     {
+        build_source_probed(overrides, Probe::Base)
+    }
+
+    /// `build_source` with a chosen probe (PAN-371 populated-base guard).
+    pub(super) fn build_source_probed<T>(overrides: &[(&str, Value)], probe: Probe) -> T
+    where
+        T: Default + Serialize + DeserializeOwned,
+    {
         let mut working = serde_json::to_value(T::default()).expect("serialize default");
         let override_keys: HashSet<&str> = overrides.iter().map(|(k, _)| *k).collect();
         {
@@ -2246,7 +2304,7 @@ mod merge_guard {
                 }
             }
             let cur = get_path(&working, path).expect("path exists");
-            let candidate = perturb_scalar(cur);
+            let candidate = perturb_scalar(cur, probe);
             if &candidate == cur {
                 continue;
             }
@@ -2426,7 +2484,11 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
-        assert_carries_all::<LoggingConfig>("LoggingConfig", &[], |a, b| a.merge_with(b));
+        assert_carries_all::<LoggingConfig>(
+            "LoggingConfig",
+            &[("n1mm_udp", json!("127.0.0.1:12060"))],
+            |a, b| a.merge_with(b),
+        );
         assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
             a.merge_with(b)
         });
@@ -2447,3 +2509,7 @@ mod merge_guard {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lib/tests/merge_rules_tests.rs"]
+mod merge_rules_tests;

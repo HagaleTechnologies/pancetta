@@ -23,6 +23,7 @@ fn a_full_record_with_both_waterfall_pairs_round_trips() {
     )
     .unwrap();
     let full = SessionRecord {
+        tx_drive_by_band: Default::default(),
         tx_freq_mode: Some(TxFreqMode::Auto),
         decode_effort: Some(EffortChoice {
             choice: DecodeEffort::Max,
@@ -142,6 +143,7 @@ fn waterfall_persists_leave_the_other_records_untouched() {
         config_at_save: 0.0,
     });
     let start = SessionRecord {
+        tx_drive_by_band: Default::default(),
         tx_freq_mode: Some(TxFreqMode::Auto),
         decode_effort: effort_max_auto(),
         waterfall_palette: palette,
@@ -394,6 +396,7 @@ fn startup_report_names_restored_waterfall_choices() {
         DecodeEffort::Auto,
         &viridis_six(),
         SessionLoad::Record(SessionRecord {
+            tx_drive_by_band: Default::default(),
             waterfall_palette: Some(WaterfallPaletteChoice {
                 choice: WaterfallPalette::Viridis,
                 config_at_save: WaterfallPalette::Viridis,
@@ -413,6 +416,7 @@ fn startup_report_names_restored_waterfall_choices() {
         DecodeEffort::Auto,
         &viridis_six(),
         SessionLoad::Record(SessionRecord {
+            tx_drive_by_band: Default::default(),
             tx_freq_mode: Some(TxFreqMode::Auto),
             decode_effort: effort_max_auto(),
             waterfall_palette: Some(WaterfallPaletteChoice {
@@ -502,6 +506,7 @@ fn a_record_without_waterfall_choices_saves_the_pan270_format() {
     save(
         &path,
         &SessionRecord {
+            tx_drive_by_band: Default::default(),
             tx_freq_mode: Some(TxFreqMode::Auto),
             decode_effort: None,
             waterfall_palette: None,

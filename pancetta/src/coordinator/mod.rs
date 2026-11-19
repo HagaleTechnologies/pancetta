@@ -34,6 +34,7 @@ mod gain_sweep_runtime;
 mod hamlib;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
+mod n1mm_udp;
 mod pipeline;
 mod psk_reporter;
 mod qrz_lookup;
@@ -60,7 +61,7 @@ mod tx;
 mod tx_drive;
 mod tx_halt;
 mod tx_log;
-mod tx_meter;
+pub(crate) mod tx_meter;
 mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;
@@ -2333,6 +2334,7 @@ impl ApplicationCoordinator {
                 None => session_state::SessionLoad::Missing,
             },
         );
+        tx_drive.restore_map(&session_startup.record.tx_drive_by_band);
         let session_report = session_state::startup_report(&session_startup);
         if let Some(reason) = &session_startup.ignored_reason {
             warn!("Session: saved choices ignored ({reason}); using defaults");

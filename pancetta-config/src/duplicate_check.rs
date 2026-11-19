@@ -43,8 +43,6 @@ impl ConfigSection for DuplicateCheckingConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.time_window_hours = other.time_window_hours;
-        self.check_frequency = other.check_frequency;
+        *self = other;
     }
 }

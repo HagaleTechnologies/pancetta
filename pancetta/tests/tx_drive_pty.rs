@@ -15,7 +15,7 @@ fn attached_terminal_reaches_the_running_station() {
     let path = home.path().join("station.toml");
     std::fs::write(
         &path,
-        "[station]\ncallsign = 'K5ARH'\ngrid_square = 'EM10'\n",
+        "[station]\ncallsign = 'K5ARH'\ngrid_square = 'EM10'\n[audio.auto_drive]\nenabled = false\n",
     )
     .unwrap();
     let mut master_fd = -1;

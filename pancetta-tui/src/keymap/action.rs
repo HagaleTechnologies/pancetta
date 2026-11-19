@@ -291,11 +291,15 @@ pub enum Action {
     TxDriveDown,
     /// F8: raise TX audio drive by 1 dB.
     TxDriveUp,
+    /// F9: toggle the selected band between automatic and manual TX drive.
+    ToggleTxDriveMode,
+    /// Shift+C: calibrate this band with a keyed carrier.
+    CalibrateTxDrive,
 }
 
 impl Action {
     /// Every variant once, in declaration order (`ALL[i].ordinal() == i`).
-    pub const ALL: [Action; 141] = [
+    pub const ALL: [Action; 143] = [
         Action::EmergencyStop,
         Action::OpenQuitConfirm,
         Action::ToggleHelp,
@@ -437,6 +441,8 @@ impl Action {
         Action::WaterfallFocusHint,
         Action::TxDriveDown,
         Action::TxDriveUp,
+        Action::ToggleTxDriveMode,
+        Action::CalibrateTxDrive,
     ];
 
     /// Position in [`Action::ALL`]. Exhaustive with no `_` arm, so a new
@@ -492,6 +498,7 @@ impl Action {
             Action::HaltTx => 45,
             Action::TogglePtt => 46,
             Action::ToggleTune => 47,
+            Action::CalibrateTxDrive => 142,
             Action::FindClearOffset => 48,
             Action::NudgeTxOffset => 49,
             Action::ToggleTxFreqMode => 50,
@@ -585,6 +592,7 @@ impl Action {
             Action::WaterfallFocusHint => 138,
             Action::TxDriveDown => 139,
             Action::TxDriveUp => 140,
+            Action::ToggleTxDriveMode => 141,
         }
     }
 
@@ -597,6 +605,7 @@ impl Action {
             Action::StartCq
             | Action::TogglePtt
             | Action::ToggleTune
+            | Action::CalibrateTxDrive
             | Action::NudgeTxOffset
             | Action::CycleTxPolicy
             | Action::ToggleAutonomous
@@ -734,7 +743,8 @@ impl Action {
             | Action::CycleWaterfallPaletteBack
             | Action::WaterfallFocusHint
             | Action::TxDriveDown
-            | Action::TxDriveUp => false,
+            | Action::TxDriveUp
+            | Action::ToggleTxDriveMode => false,
         }
     }
 }

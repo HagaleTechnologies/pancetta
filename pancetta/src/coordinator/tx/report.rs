@@ -555,3 +555,190 @@ impl super::super::ApplicationCoordinator {
         log
     }
 }
+
+/// Publish a completed FT burst's selected drive and queue session persistence.
+pub(super) async fn finish_auto_drive_burst(
+    bus: &MessageBus,
+    drive: &std::sync::Arc<super::super::tx_drive::TxDrive>,
+    snapshot: super::super::tx_drive::DriveSnapshot,
+    samples: &[pancetta_core::tx_meter::TxMeterReading],
+    context: super::super::tx_drive::DriveContext,
+    session_record: &std::sync::Arc<std::sync::Mutex<super::super::session_state::SessionRecord>>,
+    session_path: &Option<std::path::PathBuf>,
+    operating_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    split_tx_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    rig_generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ft_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) {
+    use super::super::tx_drive::DriveDecision;
+    let live_band = pancetta_core::Band::from_frequency(tx_log_dial_hz(
+        operating_frequency_hz,
+        split_tx_frequency_hz,
+    ));
+    let still_same_context = snapshot.band == live_band
+        && rig_generation.load(Ordering::Acquire) == context.rig_generation
+        && ft_mode.load(Ordering::Acquire) == context.ft_mode;
+    let decision = if still_same_context {
+        drive.complete(snapshot, samples, context)
+    } else {
+        DriveDecision::Stale
+    };
+    if decision == DriveDecision::Stale
+        && snapshot.mode == pancetta_core::tx_drive_mode::TxDriveMode::Auto
+    {
+        if let Some(limit) = drive.warn_only_limit() {
+            let mut previous = None;
+            for sample in samples {
+                match sample
+                    .alc
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                {
+                    Some(alc) if alc > limit => {
+                        if let Some(earlier) = previous {
+                            super::super::tx_meter::act(
+                                super::super::tx_meter::AlcAction::ReportOverdrive {
+                                    readings: [earlier, alc],
+                                    max_alc: limit,
+                                },
+                                bus,
+                            )
+                            .await;
+                            break;
+                        }
+                        previous = Some(alc);
+                    }
+                    Some(_) => previous = None,
+                    None => (),
+                }
+            }
+        }
+    }
+    let selected = drive.snapshot_for_band(snapshot.band);
+    // A burst without valid ALC always republishes, so the readout shows
+    // `auto unavailable` even when the band was already marked unavailable.
+    if selected.band == live_band
+        && (selected != snapshot || decision == DriveDecision::Unavailable)
+    {
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                    band: selected.band,
+                    db: selected.db,
+                    ceiling_db: drive.ceiling_db(),
+                    mode: selected.mode,
+                    available: selected.available,
+                }),
+                Instant::now(),
+            ))
+            .await;
+    }
+    let alert = match decision {
+        DriveDecision::Overdrive(db) => Some(format!("ALC high: drive {} dB", format_drive_db(db))),
+        DriveDecision::Floor => Some("ALC high: lower the rig's USB/DATA input level".to_string()),
+        _ => None,
+    };
+    if let Some(alert) = alert {
+        let diagnostic = auto_drive_diagnostic(&alert, samples, drive.max_alc());
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::Error {
+                    component_id: ComponentId::Ft8Transmitter,
+                    error_message: alert.clone(),
+                    error_code: None,
+                },
+                Instant::now(),
+            ))
+            .await;
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::DiagnosticEvent {
+                    target: "tx.drive",
+                    level: pancetta_core::DiagnosticLevel::Warn,
+                    text: diagnostic,
+                    qso_id: None,
+                    callsign: None,
+                },
+                Instant::now(),
+            ))
+            .await;
+    }
+    if drive.needs_persist() {
+        let record = session_record.clone();
+        let path = session_path.clone();
+        let drive = drive.clone();
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                super::super::session_state::persist_tx_drive_current(&record, &path, &drive)
+            })
+            .await;
+            if let Ok(Err(error)) = result {
+                tracing::warn!("Could not save TX drive: {error}");
+                let notice =
+                    "TX drive changed for this session only. Could not save TX drive.".to_string();
+                let _ = bus
+                    .send_message(ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Tui,
+                        MessageType::Error {
+                            component_id: ComponentId::Ft8Transmitter,
+                            error_message: notice.clone(),
+                            error_code: None,
+                        },
+                        Instant::now(),
+                    ))
+                    .await;
+                let _ = bus
+                    .send_message(ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Tui,
+                        MessageType::DiagnosticEvent {
+                            target: "tx.drive",
+                            level: pancetta_core::DiagnosticLevel::Warn,
+                            text: format!("{notice} {error}"),
+                            qso_id: None,
+                            callsign: None,
+                        },
+                        Instant::now(),
+                    ))
+                    .await;
+            }
+        });
+    }
+}
+
+/// Shift+D text for an Auto backoff or floor alert: the strip text plus the
+/// burst's peak valid ALC and the limit, e.g.
+/// `ALC high: drive −3 dB. Peak ALC 0.84 (limit 0.50).`
+pub(super) fn auto_drive_diagnostic(
+    alert: &str,
+    samples: &[pancetta_core::tx_meter::TxMeterReading],
+    max_alc: f32,
+) -> String {
+    let peak = samples
+        .iter()
+        .filter_map(|s| s.alc)
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .fold(None, |peak: Option<f32>, v| {
+            Some(peak.map_or(v, |p| p.max(v)))
+        });
+    match peak {
+        Some(peak) => format!("{alert}. Peak ALC {peak:.2} (limit {max_alc:.2})."),
+        None => format!("{alert}."),
+    }
+}
+
+fn format_drive_db(db: f32) -> String {
+    let value = if db.fract() == 0.0 {
+        format!("{db:.0}")
+    } else {
+        format!("{db:.1}")
+    };
+    value.replace('-', "−")
+}

@@ -131,12 +131,7 @@ impl ConfigSection for ContestScoringConfig {
     fn merge_with(&mut self, other: Self) {
         // The section replaces as a unit: an overlay that carries `[contest]`
         // wins wholesale, including its `enabled` flag.
-        self.enabled = other.enabled;
-        self.instance_id = other.instance_id;
-        self.profile_id = other.profile_id;
-        self.rules_id = other.rules_id;
-        self.operator_region = other.operator_region;
-        self.periods = other.periods;
+        *self = other;
     }
 }
 

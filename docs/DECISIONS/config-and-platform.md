@@ -10,8 +10,27 @@ Several hand-written `ConfigSection::merge_with` impls silently dropped fields a
 - `NetworkConfig::merge_with` only copied `psk_reporter`/`wspr`/`dx_cluster`/`web_api`/`proxy` — `tls`, `rate_limiting`, `reliability`, `cqdx`, `clublog`, `qrz_logbook`, `lotw`, `eqsl`, `qrz_xml`, `remote_gateway`, `station_agent` were never merged. Fixed in `pancetta-config/src/network.rs`; regression test `merge_with_carries_over_every_opt_in_integration`.
 - `StationConfig::merge_with` never merged `tx_late_max_ms`/`tx_self_parity`/`ptt_lead_ms` — these drive the live TX-slot scheduler and PTT keying lead time in `coordinator/tx.rs`, so an operator customizing any of the three via config would always get the compiled-in defaults (8000ms / Auto / 80ms) instead. Fixed in `pancetta-config/src/station.rs`; regression test `merge_with_carries_over_tx_timing_fields`.
 - Also closed `AudioConfig.bit_depth` (`pancetta-config/src/audio.rs`) opportunistically — currently unused elsewhere in the codebase, so not user-impacting today, but the same latent bug.
-- **Audited and left alone (real gaps, but currently inert — nothing in the codebase reads these fields, so they don't affect behavior today):** `UiConfig` (`typography`/`colors`/`panels`/`accessibility`/`animations`/`toolbars`/`status_bar`/`keyboard`/`logging`/`spectrum`, plus most of `WindowConfig`) and `CatInterfaceConfig` (`data_bits`/`stop_bits`/`parity`/`flow_control`/`timeout_ms`/`protocol`/`termination`/`response_timeout_ms`/`retry_count` — only `port`/`baud_rate`/`enabled` are actually wired to hamlib). Worth fixing if/when any of these get wired up; not worth the churn while they're dead config.
-- **Process gap:** nothing enforces that a new `NetworkConfig`/`StationConfig`/etc. field gets a `merge_with` line — this class of bug can recur. A macro-derived or reflection-based merge (or a test that diffs struct fields against merge_with via `serde_json::to_value` round-tripping) would close this structurally. (A structural `merge_with` guardrail test per `ConfigSection` is planned — not yet implemented; see `pancetta-config` `merge_with_*` for the existing regression tests.)
+- **Audited and left alone (real gaps, but currently inert — nothing in the codebase reads these fields, so they don't affect behavior today):** `UiConfig` (`typography`/`colors`/`panels`/`accessibility`/`animations`/`toolbars`/`status_bar`/`keyboard`/`logging`/`spectrum`, plus most of `WindowConfig`) and `CatInterfaceConfig` (`data_bits`/`stop_bits`/`parity`/`flow_control`/`timeout_ms`/`protocol`/`termination`/`response_timeout_ms`/`retry_count` — only `port`/`baud_rate`/`enabled` are actually wired to hamlib). Worth fixing if/when any of these get wired up; not worth the churn while they're dead config. These were closed later: both types now carry every field, and the guards named below enforce it.
+- **Process gap (closed).** Nothing enforced that a new field got a `merge_with` line, so this class of bug could recur. Two structural tests in `pancetta-config` now close it. `merge_guard::merge_with_carries_every_field` (`pancetta-config/src/lib.rs`) merges a fully non-default source into `Default` for every section and fails when a serialized field reverts. `merge_rules_tests::populated_base_merge_follows_each_fields_rule` (PAN-371, `pancetta-config/src/lib/tests/merge_rules_tests.rs`) merges a populated, an emptied and a cleared overlay into a populated base, per section and through `Config::merge_with`, and fails when any field's rule changes. The field-specific `merge_with_*` regression tests stay.
+
+## Merge rules: plain copy unless listed (PAN-371, 2026-11-18)
+
+A section whose fields all merge by replacement merges with `*self = other;`. The eleven field-by-field copies (`FoxConfig`, `DatabaseConfig`, `WsjtxUdpConfig`, `RemoteGatewayConfig`, `AutonomousConfig`, `ContestScoringConfig`, `HoundConfig`, `DuplicateCheckingConfig`, `TxPlacementConfig`, `DecoderConfig`, `LoggingConfig`) assigned every field of their struct unconditionally, so the change kept every merge result. They join `AlertsConfig`, `WatchlistConfig` and the nested audio and rig wrappers. A field added to one of these structs needs no merge line.
+
+Six section merges and `Config::merge_with` keep per-field code, and `pancetta-config/src/lib/tests/merge_rules_tests.rs` lists each rule:
+
+- `StationConfig`, `AudioConfig`, `RigConfig` and `CatInterfaceConfig` keep the base when the overlay holds an empty string, zero or empty list (`SkipEmpty`), replace an `Option` only when the overlay has `Some` (`SkipNone`), and extend their custom maps (`Extend`).
+- `UiConfig` keeps the base `theme` and `layout` when the overlay's is empty, ORs `accessibility.high_contrast`, and extends `custom_widgets`.
+- `NetworkConfig` extends `custom_services`.
+- `Config::merge_with` replaces `contest` only when the overlay has one. The base keeps its `metadata`, appends the overlay's `sources` and stamps `last_modified`.
+
+The `SkipEmpty` rules exist for the environment source. `load_from_environment` starts from `Config::default()` and blanks thirteen fields (the nine with a `PANCETTA_*` variable, plus `qth` and the three zones) so the merge keeps the file's values. Every other field keeps its default, so whenever one `PANCETTA_*` variable is set, every replace-rule section and every `SkipEmpty` field it does not blank (such as `rig.model`, `audio.buffer_size` and `station.tx_late_max_ms`) reverts to its default. PAN-371 kept that behaviour; PAN-460 tracks the fix in the environment source.
+
+Rejected: a derive macro, which needs a proc-macro crate for about a dozen impls, and a default `ConfigSection::merge_with`, which would let a new section that needs a sentinel compile without anyone choosing its rule.
+
+Adding a field to a replace section needs nothing. Adding a field with another rule to a section with per-field code needs the merge line and a row in that type's rule table. Adding a section needs an `assert_carries_all` call in `merge_guard` and an `assert_rules` case in `merge_rules_tests`; the test's check that its section list matches `Config`'s keys fails until the `assert_rules` case exists.
+
+To verify section coverage (PAN-371 AC6), run `cargo test -p pancetta-config --lib merge_rules_tests`. The populated-base test checks the list against the keys serialized by `Config::default()`, excluding metadata, and exercises the optional contest section separately. A second test, `config_merge_keeps_base_metadata_and_appends_sources`, checks metadata. To verify that the guard catches a missing delegation, remove `self.fox.merge_with(other.fox);` from `Config::merge_with` in a disposable checkout and rerun the command. The populated-base test should fail on `/fox/max_streams`. Restore the delegation and both tests should pass. [Merge rule tests](../../pancetta-config/src/lib/tests/merge_rules_tests.rs) · [Config merge](../../pancetta-config/src/lib.rs)
 
 ## Hardware-tier auto-classification
 
@@ -1421,3 +1440,74 @@ the lock and paths (CI compiles both, Linux CI runs the tests).
 - The build script watches existing git `HEAD`, `refs/heads`, `packed-refs` and `reftable` paths. Missing watched paths make Cargo rebuild on every invocation. A HEAD move rebuilt `pancetta` once in 1m27s on the 32-core research container. Git location environment overrides are removed so a hook or outer command cannot redirect discovery away from the compiled sources.
 - Wire versions, user agents and cache keys retain bare semver. The generated zsh completion script is not checked in. It follows clap's live command tree, including global flags as `--help` lists them, and uses first-sentence descriptions. Only zsh is supported. Completions return before logging and config startup; broken pipes are tolerated.
 - No `vergen`, `clap_complete` or `clap_mangen` dependency is needed. The release gate `scripts/check-build-identity.sh` verifies the binary's identity against the checked-out commit and matrix target.
+
+## Merge-group-verified pushes skip the heavy lanes (PAN-367, 2026-11-19)
+
+Every merge through the native merge queue ran CI twice on a byte-identical
+tree: the `merge_group` run, then the `push` run GitHub fires 26-29 s later
+when the queue fast-forwards `main` to the group head (14 of 14 sampled
+commits had both runs on the same SHA). The push run spent ~95 of ~100
+runner-minutes on `Workspace Check` + `Workspace Tests` and averaged ~27 min
+wall clock; its two observed failures (a flaky workspace test, a rustup
+download timeout) were noise on trees the merge group had already passed.
+
+- **Mechanism.** The push run's `changes` job looks up
+  `actions/workflows/ci.yml/runs?head_sha=$SHA&event=merge_group&status=success`
+  (paginated; `event`/`head_sha`/`conclusion` re-checked in jq — a check-run
+  payload carries no `event`, so the ticket's single `commits/$SHA/check-runs`
+  call cannot separate the merge-group suite from the push suite), then the
+  matched run's jobs (`filter=latest`), and publishes
+  `merge_group_verified=true` + `merge_group_run=<id>` only when job
+  `Workspace Check` and at least one `Workspace Tests (n/4)` concluded
+  `success`. The run-level conclusion alone is not proof: a notes-only merge
+  group is green with every Rust lane skipped (PAN-172). A `::notice::` and a
+  step-summary line record `already verified in merge group <run_id> (<url>)`;
+  a non-skip push writes the reason instead, so every push explains itself.
+- **Lane set.** Only `workspace-check` and `workspace-tests` gain the
+  `merge_group_verified != 'true'` term (identical strings, as the nextest
+  guard requires). The ticket's "FT8 Tests" lane no longer exists (folded into
+  `workspace-check` by PAN-321) and `cross-platform-check` never ran on push.
+  Clippy, Format, Cargo Deny, Research Check, `research-scan-tests`,
+  `changes` and the `ci` aggregator still run on every push.
+- **Cache-warm exception.** A push that changes `**/Cargo.toml`,
+  `**/Cargo.lock`, `rust-toolchain.toml`, `.cargo/**` or
+  `.github/workflows/ci.yml` (paths-filter key `cache_inputs`) still runs both
+  lanes. The push run is the only writer of those two rust-cache generations
+  (all 17 live caches sit on `refs/heads/main`); skipping unconditionally
+  would leave PRs restoring stale generations after every manifest change
+  until the weekly schedule. 4 of 14 sampled pushes still run in full. This
+  is a deliberate deviation from a literal reading of the ticket's skip
+  scenario for those commits; the cost is ~25 min of wall clock on a push that
+  changes a manifest, the benefit is no silent PR-build regression for a week.
+- **Fail closed.** The lookup step runs only on `push`, has
+  `continue-on-error: true`, writes `verified=false` first, never uses
+  `set -e`, and every error path (gh failure on either call, unparseable
+  response, no matching run) appends its reason to the step summary and exits
+  0. The lanes' `!= 'true'` gate treats empty or failed output as "run".
+  `changes` stays out of the aggregator's `needs`, so this adds no new way
+  for the aggregator to go green without work (the pre-existing fail-open
+  when `changes` itself fails is unchanged and remains a separate follow-up).
+- **Dispatch/schedule by construction.** The step's `if` is
+  `github.event_name == 'push'`; every other event leaves the output empty
+  and its lanes' existing terms are untouched, so scheduled and manual runs
+  still test everything.
+- **Main Alert.** `main-alert.yml` is untouched (a credenza inlined copy;
+  change it there first). Its `workflow_run` contract — workflow name `CI`,
+  the push trigger, and `effective_success` requiring at least one non-skipped
+  job — accepts a verified-skip push run, because the cheap lanes, `changes`,
+  `research-scan-tests` and `ci` all still ran; a green skip-push closes an
+  open main-red issue exactly like today's notes-only green pushes (replayed
+  live against notes-only push run 44190682420 during research, and offline by
+  the guard).
+- **Measured saving.** ~95 of ~100 runner-minutes and ~25 min wall clock per
+  merged PR that skips (10 of the 14 sampled commits).
+
+Offline coverage: `scripts/ci/test-ci-merge-group-verified.sh` (stub-`gh`
+cases `verified`, `two-pages`, `notes-only-mg`, `no-run`, `gh-fails`,
+`jobs-fails`, `cache-inputs`, plus a Main Alert `effective_success` replay)
+and the widened matrix in `scripts/ci/test-ci-merge-group-scope.sh`. Live
+runner behaviour is post-merge observation: the first push after a
+non-manifest PR merge should show both heavy lanes skipped with the summary
+line present, and the first push after this change's own merge runs in full
+(it changes `.github/workflows/ci.yml`, a cache-key input — the exception
+exercising itself).

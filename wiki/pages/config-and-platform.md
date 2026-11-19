@@ -25,11 +25,14 @@ everything decoded so far. Full digest:
 
 ## Digest
 
-The sharpest gotcha: **`merge_with` is a manually-maintained field list**, so a
-struct field added later is silently dropped back to its compiled-in default (a
-real, operator-reported bug fixed 2026-07-05). Nothing structurally enforces
-that a new field gets a merge line — this class of bug can recur; add the
-`self.field = other.field` line when you add a field. Tier presets and the
+The sharpest gotcha: **`merge_with` field rules are pinned by tests**. A section
+whose fields all merge by replacement is `*self = other`, so a new field needs
+no merge line. The station, audio, rig, CAT, network and UI merges keep
+per-field code (skip-empty sentinels, `Option` replacement, map extend, one
+OR), and `merge_rules_tests` lists each rule. Changing a rule, or adding a
+non-replace field without a table row, fails
+`populated_base_merge_follows_each_fields_rule`; dropping a field fails
+`merge_with_carries_every_field` (PAN-371). Tier presets and the
 effort→budget mapping (`effort.rs`) are normative in the digest and code — cited,
 not restated. Two known limitations (S3 escalation ordering; hot-reload does not
 re-seed the effort budget) are documented there.

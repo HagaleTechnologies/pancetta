@@ -189,6 +189,8 @@ pub enum TuiMessage {
     TxDriveState {
         db: f32,
         ceiling_db: f32,
+        mode: pancetta_core::tx_drive_mode::TxDriveMode,
+        available: bool,
     },
     /// DX spot
     DxSpot {
@@ -573,8 +575,12 @@ pub enum TuiCommand {
     /// Coordinator owns the tone-active state; the TUI just sends the
     /// toggle.
     ToggleTune,
+    /// Start a one-shot Tune carrier calibration; h halts it.
+    StartDriveCalibration,
     /// Adjust station TX audio drive by one signed dB step.
     AdjustTxDrive { delta_db: i8 },
+    /// Toggle Auto or Manual TX drive on the effective TX band.
+    ToggleTxDriveMode,
     /// Call a station (click-to-call from band activity)
     CallStation {
         callsign: String,
@@ -1092,9 +1098,22 @@ impl TuiRunner {
             }
             TuiMessage::TxMeterCapability(capability) => {
                 app.set_tx_meter_capability(capability);
+                if !capability.alc {
+                    app.tx_drive_available = false;
+                }
             }
-            TuiMessage::TxDriveState { db, ceiling_db } => {
+            TuiMessage::TxDriveState {
+                db,
+                ceiling_db,
+                mode,
+                available,
+            } => {
                 app.tx_drive = Some((db, ceiling_db));
+                app.tx_drive_mode = Some(mode);
+                app.tx_drive_available = available
+                    && app
+                        .tx_meter_capability
+                        .is_none_or(|capability| capability.alc);
             }
             TuiMessage::DxSpot {
                 callsign,
@@ -1516,6 +1535,9 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::AdjustTxDrive {
                     delta_db: if action == Action::TxDriveDown { -1 } else { 1 },
                 })?;
+            }
+            Action::ToggleTxDriveMode => {
+                self.message_tx.send(TuiCommand::ToggleTxDriveMode)?;
             }
             Action::AckOutOfBand => {
                 app.out_of_band_ack_visible = false;
@@ -2547,6 +2569,16 @@ impl TuiRunner {
                     };
                 } else {
                     self.message_tx.send(TuiCommand::ToggleTune)?;
+                }
+            }
+            Action::CalibrateTxDrive => {
+                if !app.tx_policy.allows_any_tx() {
+                    app.set_local_status(
+                        "Can't calibrate — TX is DISABLED (press g to re-enable)".to_string(),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    );
+                } else {
+                    self.message_tx.send(TuiCommand::StartDriveCalibration)?;
                 }
             }
             Action::FindClearOffset => {
@@ -7365,6 +7397,24 @@ mod key_tests {
         assert!(app.read().await.status_message().contains("Can't tune"));
     }
 
+    #[tokio::test]
+    async fn shift_c_emits_start_drive_calibration_only_when_tx_allowed() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::StartDriveCalibration)
+        ));
+        app.write().await.tx_policy = pancetta_core::TxPolicy::Disabled;
+        r.handle_key_event(key_shift('C')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app
+            .read()
+            .await
+            .status_message()
+            .contains("Can't calibrate"));
+    }
+
     // === PAN-21: global `k` abort ===================================
 
     /// Acceptance scenario 1: pressing `k` from the DX Hunter panel (not
@@ -7926,16 +7976,16 @@ mod key_tests {
 
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        // Leave enough rows for all bindings and headings, including Shift+L.
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 64));
+        // Leave enough rows for all bindings and headings, including F9.
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 80));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
             crate::keymap::KEYBINDINGS.len() + crate::keymap::Category::ALL.len(),
             "nothing wraps at full width; one heading per group"
         );
-        let buf = render_help(160, 64, 0);
-        let inner = help_inner(160, 64);
+        let buf = render_help(160, 80, 0);
+        let inner = help_inner(160, 80);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -7947,7 +7997,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 64, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 80, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]

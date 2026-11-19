@@ -431,6 +431,16 @@ pub(crate) fn send_ptt_command(
     state: bool,
     authorize: impl FnOnce() -> bool,
 ) -> SendIfOutcome {
+    send_ptt_command_with_attempt(message_bus, source, state, None, authorize)
+}
+
+pub(super) fn send_ptt_command_with_attempt(
+    message_bus: &MessageBus,
+    source: ComponentId,
+    state: bool,
+    attempt: Option<std::sync::Arc<super::super::tx_meter::TxDriveAttempt>>,
+    authorize: impl FnOnce() -> bool,
+) -> SendIfOutcome {
     // One CAS arbitrates gain admission and every key-down enqueue, without
     // introducing a lock or await into the last-gate-to-enqueue path.
     if state {
@@ -448,29 +458,28 @@ pub(crate) fn send_ptt_command(
         }
     }
     let mut admitted = false;
-    let outcome = message_bus.send_rig_command_if(
-        ComponentMessage::new(
-            source,
-            ComponentId::Hamlib,
-            MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
-            Instant::now(),
-        ),
-        || {
-            if !authorize() {
-                return false;
-            }
-            if !state {
-                return true;
-            }
-            if !message_bus.data_mode.is_ready() {
-                return false;
-            }
-            admitted = message_bus
-                .receive_gain
-                .admit_ptt(chrono::Utc::now().timestamp_millis());
-            admitted
-        },
+    let mut command = ComponentMessage::new(
+        source,
+        ComponentId::Hamlib,
+        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
+        Instant::now(),
     );
+    command.tx_drive_attempt = attempt;
+    let outcome = message_bus.send_rig_command_if(command, || {
+        if !authorize() {
+            return false;
+        }
+        if !state {
+            return true;
+        }
+        if !message_bus.data_mode.is_ready() {
+            return false;
+        }
+        admitted = message_bus
+            .receive_gain
+            .admit_ptt(chrono::Utc::now().timestamp_millis());
+        admitted
+    });
     if admitted && outcome != SendIfOutcome::Enqueued {
         message_bus.receive_gain.ptt_command_consumed();
     }

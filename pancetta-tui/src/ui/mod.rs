@@ -2144,9 +2144,11 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(vec![
             marker,
-            Span::raw(crate::presentation::tx_meter_text_with_drive(
+            Span::raw(crate::presentation::tx_meter_text_with_drive_state(
                 row,
                 app.tx_drive,
+                app.tx_drive_mode,
+                app.tx_drive_available,
             )),
         ]));
     }

@@ -1506,6 +1506,9 @@ impl super::super::ApplicationCoordinator {
             let fox_mode = self.fox_mode();
             let fox_max_streams = self.fox_max_streams();
             let tx_drive = self.tx_drive.clone();
+            let tx_drive_session_record = self.session_record.clone();
+            let tx_drive_session_path = self.session_state_path.clone();
+            let tx_drive_rig_generation = self.hamlib_generation.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -1642,6 +1645,7 @@ impl super::super::ApplicationCoordinator {
                                 MessageType::TransmitRequest { .. }
                                     | MessageType::MultiTransmitRequest { .. }
                                     | MessageType::TuneRequest { .. }
+                                    | MessageType::DriveCalibrationRequest { .. }
                             )
                             .then(|| GainTxIntent::new(message_bus.gain_tx_intents.clone()));
                             // 2026-07-18 operator finding: the emit_event(MessageToSend)
@@ -2982,6 +2986,28 @@ impl super::super::ApplicationCoordinator {
                                         .await;
 
                                         let live_timing_guard = ptt_sync_gate.lock().await;
+                                        // PAN-439: select drive and prepare the meter attempt before the
+                                        // final gates, so the per-band lock can never age their timing
+                                        // checks. The band read is under `ptt_sync_gate`, which spot-call
+                                        // QSY and band hops also hold.
+                                        let drive_snapshot = tx_drive.snapshot_for_band(
+                                            pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                            )),
+                                        );
+                                        let drive_context = super::super::tx_drive::DriveContext {
+                                            rig_generation: tx_drive_rig_generation
+                                                .load(Ordering::Acquire),
+                                            ft_mode: active_protocol_mode_atomic
+                                                .load(Ordering::Acquire),
+                                            stream_count: 1,
+                                        };
+                                        let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
+                                            drive_snapshot.mode
+                                                == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                            drive_snapshot.band,
+                                        );
                                         if is_autonomous_cq(
                                             qso_id.as_deref(),
                                             attempt_id,
@@ -3297,10 +3323,11 @@ impl super::super::ApplicationCoordinator {
                                         // PAN-202). The mid-TX poll remains a backstop.
                                         // PTT hardware is not asserted yet. Denial only unwinds the local
                                         // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                        let outcome = send_ptt_command(
+                                        let outcome = send_ptt_command_with_attempt(
                                             &message_bus,
                                             ComponentId::Ft8Transmitter,
                                             true,
+                                            Some(drive_attempt.clone()),
                                             || {
                                                 tx_send_authorized(
                                                     origin,
@@ -3310,7 +3337,7 @@ impl super::super::ApplicationCoordinator {
                                             },
                                         );
                                         drop(live_timing_guard);
-                                        let drive_at_key = tx_drive.get();
+                                        let drive_at_key = drive_snapshot.db;
                                         match outcome {
                                             SendIfOutcome::Enqueued => {
                                                 info!(
@@ -3779,6 +3806,8 @@ impl super::super::ApplicationCoordinator {
                                         );
                                         let (playback_ack, mut playback_waiter) =
                                             PlaybackStartAck::new();
+                                        let playback_ack = playback_ack
+                                            .with_tx_drive_attempt(drive_attempt.clone());
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -4165,6 +4194,9 @@ impl super::super::ApplicationCoordinator {
                                         let success = audio_enqueued;
                                         let duration_ms = audio_duration_ms;
 
+                                        // PAN-439: playback has ended, so close burst sampling now; a meter
+                                        // poll during the unkey tail belongs to no waveform.
+                                        drive_attempt.close_sampling();
                                         // --- Step 9: De-assert PTT (with tail delay) ---
                                         // Plain interruptible_sleep (not _or_supersede): the
                                         // frame has already fully played by this point, so
@@ -4211,7 +4243,27 @@ impl super::super::ApplicationCoordinator {
                                             }
                                             continue 'worker;
                                         }
-                                        ptt_guard.release("Step 9 unkey").await;
+                                        let release = ptt_guard.release("Step 9 unkey").await;
+                                        if success && release == PttRelease::Delivered {
+                                            // An unconfirmed, unplayed or watchdog-invalidated attempt has no
+                                            // summary and must not read as a burst without ALC.
+                                            if let Some(samples) = drive_attempt.summary() {
+                                                finish_auto_drive_burst(
+                                                    &message_bus,
+                                                    &tx_drive,
+                                                    drive_snapshot,
+                                                    &samples,
+                                                    drive_context,
+                                                    &tx_drive_session_record,
+                                                    &tx_drive_session_path,
+                                                    &operating_frequency_hz,
+                                                    &split_tx_frequency_hz,
+                                                    &tx_drive_rig_generation,
+                                                    &active_protocol_mode_atomic,
+                                                )
+                                                .await;
+                                            }
+                                        }
 
                                         // --- Step 10: Send TransmitComplete ---
                                         if let Err(e) = report_played_transmit_complete(
@@ -5914,6 +5966,21 @@ impl super::super::ApplicationCoordinator {
                                     }
 
                                     let live_timing_guard = ptt_sync_gate.lock().await;
+                                    // PAN-439: select drive and prepare the meter attempt before the
+                                    // final gates, so the per-band lock can never age their timing
+                                    // checks. The band read is under `ptt_sync_gate`, which spot-call
+                                    // QSY and band hops also hold.
+                                    let drive_snapshot = tx_drive.snapshot_for_band(
+                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                        )),
+                                    );
+                                    let drive_attempt = super::super::tx_meter::TxDriveAttempt::new(
+                                        drive_snapshot.mode
+                                            == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                        drive_snapshot.band,
+                                    );
                                     // --- Step 4d: final atomic pre-PTT gate ---
                                     // PAN-148 (Finding 1, PR #370 round 2): the
                                     // partial-staleness branch above emits per-item
@@ -6279,10 +6346,18 @@ impl super::super::ApplicationCoordinator {
                                     // PAN-202). The mid-TX poll remains a backstop.
                                     // PTT hardware is not asserted yet. Denial only unwinds the local
                                     // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                    let outcome = send_ptt_command(
+                                    let drive_context = super::super::tx_drive::DriveContext {
+                                        rig_generation: tx_drive_rig_generation
+                                            .load(Ordering::Acquire),
+                                        ft_mode: active_protocol_mode_atomic
+                                            .load(Ordering::Acquire),
+                                        stream_count: items.len(),
+                                    };
+                                    let outcome = send_ptt_command_with_attempt(
                                         &message_bus,
                                         ComponentId::Ft8Transmitter,
                                         true,
+                                        Some(drive_attempt.clone()),
                                         || {
                                             tx_send_authorized(
                                                 origin,
@@ -6292,7 +6367,7 @@ impl super::super::ApplicationCoordinator {
                                         },
                                     );
                                     drop(live_timing_guard);
-                                    let drive_at_key = tx_drive.get();
+                                    let drive_at_key = drive_snapshot.db;
                                     match outcome {
                                         SendIfOutcome::Enqueued => {
                                             info!(
@@ -6541,6 +6616,8 @@ impl super::super::ApplicationCoordinator {
                                     );
                                     let (playback_ack, mut playback_waiter) =
                                         PlaybackStartAck::new();
+                                    let playback_ack =
+                                        playback_ack.with_tx_drive_attempt(drive_attempt.clone());
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -6771,6 +6848,9 @@ impl super::super::ApplicationCoordinator {
                                     let success = audio_enqueued;
                                     let duration_ms = audio_duration_ms;
 
+                                    // PAN-439: playback has ended, so close burst sampling now; a meter
+                                    // poll during the unkey tail belongs to no waveform.
+                                    drive_attempt.close_sampling();
                                     // --- Step 9: De-assert PTT (with tail delay) ---
                                     if interruptible_sleep(
                                         Duration::from_millis(50),
@@ -6816,7 +6896,27 @@ impl super::super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
-                                    ptt_guard.release("Multi-TX Step 9 unkey").await;
+                                    let release = ptt_guard.release("Multi-TX Step 9 unkey").await;
+                                    if success && release == PttRelease::Delivered {
+                                        // An unconfirmed, unplayed or watchdog-invalidated attempt has no
+                                        // summary and must not read as a burst without ALC.
+                                        if let Some(samples) = drive_attempt.summary() {
+                                            finish_auto_drive_burst(
+                                                &message_bus,
+                                                &tx_drive,
+                                                drive_snapshot,
+                                                &samples,
+                                                drive_context,
+                                                &tx_drive_session_record,
+                                                &tx_drive_session_path,
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                                &tx_drive_rig_generation,
+                                                &active_protocol_mode_atomic,
+                                            )
+                                            .await;
+                                        }
+                                    }
 
                                     // --- Step 10: Send TransmitComplete for each item ---
                                     for ((text, qso_id), item) in item_texts
@@ -7004,7 +7104,14 @@ impl super::super::ApplicationCoordinator {
                                         true,
                                         || true,
                                     );
-                                    let drive_at_key = tx_drive.get();
+                                    let drive_at_key = tx_drive
+                                        .snapshot_for_band(pancetta_core::Band::from_frequency(
+                                            tx_log_dial_hz(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                            ),
+                                        ))
+                                        .db;
                                     if ptt_on != SendIfOutcome::Enqueued {
                                         // `Denied` here is the receive-gain gate, never
                                         // `authorize` (always true for a tune).
@@ -7104,6 +7211,476 @@ impl super::super::ApplicationCoordinator {
                                     info!("Tune: complete");
                                 }
 
+                                MessageType::DriveCalibrationRequest { tone_offset_hz } => {
+                                    let duration_secs = 12;
+                                    info!(
+                                        "Drive calibration: {}s tone at {} Hz",
+                                        duration_secs, tone_offset_hz
+                                    );
+                                    TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    // PAN-273: wait out an outstanding drop-fallback
+                                    // PTT-off before the gates below, not after them.
+                                    pending_ptt_off.settle().await;
+
+                                    // --- TX-policy hard mute ---
+                                    // A calibration carrier is a transmission. If the
+                                    // global policy is Disabled (RX-only), never
+                                    // key PTT / emit the tone. This is the
+                                    // catch-all gate matching the
+                                    // TransmitRequest / MultiTransmitRequest
+                                    // arms — defends against any Drive calibrationRequest
+                                    // source, not just the TUI relay.
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                        &hamlib_pending_frequency,
+                                        &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
+                                        &message_bus.receive_gain,
+                                        &message_bus.data_mode,
+                                    ) {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked ({}): calibration ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked ({reason}): calibration ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
+                                    // PAN-118: a calibration carrier is a transmission
+                                    // too — refuse it on the effective dial +
+                                    // tone offset before PTT, mirroring the
+                                    // band-plan sibling gate at the other
+                                    // sites. Same unwind as the hard-mute
+                                    // branch above (no TransmitComplete exists
+                                    // for a calibration).
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        tone_offset_hz,
+                                    )
+                                    .and_then(|rf| tx_band_plan_mute_reason(rf, 0.0, &band_plan))
+                                    {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked ({}): calibration ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked ({reason}): calibration ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
+                                    if !message_bus.has_rig_route()
+                                        || !message_bus
+                                            .tx_meter_capability
+                                            .lock()
+                                            .unwrap()
+                                            .is_some_and(|c| c.alc)
+                                    {
+                                        emit_diagnostic(&message_bus, "tx.drive", pancetta_core::DiagnosticLevel::Warn,
+                                            "Can't calibrate — this rig does not report ALC over CAT".to_string(), None).await;
+                                        continue;
+                                    }
+                                    if !tx_drive.auto_enabled() {
+                                        continue;
+                                    }
+                                    let Some(_admission_band) =
+                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                        ))
+                                    else {
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.drive",
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                            "Can't calibrate — unknown TX band".to_string(),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    };
+                                    // Generate a continuous sine wave
+                                    // (single tone, zero-bandwidth on air).
+                                    // The carrier rides the FT drive scale:
+                                    // it peaks at FT_NORMALIZED_PEAK and is
+                                    // reserved exactly like an FT frame, so
+                                    // the drive whose ALC first reaches onset
+                                    // here is the drive the next FT burst
+                                    // plays at. A cooler tune-style carrier
+                                    // would leave the saved value several dB
+                                    // hot for FT at ceilings below +5.
+
+                                    let omega = 2.0 * std::f64::consts::PI * tone_offset_hz
+                                        / sample_rate as f64;
+
+                                    // Engage PTT immediately. No slot
+                                    // scheduling: calibration happens NOW.
+                                    let mut ptt_guard = PttGuard::new(
+                                        message_bus.clone(),
+                                        ptt_active.clone(),
+                                        &ptt_sync_gate,
+                                        &last_ptt_on_ms,
+                                        &last_ptt_off_ms,
+                                        &pending_ptt_off,
+                                    )
+                                    .await;
+                                    // TX badge on; guard drop clears it on every
+                                    // exit path (complete / abort / shutdown).
+                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
+                                    send_tx_status(&message_bus, true).await;
+
+                                    // PAN-118: last-instant band-plan re-check.
+                                    // The tone-buffer build, `PttGuard::new`'s
+                                    // sync-gate wait and the TX-status send
+                                    // above all ran since the admission check,
+                                    // and the effective TX dial may have moved
+                                    // meanwhile. Nothing but the PTT-on send
+                                    // follows. PTT hardware was never asserted
+                                    // (`ptt_guard` only flipped the in-process
+                                    // flag), so unwind that flag and disarm
+                                    // rather than send PTT-off; the TX-badge
+                                    // guard's drop clears the badge.
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        tone_offset_hz,
+                                    )
+                                    .and_then(|rf| tx_band_plan_mute_reason(rf, 0.0, &band_plan))
+                                    {
+                                        last_ptt_off_ms
+                                            .store(super::super::now_epoch_ms(), Ordering::Release);
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked at final pre-PTT check ({}): calibration ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked at final pre-PTT check ({reason}): calibration ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
+                                    #[cfg(test)]
+                                    key_down_probe.pause_if_armed().await;
+                                    let ptt_on = send_ptt_command(
+                                        &message_bus,
+                                        ComponentId::Ft8Transmitter,
+                                        true,
+                                        || true,
+                                    );
+                                    if ptt_on != SendIfOutcome::Enqueued {
+                                        // `Denied` here is the receive-gain gate, never
+                                        // `authorize` (always true for a calibration).
+                                        let dropped = ptt_on == SendIfOutcome::Dropped;
+                                        // PAN-278: with a Hamlib route the key-down was
+                                        // dropped (full or disconnected channel) or
+                                        // refused, so the rig was never keyed. Abandon
+                                        // the calibration rather than play a tone with no
+                                        // carrier. Unwind the in-process flag like the
+                                        // band-plan refusal above: nothing entered
+                                        // Hamlib's queue, so there is no PTT-off to send.
+                                        // Without a route (`--replay`) the drop is by design
+                                        // and the tone still plays.
+                                        if message_bus.has_rig_route() {
+                                            last_ptt_off_ms.store(
+                                                super::super::now_epoch_ms(),
+                                                Ordering::Release,
+                                            );
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let why = if dropped { "dropped" } else { "refused" };
+                                            warn!(
+                                                target: "pancetta::tx.ptt",
+                                                "Drive calibration: PTT-on {} (rig not keyed); calibration ({}s @ {} Hz) abandoned",
+                                                why, duration_secs, tone_offset_hz
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.ptt",
+                                                pancetta_core::DiagnosticLevel::Warn,
+                                                format!(
+                                                    "Drive calibration: PTT-on {why} (rig not keyed); calibration abandoned"
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        if dropped {
+                                            warn!(
+                                                "Drive calibration: PTT ON not sent: no Hamlib route registered (replay mode)"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Drive calibration: PTT ON refused (rig not keyed)"
+                                            );
+                                        }
+                                    }
+
+                                    let Some(band) =
+                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                        ))
+                                    else {
+                                        ptt_guard
+                                            .release("Calibration band unknown at key time")
+                                            .await;
+                                        continue;
+                                    };
+                                    let drive_at_key = tx_drive.snapshot_for_band(Some(band)).db;
+                                    let sink_guard =
+                                        drive_calibration::CalibrationSinkGuard::install(
+                                            message_bus.active_drive_calibration.clone(),
+                                        );
+                                    let (floor, ceiling, onset) = tx_drive.calibration_limits();
+                                    let mut stepper = drive_calibration::CalibrationStepper::new(
+                                        floor, ceiling, onset,
+                                    );
+                                    let started = Instant::now();
+                                    let mut sample_index = 0usize;
+                                    let mut saved = None;
+                                    let mut missing_alc = false;
+                                    let mut audio_dropped = false;
+                                    let mut midrun_mute = None;
+                                    loop {
+                                        if let Some(reason) = tx_hard_mute_reason(
+                                            &tx_policy,
+                                            &tx_restart_inhibit,
+                                            &hamlib_command_loop_ready,
+                                            &hamlib_pending_frequency,
+                                            &hamlib_pending_split,
+                                            &hamlib_command_in_flight,
+                                            &rig_conn_state,
+                                            &audio_output_alive,
+                                            &message_bus.receive_gain,
+                                            &message_bus.data_mode,
+                                        ) {
+                                            midrun_mute = Some(reason.to_string());
+                                            break;
+                                        }
+                                        if started.elapsed()
+                                            + Duration::from_millis(
+                                                drive_calibration::CAL_SEGMENT_MS,
+                                            )
+                                            >= Duration::from_millis(
+                                                drive_calibration::CAL_MAX_KEYDOWN_MS,
+                                            )
+                                        {
+                                            break;
+                                        }
+                                        let level = stepper.level();
+                                        let segment_start = Instant::now();
+                                        // Queue the cushion once. Appending it on every step
+                                        // would accumulate audio latency and misattribute ALC.
+                                        let queued_ms = drive_calibration::CAL_SEGMENT_MS
+                                            + if sample_index == 0 {
+                                                drive_calibration::CAL_CUSHION_MS
+                                            } else {
+                                                0
+                                            };
+                                        let count =
+                                            (sample_rate as usize) * queued_ms as usize / 1000;
+                                        let mut samples: Vec<f32> = (0..count)
+                                            .map(|i| {
+                                                (((sample_index + i) as f64) * omega).sin() as f32
+                                                    * super::super::tx_drive::FT_NORMALIZED_PEAK
+                                            })
+                                            .collect();
+                                        sample_index += count;
+                                        super::super::tx_drive::apply(
+                                            &mut samples,
+                                            level,
+                                            ceiling,
+                                            true,
+                                        );
+                                        let sent = message_bus
+                                            .send_message_checked(ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Audio,
+                                                MessageType::AudioOutput {
+                                                    samples,
+                                                    sample_rate,
+                                                    flush_first: false,
+                                                    playback_started: None,
+                                                },
+                                                Instant::now(),
+                                            ))
+                                            .await;
+                                        if !matches!(sent, Ok(true)) {
+                                            audio_dropped = true;
+                                            break;
+                                        }
+                                        if interruptible_sleep(
+                                            Duration::from_millis(
+                                                drive_calibration::CAL_SEGMENT_MS,
+                                            ),
+                                            &shutdown,
+                                            &abort_current_tx,
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
+                                        let readings: Vec<Option<f32>> = {
+                                            let mut ticks = sink_guard.sink().ticks.lock().unwrap();
+                                            let values = ticks
+                                                .iter()
+                                                .filter(|(t, _)| {
+                                                    *t >= segment_start
+                                                        + Duration::from_millis(
+                                                            drive_calibration::CAL_CUSHION_MS,
+                                                        )
+                                                })
+                                                .map(|(_, alc)| *alc)
+                                                .collect();
+                                            ticks.clear();
+                                            values
+                                        };
+                                        match stepper.observe(&readings) {
+                                            drive_calibration::Decision::StepUp => {}
+                                            drive_calibration::Decision::Knee(db) => {
+                                                saved = Some((db, false));
+                                                break;
+                                            }
+                                            drive_calibration::Decision::Ceiling(db) => {
+                                                saved = Some((db, true));
+                                                break;
+                                            }
+                                            drive_calibration::Decision::Abort => {
+                                                missing_alc = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    drop(sink_guard);
+                                    // Clear queued carrier before releasing PTT.
+                                    let _ = message_bus
+                                        .send_message(ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Audio,
+                                            MessageType::AudioOutput {
+                                                samples: Vec::new(),
+                                                sample_rate,
+                                                flush_first: true,
+                                                playback_started: None,
+                                            },
+                                            Instant::now(),
+                                        ))
+                                        .await;
+                                    ptt_guard.release("Drive calibration unkey").await;
+                                    if shutdown.load(Ordering::Acquire) {
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.drive",
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                            "Drive calibration stopped — shutdown; nothing saved"
+                                                .to_string(),
+                                            None,
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    if abort_current_tx.load(Ordering::Acquire) {
+                                        emit_diagnostic(&message_bus, "tx.drive", pancetta_core::DiagnosticLevel::Warn,
+                                            "Drive calibration stopped — operator halt; nothing saved".to_string(), None).await;
+                                        continue;
+                                    }
+                                    if let Some((db, no_onset)) = saved {
+                                        let selected = tx_drive.calibrate_band(band, db);
+                                        let _ = message_bus.send_message(ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter, ComponentId::Tui,
+                                            MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                                                band: Some(band), db: selected.db,
+                                                ceiling_db: tx_drive.ceiling_db(), mode: selected.mode,
+                                                available: selected.available,
+                                            }), Instant::now(),
+                                        )).await;
+                                        let detail = if no_onset {
+                                            format!("Drive calibrated: {} → {} dB — no ALC onset below the ceiling", drive_calibration::display_band(band), drive_calibration::display_db(db))
+                                        } else {
+                                            format!(
+                                                "Drive calibrated: {} → {} dB (was {} dB)",
+                                                drive_calibration::display_band(band),
+                                                drive_calibration::display_db(db),
+                                                drive_calibration::display_db(drive_at_key)
+                                            )
+                                        };
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.drive",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            detail,
+                                            None,
+                                        )
+                                        .await;
+                                        if tx_drive.needs_persist() {
+                                            let record = tx_drive_session_record.clone();
+                                            let path = tx_drive_session_path.clone();
+                                            let drive = tx_drive.clone();
+                                            let bus = message_bus.clone();
+                                            tokio::spawn(async move {
+                                                let result = tokio::task::spawn_blocking(move ||
+                                                    super::super::session_state::persist_tx_drive_current(&record, &path, &drive)
+                                                ).await;
+                                                if let Ok(Err(error)) = result {
+                                                    emit_diagnostic(&bus, "tx.drive", pancetta_core::DiagnosticLevel::Warn,
+                                                        format!("TX drive changed for this session only. Could not save TX drive. {error}"), None).await;
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        let detail = if let Some(reason) = midrun_mute.as_ref() {
+                                            format!("Drive calibration stopped — {reason}; nothing saved")
+                                        } else if audio_dropped {
+                                            "Drive calibration stopped — audio output dropped; nothing saved".to_string()
+                                        } else if missing_alc {
+                                            "Drive calibration stopped — ALC readings stopped mid-run; nothing saved".to_string()
+                                        } else {
+                                            "Drive calibration stopped — time limit reached; nothing saved".to_string()
+                                        };
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.drive",
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                            detail,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 _ => {} // Ignore other message types
                             }
                         }
