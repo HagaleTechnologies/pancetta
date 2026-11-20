@@ -12,6 +12,7 @@
 //! startup — same harness shape as `tests/shutdown_signals.rs`.
 
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -189,6 +190,27 @@ fn default_config_decodes_without_writing_any_wav() {
     );
 }
 
+/// Whether the 44-byte PCM WAV header at `path` matches the file's current
+/// length, i.e. the writer has finalized it. `hound::WavWriter::create`
+/// creates the final filename immediately but only flushes the 44-byte
+/// header with the data sizes on `finalize()`, so both size fields are
+/// placeholders until then: RIFF size at offset 4 is `len - 8` and the data
+/// chunk size at offset 40 is `len - 44` exactly when the file is complete.
+fn wav_header_matches_size(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 44];
+    if f.read_exact(&mut header).is_err() {
+        return false;
+    }
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64 == len - 8
+        && u32::from_le_bytes(header[40..44].try_into().unwrap()) as u64 == len - 44
+}
+
 /// Scenario 2: an operator who enables recording gets it where they asked.
 #[test]
 fn enabled_recording_writes_windows_into_the_configured_directory() {
@@ -237,8 +259,18 @@ fn enabled_recording_writes_windows_into_the_configured_directory() {
     );
 
     // The recording is a 12 kHz mono 16-bit WAV of one decode window.
-    let recorded = wavs_under(&rec_dir, None);
+    // `wavs_under` reports entries in readdir order and the recorder's final
+    // filename exists from `File::create` on, so wait for the oldest one to
+    // be finalized before parsing: a mid-write file can still be under the
+    // 44-byte header hound needs (PAN-422).
+    let mut recorded = wavs_under(&rec_dir, None);
     assert!(!recorded.is_empty());
+    recorded.sort();
+    run.wait_for(
+        "the first recorded window to be finalized",
+        Duration::from_secs(30),
+        |_| wav_header_matches_size(&recorded[0]),
+    );
     let spec = hound::WavReader::open(&recorded[0]).unwrap().spec();
     assert_eq!(spec.channels, 1);
     assert_eq!(spec.sample_rate, 12000);
