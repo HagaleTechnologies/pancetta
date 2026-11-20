@@ -115,6 +115,36 @@ async fn eqsl_errors_redact_password() {
 }
 
 #[tokio::test]
+async fn whitespace_bearing_credentials_still_redact_at_body_edges() {
+    // The credential's own edge whitespace used to be trimmed away before
+    // exact matching, leaving the visible part of the secret in the error.
+    let password = " pw+secret ";
+    let addr = respond("500 Internal Server Error", " pw+secret ".into());
+    let err = ClubLogClient::new("a@example.com", password, "K1ABC", "api-secret")
+        .with_endpoint(format!("http://{addr}/"))
+        .upload_adif("<EOR>")
+        .await
+        .unwrap_err();
+    let text = err.upload_failure_text();
+    assert!(text.contains("<redacted>"), "{text}");
+    assert!(!text.contains("pw+secret"), "{text}");
+}
+
+#[test]
+fn qrz_logbook_reason_edge_whitespace_still_redacts() {
+    // Same class inside the k=v parser: the REASON value used to be trimmed
+    // before decoding, so an unencoded echo of a whitespace-bearing key lost
+    // the whitespace its spellings match on.
+    let key = " qrz-secret ";
+    let spellings: Vec<String> = form_spellings(key);
+    let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+    let err = parse_qrz_response_inner("RESULT=FAIL&REASON= qrz-secret ", &refs).unwrap_err();
+    let text = err.upload_failure_text();
+    assert!(text.contains("<redacted>"), "{text}");
+    assert!(!text.contains("qrz-secret"), "{text}");
+}
+
+#[tokio::test]
 async fn oversized_error_body_omits_partial_preview() {
     let (addr, served) = crate::test_support::serve_chunked(
         "HTTP/1.1 500 Internal Server Error",

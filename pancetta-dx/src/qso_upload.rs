@@ -88,7 +88,11 @@ pub fn upload_failure_class_for_status(status: u16) -> UploadFailureClass {
 }
 
 fn sanitized(body: &str, secrets: &[&str]) -> String {
-    pancetta_core::error_redaction::sanitize_error_body(body.trim(), secrets)
+    // Redact before trimming: trimming first would strip the edge whitespace
+    // of a credential echo that its spellings match on.
+    pancetta_core::error_redaction::sanitize_error_body(body, secrets)
+        .trim()
+        .to_string()
 }
 
 fn html_spelling(value: &str) -> String {
@@ -339,20 +343,25 @@ fn parse_qrz_response_inner(body: &str, secrets: &[&str]) -> Result<QrzInsertOut
     let mut reason: Option<String> = None;
     let mut logid: Option<String> = None;
 
-    for pair in body.trim().split('&') {
+    // No whole-body trim before splitting: it would strip the edge whitespace
+    // of the final pair's value, which a credential echo can match on. Keys
+    // are trimmed below; structural values trim at their decode sites.
+    for pair in body.split('&') {
         let mut it = pair.splitn(2, '=');
         let key = it.next().unwrap_or("").trim();
-        let value = it.next().unwrap_or("").trim();
         if key.is_empty() {
             continue;
         }
-        let value = url_decode(value);
+        let raw_value = it.next().unwrap_or("");
         match key.to_ascii_uppercase().as_str() {
             // Accept either RESULT (documented) or STATUS (defensive alias).
-            "RESULT" | "STATUS" => result = Some(value),
-            "REASON" => reason = Some(value),
+            "RESULT" | "STATUS" => result = Some(url_decode(raw_value.trim())),
+            // The REASON feeds redacted error text: decode it untrimmed so an
+            // unencoded echo of a whitespace-bearing key keeps the whitespace
+            // its spellings match on.
+            "REASON" => reason = Some(url_decode(raw_value)),
             // Documented as LOGID; LOGIDS is the multi-record variant.
-            "LOGID" | "LOGIDS" => logid = Some(value),
+            "LOGID" | "LOGIDS" => logid = Some(url_decode(raw_value.trim())),
             _ => {}
         }
     }
@@ -366,10 +375,14 @@ fn parse_qrz_response_inner(body: &str, secrets: &[&str]) -> Result<QrzInsertOut
     match result_upper.as_str() {
         "OK" => Ok(QrzInsertOutcome::Inserted { logid }),
         // REPLACE = duplicate that was overwritten (only when OPTION=REPLACE).
-        "REPLACE" => Ok(QrzInsertOutcome::Duplicate { reason }),
+        "REPLACE" => Ok(QrzInsertOutcome::Duplicate {
+            reason: reason.map(|r| r.trim().to_string()),
+        }),
         // A plain duplicate without OPTION=REPLACE comes back as FAIL with a
         // REASON mentioning "duplicate"; treat that as non-fatal.
-        "FAIL" if reason_is_dupe => Ok(QrzInsertOutcome::Duplicate { reason }),
+        "FAIL" if reason_is_dupe => Ok(QrzInsertOutcome::Duplicate {
+            reason: reason.map(|r| r.trim().to_string()),
+        }),
         "FAIL" => Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::RecordRejected,
             message: format!(

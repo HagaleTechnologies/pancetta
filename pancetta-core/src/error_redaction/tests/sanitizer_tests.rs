@@ -17,3 +17,12 @@ fn ignores_empty_secrets() {
         "service says pat_ and ok"
     );
 }
+
+#[test]
+fn secret_overlapping_the_marker_cannot_rewrite_inserted_markers() {
+    // "act" is a substring of "<redacted>": replacing secrets one after
+    // another against the previous output used to rewrite the marker already
+    // inserted for the other secret into a malformed chain.
+    let out = sanitize_error_body("mission act", &["mission", "act"]);
+    assert_eq!(out, "<redacted> <redacted>");
+}

@@ -247,7 +247,11 @@ impl QrzXmlClient {
         secrets.extend_from_slice(extra);
         let encoded: Vec<String> = secrets.iter().map(|s| urlencode(s)).collect();
         secrets.extend(encoded.iter().map(String::as_str));
+        // Redact before trimming so a credential with edge whitespace still
+        // matches its own spelling.
         pancetta_core::error_redaction::sanitize_error_body(message, &secrets)
+            .trim()
+            .to_string()
     }
 
     /// Perform a single lookup with the given session key.
@@ -265,8 +269,12 @@ impl QrzXmlClient {
                 "Malformed QRZ XML response".into(),
             ))
         })? {
+            // Classify on the parsed text: redaction clips for display, and
+            // the clipped message must not lose the phrases callers match on.
             let safe = if is_session_expired(&msg) {
                 "Session Timeout".to_string()
+            } else if is_not_found(&msg) {
+                "Not found".to_string()
             } else {
                 self.sanitize(&msg, &[key])
             };
@@ -309,6 +317,13 @@ fn is_session_expired(msg: &str) -> bool {
         || (lower.contains("session") && lower.contains("expire"))
 }
 
+/// True if a QRZ lookup error reports the callsign was not found. Checked on
+/// the parsed text, before redaction clips the message for display, so the
+/// interactive coordinator can still cache the miss.
+fn is_not_found(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("not found")
+}
+
 /// Parse the `<Session>` block: returns a `<Key>` or an `<Error>` if present.
 fn parse_session(xml: &str) -> Result<SessionResult> {
     // QRZ nests `<Key>`/`<Error>` inside `<Session>`. Extract the text of the
@@ -321,7 +336,9 @@ fn parse_session(xml: &str) -> Result<SessionResult> {
     }
     if let Some(err) = extract_tag_text(xml, "Error")? {
         if !err.trim().is_empty() {
-            return Ok(SessionResult::Error(err.trim().to_string()));
+            // Keep the text untrimmed: redaction matches spellings that can
+            // carry edge whitespace, and trimming happens after it.
+            return Ok(SessionResult::Error(err));
         }
     }
     Ok(SessionResult::None)

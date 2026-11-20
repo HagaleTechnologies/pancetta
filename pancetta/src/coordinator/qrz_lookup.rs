@@ -309,6 +309,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_not_found_errors_are_still_cached_as_misses() {
+        // "Not found" past the display clip must not turn a cacheable miss
+        // into an uncached lookup failure.
+        let padding = "x".repeat(300);
+        let body: &'static str = Box::leak(
+            format!(
+                "<QRZDatabase><Session><Error>{padding} Not found: DL1ABC</Error></Session></QRZDatabase>"
+            )
+            .into_boxed_str(),
+        );
+        let (url, count, server) = speaking_qrz_server(body).await;
+        let (ctx, rx) = context(true, Some(url));
+        for _ in 0..2 {
+            handle_lookup_callsign(&ctx, "DL1ABC".into()).await;
+            assert!(
+                matches!(next(&rx).await, TuiMessage::StatusUpdate {status, ..} if status == "DL1ABC not found on QRZ")
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn silent_qrz_server_times_out_without_blocking_later_commands() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
