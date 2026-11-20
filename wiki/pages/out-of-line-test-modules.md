@@ -25,11 +25,11 @@ test fails until the row exists. Moving `coordinator/qso.rs`'s tests creates
 `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`.
 `tx/` and `station_agent/` already have rows.
 
-`include_str!` resolves from the test file. When `tx.rs` moves,
-`pan273_worker_unkey_tests` reads `tx.rs` with `include_str!("tx.rs")`, and that
-must become `include_str!("../../tx.rs")`. `pan115_worker_gate_tests` holds the TX
-worker harness: thirteen sibling modules in `tx.rs`, plus `hamlib.rs` and
-`tx/abort_transcripts.rs`, import it, so renaming it edits all of them.
+`include_str!` resolves from the test file. `worker_unkey_tests` reads
+`tx.rs` with `include_str!("../../tx.rs")`. `worker_gate_tests` holds the TX
+worker harness: thirteen sibling modules in `tx/tests/`, plus `hamlib.rs`,
+`tx/abort_transcripts.rs`, `tx/tests/drive_calibration_tests.rs` and
+`tx/tests/tx_drive_tests.rs`, import it, so renaming it edits all of them.
 
 Renaming a test module renames every test in it, which changes `--list` output,
 nextest filters and `scripts/pan325_load_loop.sh`.

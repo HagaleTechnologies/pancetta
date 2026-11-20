@@ -709,7 +709,7 @@ stale coalesce-time binding. Single-TX Step 4c already carried the binding with
 the payload (PR #362 round 4); the bundle arm did not.
 
 Both shapes reproduced through the real TX worker on `e90233a` (temporary
-module over `pan115_worker_gate_tests::worker_harness`, `qa` intent re-bound to
+module over `worker_gate_tests::worker_harness`, `qa` intent re-bound to
 `client-B`, two-item bundle):
 
 ```
@@ -723,7 +723,7 @@ A-TO-B: armed=Some("client-A") completions=[("SM2LIY K5ARH R-14", true), ("C6AVD
 
 A `Local` bundle keyed a frame re-bound to an unarmed client (with or without
 new text), and client A's bundle aired client B's frame under A's gate. The
-same scenarios are now the `pan136_bundle_binding_worker_tests` module in
+same scenarios are now the `bundle_binding_worker_tests` module in
 `coordinator/tx.rs`. With Step 4b-rebind disabled, its three reproduction tests
 fail and the armed-B and unarmed-control tests pass, as on `main`.
 
