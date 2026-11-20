@@ -24,7 +24,7 @@ Six section merges and `Config::merge_with` keep per-field code, and `pancetta-c
 - `NetworkConfig` extends `custom_services`.
 - `Config::merge_with` replaces `contest` only when the overlay has one. The base keeps its `metadata`, appends the overlay's `sources` and stamps `last_modified`.
 
-The `SkipEmpty` rules exist for the environment source. `load_from_environment` starts from `Config::default()` and blanks thirteen fields (the nine with a `PANCETTA_*` variable, plus `qth` and the three zones) so the merge keeps the file's values. Every other field keeps its default, so whenever one `PANCETTA_*` variable is set, every replace-rule section and every `SkipEmpty` field it does not blank (such as `rig.model`, `audio.buffer_size` and `station.tx_late_max_ms`) reverts to its default. PAN-371 kept that behaviour; PAN-460 tracks the fix in the environment source.
+The `SkipEmpty` rules govern file-to-file merges. Environment overrides apply directly to their nine target fields at the environment source's priority, so an override leaves every unrelated file setting intact. Empty strings and parsed zeroes leave their target fields unchanged; malformed numbers are ignored. PAN-460 changed the environment source without changing PAN-371's file merge rules.
 
 Rejected: a derive macro, which needs a proc-macro crate for about a dozen impls, and a default `ConfigSection::merge_with`, which would let a new section that needs a sentinel compile without anyone choosing its rule.
 
