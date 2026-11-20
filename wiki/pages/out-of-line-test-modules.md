@@ -35,7 +35,7 @@ Renaming a test module renames every test in it, which changes `--list` output,
 nextest filters and `scripts/pan325_load_loop.sh`.
 
 When moving a module, copy the text and run `cargo fmt --all`. Do not dedent by
-hand: a string literal in `tx.rs`'s `pan183_attempt_identity_tests` has leading
+hand: a string literal in `tx/tests/attempt_identity_tests.rs` has leading
 spaces that are part of its value. Review a move with `git diff --patience`; the
 default diff misaligns repeated test lines.
 
