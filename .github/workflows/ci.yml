@@ -452,6 +452,8 @@ jobs:
           done
           bash scripts/ci/test-release-notes.sh
           shellcheck -s bash scripts/release-notes.sh scripts/split-debuginfo.sh scripts/ci/*.sh scripts/ci/research-scan-shepherd/*.sh scripts/ci/research-scan-shepherd/stub/gh scripts/ci/research-scan-shepherd/stub/date
+      - name: Test PAN-213 manifest repair fixtures
+        run: python3 -m unittest discover -s scripts/tests -p test_pan213_manifests.py
 
   # Fast checks — run on every push and PR (~2 min)
   clippy:

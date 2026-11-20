@@ -17,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pan213_manifests  # noqa: E402
+import pan213_manifests
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "pan213_manifests.py")
 SURVEY = "research/corpus/surveys/2026-05-30"
@@ -54,7 +54,12 @@ def load_json(path):
 
 
 def row(path, digest, **extra):
-    entry = {"wav_path": path, "wav_sha256": digest, "interest_score": 1.5, "slot_hhmmss": "000000"}
+    entry = {
+        "wav_path": path,
+        "wav_sha256": digest,
+        "interest_score": 1.5,
+        "slot_hhmmss": "000000",
+    }
     entry.update(extra)
     return entry
 
@@ -78,17 +83,25 @@ def write_json(path, obj, indent=2):
         json.dump(obj, f, indent=indent)
 
 
-def build_root(base, all_rows=(), existing_rows=(), today_rows=(), ks_entries=(), indent=2):
+def build_root(
+    base, all_rows=(), existing_rows=(), today_rows=(), ks_entries=(), indent=2
+):
     root = os.path.join(base, "repo")
     write_json(os.path.join(root, ALL_WAVS), list(all_rows), indent)
-    write_json(os.path.join(root, f"{SURVEY}/existing_top100.entries.json"), list(existing_rows), indent)
+    write_json(
+        os.path.join(root, f"{SURVEY}/existing_top100.entries.json"),
+        list(existing_rows),
+        indent,
+    )
     write_json(os.path.join(root, TODAY), list(today_rows), indent)
     write_json(
         os.path.join(root, f"{SURVEY}/per_wav.json"),
         [{"wav_filename": "ft8_20260530_152356.wav", "file_bytes": 303404}],
         indent,
     )
-    write_json(os.path.join(root, f"{SURVEY}/summary.json"), {"sampled_wav_count": 1}, indent)
+    write_json(
+        os.path.join(root, f"{SURVEY}/summary.json"), {"sampled_wav_count": 1}, indent
+    )
     write_json(
         os.path.join(root, KS),
         {
@@ -105,7 +118,9 @@ def build_root(base, all_rows=(), existing_rows=(), today_rows=(), ks_entries=()
 
 
 def run_cmd(argv):
-    proc = subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True, text=True)
+    proc = subprocess.run(
+        [sys.executable, SCRIPT, *argv], capture_output=True, text=True
+    )
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -118,7 +133,17 @@ def run_check(root, verify=False):
 
 def run_repair(root, corpus, nas, out):
     return run_cmd(
-        ["repair", "--root", root, "--corpus-dir", corpus, "--nas-dir", nas, "--output-dir", out]
+        [
+            "repair",
+            "--root",
+            root,
+            "--corpus-dir",
+            corpus,
+            "--nas-dir",
+            nas,
+            "--output-dir",
+            out,
+        ]
     )
 
 
@@ -230,7 +255,9 @@ class CheckVerifyFilesTests(Pan213TestCase):
         write_file(os.path.join(store, "ok1.wav"), ok1)
         write_file(os.path.join(store, "ok2.wav"), ok2)
         write_file(os.path.join(store, "bad.wav"), changed)
-        os.symlink("/fake/.pancetta/recordings/gone.wav", os.path.join(store, "link.wav"))
+        os.symlink(
+            "/fake/.pancetta/recordings/gone.wav", os.path.join(store, "link.wav")
+        )
         rows = [
             row(f"{store}/ok1.wav", sha256(ok1)),
             row(f"{store}/ok1.wav", sha256(ok1)),
@@ -343,9 +370,20 @@ class RepairDropAccountingTests(Pan213TestCase):
             row(f"{store}/stable.wav", sha256(stable), error=None),
             live_row("mm.wav", sha256(mm_expected)),
         ]
-        today_rows = [{"note": "path-free row"}, live_row("dup.wav", sha256(dup_expected))]
-        ks_entries = [ks_row("dup.wav", sha256(dup_expected)), ks_row("keep.wav", sha256(keep))]
-        root = build_root(self.tmp.name, all_rows=all_rows, today_rows=today_rows, ks_entries=ks_entries)
+        today_rows = [
+            {"note": "path-free row"},
+            live_row("dup.wav", sha256(dup_expected)),
+        ]
+        ks_entries = [
+            ks_row("dup.wav", sha256(dup_expected)),
+            ks_row("keep.wav", sha256(keep)),
+        ]
+        root = build_root(
+            self.tmp.name,
+            all_rows=all_rows,
+            today_rows=today_rows,
+            ks_entries=ks_entries,
+        )
         out_dir = os.path.join(self.tmp.name, "stage")
 
         code, out = run_repair(root, corpus, nas, out_dir)
@@ -373,10 +411,18 @@ class RepairDropAccountingTests(Pan213TestCase):
         self.assertEqual(staged_today, [{"note": "path-free row"}])
 
         staged_ks = load_json(os.path.join(out_dir, KS))
-        for key in ("schema_version", "label", "source", "freq_gate_hz", "time_gate_sec"):
+        for key in (
+            "schema_version",
+            "label",
+            "source",
+            "freq_gate_hz",
+            "time_gate_sec",
+        ):
             self.assertIn(key, staged_ks)
         self.assertEqual(len(staged_ks["entries"]), 1)
-        self.assertEqual(staged_ks["entries"][0]["wav_path"], os.path.join(corpus, "keep.wav"))
+        self.assertEqual(
+            staged_ks["entries"][0]["wav_path"], os.path.join(corpus, "keep.wav")
+        )
         self.assertEqual(staged_ks["entries"][0]["pairs"], ks_entries[1]["pairs"])
 
         for name in ("per_wav.json", "summary.json"):
@@ -396,8 +442,13 @@ class RepairDropAccountingTests(Pan213TestCase):
                 ]
             ),
         )
-        self.assertEqual(drops["~/.pancetta/recordings/dup.wav"]["reason"], "no_candidate")
-        self.assertEqual(drops["~/.pancetta/recordings/dup.wav"]["expected_sha256"], sha256(dup_expected))
+        self.assertEqual(
+            drops["~/.pancetta/recordings/dup.wav"]["reason"], "no_candidate"
+        )
+        self.assertEqual(
+            drops["~/.pancetta/recordings/dup.wav"]["expected_sha256"],
+            sha256(dup_expected),
+        )
         self.assertEqual(
             drops["~/.pancetta/recordings/dup.wav"]["occurrences"],
             [
@@ -406,11 +457,21 @@ class RepairDropAccountingTests(Pan213TestCase):
                 {"manifest": KS, "row_index": 0},
             ],
         )
-        self.assertEqual(drops["~/.pancetta/recordings/mm.wav"]["reason"], "digest_mismatch")
-        rejected = {c["path"]: c["sha256"] for c in drops["~/.pancetta/recordings/mm.wav"]["rejected_candidates"]}
+        self.assertEqual(
+            drops["~/.pancetta/recordings/mm.wav"]["reason"], "digest_mismatch"
+        )
+        rejected = {
+            c["path"]: c["sha256"]
+            for c in drops["~/.pancetta/recordings/mm.wav"]["rejected_candidates"]
+        }
         self.assertEqual(rejected[os.path.join(corpus, "mm.wav")], sha256(mm_corpus))
-        self.assertEqual(rejected[os.path.join(nas, "2026-05", "mm.wav")], sha256(mm_nas))
-        self.assertEqual(drops["~/.pancetta/recordings/mm.wav"]["occurrences"], [{"manifest": ALL_WAVS, "row_index": 3}])
+        self.assertEqual(
+            rejected[os.path.join(nas, "2026-05", "mm.wav")], sha256(mm_nas)
+        )
+        self.assertEqual(
+            drops["~/.pancetta/recordings/mm.wav"]["occurrences"],
+            [{"manifest": ALL_WAVS, "row_index": 3}],
+        )
 
         self.assertEqual(
             report["counts"]["distinct_wavs"],
@@ -438,6 +499,31 @@ class RepairDropAccountingTests(Pan213TestCase):
 
 
 class RepairInventoryFailureTests(Pan213TestCase):
+    def test_repair_rejects_candidates_outside_supplied_stores(self):
+        data = wav_bytes(43)
+        corpus = os.path.join(self.tmp.name, "corpus")
+        nas = os.path.join(self.tmp.name, "nas")
+        external = os.path.join(self.tmp.name, "outside", "a.wav")
+        write_file(external, data)
+        os.makedirs(corpus)
+        os.makedirs(os.path.join(nas, "2026-05"))
+        root = build_root(self.tmp.name, all_rows=[live_row("a.wav", sha256(data))])
+
+        os.symlink(external, os.path.join(corpus, "a.wav"))
+        code, output = run_repair_inprocess(
+            root, corpus, nas, os.path.join(self.tmp.name, "stage-local")
+        )
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("outside supplied store", output)
+
+        os.unlink(os.path.join(corpus, "a.wav"))
+        os.symlink(external, os.path.join(nas, "2026-05", "a.wav"))
+        code, output = run_repair_inprocess(
+            root, corpus, nas, os.path.join(self.tmp.name, "stage-nas")
+        )
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("outside supplied store", output)
+
     def test_repair_fails_on_unavailable_store_or_inventory_error(self):
         a = wav_bytes(41)
         gone = wav_bytes(42)
@@ -454,13 +540,17 @@ class RepairInventoryFailureTests(Pan213TestCase):
             source_before = f.read()
 
         out_dir = os.path.join(self.tmp.name, "stage-a")
-        code, out = run_repair_inprocess(root, os.path.join(self.tmp.name, "absent"), nas, out_dir)
+        code, out = run_repair_inprocess(
+            root, os.path.join(self.tmp.name, "absent"), nas, out_dir
+        )
         self.assertNotEqual(code, 0, out)
         self.assertIn("corpus not accessible", out)
         self.assertFalse(os.path.exists(out_dir))
 
         out_dir = os.path.join(self.tmp.name, "stage-b")
-        code, out = run_repair_inprocess(root, corpus, os.path.join(self.tmp.name, "absent"), out_dir)
+        code, out = run_repair_inprocess(
+            root, corpus, os.path.join(self.tmp.name, "absent"), out_dir
+        )
         self.assertNotEqual(code, 0, out)
         self.assertIn("NAS archive", out)
         self.assertFalse(os.path.exists(out_dir))
@@ -503,7 +593,10 @@ class RepairInventoryFailureTests(Pan213TestCase):
         with self.subTest("contradictory digests for one path"):
             bad_root = build_root(
                 os.path.join(self.tmp.name, "contradiction"),
-                all_rows=[live_row("a.wav", sha256(a)), live_row("a.wav", sha256(gone))],
+                all_rows=[
+                    live_row("a.wav", sha256(a)),
+                    live_row("a.wav", sha256(gone)),
+                ],
             )
             out_dir = os.path.join(self.tmp.name, "stage-f")
             code, out = run_repair_inprocess(bad_root, corpus, nas, out_dir)

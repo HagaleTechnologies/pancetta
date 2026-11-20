@@ -44,7 +44,9 @@ ARRAY_FILES = (
     "today_top100.entries.json",
 )
 PATH_FREE_FILES = ("per_wav.json", "summary.json")
-REQUIRED_FILES = tuple(f"{SURVEY_DIR}/{name}" for name in ARRAY_FILES + PATH_FREE_FILES) + (KILL_SWITCH,)
+REQUIRED_FILES = tuple(
+    f"{SURVEY_DIR}/{name}" for name in ARRAY_FILES + PATH_FREE_FILES
+) + (KILL_SWITCH,)
 RECOVERY_REPORT = "research/corpus/PAN-213-recovery.json"
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 MONTH_SHARD = re.compile(r"^\d{4}-\d{2}$")
@@ -66,11 +68,11 @@ def _split_root_parts(path):
     m = re.match(r"^([A-Za-z]:)", s)
     if m:
         root = m.group(1)
-        s = s[m.end():]
+        s = s[m.end() :]
     elif s.startswith("~"):
         m = re.match(r"^(~[^/]*)", s)
         root = m.group(1)
-        s = s[m.end():]
+        s = s[m.end() :]
     elif s.startswith("/"):
         root = "/"
     parts = [seg for seg in s.split("/") if seg]
@@ -118,7 +120,7 @@ def store_basename(path):
 
 
 class Reference:
-    __slots__ = ("rel", "index", "path", "digest")
+    __slots__ = ("digest", "index", "path", "rel")
 
     def __init__(self, rel, index, path, digest):
         self.rel = rel
@@ -133,7 +135,9 @@ def _validate_rows(rel, rows):
             raise ManifestError(f"{rel} row {i}: entry is not a JSON object")
         if "wav_path" in row and row["wav_path"] is not None:
             if not isinstance(row["wav_path"], str) or not row["wav_path"]:
-                raise ManifestError(f"{rel} row {i}: wav_path must be a non-empty string")
+                raise ManifestError(
+                    f"{rel} row {i}: wav_path must be a non-empty string"
+                )
 
 
 def _read_json(path):
@@ -142,10 +146,14 @@ def _read_json(path):
 
 
 def load_required(root):
-    missing = [rel for rel in REQUIRED_FILES if not os.path.isfile(os.path.join(root, rel))]
+    missing = [
+        rel for rel in REQUIRED_FILES if not os.path.isfile(os.path.join(root, rel))
+    ]
     if missing:
         raise ManifestError(
-            "missing required input(s): " + ", ".join(missing) + " (all six are required)"
+            "missing required input(s): "
+            + ", ".join(missing)
+            + " (all six are required)"
         )
     data = OrderedDict()
     for rel in REQUIRED_FILES:
@@ -189,7 +197,9 @@ def collect_references(data):
     entries = data[KILL_SWITCH]["entries"]
     for i, row in enumerate(entries):
         if "wav_path" in row and row["wav_path"] is not None:
-            refs.append(Reference(KILL_SWITCH, i, row["wav_path"], row.get("wav_sha256")))
+            refs.append(
+                Reference(KILL_SWITCH, i, row["wav_path"], row.get("wav_sha256"))
+            )
     return refs
 
 
@@ -204,18 +214,34 @@ def file_digest(path):
     return h.hexdigest()
 
 
+def require_inside_store(path, store):
+    resolved = os.path.realpath(path)
+    root = os.path.realpath(store)
+    if os.path.commonpath((resolved, root)) != root:
+        raise InventoryError(
+            f"candidate resolves outside supplied store: {path} -> {resolved}"
+        )
+    return resolved
+
+
 def _verify_reference(ref, cache):
     resolved = os.path.realpath(os.path.expanduser(ref.path))
     status, _ = classify_path(resolved)
     if status == "live":
-        return [f"{ref.rel} row {ref.index}: {ref.path}: resolves into the live buffer: {resolved}"]
+        return [
+            f"{ref.rel} row {ref.index}: {ref.path}: resolves into the live buffer: {resolved}"
+        ]
     if not os.path.exists(resolved):
         return [f"{ref.rel} row {ref.index}: {ref.path}: file not found: {resolved}"]
     if not os.path.isfile(resolved):
-        return [f"{ref.rel} row {ref.index}: {ref.path}: not a regular file: {resolved}"]
+        return [
+            f"{ref.rel} row {ref.index}: {ref.path}: not a regular file: {resolved}"
+        ]
     digest = ref.digest
     if not isinstance(digest, str) or not HEX64.match(digest):
-        return [f"{ref.rel} row {ref.index}: {ref.path}: wav_sha256 is missing or not a 64-hex digest"]
+        return [
+            f"{ref.rel} row {ref.index}: {ref.path}: wav_sha256 is missing or not a 64-hex digest"
+        ]
     if resolved not in cache:
         cache[resolved] = file_digest(resolved)
     actual = cache[resolved]
@@ -255,7 +281,9 @@ def cmd_check(args):
     for line in failures:
         print(f"pan213 check: {line}")
     if failures:
-        print(f"pan213 check: FAILED, {len(failures)} problem reference(s) under {args.root}")
+        print(
+            f"pan213 check: FAILED, {len(failures)} problem reference(s) under {args.root}"
+        )
         return 1
     mode = ", every file hashed" if args.verify_files else ", no WAV I/O"
     print(
@@ -268,7 +296,9 @@ def index_nas_shards(nas_dir):
     try:
         with os.scandir(nas_dir) as it:
             shards = sorted(
-                e.name for e in it if e.is_dir(follow_symlinks=False) and MONTH_SHARD.match(e.name)
+                e.name
+                for e in it
+                if e.is_dir(follow_symlinks=False) and MONTH_SHARD.match(e.name)
             )
     except OSError as e:
         raise InventoryError(f"cannot list NAS archive {nas_dir}: {e}")
@@ -342,7 +372,8 @@ def _decide(data, corpus_dir, nas_dir):
         status, _ = classify_path(old)
         rejected = []
 
-        def try_candidate(path):
+        def try_candidate(path, store):
+            require_inside_store(path, store)
             actual = file_digest(path)
             if actual == digest:
                 return True
@@ -363,16 +394,18 @@ def _decide(data, corpus_dir, nas_dir):
         matched = None
         if name:
             local_path = os.path.join(corpus_dir, name)
-            if os.path.isfile(local_path) and try_candidate(local_path):
+            if os.path.isfile(local_path) and try_candidate(local_path, corpus_dir):
                 matched = local_path
             if matched is None:
                 for candidate in nas_lookup(name):
-                    if try_candidate(candidate):
+                    if try_candidate(candidate, nas_dir):
                         matched = candidate
                         break
         if matched is not None:
             group["outcome"] = (
-                "resolved_nas" if matched.startswith(nas_dir + os.sep) else "resolved_local"
+                "resolved_nas"
+                if matched.startswith(nas_dir + os.sep)
+                else "resolved_local"
             )
             group["new_path"] = matched
         else:
@@ -474,7 +507,9 @@ def cmd_repair(args):
                 shutil.copyfile(os.path.join(root, rel), staged_path)
                 continue
             _dump_like_source(
-                _rewrite_rows(data[rel], rel, groups, occurrences), sources[rel], staged_path
+                _rewrite_rows(data[rel], rel, groups, occurrences),
+                sources[rel],
+                staged_path,
             )
         kill_switch = dict(data[KILL_SWITCH])
         kill_switch["entries"] = _rewrite_rows(
@@ -550,7 +585,9 @@ def cmd_repair(args):
     print(
         f"  verified at stable path:    {distinct['retained_stable']} / {references['retained_stable']}"
     )
-    print(f"  dropped (see report):       {distinct['dropped']} / {references['dropped']}")
+    print(
+        f"  dropped (see report):       {distinct['dropped']} / {references['dropped']}"
+    )
     if nas_state["shards"]:
         print(f"  month shards searched: {', '.join(nas_state['shards'])}")
     print(f"pan213 repair: staged tree: {out_dir}")
@@ -570,8 +607,12 @@ def main(argv=None):
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    check = sub.add_parser("check", help="reject live-buffer and non-absolute WAV paths")
-    check.add_argument("--root", required=True, help="repository root holding the six input files")
+    check = sub.add_parser(
+        "check", help="reject live-buffer and non-absolute WAV paths"
+    )
+    check.add_argument(
+        "--root", required=True, help="repository root holding the six input files"
+    )
     check.add_argument(
         "--verify-files",
         action="store_true",
@@ -579,11 +620,25 @@ def main(argv=None):
     )
     check.set_defaults(func=cmd_check)
 
-    repair = sub.add_parser("repair", help="stage a digest-verified rewrite of broken references")
-    repair.add_argument("--root", required=True, help="repository root holding the six input files")
-    repair.add_argument("--corpus-dir", required=True, help="local corpus directory (~/.pancetta/corpus)")
-    repair.add_argument("--nas-dir", required=True, help="NAS archive root holding YYYY-MM month shards")
-    repair.add_argument("--output-dir", required=True, help="fresh staging directory for the repaired tree")
+    repair = sub.add_parser(
+        "repair", help="stage a digest-verified rewrite of broken references"
+    )
+    repair.add_argument(
+        "--root", required=True, help="repository root holding the six input files"
+    )
+    repair.add_argument(
+        "--corpus-dir",
+        required=True,
+        help="local corpus directory (~/.pancetta/corpus)",
+    )
+    repair.add_argument(
+        "--nas-dir", required=True, help="NAS archive root holding YYYY-MM month shards"
+    )
+    repair.add_argument(
+        "--output-dir",
+        required=True,
+        help="fresh staging directory for the repaired tree",
+    )
     repair.set_defaults(func=cmd_repair)
 
     args = parser.parse_args(argv)
