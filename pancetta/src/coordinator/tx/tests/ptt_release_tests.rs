@@ -1,3 +1,4 @@
+// PAN-135. Formerly the inline module `pan135_ptt_release_tests`.
 use super::*;
 use crate::message_bus::{MessageBus, RigControlMessage};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
