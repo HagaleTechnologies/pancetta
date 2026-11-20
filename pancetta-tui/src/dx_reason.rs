@@ -221,7 +221,7 @@ pub fn reason_for(
             }
             PriorityTier::PerBandDxccNew => Headline::NeededEntity {
                 known: need.and_then(|n| n.dxcc_needed),
-                local: need.and_then(|n| n.dxcc_source) == Some(NeedSource::LocalLogbook),
+                local: f.need_source == NeedSource::LocalLogbook,
             },
             PriorityTier::SpecialStation if f.notable => Headline::Notable,
             PriorityTier::SpecialStation => Headline::SpecialEvent,
