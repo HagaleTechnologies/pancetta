@@ -14666,6 +14666,75 @@ mod replay_history_seed_tests {
             .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME)
     }
 
+    /// PAN-424: one read-only snapshot of the queue file, deliberately not
+    /// `OutboxStore::open` — that can quarantine a file it cannot parse,
+    /// and the live worker still owns the queue while the test polls it.
+    /// The worker writes by atomic replacement, so every read is a whole
+    /// snapshot: `Ok(None)` is a file not created yet, `Ok(Some)` a parsed
+    /// one, and any other read or parse failure is an error naming the
+    /// path.
+    fn read_outbox_snapshot(
+        path: &std::path::Path,
+    ) -> Result<Option<Vec<pancetta_dx::upload_outbox::OutboxEntry>>, String> {
+        #[derive(serde::Deserialize)]
+        struct OutboxFile {
+            entries: Vec<pancetta_dx::upload_outbox::OutboxEntry>,
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        serde_json::from_slice::<OutboxFile>(&bytes)
+            .map(|file| Some(file.entries))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// PAN-424: wait for `call`'s `destination` upload to be queued on
+    /// disk. The enqueue happens in the subscriber task and the queue
+    /// write in the worker, so the test must observe the file rather than
+    /// sleep past a fixed delay — the delay is what raced on CI (PR #683,
+    /// run 44019998471). Same 50 ms cadence and ~5 s budget as
+    /// `wait_for_adif_record`. Fails through `Err` (with the callsign,
+    /// destination and deadline in the timeout text) rather than panicking,
+    /// so the caller can still shut the coordinator down before reporting.
+    async fn wait_for_queued_upload(
+        home: &std::path::Path,
+        call: &str,
+        destination: pancetta_dx::upload_outbox::UploadDestination,
+    ) -> Result<(), String> {
+        let path = outbox_path(home);
+        let budget = std::time::Duration::from_secs(5);
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(5);
+        let outcome = tokio::time::timeout(budget, async {
+            loop {
+                match read_outbox_snapshot(&path) {
+                    Ok(Some(entries)) => {
+                        if entries
+                            .iter()
+                            .any(|entry| entry.call == call && entry.destination == destination)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    // No file yet, or a valid snapshot without the wanted
+                    // entry: keep polling.
+                    Ok(None) => {}
+                    Err(report) => return Err(report),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "no {destination:?} upload for {call} was queued in {} by {deadline}",
+                path.display()
+            )),
+        }
+    }
+
     /// PAN-232 Tier 1: a QSO that completes while its QRZ XML lookup hangs
     /// still has its uploads queued when pancetta shuts down, without the
     /// QRZ data, shutdown does not wait for the lookup, and the next start
@@ -14782,12 +14851,30 @@ mod replay_history_seed_tests {
     /// shutdown flag flips (it finishes the message it is handling), so the
     /// upload subscriber must keep receiving until shutdown asks it to
     /// finish, not stop on the flag alone.
+    ///
+    /// PAN-424: the enqueue is observed, never slept past. The startup wait
+    /// is `qso_consumer_ready`, which the QSO task releases only after the
+    /// upload subscriber has started, and the completion is confirmed on
+    /// disk with a bounded poll before coordinator teardown begins — a
+    /// fixed delay is what raced on CI (PR #683, run 44019998471). No
+    /// flag-to-completion sleep either: that cadence only gates in-flight
+    /// QRZ lookups, and this fixture has QRZ disabled.
     #[tokio::test]
     async fn qso_completed_after_the_shutdown_flag_still_has_its_uploads_queued() {
         let tmp = tempfile::tempdir().unwrap();
         let mut coordinator = clublog_coordinator(tmp.path()).await;
+        let mut consumer_ready = coordinator.qso_consumer_ready.subscribe();
         coordinator.start_qso_component().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Released immediately before the QSO task's receiver loop, after
+        // the upload subscriber has started (same bounded wait as the
+        // PAN-42 test below).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            consumer_ready.wait_for(|ready| *ready),
+        )
+        .await
+        .expect("QSO consumer never became ready")
+        .unwrap();
         let manager = coordinator
             .qso_manager_watch
             .borrow()
@@ -14796,13 +14883,26 @@ mod replay_history_seed_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
-        // More than four of the subscriber's shutdown polls.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         super::replay_local_log_tests::complete_one_qso(&manager).await;
+        // The flag is up, so shutdown could abort the QSO task on its join
+        // timeout at any moment: the upload must already be queued on disk
+        // before teardown starts. The result is saved and asserted only
+        // after `shutdown()`, so the coordinator is always torn down.
+        let queued = wait_for_queued_upload(
+            tmp.path(),
+            "K1DEF",
+            pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+        )
+        .await;
         coordinator.shutdown().await.unwrap();
+        queued.expect("the K1DEF ClubLog upload was queued before shutdown");
         let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(outbox_path(tmp.path()));
         assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
         assert_eq!(store.entries()[0].call, "K1DEF");
+        assert_eq!(
+            store.entries()[0].destination,
+            pancetta_dx::upload_outbox::UploadDestination::ClubLog
+        );
     }
 
     /// PAN-274: a QSO that completes after the shutdown flag flips (the Qso
