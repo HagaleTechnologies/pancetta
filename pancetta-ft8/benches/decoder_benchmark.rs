@@ -14,6 +14,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pancetta_ft8::{
     Ft8Config, Ft8Decoder, NUM_SYMBOLS, SAMPLE_RATE, SYMBOL_DURATION, WINDOW_SAMPLES,
 };
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use std::f64::consts::PI;
 use std::hint::black_box;
 
@@ -21,9 +22,13 @@ use std::hint::black_box;
 fn generate_benchmark_signal(num_signals: usize, base_snr: f32, frequency_spread: f64) -> Vec<f32> {
     let mut samples = vec![0.0f32; WINDOW_SAMPLES];
 
+    // Fixed seed (PAN-369): every run decodes identical input, so the weekly
+    // bench compares the decoder against its baseline, not two noise draws.
+    let mut rng = StdRng::seed_from_u64(0x5049_4e33_3639);
+
     // Add noise floor
     for sample in &mut samples {
-        *sample = (rand::random::<f32>() - 0.5) * 0.02;
+        *sample = (rng.random::<f32>() - 0.5) * 0.02;
     }
 
     // Add multiple FT8-like signals

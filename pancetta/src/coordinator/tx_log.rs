@@ -173,12 +173,15 @@ pub(crate) fn append_batch(
         }
     }
 
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
     let mut file = ActiveFile {
-        file: OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?,
+        file: opts.open(path)?,
         path,
     };
     append_whole_lines(&mut file, &buf)?;
@@ -591,7 +594,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn rec(text: &str) -> TxFrameRecord {
+    pub(super) fn rec(text: &str) -> TxFrameRecord {
         TxFrameRecord::new(
             chrono::Utc::now(),
             pancetta_ft8::Protocol::Ft8,
@@ -1077,3 +1080,7 @@ mod tests {
         assert_eq!(read_records(&path), vec![crash_record()]);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "tx_log/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;

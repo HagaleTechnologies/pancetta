@@ -1,21 +1,50 @@
 [package]
 name = "pancetta-ft8"
-description = "High-performance FT8 digital mode decoder for Pancetta"
+description = "FT8 and FT4 decoder, encoder and modulator for amateur radio, with the ft8_lib C reference decoder built in"
 # PAN-176: explicit crate version, decoupled from the workspace so external
 # consumers (manta) can pin by the `pancetta-ft8-v<version>` git tag. Bump
 # this independently of the workspace from now on; the release process cuts
 # the matching tag on the merge commit.
 version = "0.9.7"
 edition.workspace = true
-rust-version = { workspace = true }
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+# PAN-384: publishable on its own switch (the workspace default stays
+# `false`). Publishes together with pancetta-core, which it depends on.
+publish = true
+rust-version = "1.88"
+readme = "README.md"
+keywords = ["ft8", "ft4", "amateur-radio", "ham-radio", "decoder"]
+categories = ["multimedia::audio", "encoding", "science"]
+# PAN-384: whitelist of what the crates.io package ships. It carries the
+# ft8_lib `ft8/`, `fft/` and `common/` directories (build.rs compiles all but
+# common/audio.c and common/wave.c; about 0.2 MB) and their license, and
+# leaves out tests, benches, fixtures and the rest of the submodule (test
+# WAVs, demo/utils, and the WSJT-X files in ft4_ft8_public/ that carry no
+# license header). Without it the package is about 25 MiB. A whitelist fails
+# closed: a new large file in the submodule cannot slip in.
+include = [
+    "/src/**",
+    "/assets/**",
+    "/build.rs",
+    "/mingw_stpcpy_shim.h",
+    "/examples/decode_cycle.rs",
+    # PAN-369: src/tier_probe.rs embeds this off-air window with include_bytes!.
+    "/tests/fixtures/wav/basicft8/live_now.wav",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/THIRD-PARTY-NOTICES.md",
+    "/vendor/ft8_lib/LICENSE",
+    "/vendor/ft8_lib/ft8/**",
+    "/vendor/ft8_lib/fft/**",
+    "/vendor/ft8_lib/common/**",
+]
 
 [dependencies]
 # Shared types (SlotParity, etc.)
-pancetta-core = { path = "../pancetta-core" }
+pancetta-core = { path = "../pancetta-core", version = "0.9.7" }
 # DSP and FFT operations
 rustfft = "6.4"
 # Real-input FFT (halves the work vs. a full complex FFT for real audio;
@@ -47,8 +76,10 @@ serde_json = { version = "1.0", optional = true }
 sha2 = { version = "0.10", optional = true }
 # Async runtime for transmission control
 tokio = { version = "1.50", features = ["full"], optional = true }
-# WAV file reading for benchmark (optional)
-hound = { version = "3.5", optional = true }
+# WAV reading: the tier probe parses its embedded busy-band window
+# (PAN-369); also used by the benchmark harness and the WAV tests. Pure
+# Rust, no audio-device stack.
+hound = "3.5"
 
 [build-dependencies]
 # C compiler for ft8_lib FFI
@@ -64,8 +95,6 @@ proptest = "1.11"
 rand = "0.10"
 # Async testing runtime
 tokio-test = "0.4"
-# WAV file reading for integration tests
-hound = "3.5"
 sha2 = "0.10"
 serde_json = "1.0"
 
@@ -92,7 +121,7 @@ gpio = ["rppal"]
 # stack). The encoder and modulator are in every build (PAN-331).
 transmit = ["serde", "serialport", "cpal", "parking_lot", "tokio", "dep:serde_json", "dep:sha2"]
 # Enable benchmark harness for decoder comparison
-benchmark = ["dep:hound", "dep:serde", "dep:serde_json", "dep:sha2"]
+benchmark = ["dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable serde Serialize/Deserialize for config types (used by research harness)
 serde = ["dep:serde"]
 # Enable decoder debug output (temporary)
@@ -104,6 +133,11 @@ ft2 = []
 # reduction in OSD trials for failed-BP frames. Disable for minimal
 # builds where the weight blob and inference cost aren't acceptable.
 neural_osd = []
+
+[package.metadata.docs.rs]
+# Document the default (standalone) feature set, the one the stable API covers.
+# `transmit` pulls cpal/ALSA and serialport/udev; `ft2` adds a Protocol variant.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lints]
 workspace = true

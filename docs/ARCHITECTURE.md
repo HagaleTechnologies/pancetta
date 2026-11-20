@@ -158,6 +158,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `swr_guard.rs` | SWR protection trip logic (PAN-251). |
 | `tests/` | Out-of-line unit tests of the coordinator module itself. |
 | `tier.rs` | Hardware-tier auto-classification at startup. |
+| `tier/` | Hardware-tier auto-classification at startup. |
 | `tui_relay.rs` | TUI relay and command forwarding. |
 | `tui_relay/` | TUI relay and command forwarding. |
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
@@ -166,10 +167,12 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tx_drive/` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
+| `tx_log/` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_meter/` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
+| `upload_outbox/` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `util.rs` | Linear resampling for WAV playback. |
 | `wav_playback.rs` | WAV file playback for offline testing. |
 | `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |

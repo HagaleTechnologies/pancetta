@@ -1,0 +1,115 @@
+name: Weekly FT8 benchmark
+
+# PAN-369: run `cargo bench -p pancetta-ft8` weekly on one dedicated
+# self-hosted host and fail when any benchmark mean is more than 15 % above
+# the reference stored on that host. The reference lives outside the checkout,
+# in the runner service user's state directory, namespaced by rustc version
+# and BASELINE_REVISION. Only a manual dispatch with seed_baseline=true writes
+# it, and only when none exists. Procedure: docs/RUNBOOK.md, "Weekly FT8
+# benchmark (PAN-369)".
+
+on:
+  schedule:
+    # Mondays 12:00 UTC.
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+    inputs:
+      seed_baseline:
+        description: 'Store this run as the reference baseline (refused when one already exists)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One run at a time on the bench host; a queued run waits rather than cancels
+# a measurement in flight. The suffix is the host's runs-on label below:
+# runner labels are not available to workflow-level expressions.
+concurrency:
+  group: ft8-benchmark-ft8-bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: FT8 benchmark regression
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, linux, ft8-bench]
+    timeout-minutes: 120
+    env:
+      # Bump (v1 -> v2) on a hardware change or a deliberate rebaseline, then
+      # reseed. A toolchain bump gets a new namespace on its own.
+      BASELINE_REVISION: v1
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # PAN-56: exact pin matching rust-toolchain.toml. See
+      # docs/DECISIONS/config-and-platform.md.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Resolve baseline and output directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_line=$(rustc --version)
+          rust_version=$(awk '{print $2}' <<<"$version_line")
+          if ! [[ $rust_version =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::cannot read the Rust version from '$version_line'"
+            exit 1
+          fi
+          baseline_dir="${XDG_STATE_HOME:-$HOME/.local/state}/pancetta/ft8-bench/${rust_version}/${BASELINE_REVISION}"
+          criterion_home=$(mktemp -d "$RUNNER_TEMP/ft8-criterion.XXXXXX")
+          {
+            echo "RUST_VERSION=$rust_version"
+            echo "BASELINE_DIR=$baseline_dir"
+            echo "CRITERION_HOME=$criterion_home"
+          } >>"$GITHUB_ENV"
+          echo "rust $rust_version, baseline $baseline_dir, criterion output $criterion_home"
+
+      - name: Run FT8 benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench -p pancetta-ft8
+
+      - name: Seed the baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.seed_baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -e $BASELINE_DIR ]] && { [[ ! -d $BASELINE_DIR ]] || [[ -n $(find "$BASELINE_DIR" -mindepth 1 -print -quit) ]]; }; then
+            echo "::error::a baseline already exists at $BASELINE_DIR; refusing to overwrite it. To rebaseline, bump BASELINE_REVISION in .github/workflows/ft8-benchmark.yml and reseed (docs/RUNBOOK.md)."
+            exit 1
+          fi
+          # The new suite must itself be complete and valid before it is stored.
+          bash scripts/ci/check-criterion-regression.sh "$CRITERION_HOME" "$CRITERION_HOME"
+          staging="$BASELINE_DIR.tmp.$$"
+          trap 'rm -rf "$staging"' EXIT
+          rm -rf "$staging"
+          mkdir -p "$(dirname "$BASELINE_DIR")"
+          cp -a "$CRITERION_HOME" "$staging"
+          # rename(2): replaces at most an empty directory, never a stored baseline.
+          mv -T "$staging" "$BASELINE_DIR"
+          echo "Stored the FT8 benchmark baseline at $BASELINE_DIR"
+
+      - name: Compare against the stored baseline
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.seed_baseline) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d $BASELINE_DIR ]]; then
+            echo "::error::no FT8 benchmark baseline at $BASELINE_DIR. To seed it: dispatch Weekly FT8 benchmark with seed_baseline=true; see docs/RUNBOOK.md"
+            exit 1
+          fi
+          bash scripts/ci/check-criterion-regression.sh "$BASELINE_DIR" "$CRITERION_HOME" 15
+
+      - name: Remove Criterion output
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n ${CRITERION_HOME:-} ]]; then rm -rf "$CRITERION_HOME"; fi

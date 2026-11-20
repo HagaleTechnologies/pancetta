@@ -48,6 +48,14 @@ const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 /// Most bytes of a 2xx `log_qso` body read to look for a duplicate marker.
 const MAX_LOG_QSO_BODY_BYTES: usize = 64 * 1024;
 
+fn qso_remote_id(resp: &reqwest::Response) -> Option<String> {
+    let value = resp.headers().get("X-QSO-Id")?.to_str().ok()?.trim();
+    (value.len() <= 128
+        && !value.is_empty()
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)))
+    .then(|| value.to_owned())
+}
+
 /// A response body read up to a byte budget by [`read_body_capped`].
 struct CappedBody {
     /// The body, or its first `limit` bytes when `truncated`.
@@ -329,6 +337,7 @@ impl CqdxClient {
             .await?;
 
         let status = resp.status();
+        let remote_id = qso_remote_id(&resp);
 
         // 401 is always an auth failure regardless of body.
         if status.as_u16() == 401 {
@@ -337,7 +346,7 @@ impl CqdxClient {
         // 409 Conflict is the conventional "already logged" signal — treat as
         // a non-fatal duplicate.
         if status.as_u16() == 409 {
-            return Ok(QsoUploadOutcome::Duplicate);
+            return Ok(QsoUploadOutcome::Duplicate { remote_id });
         }
         if !status.is_success() {
             let body = error_body_text(resp).await;
@@ -361,12 +370,12 @@ impl CqdxClient {
             if !bytes.is_empty() {
                 if let Ok(parsed) = serde_json::from_slice::<QsoUploadBody>(&bytes) {
                     if parsed.is_duplicate() {
-                        return Ok(QsoUploadOutcome::Duplicate);
+                        return Ok(QsoUploadOutcome::Duplicate { remote_id });
                     }
                 }
             }
         }
-        Ok(QsoUploadOutcome::Logged)
+        Ok(QsoUploadOutcome::Logged { remote_id })
     }
 
     async fn check_status(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
@@ -408,61 +417,11 @@ impl CqdxClient {
     }
 }
 
-/// Maximum length (in chars) of a sanitized error body embedded in
-/// [`CqdxError::Server`].
+#[cfg(test)]
 const MAX_ERROR_BODY_CHARS: usize = 200;
 
-/// Sanitize a server error-response body before embedding it in an error that
-/// may be logged.
-///
-/// Belt-and-suspenders defense: if the cqdx server ever (bug) echoed the bearer
-/// token back in an error body, embedding the raw body in `CqdxError::Server`
-/// would surface it in pancetta logs. This redacts any `pat_<...>` token-shaped
-/// substrings to `pat_***REDACTED***` and truncates the result to
-/// [`MAX_ERROR_BODY_CHARS`] chars (appending `…` if truncated).
-///
-/// The `pat_` redaction is done with a manual scan (no regex dependency).
 fn sanitize_error_body(body: &str) -> String {
-    // Redact `pat_` followed by one-or-more token chars ([A-Za-z0-9_]).
-    let mut redacted = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if body[i..].starts_with("pat_") {
-            // Consume the trailing token characters.
-            let mut j = i + 4;
-            while j < bytes.len() {
-                let c = bytes[j];
-                if c.is_ascii_alphanumeric() || c == b'_' {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            // Only redact if there was at least one token char after `pat_`.
-            if j > i + 4 {
-                redacted.push_str("pat_***REDACTED***");
-                i = j;
-                continue;
-            }
-        }
-        // Push this single character (handle multi-byte UTF-8 correctly).
-        let ch_len = match body[i..].chars().next() {
-            Some(c) => c.len_utf8(),
-            None => 1,
-        };
-        redacted.push_str(&body[i..i + ch_len]);
-        i += ch_len;
-    }
-
-    // Truncate to MAX_ERROR_BODY_CHARS chars, appending an ellipsis if cut.
-    if redacted.chars().count() > MAX_ERROR_BODY_CHARS {
-        let mut out: String = redacted.chars().take(MAX_ERROR_BODY_CHARS).collect();
-        out.push('…');
-        out
-    } else {
-        redacted
-    }
+    pancetta_core::error_redaction::sanitize_error_body(body, &[])
 }
 
 #[cfg(test)]
@@ -474,7 +433,7 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_client(base_url: &str) -> CqdxClient {
+    pub(super) fn test_client(base_url: &str) -> CqdxClient {
         CqdxClient::new(base_url.to_string(), "pat_test_token".to_string()).unwrap()
     }
 
@@ -938,7 +897,7 @@ mod tests {
     }
 
     /// Build a representative completed-QSO record for the logbook tests.
-    fn sample_qso() -> QsoRecord {
+    pub(super) fn sample_qso() -> QsoRecord {
         QsoRecord {
             callsign: "JA1ABC".to_string(),
             remote_grid: Some("PM95".to_string()),
@@ -984,7 +943,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Logged);
+        assert_eq!(outcome, QsoUploadOutcome::Logged { remote_id: None });
     }
 
     /// A 409 Conflict is a non-fatal duplicate, not an error.
@@ -999,7 +958,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// A 200 whose body marks the record as a duplicate is also non-fatal.
@@ -1017,7 +976,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// cqdx-api.v1 (cqdx PR #126, Q-0007): the upload always returns HTTP 201
@@ -1040,7 +999,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// cqdx-api.v1: a 201 with `duplicate: false` (a freshly-inserted contact)
@@ -1061,7 +1020,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Logged);
+        assert_eq!(outcome, QsoUploadOutcome::Logged { remote_id: None });
     }
 
     /// A 401 is surfaced as `Unauthorized` so the caller can stop retrying.
@@ -1424,7 +1383,10 @@ mod tests {
         let (url, h) = serve_body("201 Created", Framing::Chunked, br#"{"ok":true}"#, 64 * MIB);
         let result = test_client(&url).log_qso(sample_qso()).await;
         let s = served(h).await;
-        assert_eq!(result.unwrap(), QsoUploadOutcome::Logged);
+        assert_eq!(
+            result.unwrap(),
+            QsoUploadOutcome::Logged { remote_id: None }
+        );
         assert!(
             !s.completed && s.written < 32 * MIB,
             "client kept reading: {} bytes written, completed={}",
@@ -1438,7 +1400,10 @@ mod tests {
         let (url, h) = serve_body("200 OK", Framing::Chunked, br#"{"status":"duplicate"}"#, 0);
         let result = test_client(&url).log_qso(sample_qso()).await;
         let s = served(h).await;
-        assert_eq!(result.unwrap(), QsoUploadOutcome::Duplicate);
+        assert_eq!(
+            result.unwrap(),
+            QsoUploadOutcome::Duplicate { remote_id: None }
+        );
         assert!(s.completed);
     }
 
@@ -1470,3 +1435,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client/tests/tls_security_tests.rs"]
 mod tls_security_tests;
+
+#[cfg(test)]
+#[path = "client/tests/remote_id_tests.rs"]
+mod remote_id_tests;

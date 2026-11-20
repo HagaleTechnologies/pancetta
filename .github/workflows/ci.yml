@@ -146,6 +146,16 @@ jobs:
               - 'pancetta-protocol/tests/fixtures/rig-api.v1.schema.json'
               # PAN-284: the Workspace Check lane runs this gate on real bench output.
               - 'scripts/ci/check-criterion-budget.sh'
+              # PAN-384: packaging inputs that are not .rs or Cargo.toml
+              - 'scripts/ci/check-publish-package.sh'
+              - 'scripts/ci/check-crate-size.sh'
+              - 'pancetta-ft8/README.md'
+              - 'pancetta-core/README.md'
+              - '**/LICENSE-*'
+              - '**/THIRD-PARTY-NOTICES.md'
+              - 'pancetta-ft8/assets/**'
+              - 'pancetta-ft8/*.h'
+              - 'pancetta-ft8/vendor/**'
             # PAN-372: research crate and its direct build inputs.
             research:
               - 'pancetta-research/**'
@@ -473,7 +483,7 @@ jobs:
           toolchain: 1.98.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: clippy
@@ -558,7 +568,7 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-tests
@@ -644,7 +654,7 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-check
@@ -657,6 +667,12 @@ jobs:
         # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
         # run in workspace-tests with `--features transmit`.
         run: cargo test -p pancetta-ft8
+
+      # PAN-384: pancetta-core and pancetta-ft8 must stay publishable together,
+      # with the ft8_lib C sources inside and each .crate under crates.io's
+      # 10 MB limit. A dry-run never uploads.
+      - name: Publish dry-run, pancetta-core + pancetta-ft8 (PAN-384)
+        run: bash scripts/ci/check-publish-package.sh
 
       - name: Build examples
         run: cargo build --workspace --exclude pancetta-research --examples
@@ -758,7 +774,7 @@ jobs:
           toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: cross-${{ matrix.os }}

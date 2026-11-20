@@ -9,7 +9,11 @@
 //!
 //! 1. [`initialize`] seeds an `Arc<AtomicBool>` from the env var (operator
 //!    override), checks the on-disk cache, and either applies the cached
-//!    tier directly or spawns a background probe.
+//!    tier directly or spawns a background probe. PAN-369: before a due
+//!    probe it reads the 1-minute load average; above the logical core
+//!    count it defers measurement to a later startup and applies the
+//!    previous same-host tier, or Moderate (Auto at the Standard 250 ms
+//!    budget) when there is none, without touching the cache.
 //! 2. The atomic is handed to the FT8 hot loop; reading it is a single
 //!    relaxed load per window iteration.
 //! 3. `initialize` and the background probe worker both also re-publish
@@ -54,7 +58,11 @@ use tracing::{debug, info, warn};
 
 use super::effort::{seed_effort_budget, DecodeWindowConfig};
 
-const CACHE_SCHEMA_VERSION: u32 = 1;
+/// PAN-369: schema 2 marks a busy-window measurement. Schema 1 (the
+/// synthetic-CQ probe) is read only as a same-host fallback tier for a
+/// deferred startup and is replaced by the next successful probe.
+const CACHE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
 
 /// Operator-supplied override of the scoped-fast-path flag.
@@ -122,9 +130,11 @@ pub(crate) fn default_cache_path() -> Option<PathBuf> {
     pancetta_core::data_dir::try_current().map(|d| d.join("tier_cache.json"))
 }
 
-/// Read and parse the cache file. Returns `None` on any error: missing
-/// file, malformed JSON, mismatched schema version. All non-trivial
-/// failures log at `debug!`.
+/// Read and parse the cache file once. Returns `None` on any error:
+/// missing file, malformed JSON, or a schema this build does not know
+/// (anything but the current or legacy schema). All non-trivial failures
+/// log at `debug!`; [`evaluate_cache`] decides what a parsed entry is
+/// worth.
 pub(crate) fn load_cache(path: &Path) -> Option<TierCache> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -141,45 +151,144 @@ pub(crate) fn load_cache(path: &Path) -> Option<TierCache> {
             return None;
         }
     };
-    if cache.schema_version != CACHE_SCHEMA_VERSION {
+    if cache.schema_version != CACHE_SCHEMA_VERSION
+        && cache.schema_version != LEGACY_CACHE_SCHEMA_VERSION
+    {
         debug!(
-            "tier cache: schema version {} != expected {}; re-probing",
-            cache.schema_version, CACHE_SCHEMA_VERSION
+            "tier cache: unknown schema version {} (expected {} or legacy {}); ignoring",
+            cache.schema_version, CACHE_SCHEMA_VERSION, LEGACY_CACHE_SCHEMA_VERSION
         );
         return None;
     }
     Some(cache)
 }
 
+/// What the on-disk cache is worth at startup (PAN-369).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheVerdict {
+    /// A current busy-window measurement for this host and build: apply it,
+    /// no measurement is due.
+    Current(HardwareTier),
+    /// A legacy or version-stale entry for this same CPU and core count: a
+    /// measurement is due, and this tier stands in only if it is deferred.
+    Fallback(HardwareTier),
+    /// No usable entry (missing, malformed, unknown schema or tier, other
+    /// host): a measurement is due with no previous tier.
+    Miss,
+}
+
+/// Classify a parsed cache entry against this host and build.
+pub(crate) fn evaluate_cache(
+    cache: Option<&TierCache>,
+    cpu_model: &str,
+    core_count: usize,
+    pancetta_version: &str,
+) -> CacheVerdict {
+    let Some(cache) = cache else {
+        return CacheVerdict::Miss;
+    };
+    if cache.cpu_model != cpu_model || cache.core_count != core_count {
+        return CacheVerdict::Miss;
+    }
+    let Some(tier) = cache.parse_tier() else {
+        debug!("tier cache: unknown tier string '{}'", cache.tier);
+        return CacheVerdict::Miss;
+    };
+    match cache.schema_version {
+        CACHE_SCHEMA_VERSION if cache.pancetta_version == pancetta_version => {
+            CacheVerdict::Current(tier)
+        }
+        CACHE_SCHEMA_VERSION | LEGACY_CACHE_SCHEMA_VERSION => CacheVerdict::Fallback(tier),
+        _ => CacheVerdict::Miss,
+    }
+}
+
+/// Parse the 1-minute field of a `/proc/loadavg` line. `None` for a
+/// missing, malformed, negative or non-finite value.
+pub(crate) fn parse_loadavg(contents: &str) -> Option<f64> {
+    let load: f64 = contents.split_whitespace().next()?.parse().ok()?;
+    valid_load(load)
+}
+
+fn valid_load(load: f64) -> Option<f64> {
+    (load.is_finite() && load >= 0.0).then_some(load)
+}
+
+/// The host's 1-minute load average from `/proc/loadavg`, or `None` when
+/// the reading fails. In a container this is the host-wide load, compared
+/// against the container's logical cores.
+#[cfg(target_os = "linux")]
+pub(crate) fn one_minute_load() -> Option<f64> {
+    parse_loadavg(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+/// The host's 1-minute load average from `getloadavg(3)`, or `None` when
+/// the call fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn one_minute_load() -> Option<f64> {
+    let mut loads = [0.0f64; 1];
+    // SAFETY: `loads` is a valid, writable buffer of exactly one f64, and
+    // `getloadavg` writes at most `nelem` (1) entries into it.
+    let written = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    if written == 1 {
+        valid_load(loads[0])
+    } else {
+        None
+    }
+}
+
+/// Windows and other platforms have no 1-minute load average: always
+/// unavailable, so the probe runs without a load check.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn one_minute_load() -> Option<f64> {
+    None
+}
+
+/// The load check that gates a due probe (PAN-369).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LoadCheck {
+    /// Load at or below the core count: measure.
+    Proceed,
+    /// No reading: measure anyway.
+    Unavailable,
+    /// Load strictly above the core count: defer measurement.
+    Defer { load: f64, cores: usize },
+}
+
+/// Compare a 1-minute load reading with the logical core count. Only a load
+/// strictly above the core count defers; equal load still measures.
+pub(crate) fn check_load(load: Option<f64>, cores: usize) -> LoadCheck {
+    match load {
+        None => LoadCheck::Unavailable,
+        Some(load) if load > cores as f64 => LoadCheck::Defer { load, cores },
+        Some(_) => LoadCheck::Proceed,
+    }
+}
+
+/// The station-log line for a deferred probe.
+pub(crate) fn deferral_message(load: f64, cores: usize, previous: Option<HardwareTier>) -> String {
+    let using = match previous {
+        Some(tier) => format!("previous tier {}", tier.as_str()),
+        None => "Standard (no previous tier)".to_string(),
+    };
+    format!(
+        "tier probe deferred: 1-minute load {load:.2} exceeds {cores} logical cores; using {using}"
+    )
+}
+
 /// Write the cache atomically (temp + rename). Best-effort: failures
 /// log at `warn!` but do not propagate. Creates parent directory if
 /// missing.
 pub(crate) fn save_cache(path: &Path, cache: &TierCache) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!("tier cache: failed to create {}: {}", parent.display(), e);
-            return;
-        }
-    }
-    let json = match serde_json::to_vec_pretty(cache) {
+    let json = match serde_json::to_string_pretty(cache) {
         Ok(j) => j,
         Err(e) => {
             warn!("tier cache: serialize failed: {}", e);
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        warn!("tier cache: write to {} failed: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        warn!(
-            "tier cache: rename {} → {} failed: {}",
-            tmp.display(),
-            path.display(),
-            e
-        );
+    if let Err(e) = pancetta_config::Config::write_secure_atomic(path, &json) {
+        warn!("tier cache: write to {} failed: {}", path.display(), e);
     }
 }
 
@@ -320,19 +429,34 @@ fn probe_completion_should_reseed_budget(live_effort: DecodeEffort) -> bool {
 /// depends on the tier (see `preset_budget_ms`), so this never clobbers an
 /// operator's explicit non-Auto choice, and is a no-op change of behavior
 /// for the untouched-`Auto` case.
-#[allow(clippy::too_many_arguments)]
-fn spawn_probe_worker(
-    cpu_model: String,
-    core_count: usize,
-    pancetta_version: String,
-    cache_path: Option<PathBuf>,
-    override_: Override,
-    scoped_fast_path: Arc<AtomicBool>,
-    budget_override: Option<u64>,
-    current_decode_effort: Arc<AtomicU8>,
-    resolved_hardware_tier: Arc<AtomicU8>,
-    decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
-) {
+/// Everything the background probe worker needs (PAN-369: one value so the
+/// startup decision can hand it to an injected launcher in tests).
+pub(crate) struct ProbeJob {
+    pub cpu_model: String,
+    pub core_count: usize,
+    pub pancetta_version: String,
+    pub cache_path: Option<PathBuf>,
+    pub override_: Override,
+    pub scoped_fast_path: Arc<AtomicBool>,
+    pub budget_override: Option<u64>,
+    pub current_decode_effort: Arc<AtomicU8>,
+    pub resolved_hardware_tier: Arc<AtomicU8>,
+    pub decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
+}
+
+fn spawn_probe_worker(job: ProbeJob) {
+    let ProbeJob {
+        cpu_model,
+        core_count,
+        pancetta_version,
+        cache_path,
+        override_,
+        scoped_fast_path,
+        budget_override,
+        current_decode_effort,
+        resolved_hardware_tier,
+        decode_window,
+    } = job;
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
             Ok(r) => r,
@@ -461,7 +585,6 @@ fn spawn_probe_worker(
 /// (final-review Finding 1). The synchronous cache-hit path below has no
 /// such race (it runs before the TUI can accept input), so it seeds from
 /// the startup `effort` value directly, same as before.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn initialize(
     effort: DecodeEffort,
     budget_override: Option<u64>,
@@ -469,77 +592,167 @@ pub(crate) async fn initialize(
     resolved_hardware_tier: Arc<AtomicU8>,
     decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
 ) -> Arc<AtomicBool> {
-    let scoped_fast_path = Arc::new(AtomicBool::new(false));
-
     let env_value = std::env::var(ENV_OVERRIDE).ok();
     let override_ = parse_override(env_value.as_deref());
     info!("tier: env override = {}", override_.as_str());
 
-    // Seed the atomic from env immediately. The probe (if any) will
-    // re-apply after measurement, but only if override == None.
-    if override_ == Override::ForceOn {
-        scoped_fast_path.store(true, Ordering::Release);
-    }
-
     let (cpu_model, core_count) = current_hardware_key();
-    let pancetta_version = env!("CARGO_PKG_VERSION").to_string();
-    let cache_path = default_cache_path();
-
-    let cached: Option<TierCache> = cache_path.as_deref().and_then(load_cache);
-
-    let need_probe = match &cached {
-        Some(c)
-            if c.cpu_model == cpu_model
-                && c.core_count == core_count
-                && c.pancetta_version == pancetta_version =>
-        {
-            if let Some(tier) = c.parse_tier() {
-                let summary = apply_tier(tier, override_, &scoped_fast_path).await;
-                info!(
-                    "tier: cache hit (cpu='{}', cores={}, v{}) → {} — {}",
-                    cpu_model,
-                    core_count,
-                    pancetta_version,
-                    tier.as_str(),
-                    summary
-                );
-                {
-                    let mut window_guard = decode_window.write().await;
-                    seed_effort_budget(effort, budget_override, tier, &mut window_guard);
-                }
-                resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
-                false
-            } else {
-                debug!("tier cache: unknown tier string '{}', re-probing", c.tier);
-                true
-            }
-        }
-        Some(_) => {
-            info!("tier: cache stale (host or version changed), scheduling background probe");
-            true
-        }
-        None => {
-            info!("tier: no cache, scheduling background probe");
-            true
-        }
+    let host = StartupHost {
+        cpu_model,
+        core_count,
+        pancetta_version: env!("CARGO_PKG_VERSION").to_string(),
+        cache_path: default_cache_path(),
+        override_,
     };
-
-    if need_probe {
-        spawn_probe_worker(
-            cpu_model,
-            core_count,
-            pancetta_version,
-            cache_path,
-            override_,
-            scoped_fast_path.clone(),
+    initialize_with(
+        host,
+        StartupState {
+            effort,
             budget_override,
             current_decode_effort,
             resolved_hardware_tier,
             decode_window,
-        );
+        },
+        one_minute_load,
+        spawn_probe_worker,
+    )
+    .await
+}
+
+/// Host and build identity, cache location and env override that
+/// [`initialize`] reads from the real machine (PAN-369: injected in tests).
+pub(crate) struct StartupHost {
+    pub cpu_model: String,
+    pub core_count: usize,
+    pub pancetta_version: String,
+    pub cache_path: Option<PathBuf>,
+    pub override_: Override,
+}
+
+/// The coordinator state a startup tier decision publishes into.
+pub(crate) struct StartupState {
+    pub effort: DecodeEffort,
+    pub budget_override: Option<u64>,
+    pub current_decode_effort: Arc<AtomicU8>,
+    pub resolved_hardware_tier: Arc<AtomicU8>,
+    pub decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
+}
+
+/// The startup tier decision behind [`initialize`], with the load reading
+/// and the probe launcher injected (PAN-369).
+///
+/// A current cache entry applies directly; `read_load` is not called. When
+/// a measurement is due, `read_load` runs once: a 1-minute load strictly
+/// above `host.core_count` defers the probe (nothing launched, the cache
+/// untouched) and applies the previous same-host tier from a legacy or
+/// version-stale entry, else Moderate, the tier at which Auto uses the
+/// Standard 250 ms budget. Otherwise `launch_probe` receives the job.
+pub(crate) async fn initialize_with(
+    host: StartupHost,
+    state: StartupState,
+    read_load: impl FnOnce() -> Option<f64>,
+    launch_probe: impl FnOnce(ProbeJob),
+) -> Arc<AtomicBool> {
+    let scoped_fast_path = Arc::new(AtomicBool::new(false));
+
+    // Seed the atomic from env immediately. The probe (if any) will
+    // re-apply after measurement, but only if override == None.
+    if host.override_ == Override::ForceOn {
+        scoped_fast_path.store(true, Ordering::Release);
     }
 
+    let cached: Option<TierCache> = host.cache_path.as_deref().and_then(load_cache);
+    let verdict = evaluate_cache(
+        cached.as_ref(),
+        &host.cpu_model,
+        host.core_count,
+        &host.pancetta_version,
+    );
+
+    let previous = match verdict {
+        CacheVerdict::Current(tier) => {
+            let summary = apply_startup_tier(tier, host.override_, &scoped_fast_path, &state).await;
+            info!(
+                "tier: cache hit (cpu='{}', cores={}, v{}) → {} — {}",
+                host.cpu_model,
+                host.core_count,
+                host.pancetta_version,
+                tier.as_str(),
+                summary
+            );
+            return scoped_fast_path;
+        }
+        CacheVerdict::Fallback(tier) => {
+            info!(
+                "tier: cache stale (earlier probe schema or version changed; previous tier {}), measurement due",
+                tier.as_str()
+            );
+            Some(tier)
+        }
+        CacheVerdict::Miss if cached.is_some() => {
+            info!("tier: cache stale (host changed or entry unusable), measurement due");
+            None
+        }
+        CacheVerdict::Miss => {
+            info!("tier: no cache, measurement due");
+            None
+        }
+    };
+
+    match check_load(read_load(), host.core_count) {
+        LoadCheck::Defer { load, cores } => {
+            warn!("{}", deferral_message(load, cores, previous));
+            let tier = previous.unwrap_or(HardwareTier::Moderate);
+            let summary = apply_startup_tier(tier, host.override_, &scoped_fast_path, &state).await;
+            info!(
+                "tier: deferred startup applied {} — {}",
+                tier.as_str(),
+                summary
+            );
+            return scoped_fast_path;
+        }
+        LoadCheck::Unavailable => {
+            info!("tier probe: 1-minute load unavailable; proceeding without load check");
+        }
+        LoadCheck::Proceed => {}
+    }
+
+    info!("tier: scheduling background probe");
+    launch_probe(ProbeJob {
+        cpu_model: host.cpu_model,
+        core_count: host.core_count,
+        pancetta_version: host.pancetta_version,
+        cache_path: host.cache_path,
+        override_: host.override_,
+        scoped_fast_path: scoped_fast_path.clone(),
+        budget_override: state.budget_override,
+        current_decode_effort: state.current_decode_effort,
+        resolved_hardware_tier: state.resolved_hardware_tier,
+        decode_window: state.decode_window,
+    });
+
     scoped_fast_path
+}
+
+/// Publish a startup tier (cache hit or deferred probe): flip the scoped
+/// fast path, seed the decode window from the startup effort and budget
+/// override, and record the tier for a later live `Auto` cycle. Runs before
+/// the TUI accepts input, so the startup effort is the live one.
+async fn apply_startup_tier(
+    tier: HardwareTier,
+    override_: Override,
+    scoped_fast_path: &AtomicBool,
+    state: &StartupState,
+) -> String {
+    let summary = apply_tier(tier, override_, scoped_fast_path).await;
+    {
+        let mut window_guard = state.decode_window.write().await;
+        seed_effort_budget(state.effort, state.budget_override, tier, &mut window_guard);
+    }
+    state
+        .resolved_hardware_tier
+        .store(tier.as_u8(), Ordering::Release);
+    summary
 }
 
 #[cfg(test)]
@@ -547,7 +760,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn make_cache(tier: &str) -> TierCache {
+    pub(super) fn make_cache(tier: &str) -> TierCache {
         TierCache {
             schema_version: CACHE_SCHEMA_VERSION,
             cpu_model: "Apple M4".to_string(),
@@ -715,6 +928,10 @@ mod tests {
         }
     }
 
+    // PAN-369: the startup decision itself is exercised through
+    // `initialize_with` in `tests/load_guard_tests.rs` with an injected
+    // load reading, temporary cache path and counted probe launcher.
+    //
     // Note: `tier::initialize`/`spawn_probe_worker` themselves are not
     // exercised end-to-end here — `initialize` reads/writes the real
     // `~/.pancetta/tier_cache.json` (via `default_cache_path`) and
@@ -729,3 +946,11 @@ mod tests {
     // call at the end of `initialize`), which reads it live at re-seed
     // time via `probe_completion_should_reseed_budget`, tested above.
 }
+
+#[cfg(test)]
+#[path = "tier/tests/load_guard_tests.rs"]
+mod load_guard_tests;
+
+#[cfg(all(test, unix))]
+#[path = "tier/tests/private_atomic_save_tests.rs"]
+mod private_atomic_save_tests;

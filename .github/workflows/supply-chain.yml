@@ -132,7 +132,7 @@ jobs:
       actions: read
       contents: read
       security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
     with:
       # The job conclusion is the gate; code-scanning upload needs GitHub
       # Advanced Security on private repos and is not what we're relying on.
@@ -181,7 +181,7 @@ jobs:
       # next, letting the reporter treat a PR-fabricated "no advisories"
       # baseline as the real pre-PR scan (Codex round, widdershins #219).
       - name: "Run scanner on existing code"
-        uses: google/osv-scanner-action/osv-scanner-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@d3c1414ded37de590f207572e37a7d180f1d0ef7 # v2.5.1
         env:
           GOTOOLCHAIN: auto
         continue-on-error: true
@@ -194,7 +194,7 @@ jobs:
       - name: "Checkout head of the merge group"
         run: git checkout -f "$GITHUB_SHA"
       - name: "Run scanner on new code"
-        uses: google/osv-scanner-action/osv-scanner-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@d3c1414ded37de590f207572e37a7d180f1d0ef7 # v2.5.1
         env:
           GOTOOLCHAIN: auto
         continue-on-error: true
@@ -205,7 +205,7 @@ jobs:
             -r
             ./
       - name: "Run osv-scanner-reporter"
-        uses: google/osv-scanner-action/osv-reporter-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        uses: google/osv-scanner-action/osv-reporter-action@d3c1414ded37de590f207572e37a7d180f1d0ef7 # v2.5.1
         with:
           scan-args: |-
             --output=${{ env.OSV_SCAN_DIR }}/results.sarif
@@ -240,7 +240,7 @@ jobs:
           echo "OSV_SCAN_DIR=$dir" >> "$GITHUB_ENV"
       - name: "Run scanner on HEAD"
         id: scan
-        uses: google/osv-scanner-action/osv-scanner-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@d3c1414ded37de590f207572e37a7d180f1d0ef7 # v2.5.1
         env:
           GOTOOLCHAIN: auto
         continue-on-error: true
@@ -258,7 +258,7 @@ jobs:
             exit 1
           fi
       - name: "Run osv-scanner-reporter"
-        uses: google/osv-scanner-action/osv-reporter-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        uses: google/osv-scanner-action/osv-reporter-action@d3c1414ded37de590f207572e37a7d180f1d0ef7 # v2.5.1
         with:
           scan-args: |-
             --output=${{ env.OSV_SCAN_DIR }}/results.sarif

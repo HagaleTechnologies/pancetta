@@ -52,7 +52,7 @@
 //! eQSL bad login) or `RecordRejected` (any other 4xx, QRZ `RESULT=FAIL`, an
 //! oversized 2xx body). The coordinator's pending-upload queue uses the class
 //! to decide between retrying, holding the record and warning the operator.
-//! The error text is unchanged, so log lines read as before.
+//! Error text retains the service status and class while redacting client credentials.
 
 use crate::{body, DxError, DxErrorInner, Result};
 use reqwest::Client;
@@ -87,16 +87,51 @@ pub fn upload_failure_class_for_status(status: u16) -> UploadFailureClass {
     }
 }
 
+fn sanitized(body: &str, secrets: &[&str]) -> String {
+    // Redact before trimming: trimming first would strip the edge whitespace
+    // of a credential echo that its spellings match on.
+    pancetta_core::error_redaction::sanitize_error_body(body, secrets)
+        .trim()
+        .to_string()
+}
+
+fn html_spelling(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn form_spellings(value: &str) -> Vec<String> {
+    vec![
+        value.to_string(),
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect(),
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("x", value)
+            .finish()
+            .trim_start_matches("x=")
+            .to_string(),
+        html_spelling(value),
+    ]
+}
+
 /// The error for a non-2xx upload response: today's message text, plus the
 /// status class.
-fn http_failure(service: &str, status: reqwest::StatusCode, body: &str) -> DxError {
+fn http_failure(
+    service: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    secrets: &[&str],
+) -> DxError {
     DxError::from(DxErrorInner::Upload {
         class: upload_failure_class_for_status(status.as_u16()),
         message: format!(
             "{} upload failed: HTTP {} — {}",
             service,
             status,
-            body.trim()
+            sanitized(body, secrets)
         ),
     })
 }
@@ -195,18 +230,20 @@ impl ClubLogClient {
             .await?;
 
         let status = response.status();
-        // Body may carry an operator-facing message; safe to surface (it does
-        // not echo our POSTed credentials). It only feeds the error message,
-        // so only its first bytes are read.
-        let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES)
-            .await
-            .unwrap_or_default();
+        // Error responses can echo the posted form. Read only a complete bounded
+        // body, then redact its credentials before storing the error.
+        let body = body::error_text(response).await.unwrap_or_default();
 
         if status.is_success() {
             debug!(target: "qso.upload", "ClubLog accepted QSO (HTTP {})", status);
             Ok(())
         } else {
-            Err(http_failure("ClubLog", status, &body))
+            let spellings: Vec<String> = [&self.password, &self.api_key]
+                .iter()
+                .flat_map(|v| form_spellings(v))
+                .collect();
+            let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+            Err(http_failure("ClubLog", status, &body, &refs))
         }
     }
 }
@@ -260,8 +297,8 @@ impl QrzLogbookClient {
     ///
     /// Returns a [`QrzInsertOutcome`] distinguishing inserted vs. duplicate.
     /// `RESULT=FAIL` for a non-duplicate reason, `RESULT=AUTH`, an HTTP error,
-    /// or any unrecognised response is mapped to [`DxError`] carrying the raw
-    /// response (which does not echo the API key).
+    /// or any unrecognised response is mapped to [`DxError`] with a redacted
+    /// response diagnostic.
     pub async fn upload_adif(&self, adif_record: &str) -> Result<QrzInsertOutcome> {
         let params = [
             ("KEY", self.api_key.as_str()),
@@ -278,12 +315,16 @@ impl QrzLogbookClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES).await?;
-            return Err(http_failure("QRZ Logbook", status, &body));
+            let body = body::error_text(response).await?;
+            let spellings = form_spellings(&self.api_key);
+            let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+            return Err(http_failure("QRZ Logbook", status, &body, &refs));
         }
 
         let body = body::text_within(response, UPLOAD_MAX_BODY_BYTES).await?;
-        parse_qrz_response(&body)
+        let spellings = form_spellings(&self.api_key);
+        let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+        parse_qrz_response_inner(&body, &refs)
     }
 }
 
@@ -292,26 +333,35 @@ impl QrzLogbookClient {
 /// Defensive: keys are matched case-insensitively and URL-decoded, and the
 /// `RESULT`/`STATUS` field is tolerated under either name. A `FAIL` whose
 /// `REASON` mentions a duplicate is reclassified as a (non-fatal) duplicate.
-/// Anything else is an [`Err`] carrying the raw response.
+/// Anything else is an [`Err`] carrying a bounded, redacted response.
 pub fn parse_qrz_response(body: &str) -> Result<QrzInsertOutcome> {
+    parse_qrz_response_inner(body, &[])
+}
+
+fn parse_qrz_response_inner(body: &str, secrets: &[&str]) -> Result<QrzInsertOutcome> {
     let mut result: Option<String> = None;
     let mut reason: Option<String> = None;
     let mut logid: Option<String> = None;
 
-    for pair in body.trim().split('&') {
+    // No whole-body trim before splitting: it would strip the edge whitespace
+    // of the final pair's value, which a credential echo can match on. Keys
+    // are trimmed below; structural values trim at their decode sites.
+    for pair in body.split('&') {
         let mut it = pair.splitn(2, '=');
         let key = it.next().unwrap_or("").trim();
-        let value = it.next().unwrap_or("").trim();
         if key.is_empty() {
             continue;
         }
-        let value = url_decode(value);
+        let raw_value = it.next().unwrap_or("");
         match key.to_ascii_uppercase().as_str() {
             // Accept either RESULT (documented) or STATUS (defensive alias).
-            "RESULT" | "STATUS" => result = Some(value),
-            "REASON" => reason = Some(value),
+            "RESULT" | "STATUS" => result = Some(url_decode(raw_value.trim())),
+            // The REASON feeds redacted error text: decode it untrimmed so an
+            // unencoded echo of a whitespace-bearing key keeps the whitespace
+            // its spellings match on.
+            "REASON" => reason = Some(url_decode(raw_value)),
             // Documented as LOGID; LOGIDS is the multi-record variant.
-            "LOGID" | "LOGIDS" => logid = Some(value),
+            "LOGID" | "LOGIDS" => logid = Some(url_decode(raw_value.trim())),
             _ => {}
         }
     }
@@ -325,15 +375,22 @@ pub fn parse_qrz_response(body: &str) -> Result<QrzInsertOutcome> {
     match result_upper.as_str() {
         "OK" => Ok(QrzInsertOutcome::Inserted { logid }),
         // REPLACE = duplicate that was overwritten (only when OPTION=REPLACE).
-        "REPLACE" => Ok(QrzInsertOutcome::Duplicate { reason }),
+        "REPLACE" => Ok(QrzInsertOutcome::Duplicate {
+            reason: reason.map(|r| r.trim().to_string()),
+        }),
         // A plain duplicate without OPTION=REPLACE comes back as FAIL with a
         // REASON mentioning "duplicate"; treat that as non-fatal.
-        "FAIL" if reason_is_dupe => Ok(QrzInsertOutcome::Duplicate { reason }),
+        "FAIL" if reason_is_dupe => Ok(QrzInsertOutcome::Duplicate {
+            reason: reason.map(|r| r.trim().to_string()),
+        }),
         "FAIL" => Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::RecordRejected,
             message: format!(
                 "QRZ Logbook insert failed: {}",
-                reason.unwrap_or_else(|| "unknown reason".to_string())
+                sanitized(
+                    &reason.unwrap_or_else(|| "unknown reason".to_string()),
+                    secrets
+                )
             ),
         })),
         "AUTH" => Err(DxError::from(DxErrorInner::Upload {
@@ -343,7 +400,7 @@ pub fn parse_qrz_response(body: &str) -> Result<QrzInsertOutcome> {
         })),
         _ => Err(DxError::from(DxErrorInner::Parse(format!(
             "Unrecognised QRZ Logbook response: {}",
-            body.trim()
+            sanitized(body, secrets)
         )))),
     }
 }
@@ -476,14 +533,22 @@ impl EqslClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES)
-                .await
-                .unwrap_or_default();
-            return Err(http_failure("eQSL", status, &body));
+            let body = body::error_text(response).await.unwrap_or_default();
+            let spellings: Vec<String> = [&self.username, &self.password]
+                .iter()
+                .flat_map(|v| form_spellings(v))
+                .collect();
+            let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+            return Err(http_failure("eQSL", status, &body, &refs));
         }
 
         let body = body::text_within(response, UPLOAD_MAX_BODY_BYTES).await?;
-        parse_eqsl_response(&body)
+        let spellings: Vec<String> = [&self.username, &self.password]
+            .iter()
+            .flat_map(|v| form_spellings(v))
+            .collect();
+        let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+        parse_eqsl_response_inner(&body, &refs)
     }
 }
 
@@ -494,6 +559,10 @@ impl EqslClient {
 /// of N" success → [`QsoUploadOutcome::Logged`]; a body mentioning a bad
 /// user/password → [`DxError`]; anything else is an error carrying the body.
 pub fn parse_eqsl_response(body: &str) -> Result<QsoUploadOutcome> {
+    parse_eqsl_response_inner(body, &[])
+}
+
+fn parse_eqsl_response_inner(body: &str, secrets: &[&str]) -> Result<QsoUploadOutcome> {
     let lower = body.to_lowercase();
 
     // Order matters: a duplicate page can also say "Result: ...", so check the
@@ -508,7 +577,10 @@ pub fn parse_eqsl_response(body: &str) -> Result<QsoUploadOutcome> {
     {
         return Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::LoginRejected,
-            message: format!("eQSL upload rejected (authentication): {}", body.trim()),
+            message: format!(
+                "eQSL upload rejected (authentication): {}",
+                sanitized(body, secrets)
+            ),
         }));
     }
 
@@ -519,7 +591,7 @@ pub fn parse_eqsl_response(body: &str) -> Result<QsoUploadOutcome> {
 
     Err(DxError::from(DxErrorInner::Parse(format!(
         "Unrecognised eQSL response: {}",
-        body.trim()
+        sanitized(body, secrets)
     ))))
 }
 
@@ -1275,3 +1347,7 @@ mod tests {
 #[cfg(test)]
 #[path = "qso_upload/tests/tls_security_tests.rs"]
 mod tls_security_tests;
+
+#[cfg(test)]
+#[path = "qso_upload/tests/error_redaction_tests.rs"]
+mod error_redaction_tests;

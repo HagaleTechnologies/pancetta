@@ -37,6 +37,22 @@ effort→budget mapping (`effort.rs`) are normative in the digest and code — c
 not restated. Two known limitations (S3 escalation ordering; hot-reload does not
 re-seed the effort budget) are documented there.
 
+Tier-probe gotcha (PAN-369): **the probe measures the production workload, and
+never on a loaded host.** `probe_hardware_tier` times one embedded off-air busy
+window (`basicft8/live_now.wav`) through `run_overlapped_passes`, the join,
+`merge_ft8lib_first` and `drop_unresolved_hash_twins`, so the old synthetic-CQ
+floor no longer sets the tier; a `ft8lib_stub` build returns a probe error rather
+than timing native alone. The cache is schema 2: only a schema-2 entry for the
+same CPU, core count and version is a hit (no load read). Schema 1 and
+version-stale schema 2 for the same CPU and core count are fallback tiers only. When a probe is due
+and the 1-minute load (Linux `/proc/loadavg`, macOS `getloadavg`) is strictly
+above `num_cpus::get()`, startup launches nothing, leaves the cache alone,
+applies the fallback tier or Moderate (Auto = Standard 250 ms) through the
+cache-hit path, and logs `tier probe deferred: …`; the next startup retries.
+In a container the host-wide load is compared with the local core count.
+Windows has no load average and always probes. Thresholds (400/1200 ms) stay
+provisional until quiet-host calibration on target hardware.
+
 Effort-override gotcha (PAN-158): **every `Ft8Config` field `apply_effort_overrides`
 writes must also be a `DecoderRebuildKey` field** (`coordinator/ft8.rs`), or the hot
 loop adopts the new budget but keeps decoding with the old decoder. Eco and Standard

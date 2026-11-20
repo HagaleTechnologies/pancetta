@@ -14,39 +14,48 @@
 //! - `HardwareTier` enum (Fast | Moderate | Slow).
 //! - `classify_tier(p95_ms)` — pure function mapping wall-clock to tier.
 //! - `recommend_actions(tier)` — per-tier runtime recommendations.
-//! - `probe_hardware_tier(n)` — generates a
-//!   synthetic FT8 signal, decodes N times, returns percentile stats +
+//! - `probe_hardware_tier(n)` — decodes an embedded off-air busy-band
+//!   window through the live station's overlapped reference + native
+//!   passes and production merge N times, returns percentile stats +
 //!   classification + recommendations.
 //!
-//! Tier thresholds are conservative initial values, tunable as
-//! cross-machine data lands.
+//! PAN-369: the probe used to time the native decoder alone on one
+//! synthetic CQ in silence, which measured only the per-decode floor. It
+//! now times the work the coordinator does on every FT8 window (see
+//! `pancetta/src/coordinator/ft8.rs`): the ft8_lib reference pass with its
+//! display capture and the native AP pass started together by
+//! [`crate::window_execution::run_overlapped_passes`], the join,
+//! [`crate::merge::merge_ft8lib_first`] and
+//! [`crate::merge::drop_unresolved_hash_twins`], on a committed 12 kHz
+//! off-air recording of a busy 20 m window
+//! (`tests/fixtures/wav/basicft8/live_now.wav`, 27 decodes standalone).
+//! Tier thresholds remain provisional until quiet-host calibration lands.
 
 use std::time::Duration;
 
 /// Coarse classification of the host's decode capability.
 ///
-/// Boundaries are tuned against the **synthetic-signal baseline** the
-/// probe measures, not against the real-world hard-200 distribution.
-/// A clean synthetic FT8 message decodes via the easy fast path
-/// (pass 1 hits, no multipass, no OSD fallback) — so the probe's p95
-/// is roughly the **per-decode floor** on this hardware. Real-world
-/// p95 is typically 5-10× higher because the bimodal tail (hard WAVs
-/// triggering multipass + OSD) dominates the upper percentiles.
+/// Boundaries apply to the p95 wall clock of one busy production window
+/// (PAN-369): the overlapped ft8_lib reference and native passes, their
+/// join, and the production merge on the embedded off-air recording. The
+/// 400 / 1200 ms boundaries are carried over from the earlier
+/// synthetic-signal probe and stay **provisional**: no quiet-host
+/// calibration on target hardware (M4, N100 MiniPC, Pi) exists yet for this
+/// workload, and Pi-class hardware remains unmeasured.
 ///
-/// Calibration anchors (M4 Mac Mini, 2026-06-04):
-///   synthetic p95 = 211ms → hard-200 p95 = 2132ms (≈10× multiplier).
+/// Measured evidence (PAN-369 plan, 2026-11-18): on a two-CPU container
+/// with a 1-minute load of 25.4, the old synthetic probe read p95 296 ms
+/// (Fast) while the busy-window probe read p95 421 ms (Moderate), with 25
+/// reference, 26 native and 26 final decodes per window. Those loaded
+/// figures show the workload difference only; they are not a calibration.
 ///
-/// Tier semantics (synthetic-basis):
-/// - **Fast** (p95 < 400ms): M4-class. Real-world p95 likely under
-///   3000ms; full pipeline within slot budget on most decodes.
-/// - **Moderate** (400ms ≤ p95 < 1200ms): typical MiniPC (Intel N100
-///   class). Real-world p95 likely 4000-8000ms; scoped fast-path
-///   recommended to stay inside the 2000ms slot budget for in-QSO
-///   partners.
-/// - **Slow** (p95 ≥ 1200ms): older / very minimal hardware (ARMv7
-///   Pi 4 class). Real-world p95 likely 8000ms+; scoped fast-path
-///   is required, and reducing multipass / OSD depth should be
-///   considered.
+/// Tier semantics:
+/// - **Fast** (p95 < 400ms): the busy window decodes with ample slot
+///   headroom; full pipeline at the Deep-equivalent budget.
+/// - **Moderate** (400ms ≤ p95 < 1200ms): scoped fast-path recommended
+///   to stay inside the 2000ms slot budget for in-QSO partners.
+/// - **Slow** (p95 ≥ 1200ms): scoped fast-path is required, and reducing
+///   multipass / OSD depth should be considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareTier {
     /// Probe p95 below 400 ms.
@@ -196,40 +205,144 @@ pub fn summarize_samples(mut samples: Vec<Duration>) -> TierProbeResult {
     }
 }
 
-/// Probe the host's decode capability by running N decodes of a
-/// synthetic FT8 signal. Returns percentile stats + tier classification.
+/// The embedded off-air busy-band window (PAN-369): 15 s of 12 kHz mono
+/// PCM16 recorded on 20 m, 27 decodes with the standalone cycle API. Kept in
+/// the binary so the startup probe never depends on a fixture path.
+const BUSY_WINDOW_WAV: &[u8] = include_bytes!("../tests/fixtures/wav/basicft8/live_now.wav");
+
+/// Parse [`BUSY_WINDOW_WAV`] into one production-sized decode window:
+/// the first [`crate::WINDOW_SAMPLES`] samples, normalized by 32768 like the
+/// live audio path. Rejects anything but mono 12 kHz PCM16 holding at least
+/// a full window. Runs once per probe, outside every timed iteration.
+fn busy_window_samples() -> crate::Ft8Result<Vec<f32>> {
+    use crate::{Ft8Error, SAMPLE_RATE, WINDOW_SAMPLES};
+
+    let reader = hound::WavReader::new(std::io::Cursor::new(BUSY_WINDOW_WAV)).map_err(|e| {
+        Ft8Error::ConfigError(format!("tier probe: busy window WAV unreadable: {e}"))
+    })?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != SAMPLE_RATE
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err(Ft8Error::ConfigError(format!(
+            "tier probe: busy window must be mono {SAMPLE_RATE} Hz PCM16, got {} ch {} Hz {}-bit {:?}",
+            spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format
+        )));
+    }
+    let samples = reader
+        .into_samples::<i16>()
+        .take(WINDOW_SAMPLES)
+        .map(|s| s.map(|v| v as f32 / 32768.0))
+        .collect::<Result<Vec<f32>, _>>()
+        .map_err(|e| Ft8Error::ConfigError(format!("tier probe: busy window WAV corrupt: {e}")))?;
+    if samples.len() != WINDOW_SAMPLES {
+        return Err(Ft8Error::InsufficientData {
+            needed: WINDOW_SAMPLES,
+            available: samples.len(),
+        });
+    }
+    Ok(samples)
+}
+
+/// One timed busy-window decode: the reference and native results as each
+/// pass returned them, and the final set production delivers.
+#[derive(Debug)]
+struct BusyWindowDecode {
+    elapsed: Duration,
+    reference: Vec<crate::DecodedMessage>,
+    native: Vec<crate::DecodedMessage>,
+    delivered: Vec<crate::DecodedMessage>,
+}
+
+/// Decode `samples` once the way the live coordinator decodes an FT8 window
+/// (`pancetta/src/coordinator/ft8.rs`), timing dispatch through the join,
+/// [`crate::merge::merge_ft8lib_first`] and
+/// [`crate::merge::drop_unresolved_hash_twins`].
 ///
-/// `n` should be ≥ 3 for stable p95; ≥ 10 for stable p99. The first
-/// decode is treated as a warmup and discarded.
-pub fn probe_hardware_tier(n: usize) -> crate::Ft8Result<TierProbeResult> {
-    use crate::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+/// Fresh default decoders are built before the timer starts. The native pass
+/// uses a neutral AP context, no partner filter and an unlimited budget, so
+/// the measurement does not depend on the tier it is about to choose. A
+/// panic in either branch or a native decode error fails the iteration; no
+/// partial sample is ever recorded.
+fn decode_busy_window_once(samples: &[f32]) -> crate::Ft8Result<BusyWindowDecode> {
+    use crate::{
+        ap::ApContext, merge, window_execution::run_overlapped_passes, DecodeBudget, Ft8Config,
+        Ft8Decoder, Ft8Error, Protocol,
+    };
     use std::time::Instant;
 
+    let reference_decoder = Ft8Decoder::new(Ft8Config::default())?;
+    let mut native_decoder = Ft8Decoder::new(Ft8Config::default())?;
+    let ap_context = ApContext::default();
+
+    let start = Instant::now();
+    let outcome = run_overlapped_passes(
+        // The decoder moves into the reference worker, as in production.
+        move || {
+            let (messages, _display_grid) = reference_decoder
+                .decode_window_ft8lib_with_context_and_capture(samples, Protocol::Ft8);
+            messages
+        },
+        || {
+            native_decoder.decode_window_with_ap_scoped_partner_budgeted(
+                samples,
+                &ap_context,
+                None,
+                None,
+                DecodeBudget::unlimited(),
+            )
+        },
+    );
+    let reference = outcome.reference.ok_or_else(|| {
+        Ft8Error::MessageDecodingError("tier probe: ft8_lib reference pass panicked".to_string())
+    })?;
+    let (native, _report) = outcome.native.ok_or_else(|| {
+        Ft8Error::MessageDecodingError("tier probe: native pass panicked".to_string())
+    })??;
+    let merged = merge::merge_ft8lib_first(reference.clone(), native.clone());
+    let (delivered, _dropped) = merge::drop_unresolved_hash_twins(merged.messages, Protocol::Ft8);
+    let elapsed = start.elapsed();
+
+    Ok(BusyWindowDecode {
+        elapsed,
+        reference,
+        native,
+        delivered,
+    })
+}
+
+/// Probe the host's decode capability by running N busy-window decodes
+/// through the production overlapped passes and merge (PAN-369). Returns
+/// percentile stats + tier classification.
+///
+/// `n` should be ≥ 3 for stable p95; ≥ 10 for stable p99. One untimed
+/// warmup decode runs first; exactly `n` timed samples follow.
+///
+/// Errors (never a partial sample) when the embedded window cannot be read,
+/// a decode fails or panics, or this build has no ft8_lib reference backend
+/// (`ft8lib_stub`): without the reference pass the measurement would not be
+/// the production workload.
+pub fn probe_hardware_tier(n: usize) -> crate::Ft8Result<TierProbeResult> {
     assert!(n >= 1, "tier probe needs n >= 1 iteration");
 
-    // Generate a synthetic FT8 message once; reuse the buffer across iterations.
-    let mut encoder = Ft8Encoder::new();
-    let symbols = encoder.encode_message("CQ K5ARH EM10", None).map_err(|e| {
-        crate::Ft8Error::ConfigError(format!("tier probe: failed to encode synthetic CQ: {e}"))
-    })?;
-    let mut modulator = Ft8Modulator::new_default()?;
-    let mut tx = modulator.modulate_symbols(&symbols, 500.0).map_err(|e| {
-        crate::Ft8Error::ConfigError(format!("tier probe: failed to modulate synthetic CQ: {e}"))
-    })?;
-    tx.resize(WINDOW_SAMPLES, 0.0);
-
-    // Warmup pass — stabilizes CPU caches, FFT planner state, etc.
-    {
-        let mut decoder = Ft8Decoder::new(Ft8Config::default())?;
-        let _ = decoder.decode_window(&tx);
+    if cfg!(ft8lib_stub) {
+        return Err(crate::Ft8Error::ConfigError(
+            "tier probe: built without the ft8_lib reference decoder (ft8lib_stub); \
+             the production two-pass window cannot be measured"
+                .to_string(),
+        ));
     }
+
+    let window = busy_window_samples()?;
+
+    // Warmup pass — stabilizes CPU caches, FFT planner state, thread pools.
+    decode_busy_window_once(&window)?;
 
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut decoder = Ft8Decoder::new(Ft8Config::default())?;
-        let start = Instant::now();
-        let _ = decoder.decode_window(&tx)?;
-        samples.push(start.elapsed());
+        samples.push(decode_busy_window_once(&window)?.elapsed);
     }
 
     Ok(summarize_samples(samples))
@@ -317,6 +430,9 @@ mod tests {
         assert_eq!(result.recommendations.len(), 1);
     }
 
+    /// AC2 (PAN-369): exactly `n` timed samples after the warmup, and the
+    /// tier is the classification of their p95.
+    #[cfg(not(ft8lib_stub))]
     #[test]
     fn probe_hardware_tier_smoke_yields_sane_stats() {
         let result = probe_hardware_tier(2).expect("probe");
@@ -327,5 +443,21 @@ mod tests {
         assert!(result.p99 <= result.max);
         // Decode wall-clock should be positive (>0ms).
         assert!(result.max.as_millis() > 0);
+        assert_eq!(result.tier, classify_tier(result.p95.as_millis() as u64));
+        assert_eq!(result.recommendations, recommend_actions(result.tier));
+    }
+
+    /// A build without the C reference decoder cannot measure the production
+    /// two-pass window, so the probe reports that instead of timing native
+    /// alone.
+    #[cfg(ft8lib_stub)]
+    #[test]
+    fn probe_hardware_tier_smoke_yields_sane_stats() {
+        let err = probe_hardware_tier(2).expect_err("stub build has no reference pass");
+        assert!(err.to_string().contains("ft8lib_stub"), "{err}");
     }
 }
+
+#[cfg(test)]
+#[path = "tier_probe/tests/busy_window_tests.rs"]
+mod busy_window_tests;

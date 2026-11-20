@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// rust-version is a promise to registry users (PAN-384)
+#![deny(clippy::incompatible_msrv)]
 //! # pancetta-core
 //!
 //! Shared types, errors, and utilities used by every other crate in the workspace.
@@ -32,6 +34,7 @@ mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;
 mod dxcc_zones;
+pub mod error_redaction;
 pub mod freq_bin;
 pub mod ft8_tokens;
 pub mod gridsquare;

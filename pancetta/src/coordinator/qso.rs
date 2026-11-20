@@ -11461,16 +11461,29 @@ fn start_qso_upload_subscriber(
         && !qrz_xml_cfg.password.is_empty()
     {
         let agent = format!("pancetta-{}", env!("CARGO_PKG_VERSION"));
-        let mut client = pancetta_dx::QrzXmlClient::new(
+        let client = pancetta_dx::QrzXmlClient::new(
             qrz_xml_cfg.username.clone(),
             qrz_xml_cfg.password.clone(),
             agent,
         );
-        // Always `None` in production; see `qrz_xml_base_url_override`.
-        if let Some(url) = qrz_xml_base_url {
-            client = client.with_base_url(url);
+        // The override is used only by local tests in normal operation.
+        #[cfg(test)]
+        let client = match qrz_xml_base_url {
+            Some(url) => client.with_mock_base_url(url),
+            None => Ok(client),
+        };
+        #[cfg(not(test))]
+        let client = match qrz_xml_base_url {
+            Some(url) => client.with_base_url(url),
+            None => Ok(client),
+        };
+        match client {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                tracing::warn!(target: "dx.qrz", "{err}");
+                None
+            }
         }
-        Some(Arc::new(client))
     } else {
         None
     };
@@ -12693,7 +12706,10 @@ mod cqdx_upload_tests {
             }
             async fn deliver(&self, destination: UploadDestination, payload: String) -> Delivery {
                 self.0.lock().unwrap().push((destination, payload));
-                Delivery::Accepted { duplicate: false }
+                Delivery::Accepted {
+                    duplicate: false,
+                    remote_id: None,
+                }
             }
         }
         for enabled in [false, true] {
@@ -12774,7 +12790,10 @@ mod cqdx_upload_tests {
                 vec![UploadDestination::QrzLogbook, UploadDestination::Cqdx]
             }
             async fn deliver(&self, _: UploadDestination, _: String) -> Delivery {
-                Delivery::Accepted { duplicate: false }
+                Delivery::Accepted {
+                    duplicate: false,
+                    remote_id: None,
+                }
             }
         }
         for closed in [false, true] {
@@ -13332,7 +13351,8 @@ mod qrz_enrichment_tests {
             .local_addr()
             .unwrap();
         let client = pancetta_dx::QrzXmlClient::new("user", QRZ_PASSWORD, "pancetta-test")
-            .with_base_url(format!("http://{closed}/xml/current/"));
+            .with_mock_base_url(format!("http://{closed}/xml/current/"))
+            .unwrap();
         let logs = enrich_capturing_logs(&client).await;
         assert!(logs.contains("QRZ lookup failed for JA1ABC"), "{logs}");
         assert!(!logs.contains(QRZ_PASSWORD), "{logs}");
@@ -13354,7 +13374,8 @@ mod qrz_enrichment_tests {
                 .to_string(),
         ]);
         let client = pancetta_dx::QrzXmlClient::new("user", QRZ_PASSWORD, "pancetta-test")
-            .with_base_url(base);
+            .with_mock_base_url(base)
+            .unwrap();
         let logs = enrich_capturing_logs(&client).await;
         assert!(logs.contains("QRZ lookup failed for JA1ABC"), "{logs}");
         assert!(!logs.contains(QRZ_SESSION_KEY), "{logs}");
@@ -14620,7 +14641,10 @@ mod replay_history_seed_tests {
             payload: String,
         ) -> super::super::upload_outbox::Delivery {
             self.0.lock().unwrap().push(payload);
-            super::super::upload_outbox::Delivery::Accepted { duplicate: false }
+            super::super::upload_outbox::Delivery::Accepted {
+                duplicate: false,
+                remote_id: None,
+            }
         }
     }
 

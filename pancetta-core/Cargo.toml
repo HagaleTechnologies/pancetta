@@ -1,15 +1,32 @@
 [package]
 name = "pancetta-core"
-description = "Core shared types and utilities for all Pancetta modules"
-keywords = ["amateur-radio", "ham-radio", "types", "shared"]
+description = "Shared amateur-radio types for pancetta-ft8 and the Pancetta station: slot parity, callsigns, Maidenhead grids, FT8 tokens and DXCC lookup"
+keywords = ["amateur-radio", "ham-radio", "ft8", "callsign", "maidenhead"]
 categories = ["multimedia", "science"]
-version.workspace = true
+# PAN-384: explicit version, decoupled from the workspace, because the crate
+# publishes with pancetta-ft8 and a registry version must name one tree. Bump
+# it when a pancetta-core change ships to crates.io, and set pancetta-ft8's
+# `pancetta-core` requirement to match.
+version = "0.9.7"
 edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+# PAN-384: publishable on its own switch (the workspace default stays
+# `false`), so pancetta-ft8 can be. The two publish together.
+publish = true
+rust-version = "1.88"
+readme = "README.md"
+# PAN-384: the package ships the library sources, README, license files and
+# notices only. `data/` is read by a #[cfg(test)] include_str! alone, and the
+# tests, benches and scripts stay in the repository.
+include = [
+    "/src/**/*.rs",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/THIRD-PARTY-NOTICES.md",
+]
 
 [dependencies]
 # Workspace dependencies
@@ -26,6 +43,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[bench]]
 name = "dxcc_lookup"
 harness = false
+
+[package.metadata.docs.rs]
+# Document the default feature set on one target, as pancetta-ft8 does.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lints]
 workspace = true
