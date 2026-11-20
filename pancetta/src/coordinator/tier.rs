@@ -280,31 +280,15 @@ pub(crate) fn deferral_message(load: f64, cores: usize, previous: Option<Hardwar
 /// log at `warn!` but do not propagate. Creates parent directory if
 /// missing.
 pub(crate) fn save_cache(path: &Path, cache: &TierCache) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!("tier cache: failed to create {}: {}", parent.display(), e);
-            return;
-        }
-    }
-    let json = match serde_json::to_vec_pretty(cache) {
+    let json = match serde_json::to_string_pretty(cache) {
         Ok(j) => j,
         Err(e) => {
             warn!("tier cache: serialize failed: {}", e);
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        warn!("tier cache: write to {} failed: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        warn!(
-            "tier cache: rename {} → {} failed: {}",
-            tmp.display(),
-            path.display(),
-            e
-        );
+    if let Err(e) = pancetta_config::Config::write_secure_atomic(path, &json) {
+        warn!("tier cache: write to {} failed: {}", path.display(), e);
     }
 }
 
@@ -776,7 +760,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn make_cache(tier: &str) -> TierCache {
+    pub(super) fn make_cache(tier: &str) -> TierCache {
         TierCache {
             schema_version: CACHE_SCHEMA_VERSION,
             cpu_model: "Apple M4".to_string(),
@@ -966,3 +950,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tier/tests/load_guard_tests.rs"]
 mod load_guard_tests;
+
+#[cfg(all(test, unix))]
+#[path = "tier/tests/private_atomic_save_tests.rs"]
+mod private_atomic_save_tests;

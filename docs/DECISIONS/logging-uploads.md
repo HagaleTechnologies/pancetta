@@ -213,3 +213,7 @@ and the vendor documentation says three of the four programs do not take
 what was verified. `pancetta-config/tests/interop_table.rs` stops a row from
 claiming a result without a date. Every row ships unverified; JTAlert and
 Log4OM 2 stay `unverified (no Windows station)` until a Windows host exists.
+
+### cqdx upload receipts (PAN-378)
+
+The schema-1 upload outbox saves up to 100 accepted cqdx IDs in insertion order, separately from pending uploads. A repeated QSO UUID and destination replaces its earlier receipt; a response without a usable ID leaves the old receipt intact. The worker saves the receipt with the removal of the accepted pending entry. An older Pancetta build can read the additive `accepted` field but drops it when it next rewrites the queue, so downgrades lose these receipts.
