@@ -32,10 +32,28 @@ pub(crate) async fn text_within(resp: Response, limit: usize) -> Result<String> 
 }
 
 /// The first `limit` bytes of the body as text; the rest is never read.
+#[cfg(test)]
 pub(crate) async fn text_prefix(mut resp: Response, limit: usize) -> Result<String> {
     let charset = charset_label(&resp);
     let (bytes, _) = read_capped(&mut resp, limit).await?;
     Ok(decode(charset.as_deref(), &bytes))
+}
+
+/// Complete error response, or a fixed message when a capped read is incomplete.
+pub(crate) async fn error_text(mut resp: Response) -> Result<String> {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_ERROR_BODY_BYTES as u64)
+    {
+        return Ok("response body omitted (too large)".into());
+    }
+    let charset = charset_label(&resp);
+    let (bytes, truncated) = read_capped(&mut resp, MAX_ERROR_BODY_BYTES).await?;
+    if truncated {
+        Ok("response body omitted (too large)".into())
+    } else {
+        Ok(decode(charset.as_deref(), &bytes))
+    }
 }
 
 /// Read until the body ends or passes `limit`; `true` if it was longer.

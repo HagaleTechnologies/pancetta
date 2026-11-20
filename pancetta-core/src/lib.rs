@@ -34,6 +34,7 @@ mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;
 mod dxcc_zones;
+pub mod error_redaction;
 pub mod freq_bin;
 pub mod ft8_tokens;
 pub mod gridsquare;

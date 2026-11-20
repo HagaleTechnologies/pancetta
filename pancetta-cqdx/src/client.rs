@@ -417,61 +417,11 @@ impl CqdxClient {
     }
 }
 
-/// Maximum length (in chars) of a sanitized error body embedded in
-/// [`CqdxError::Server`].
+#[cfg(test)]
 const MAX_ERROR_BODY_CHARS: usize = 200;
 
-/// Sanitize a server error-response body before embedding it in an error that
-/// may be logged.
-///
-/// Belt-and-suspenders defense: if the cqdx server ever (bug) echoed the bearer
-/// token back in an error body, embedding the raw body in `CqdxError::Server`
-/// would surface it in pancetta logs. This redacts any `pat_<...>` token-shaped
-/// substrings to `pat_***REDACTED***` and truncates the result to
-/// [`MAX_ERROR_BODY_CHARS`] chars (appending `…` if truncated).
-///
-/// The `pat_` redaction is done with a manual scan (no regex dependency).
 fn sanitize_error_body(body: &str) -> String {
-    // Redact `pat_` followed by one-or-more token chars ([A-Za-z0-9_]).
-    let mut redacted = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if body[i..].starts_with("pat_") {
-            // Consume the trailing token characters.
-            let mut j = i + 4;
-            while j < bytes.len() {
-                let c = bytes[j];
-                if c.is_ascii_alphanumeric() || c == b'_' {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            // Only redact if there was at least one token char after `pat_`.
-            if j > i + 4 {
-                redacted.push_str("pat_***REDACTED***");
-                i = j;
-                continue;
-            }
-        }
-        // Push this single character (handle multi-byte UTF-8 correctly).
-        let ch_len = match body[i..].chars().next() {
-            Some(c) => c.len_utf8(),
-            None => 1,
-        };
-        redacted.push_str(&body[i..i + ch_len]);
-        i += ch_len;
-    }
-
-    // Truncate to MAX_ERROR_BODY_CHARS chars, appending an ellipsis if cut.
-    if redacted.chars().count() > MAX_ERROR_BODY_CHARS {
-        let mut out: String = redacted.chars().take(MAX_ERROR_BODY_CHARS).collect();
-        out.push('…');
-        out
-    } else {
-        redacted
-    }
+    pancetta_core::error_redaction::sanitize_error_body(body, &[])
 }
 
 #[cfg(test)]

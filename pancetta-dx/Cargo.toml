@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+qrz-test-support = []
+
 [dependencies]
 # Internal dependencies
 pancetta-core = { path = "../pancetta-core" }
