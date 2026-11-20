@@ -353,6 +353,13 @@ class RepairDropAccountingTests(Pan213TestCase):
 
         staged_all = load_json(os.path.join(out_dir, ALL_WAVS))
         self.assertEqual(len(staged_all), 2)
+        with open(os.path.join(out_dir, ALL_WAVS)) as f:
+            staged_text = f.read()
+        self.assertTrue(staged_text.startswith('[\n  {\n    "wav_path"'))
+        self.assertFalse(staged_text.endswith("\n"))
+        with open(os.path.join(out_dir, KS)) as f:
+            staged_ks_text = f.read()
+        self.assertTrue(staged_ks_text.startswith('{\n "schema_version": 1,\n'))
         self.assertEqual(staged_all[0]["wav_path"], os.path.join(corpus, "keep.wav"))
         staged_keep = dict(staged_all[0])
         original_keep = dict(all_rows[1])
@@ -492,6 +499,28 @@ class RepairInventoryFailureTests(Pan213TestCase):
 
         with open(os.path.join(root, ALL_WAVS), "rb") as f:
             self.assertEqual(f.read(), source_before)
+
+        with self.subTest("contradictory digests for one path"):
+            bad_root = build_root(
+                os.path.join(self.tmp.name, "contradiction"),
+                all_rows=[live_row("a.wav", sha256(a)), live_row("a.wav", sha256(gone))],
+            )
+            out_dir = os.path.join(self.tmp.name, "stage-f")
+            code, out = run_repair_inprocess(bad_root, corpus, nas, out_dir)
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("contradictory wav_sha256", out)
+            self.assertFalse(os.path.exists(out_dir))
+
+        with self.subTest("malformed digest"):
+            bad_root = build_root(
+                os.path.join(self.tmp.name, "baddigest"),
+                all_rows=[live_row("a.wav", "not-a-digest")],
+            )
+            out_dir = os.path.join(self.tmp.name, "stage-g")
+            code, out = run_repair_inprocess(bad_root, corpus, nas, out_dir)
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("not a 64-hex digest", out)
+            self.assertFalse(os.path.exists(out_dir))
 
 
 if __name__ == "__main__":
