@@ -38,8 +38,9 @@ rust-version = "1.98"
 authors = ["Hagale Technologies, LLC"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/HagaleTechnologies/pancetta"
-# Pre-1.0: crates aren't published to crates.io. Flip to `true` and add
-# `version = "..."` to each path dep when ready to publish.
+# The default for every crate: not publishable. pancetta-core and
+# pancetta-ft8 opt in with their own `publish = true` (PAN-384) and publish
+# together. Flipping this would make every crate publishable.
 publish = false
 
 [workspace.dependencies]

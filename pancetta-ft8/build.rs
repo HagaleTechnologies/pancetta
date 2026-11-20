@@ -45,6 +45,21 @@ fn main() {
 
         build.compile("ft8_lib");
     } else {
+        // PAN-384: cargo writes `Cargo.toml.orig` into every packaged crate and a
+        // git checkout never has one. A packaged crate without the C sources is a
+        // broken package: fail so `cargo package`/`cargo publish` verification
+        // refuses it instead of shipping the stub decoder to the registry.
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
+        if std::path::Path::new(&manifest_dir)
+            .join("Cargo.toml.orig")
+            .exists()
+        {
+            panic!(
+                "packaged pancetta-ft8 is missing vendor/ft8_lib: run \
+                 `git submodule update --init` before `cargo package` or `cargo publish`"
+            );
+        }
         // ft8_lib vendor sources not found — using pure-Rust decoder instead.
         // Signal to the Rust code that stubs should be used instead of real FFI.
         // Loud but non-fatal: CI worktrees and research builds rely on this path.

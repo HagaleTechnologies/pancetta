@@ -17,8 +17,8 @@ name: Release
 #     the VLAs in vendor/ft8_lib/ft8/decode.c (error C2057; see the
 #     cross-platform-check note in ci.yml, 2026-05-23). The on-rig Windows
 #     MiniPC builds with MinGW already, so gnu is also the proven toolchain.
-#   - crates.io publishing is OUT of scope ([workspace.package] publish=false).
-#     This workflow ships binaries only.
+#   - crates.io publishing is a manual operator step (docs/decoder-crate.md
+#     § Publishing to crates.io, PAN-384). This workflow ships binaries only.
 #   - Every action is pinned to a full commit SHA (version in the trailing
 #     comment). The workflow token defaults to read-only. The build job gets
 #     id-token/attestations write for tag-gated build-provenance attestations;

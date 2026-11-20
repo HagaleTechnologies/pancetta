@@ -49,9 +49,67 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-`ft8_lib` itself bundles `kissfft` (FFT primitives) under a 3-clause
-BSD-style license; see `pancetta-ft8/vendor/ft8_lib/fft/` for that
-notice.
+`ft8_lib` itself bundles `kissfft` (FFT primitives) under the
+BSD-3-Clause license; its notice follows.
+
+---
+
+## kissfft (bundled inside ft8_lib)
+
+- **Project:** [`mborgerding/kissfft`](https://github.com/mborgerding/kissfft)
+- **Author:** Mark Borgerding
+- **Bundled at:** `pancetta-ft8/vendor/ft8_lib/fft/`
+- **Used as:** the FFT inside ft8_lib's C decoder. Its source files carry
+  only `SPDX-License-Identifier: BSD-3-Clause` and a pointer to a `COPYING`
+  file that ft8_lib does not ship, so the BSD-3-Clause text is reproduced
+  here with the copyright line from `kiss_fft.c`.
+
+```
+Copyright (c) 2003-2010, Mark Borgerding. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+---
+
+## AD1C country files (cty.dat)
+
+- **Project:** BigCTY country files, maintained by Jim Reisert, AD1C
+  ([country-files.com](https://www.country-files.com/))
+- **Used in:** `pancetta-core/src/` (`pancetta-core/src/dxcc_*.rs`)
+- **Used as:** the source of the generated DXCC prefix, exact-call, zone
+  and entity tables (`dxcc_table.rs`, `dxcc_exact.rs`, `dxcc_zones.rs` and
+  `dxcc_registry.rs`), produced by `pancetta-core/scripts/gen_dxcc_table.py`
+  from input `VER20261107` (recorded in `dxcc_registry.rs`).
+- **Terms:** the repository records them only as "free for amateur use".
+  Confirmation of the redistribution terms is pending and tracked as a
+  follow-up to PAN-384; it gates any crates.io publish of pancetta-core.
+
+ADIF DXCC entity codes come from the ADIF specification
+(<https://adif.org/315/ADIF_315_annotated.htm>).
 
 ---
 

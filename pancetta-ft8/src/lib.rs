@@ -1,6 +1,8 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 // Crate-level warn overrides command-line -D, so Clippy must also deny here.
 #![cfg_attr(clippy, deny(clippy::undocumented_unsafe_blocks))]
+// rust-version is a promise to registry users (PAN-384)
+#![deny(clippy::incompatible_msrv)]
 //! # pancetta-ft8
 //!
 //! FT8 protocol encoder, decoder, modulator, and OSD — bit-exact with WSJT-X / ft8_lib.
@@ -8,14 +10,15 @@
 //! High-performance FT8 digital mode decoder and encoder optimized for real-time processing.
 //!
 //! This crate provides a complete FT8 implementation with:
-//! - Measured decode performance (shipped pipeline and native-only curves): docs/decoder-comparison.md
+//! - Measured decode performance (shipped pipeline and native-only curves):
+//!   <https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v0.9.7/docs/decoder-comparison.md>
 //! - 12.64 second processing windows
 //! - Support for 50+ simultaneous decodes
 //! - Zero-allocation hot path
 //! - Comprehensive time synchronization
 //! - FT8 message encoding and transmission
-//! - PTT control and safety features
-//! - FCC Part 97 compliance
+//! - PTT control and safety features (with the `transmit` feature)
+//! - FCC Part 97 compliance (with the `transmit` feature)
 //!
 //! ## Data Flow
 //! `pancetta-dsp` (12kHz FT8 windows) -> **pancetta-ft8** -> coordinator (decoded messages)
@@ -46,7 +49,8 @@
 //!
 //! ```toml
 //! [dependencies]
-//! pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
+//! pancetta-ft8 = "0.9"
+//! # pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.7" }
 //! ```
 //!
 //! ```rust

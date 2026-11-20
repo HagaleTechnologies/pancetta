@@ -1,21 +1,50 @@
 [package]
 name = "pancetta-ft8"
-description = "High-performance FT8 digital mode decoder for Pancetta"
+description = "FT8 and FT4 decoder, encoder and modulator for amateur radio, with the ft8_lib C reference decoder built in"
 # PAN-176: explicit crate version, decoupled from the workspace so external
 # consumers (manta) can pin by the `pancetta-ft8-v<version>` git tag. Bump
 # this independently of the workspace from now on; the release process cuts
 # the matching tag on the merge commit.
 version = "0.9.7"
 edition.workspace = true
-rust-version = { workspace = true }
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+# PAN-384: publishable on its own switch (the workspace default stays
+# `false`). Publishes together with pancetta-core, which it depends on.
+publish = true
+rust-version = "1.88"
+readme = "README.md"
+keywords = ["ft8", "ft4", "amateur-radio", "ham-radio", "decoder"]
+categories = ["multimedia::audio", "encoding", "science"]
+# PAN-384: whitelist of what the crates.io package ships. It carries the
+# ft8_lib `ft8/`, `fft/` and `common/` directories (build.rs compiles all but
+# common/audio.c and common/wave.c; about 0.2 MB) and their license, and
+# leaves out tests, benches, fixtures and the rest of the submodule (test
+# WAVs, demo/utils, and the WSJT-X files in ft4_ft8_public/ that carry no
+# license header). Without it the package is about 25 MiB. A whitelist fails
+# closed: a new large file in the submodule cannot slip in.
+include = [
+    "/src/**",
+    "/assets/**",
+    "/build.rs",
+    "/mingw_stpcpy_shim.h",
+    "/examples/decode_cycle.rs",
+    # PAN-369: src/tier_probe.rs embeds this off-air window with include_bytes!.
+    "/tests/fixtures/wav/basicft8/live_now.wav",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/THIRD-PARTY-NOTICES.md",
+    "/vendor/ft8_lib/LICENSE",
+    "/vendor/ft8_lib/ft8/**",
+    "/vendor/ft8_lib/fft/**",
+    "/vendor/ft8_lib/common/**",
+]
 
 [dependencies]
 # Shared types (SlotParity, etc.)
-pancetta-core = { path = "../pancetta-core" }
+pancetta-core = { path = "../pancetta-core", version = "0.9.7" }
 # DSP and FFT operations
 rustfft = "6.4"
 # Real-input FFT (halves the work vs. a full complex FFT for real audio;
@@ -104,6 +133,11 @@ ft2 = []
 # reduction in OSD trials for failed-BP frames. Disable for minimal
 # builds where the weight blob and inference cost aren't acceptable.
 neural_osd = []
+
+[package.metadata.docs.rs]
+# Document the default (standalone) feature set, the one the stable API covers.
+# `transmit` pulls cpal/ALSA and serialport/udev; `ft2` adds a Protocol variant.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lints]
 workspace = true

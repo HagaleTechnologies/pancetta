@@ -32,9 +32,14 @@ def check(target):
     for name in ['rustls', 'tokio-tungstenite', 'tungstenite', 'dirs', 'signal-hook']:
         assert len(versions.get(name, set())) == 1, (target, name, versions.get(name))
     assert len(members) == 14
+    # PAN-384: the two crates.io crates promise registry users an older MSRV
+    # (1.88, held by #![deny(clippy::incompatible_msrv)] in each lib.rs); every
+    # other member inherits the workspace 1.98.
+    registry_msrv = {'pancetta-core': '1.88', 'pancetta-ft8': '1.88'}
     for key in members:
         p = packages[key]
-        assert p['rust_version'] == '1.98', (p['name'], p['rust_version'])
+        expected = registry_msrv.get(p['name'], '1.98')
+        assert p['rust_version'] == expected, (p['name'], p['rust_version'], expected)
     # Check resolved direct edges too: a lone transitive version must not
     # conceal a member switching its declaration to a second, unused line.
     aligned = {'tokio-tungstenite': '0.29.', 'dirs': '6.', 'signal-hook': '0.3.'}

@@ -16,7 +16,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 
 | Crate | Purpose | Status |
 |-------|---------|--------|
-| `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Bit-exact with ft8_lib/WSJT-X |
+| `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Bit-exact with ft8_lib/WSJT-X; crates.io-ready with pancetta-core (CI dry-run), not yet published |
 | `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
 | `pancetta-config` | Configuration loading, validation; file watch live-applies selected autonomous policy, TX timing, receive gain presets and remote-access consent/revocations (operational reload unreleased) | Production-ready |
@@ -25,7 +25,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; CAT/PTT on-air validated (FTdx10); opt-in receive overload ATT guard, configured data-mode control and TX power/ALC meter reads are hardware-unverified |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Live; spots envelope unverified against live API |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
-| `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable |
+| `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable; crates.io-ready with pancetta-ft8, not yet published |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
 | `pancetta-research` | Local-only decoder-iteration harness | Local-only; excluded from CI except a non-required compile-only check lane (PAN-372) |
@@ -104,6 +104,7 @@ New unit tests go in the same crate, `src/<module>/tests/<behaviour>_tests.rs`, 
 - TX-offset candidates have one source, `frequency::admissible_candidates`: both `allocate_smart_frequency_in_range` paths (spectral and no-snapshot) filter it by one `TxOffsetConstraints` and share one exhaustion tail (`avoid_hz` returned unchanged), and the placement instrument ranks its unconstrained grid; a new constraint kind goes into `TxOffsetConstraints`, never into one path (PAN-80).
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - Stable decoder API (PAN-380): the items listed in `pancetta-ft8/README.md` § Stable API and compatibility policy are pinned at compile time by `pancetta-ft8/tests/stable_api_guard.rs`. Changing one needs a minor crate-version bump while below 1.0, the README list, the guard and `CHANGELOG.md` in one PR, proposed in dispensa first.
+- Registry packaging (PAN-384): `pancetta-core` and `pancetta-ft8` are the only publishable crates (`[workspace.package] publish` stays `false`), and they publish together. Each ships through an `include` whitelist. `scripts/ci/check-publish-package.sh` keeps `cargo publish --dry-run -p pancetta-core -p pancetta-ft8` green and each `.crate` under 10 MB, and a packaged `pancetta-ft8` without the ft8_lib sources fails its build instead of shipping the stub.
 - External WSJT-X decodes (PAN-381) enter only through `ft8_to_tui_tx`: the decode listener never puts a decode on the message bus and never sends a datagram, so the QSO engine, Autonomous, alerts, PSKReporter, the remote gateway and the WSJT-X re-emit never see them; it binds loopback only and drops decodes until that WSJT-X has sent a Status with a dial. Space and directed replies on an `EXT` decode whose band or mode differs from pancetta's operating band and mode, or whose rig readback names another band, are refused with a status line (PAN-435).
 - Every acting consumer of `MessageType::DecodedMessage` (QSO, autonomous, WSJT-X relay) drops a decode whose `captured_dial_hz` maps to a different band than the live dial (fail-open on unknown dials) — a decode captured before a band switch is never acted on after it (PAN-69).
 - `merge_with` must carry every config field, and each field merges by replacement unless its type's rule table in `pancetta-config/src/lib/tests/merge_rules_tests.rs` lists another rule (PAN-371; `docs/DECISIONS/config-and-platform.md`).
