@@ -936,6 +936,14 @@ poll_interval_secs = 30      # how often to poll for new priority spots
 > block verbatim and only changing `token` is equally safe if you'd
 > rather see everything explicitly.
 
+> With `[network.station_agent]` also enabled, `enabled = true` with a
+> `token` starts the station agent's authorization poll. cqdx.io then
+> decides which remote clients may connect and use non-TX control (QSY,
+> split, stop CQ, take control). A client can still arm TX only with a
+> device key stored by `pancetta trust-client`; see
+> [Station-agent local TX trust](#station-agent-local-tx-trust) and
+> [SECURITY.md](../SECURITY.md#remote-operation).
+
 | Key | Service | Notes |
 |---|---|---|
 | `clublog.enabled` | ClubLog | Master switch. When `true`, `email`, `password`, and `api_key` are all required (validation fails otherwise). |

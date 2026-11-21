@@ -210,3 +210,23 @@ while a cloud request is stalled, so local revocation does not wait for cqdx.
 
 Pending-key capture from msg1 remains blocked on dispensa Q-0069. The TUI
 trust prompt remains a follow-up. Pairing does not populate client trust files.
+
+## Status update (PAN-362)
+
+The Medium finding's relay-only path is closed. A peer proves the keys
+behind its keyId inside the Noise handshake (PAN-95), must be on the live
+admission list for every action (PAN-96), and needs a `qsy`-scoped hello
+token for `qsy`, `setSplit` and `takeControl` (PAN-253, PAN-283). A relay
+that stamps `src` can no longer act as a client.
+
+What remains is rooted in cqdx, not the relay. With `[network.cqdx]`
+enabled and a token, cqdx's authorization edges are the admission list and
+cqdx signs the hello token. Whoever can add an edge for the station on cqdx
+can connect a key it holds, read the display feed, `qsy` or `setSplit` an
+idle rig (PAN-252 refuses while keyed or while a station-run QSO is
+active), `stopCq`, and take control from the operator's remote client. TX
+stays rooted in the station-local `clients/<keyId>.pub` (PAN-309). The
+project accepted this residual on 2026-11-07. Severity stays Medium, with
+the attacker narrowed from "relay or cqdx compromise" to "cqdx compromise
+or a wrongly granted cqdx edge". See `docs/DECISIONS/remote-operation.md`,
+"Two trust roots (PAN-362)".

@@ -80,10 +80,39 @@ Both remote channels are off by default. The local gateway
 (`[network.remote_gateway]`) requires `auth_token`. It accepts browser pages
 only from origins in `allowed_origins`, which defaults to an empty list, and
 binds a non-loopback address only with `allow_network_exposure = true`.
-Remote TX through the station agent (`[network.station_agent]`) needs local
-consent (`remote_tx_enabled`) and a signed arm from an allow-listed client.
 Both sections are described in
 [docs/CONFIG.md](docs/CONFIG.md).
+
+The station agent (`[network.station_agent]`) has two trust roots.
+
+- **Transmit is rooted on the station.** A remote client can arm TX only
+  after you store its device key with `pancetta trust-client`
+  (`<key_dir>/clients/<keyId>.pub`), and only while `remote_tx_enabled` is
+  on. The arm must also carry the client's signature and a TX-enabled
+  cqdx.io token. Cloud data alone cannot arm TX.
+- **Connection and non-TX control are rooted in cqdx.io when the cqdx
+  integration is on.** Turning on `[network.cqdx]` with a token, the same
+  setting that turns on spots and logbook upload, makes cqdx.io's
+  authorization list the station agent's admission list. Any key cqdx.io
+  lists for your station can connect with no step on the station, and
+  cqdx.io signs the token that grants its `status` or `qsy` scope. Without
+  the cqdx integration only keys in `tx_allow_list` can connect.
+
+The project accepts the residual risk (decision of 2026-11-07). Anyone who
+can add an authorization for your station on cqdx.io, including an attacker
+who compromises cqdx.io, can connect a key they hold, read your decodes and
+waterfall, retune or re-split the rig while it is not transmitting and no
+station-run QSO is active, stop a CQ, and take control from your own remote
+client, which disarms it. A cqdx.io compromise alone cannot make the station
+transmit, because that also needs a device key you trusted on the station.
+
+With the cqdx integration on, revoke a client's admission by removing its
+authorization on cqdx.io; a `tx_allow_list` removal is undone by the next
+poll. Without it, remove the client from `tx_allow_list`.
+`pancetta untrust-client` and `remote_tx_enabled = false` remove TX only.
+Setting `[network.station_agent] enabled = false` cuts off all remote access
+on the station. Details:
+[remote-operation decisions](docs/DECISIONS/remote-operation.md).
 
 ### `unsafe` Code
 
