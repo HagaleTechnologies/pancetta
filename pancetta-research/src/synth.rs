@@ -194,7 +194,10 @@ pub fn generate_crowded_edge(
             *x *= scale;
         }
         let bytes = crowded_wav_bytes(&window);
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let sha256 = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let entry = CrowdedEdgeEntry {
             wav_path: config
                 .output_dir

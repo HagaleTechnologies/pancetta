@@ -136,7 +136,10 @@ pub fn preflight_curated_corpus(
             }
         }
         if entry.wav_path.is_file() {
-            let actual = format!("{:x}", Sha256::digest(std::fs::read(&entry.wav_path)?));
+            let actual = Sha256::digest(std::fs::read(&entry.wav_path)?)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             if !actual.eq_ignore_ascii_case(&entry.wav_sha256) {
                 missing.push(format!(
                     "WAV SHA-256 mismatch: {} expected {} got {}",

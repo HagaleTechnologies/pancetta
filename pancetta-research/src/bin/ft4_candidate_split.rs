@@ -23,7 +23,10 @@ fn observe(
 ) -> Result<(WavObservation, String)> {
     let path = workspace.join(&e.wav_path);
     let bytes = std::fs::read(&path)?;
-    let sha = format!("{:x}", Sha256::digest(&bytes));
+    let sha = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let (jt9_recovered, identity) = jt9_recovered_from_cache(baseline, &sha, &e.encoded_message)?;
     // Same PCM scaling as src/decoder.rs's native WAV loader.
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;

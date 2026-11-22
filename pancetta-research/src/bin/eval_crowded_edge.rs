@@ -66,7 +66,10 @@ struct Scorecard {
 }
 fn read_wav(path: &Path, expected: &CrowdedEdgeEntry) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path).with_context(|| format!("missing WAV {}", path.display()))?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     anyhow::ensure!(
         hash == expected.sha256,
         "WAV hash mismatch: {}",
@@ -182,7 +185,10 @@ fn totals(records: &[WavRecord], qualified_only: bool) -> Totals {
 fn evaluate(manifest_path: &Path, output: &Path, wav_dir: Option<&Path>) -> Result<Scorecard> {
     let start = Instant::now();
     let manifest_bytes = std::fs::read(manifest_path)?;
-    let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let manifest_sha256 = Sha256::digest(&manifest_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let manifest: CrowdedEdgeManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
