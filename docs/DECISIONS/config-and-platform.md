@@ -1574,3 +1574,51 @@ non-manifest PR merge should show both heavy lanes skipped with the summary
 line present, and the first push after this change's own merge runs in full
 (it changes `.github/workflows/ci.yml`, a cache-key input — the exception
 exercising itself).
+
+## Off chrono: jiff and `UtcTimestamp` (PAN-441, 2026-11-22)
+
+RUSTSEC-2026-0543 marks every chrono release unmaintained, and `deny.toml`
+carried a temporary ignore for it (PAN-430/PAN-431). The workspace now uses
+`jiff` 0.2 (`default-features = false`, `std` + `serde`; no time-zone
+database, every use is UTC), sqlx's unused `chrono` feature is off, chrono is
+gone from `Cargo.lock`, the ignore is deleted, and
+`scripts/ci/test-dependency-policy.py` forbids chrono for every target.
+
+**jiff, not `time`.** jiff's MSRV (1.70) sits below `pancetta-core`'s
+registry MSRV of 1.88, where `time` 0.3.55 needs exactly 1.88; jiff's
+`strptime` accepts the ADIF date and time shapes chrono accepted, where
+`time` rejected four; and its RFC 3339 reader is about as lenient as chrono's.
+
+**One instant type.** `pancetta_core::time::UtcTimestamp` wraps
+`jiff::Timestamp` and replaces `DateTime<Utc>` everywhere. Its serde and
+`Debug` forms write `YYYY-MM-DDTHH:MM:SS[.frac]Z`, `to_rfc3339()` writes
+`+00:00`, and `Display` writes `YYYY-MM-DD HH:MM:SS[.frac] UTC`, exactly as
+chrono did. The fraction is omitted when zero and otherwise printed with 3, 6
+or 9 digits (jiff's own writer trims trailing zeros, so `.500` would become
+`.5`). Keeping the digit groups keeps SQLite's text `ORDER BY created_at`
+and the `check_duplicate` text comparison in time order, and keeps stored
+JSON, ADIF `APP_PANCETTA_CONTEST_CONTEXT` values and the qso.db checksums byte
+for byte. Parsing trims leading whitespace and truncates fractions past nine
+digits, so every string chrono read still reads. A wrapper, rather than a
+`#[serde(with = ...)]` annotation per field, covers the 84 serialized fields
+(tuple fields included) by construction. `pancetta/tests/utc_timestamp_invariant.rs`
+fails on any raw `jiff::Timestamp` outside `pancetta-core/src/time.rs`, its
+tests and `pancetta/src/build_identity.rs` (the build script cannot depend on
+`pancetta-core`). The fixtures in `pancetta-qso/tests/fixtures/pan441/` were
+written by the chrono build and still round-trip byte for byte.
+
+**Durations and civil types.** Durations use `jiff::SignedDuration` directly;
+no serialized type holds one, so only log text changes (`TimeDelta { secs:
+180, nanos: 0 }` becomes `3m`). `SignedDurationExt` gives the `i64`
+millisecond, microsecond and nanosecond readings and `to_std` the chrono
+code used. `UtcTimestamp`'s calendar accessors return chrono's widths (`u32`,
+`i32`), because jiff's `i8` fields overflow in arithmetic such as `hour * 60`.
+`NaiveDate`/`NaiveTime`/`NaiveDateTime` became `jiff::civil::{Date, Time,
+DateTime}`.
+
+**Two narrowed edges, malformed data only.** jiff cannot hold a leap second,
+so ADIF `TIME_ON 235960` or a stored `...:60Z` now reads as `:59`
+(`adif_leap_second_reads_as_59`); chrono's `Utc::now()` never produced one.
+jiff's range ends near year 9999, so ADIF `QSO_DATE 99991231` now fails with
+`AdifError::InvalidDateTime` (`adif_year_9999_is_rejected`) where chrono
+accepted it.

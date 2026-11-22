@@ -17,6 +17,8 @@ use crate::app::{App, ColorCapability};
 use crate::config::Config;
 use crate::theme::{self, Theme, ThemeName};
 use crate::view::ActiveView;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
@@ -153,7 +155,7 @@ fn decode(
     source: DecodeSource,
 ) -> crate::app::DecodedMessageView {
     crate::app::DecodedMessageView {
-        timestamp: chrono::Utc::now() - chrono::Duration::seconds(10),
+        timestamp: UtcTimestamp::now() - SignedDuration::from_secs(10),
         frequency: 14_074_000.0,
         mode: "FT8".to_string(),
         snr,
@@ -178,7 +180,7 @@ fn decode(
 }
 
 fn banner(call: &str, qso_id: &str) -> crate::app::ActiveQsoBanner {
-    let at = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let at = UtcTimestamp::now() - SignedDuration::from_secs(10);
     crate::app::ActiveQsoBanner {
         their_callsign: call.to_string(),
         state: "wait rpt".to_string(),
@@ -215,7 +217,7 @@ fn engaged_banner() -> crate::app::ActiveQsoBanner {
     let mut b = banner("W1AW", "qso-1");
     b.call_count = 2;
     b.max_calls = 5;
-    b.watchdog_deadline = Some(chrono::Utc::now() + chrono::Duration::seconds(120));
+    b.watchdog_deadline = Some(UtcTimestamp::now() + SignedDuration::from_secs(120));
     b
 }
 
@@ -234,7 +236,7 @@ fn dx_station(call: &str, priority_score: u32) -> crate::app::DxStation {
         frequency: 14.074,
         band: None,
         mode: "FT8".to_string(),
-        last_seen: chrono::Utc::now() - chrono::Duration::seconds(10),
+        last_seen: UtcTimestamp::now() - SignedDuration::from_secs(10),
         snr: -10,
         distance: None,
         bearing: None,
@@ -279,7 +281,7 @@ fn placement() -> crate::app::PlacementView {
         openness: (0..96).map(|i| (i % 5) as u8).collect(),
         bin_hz: 25.0,
         range: (200.0, 2600.0),
-        received_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+        received_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
     }
 }
 
@@ -394,7 +396,7 @@ async fn fixture(name: ThemeName) -> App {
     ] {
         app.diagnostic_events
             .push_back(crate::app::DiagnosticEventRecord {
-                ts: chrono::Utc::now() - chrono::Duration::seconds(10),
+                ts: UtcTimestamp::now() - SignedDuration::from_secs(10),
                 target: "qso",
                 level,
                 text: text.into(),
@@ -419,7 +421,7 @@ async fn fixture(name: ThemeName) -> App {
             outcome,
             last_state: last_state.into(),
             freq_hz: 14_074_000,
-            ts: chrono::Utc::now() - chrono::Duration::seconds(10),
+            ts: UtcTimestamp::now() - SignedDuration::from_secs(10),
             brief_timeline: vec![],
         });
     }
@@ -458,7 +460,7 @@ async fn fixture(name: ThemeName) -> App {
         app.qso_history.push_back(crate::app::QsoHistoryItem {
             call_sign: call_sign.to_string(),
             success,
-            completed_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            completed_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
         });
     }
 
@@ -742,7 +744,7 @@ fn render_with(app: &mut App, surface: Surface) -> Snapshot {
                 let mut drift = banner("F5DRF", "qso-3");
                 drift.pending_freq_drift_hz = Some(25.0);
                 drift.pending_freq_drift_since =
-                    Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+                    Some(UtcTimestamp::now() - SignedDuration::from_secs(10));
                 app.apply_active_qsos(vec![engaged_banner(), hound, drift], vec![queued_call()]);
             }
             let buf = draw_panel(app, surface);

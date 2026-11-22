@@ -1,5 +1,6 @@
 use super::*;
-use chrono::Utc;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 fn manager_with_call(our: &str) -> QsoManager {
     let config = QsoManagerConfig {
@@ -21,7 +22,7 @@ fn manager_with_call(our: &str) -> QsoManager {
 /// pass a metadata; this helper ensures the regression cases use the
 /// canonical "no partner_freq" path, matching pre-Hound behavior.
 fn normal_metadata(our: &str, their_freq: f64) -> QsoMetadata {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: uuid::Uuid::new_v4(),
         our_callsign: our.into(),
@@ -69,7 +70,7 @@ async fn spoofed_signal_report_does_not_advance_state() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     // Attacker sends a properly-addressed report from a DIFFERENT call.
     let spoof = MessageType::SignalReport {
@@ -105,7 +106,7 @@ async fn legitimate_signal_report_advances_state() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let legit = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -136,7 +137,7 @@ fn is_message_relevant_rejects_spoofed_sender() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let spoof = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -154,7 +155,7 @@ fn classify_relevance_reports_only_entangled_security_traffic() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let metadata = normal_metadata("K5ARH", 1500.0);
     let impostor = MessageType::SignalReport {
@@ -208,7 +209,7 @@ fn is_message_relevant_accepts_legitimate_sender() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let legit = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -230,7 +231,7 @@ fn is_message_relevant_tight_gate_for_initial_ambiguous_match() {
     let manager = manager_with_call("K5ARH");
     let state = QsoState::CallingCq {
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
         call_count: 1,
     };
     // A bare report answering our CQ (A4 routing shape), addressed to us.
@@ -260,7 +261,7 @@ fn is_message_relevant_established_qso_allows_drift() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let legit = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -291,7 +292,7 @@ fn is_message_relevant_hound_keys_on_partner_freq() {
     let state = QsoState::RespondingToCq {
         target_callsign: "KH8B".into(),
         frequency: 600.0, // our TX offset (Hound calls low)
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let fox_report = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -336,7 +337,7 @@ fn is_message_relevant_partner_freq_none_falls_back_to_state_freq() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let legit = MessageType::SignalReport {
         to_station: "K5ARH".into(),
@@ -419,7 +420,7 @@ async fn noting_a_new_drift_candidate_emits_state_changed() {
         report: -11,
     };
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, Utc::now())
+        .maybe_confirm_frequency_drift_at(&report, 937.5, UtcTimestamp::now())
         .await;
 
     assert!(
@@ -462,7 +463,7 @@ async fn clearing_a_drift_candidate_without_confirming_emits_state_changed() {
         report: -11,
     };
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, Utc::now())
+        .maybe_confirm_frequency_drift_at(&report, 937.5, UtcTimestamp::now())
         .await;
     assert!(
         manager
@@ -479,7 +480,7 @@ async fn clearing_a_drift_candidate_without_confirming_emits_state_changed() {
     // Back within tolerance of the QSO's OWN frequency (1500.0) — the
     // early "in-tolerance, clear the candidate" branch, not a confirm.
     manager
-        .maybe_confirm_frequency_drift_at(&report, 1500.0, Utc::now())
+        .maybe_confirm_frequency_drift_at(&report, 1500.0, UtcTimestamp::now())
         .await;
 
     assert!(
@@ -765,7 +766,7 @@ async fn duplicate_delivery_of_same_transmission_does_not_confirm() {
         from_station: "LU7LRP".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     // Two decode-pipeline copies of the SAME transmission, milliseconds apart --
     // mirrors the hb-091 scoped fast-path + standard pipeline both forwarding the
     // same window's content to the QSO component.
@@ -773,7 +774,7 @@ async fn duplicate_delivery_of_same_transmission_does_not_confirm() {
         .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::milliseconds(50))
+        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + SignedDuration::from_millis(50))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -790,7 +791,7 @@ async fn duplicate_delivery_of_same_transmission_does_not_confirm() {
 
     // A genuinely later sighting (>=5s after the ORIGINAL t0, not the duplicate) confirms.
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + SignedDuration::from_secs(6))
         .await;
     let progress = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(
@@ -817,12 +818,12 @@ async fn sighting_just_under_the_confirm_gap_does_not_confirm() {
         from_station: "LU7LRP".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::milliseconds(4900))
+        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + SignedDuration::from_millis(4900))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -854,12 +855,12 @@ async fn sighting_at_exactly_the_confirm_gap_does_confirm() {
         from_station: "LU7LRP".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::seconds(5))
+        .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + SignedDuration::from_secs(5))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -894,12 +895,12 @@ async fn drift_candidate_confirms_near_the_passband_edges() {
         from_station: "LU7LRP".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report_low, 250.0, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report_low, 250.0, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report_low, 250.0, t0 + SignedDuration::from_secs(6))
         .await;
     let progress = manager.get_qso(qso_low).await.unwrap();
     assert_eq!(
@@ -918,12 +919,12 @@ async fn drift_candidate_confirms_near_the_passband_edges() {
         from_station: "VK9XYZ".into(),
         report: -9,
     };
-    let t1 = Utc::now();
+    let t1 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report_high, 2850.0, t1)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report_high, 2850.0, t1 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report_high, 2850.0, t1 + SignedDuration::from_secs(6))
         .await;
     let progress = manager.get_qso(qso_high).await.unwrap();
     assert_eq!(
@@ -947,12 +948,12 @@ async fn drift_candidate_rejects_outside_the_rx_plausibility_bound() {
         from_station: "LU7LRP".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 2950.0, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 2950.0, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, 2950.0, t0 + SignedDuration::from_secs(6))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -1044,7 +1045,7 @@ async fn spot_call_at_a_stale_offset_recovers_on_the_second_reply() {
         .maybe_confirm_frequency_drift_at(
             &report,
             1210.0,
-            Utc::now() - chrono::Duration::seconds(30),
+            UtcTimestamp::now() - SignedDuration::from_secs(30),
         )
         .await;
     manager
@@ -1088,7 +1089,7 @@ async fn tx_offset_only_call_relatches_partner_and_keeps_tx() {
         .maybe_confirm_frequency_drift_at(
             &report,
             1210.0,
-            Utc::now() - chrono::Duration::seconds(30),
+            UtcTimestamp::now() - SignedDuration::from_secs(30),
         )
         .await;
     manager
@@ -1182,12 +1183,12 @@ async fn split_tx_relatch_emits_state_change_for_decoder_refresh() {
 
     // Subscribe AFTER establishment so only relatch-driven events are seen.
     let mut events = manager.subscribe();
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 855.0, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + SignedDuration::from_secs(6))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -1237,12 +1238,12 @@ async fn relatched_partner_freq_routes_subsequent_frames() {
         from_station: "K6L".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 855.0, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + SignedDuration::from_secs(6))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -1283,12 +1284,12 @@ async fn held_offset_qso_with_dx_on_partner_freq_never_drifts() {
         from_station: "VK4DX".into(),
         report: -11,
     };
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     manager
         .maybe_confirm_frequency_drift_at(&report, 700.0, t0)
         .await;
     manager
-        .maybe_confirm_frequency_drift_at(&report, 700.0, t0 + chrono::Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, 700.0, t0 + SignedDuration::from_secs(6))
         .await;
 
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -1535,7 +1536,7 @@ async fn spoofed_report_ack_does_not_advance_to_completion() {
         their_report: Some(-15),
         our_report: -10,
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let spoof = MessageType::ReportAck {
         to_station: "K5ARH".into(),
@@ -1565,7 +1566,7 @@ async fn spoofed_final_confirmation_does_not_complete_qso() {
         our_report: -10,
         frequency: 1500.0,
         grid_square: None,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let spoof = MessageType::FinalConfirmation {
         to_station: "K5ARH".into(),
@@ -1594,7 +1595,7 @@ async fn legitimate_final_confirmation_completes_qso() {
         our_report: -10,
         frequency: 1500.0,
         grid_square: None,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let legit = MessageType::FinalConfirmation {
         to_station: "K5ARH".into(),

@@ -1,4 +1,5 @@
 //! Formatting and geometry only. Scoring is owned by pancetta-qso.
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::contest::ledger::{ContestScoreState, ContestScoreUpdate};
 use ratatui::{layout::Rect, widgets::Paragraph, Frame};
 
@@ -112,7 +113,7 @@ mod tests {
         let context =
             ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
                 .unwrap();
-        let snapshot = reduce_contest_score(&context, &[], chrono::Utc::now()).unwrap();
+        let snapshot = reduce_contest_score(&context, &[], UtcTimestamp::now()).unwrap();
         let u = update(ContestScoreState::Ready(snapshot));
         let backend = ratatui::backend::TestBackend::new(100, 5);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

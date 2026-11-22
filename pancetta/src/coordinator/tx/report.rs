@@ -1,4 +1,5 @@
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 /// Observer-only RAII guard for the TUI's TX-active badge (Batch 93).
 ///
@@ -79,9 +80,9 @@ pub(crate) const TX_PLAYBACK_START_WAIT: Duration = Duration::from_millis(100);
 /// instant if confirmation is unavailable. Called only after authorized enqueue.
 pub(super) async fn frame_log_instant(
     waiter: &mut PlaybackStartWaiter,
-    enqueued_at: chrono::DateTime<chrono::Utc>,
+    enqueued_at: UtcTimestamp,
     text: &str,
-) -> chrono::DateTime<chrono::Utc> {
+) -> UtcTimestamp {
     match waiter.wait_for(TX_PLAYBACK_START_WAIT).await {
         PlaybackStartState::Started(at) => at,
         PlaybackStartState::Pending => {
@@ -107,7 +108,7 @@ pub(super) async fn log_tx_frame(
     text: String,
     freq_hz: f64,
     qso_id: Option<String>,
-    timestamp: chrono::DateTime<chrono::Utc>,
+    timestamp: UtcTimestamp,
 ) {
     let log_msg = ComponentMessage::new(
         ComponentId::Ft8Transmitter,
@@ -513,7 +514,7 @@ pub(super) async fn emit_disarm_interrupt_signals(
     )
     .await;
     audit_log.record(&pancetta_agent::audit::AuditEvent {
-        ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+        ts_unix_ms: UtcTimestamp::now().as_millisecond(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
         operator_callsign,
         detail: denial_reason.clone(),

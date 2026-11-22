@@ -2,10 +2,11 @@
 //! limit never changes the TX verdict.
 use super::tests::{app, health, labels, snapshot, visible_labels};
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 fn pan295_decode() -> crate::app::DecodedMessageView {
     crate::app::DecodedMessageView {
-        timestamp: Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: 14_074_000.0,
         mode: "FT8".into(),
         snr: -10,

@@ -3,7 +3,7 @@
 //! All time coordinates are originating UTC slot starts in seconds, never decode
 //! receipt times. PSD input is settled mono 12 kHz audio, with capture lead removed.
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -156,8 +156,8 @@ pub struct Report {
     pub band: String,
     pub dial_hz: u64,
     pub mode: String,
-    pub started_utc: DateTime<Utc>,
-    pub ended_utc: DateTime<Utc>,
+    pub started_utc: UtcTimestamp,
+    pub ended_utc: UtcTimestamp,
     pub requested_duration_seconds: u64,
     pub original_gain: GainSetting,
     pub settings: Vec<SettingSummary>,
@@ -222,7 +222,7 @@ impl Report {
         original_gain: GainSetting,
         candidates: Vec<GainSetting>,
     ) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self { schema_version: 1, band, dial_hz, mode: "FT8".into(), started_utc: now, ended_utc: now,
             requested_duration_seconds: duration, original_gain,
             settings: candidates.into_iter().map(|gain| SettingSummary { gain, valid_windows: 0, noise_dbfs_per_hz: None, matched_snr_db: None, unique_stations: 0 }).collect(),
@@ -233,7 +233,7 @@ impl Report {
     }
 
     pub fn finish(&mut self, restored: bool, failure: Option<String>) {
-        self.ended_utc = Utc::now();
+        self.ended_utc = UtcTimestamp::now();
         self.recommendation = None;
         self.reasons.clear();
         self.comparisons.clear();

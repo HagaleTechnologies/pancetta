@@ -8,6 +8,7 @@
 
 use super::merge_guard::{build_source_probed, collect_leaves, get_path, set_path, Probe, Seg};
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -691,9 +692,7 @@ fn populated_base_merge_follows_each_fields_rule() {
 /// `last_modified`.
 #[test]
 fn config_merge_keeps_base_metadata_and_appends_sources() {
-    let stamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let stamp = str::parse::<UtcTimestamp>("2026-01-01T00:00:00Z").unwrap();
     let meta = |version: &str, source: &str| {
         Some(ConfigMetadata {
             version: version.to_string(),

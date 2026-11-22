@@ -85,7 +85,7 @@ fn frame_strategy() -> impl Strategy<Value = Frame> {
 }
 
 /// Discriminant-only view of the state, so "unchanged variant" comparisons
-/// ignore per-transition timestamps (`started_at = Utc::now()`).
+/// ignore per-transition timestamps (`started_at = UtcTimestamp::now()`).
 fn state_tag(s: &QsoState) -> std::mem::Discriminant<QsoState> {
     std::mem::discriminant(s)
 }

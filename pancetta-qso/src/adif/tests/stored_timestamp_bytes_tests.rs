@@ -5,6 +5,7 @@
 use super::*;
 use crate::contest::ledger::{ContestEvidence, LoggedContestContext, CONTEXT};
 use crate::contest::scoring::ContestPeriod;
+use pancetta_core::time::UtcTimestamp;
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/pan441/qsos.adi");
 const RENDERED: &str = include_str!("../../../tests/fixtures/pan441/qsos.rendered.adi");
@@ -32,8 +33,8 @@ fn value<'a>(record: &'a AdifRecord, name: &str) -> Option<&'a str> {
     record.fields.get(name).map(|field| field.value.as_str())
 }
 
-fn instant(secs: i64, nanos: u32) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, nanos).expect("in range")
+fn instant(secs: i64, nanos: u32) -> UtcTimestamp {
+    UtcTimestamp::from_parts(secs, nanos).expect("in range")
 }
 
 #[test]
@@ -131,7 +132,6 @@ fn single_record(body: &str) -> AdifRecord {
 }
 
 #[test]
-#[ignore = "PAN-441: enabled in Phase 3 when jiff narrows these edges"]
 fn adif_leap_second_reads_as_59() {
     let processor = AdifProcessor::new();
     let record = single_record(
@@ -142,7 +142,6 @@ fn adif_leap_second_reads_as_59() {
 }
 
 #[test]
-#[ignore = "PAN-441: enabled in Phase 3 when jiff narrows these edges"]
 fn adif_year_9999_is_rejected() {
     let processor = AdifProcessor::new();
     let record = single_record(

@@ -119,8 +119,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::ResponseStep;
 use tokio::sync::broadcast::error::TryRecvError;
 
@@ -147,7 +148,7 @@ pub const SLOT_SECONDS: i64 = 15;
 /// the current slot start. This anchoring is deliberate and load-bearing.
 ///
 /// The engine stamps `QsoState::started_at` / `first_call_at` with the real
-/// `Utc::now()`, and the per-state timeouts / manual watchdog compute
+/// `UtcTimestamp::now()`, and the per-state timeouts / manual watchdog compute
 /// `virtual_now - started_at` (then cast to `u64` for comparison). Two failure
 /// modes must be avoided:
 ///
@@ -170,7 +171,7 @@ pub const SLOT_SECONDS: i64 = 15;
 /// with the engine's own parity math.
 #[derive(Debug, Clone)]
 pub struct SimClock {
-    base: DateTime<Utc>,
+    base: UtcTimestamp,
     slot: u64,
 }
 
@@ -179,34 +180,33 @@ impl SimClock {
     /// that want a stable, parity-defined origin in unit tests via
     /// [`SimClock::with_base`]. Not used as the live base — see the [`SimClock`]
     /// type docs for why the live base anchors to wall-clock now.
-    pub fn epoch() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
+    pub fn epoch() -> UtcTimestamp {
+        UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0)
             .expect("fixed sim epoch 2026-01-01T00:00:00Z is a valid, unambiguous UTC instant")
     }
 
     /// Snap an instant *down* to the 15s slot boundary containing it.
-    fn slot_floor(t: DateTime<Utc>) -> DateTime<Utc> {
+    fn slot_floor(t: UtcTimestamp) -> UtcTimestamp {
         let ns = t
-            .timestamp_nanos_opt()
+            .as_nanosecond_i64()
             .expect("wall clock within representable ns range");
         const SLOT_NS: i64 = SLOT_SECONDS * 1_000_000_000;
         let idx = ns.div_euclid(SLOT_NS);
-        DateTime::<Utc>::from_timestamp_nanos(idx * SLOT_NS)
+        UtcTimestamp::from_nanosecond_i64(idx * SLOT_NS)
     }
 
     /// Create a clock at slot 0, anchored to the slot boundary containing the
     /// current wall clock.
     pub fn new() -> Self {
         Self {
-            base: Self::slot_floor(Utc::now()),
+            base: Self::slot_floor(UtcTimestamp::now()),
             slot: 0,
         }
     }
 
     /// Create a clock anchored to an explicit base instant (snapped down to its
     /// containing slot boundary). Mainly for deterministic unit tests.
-    pub fn with_base(base: DateTime<Utc>) -> Self {
+    pub fn with_base(base: UtcTimestamp) -> Self {
         Self {
             base: Self::slot_floor(base),
             slot: 0,
@@ -214,7 +214,7 @@ impl SimClock {
     }
 
     /// Create a clock whose slot 0 is anchored to a wall-clock slot boundary
-    /// **of Even parity**: floor `Utc::now()` to its slot boundary, then bump
+    /// **of Even parity**: floor `UtcTimestamp::now()` to its slot boundary, then bump
     /// forward one slot if that boundary is Odd.
     ///
     /// This is the base the autonomous-drive harness uses. It keeps `base`
@@ -224,17 +224,17 @@ impl SimClock {
     /// per-slot parity deterministic — slot 0 Even, slot 1 Odd, … — so the
     /// autonomous operator's Even-parity TX gating is reproducible.
     pub fn new_even() -> Self {
-        let floored = Self::slot_floor(Utc::now());
+        let floored = Self::slot_floor(UtcTimestamp::now());
         let base = if SlotParity::of(floored) == SlotParity::Even {
             floored
         } else {
-            floored + ChronoDuration::seconds(SLOT_SECONDS)
+            floored + SignedDuration::from_secs(SLOT_SECONDS)
         };
         Self { base, slot: 0 }
     }
 
     /// The slot-0 base instant (a 15s slot boundary).
-    pub fn base(&self) -> DateTime<Utc> {
+    pub fn base(&self) -> UtcTimestamp {
         self.base
     }
 
@@ -244,8 +244,8 @@ impl SimClock {
     }
 
     /// The virtual `now` at the start of the current slot.
-    pub fn now(&self) -> DateTime<Utc> {
-        self.base + ChronoDuration::seconds(self.slot as i64 * SLOT_SECONDS)
+    pub fn now(&self) -> UtcTimestamp {
+        self.base + SignedDuration::from_secs(self.slot as i64 * SLOT_SECONDS)
     }
 
     /// The parity of the current slot, derived from the virtual `now` via the
@@ -1191,7 +1191,7 @@ impl Sim {
     /// the [`Timeline`]. The duplicate / DX-busy / recently-responded gates
     /// all live inside [`AutonomousOperator::decide_at`], so a suppressed CQ
     /// simply produces no `Transmit` here.
-    async fn run_autonomous_slot(&mut self, injects: &[Reception], now: DateTime<Utc>) {
+    async fn run_autonomous_slot(&mut self, injects: &[Reception], now: UtcTimestamp) {
         // Build DecodedMessageInfo for the operator from this slot's decodes.
         // The `callsign` field is the *sender* of the decode (production sets
         // it from the decoder's `from_callsign`), parsed with the real
@@ -1236,7 +1236,7 @@ impl Sim {
                 .operator
                 .feed_decoded_messages_at(&infos, drive.evaluator.as_ref(), now);
             drive.operator.set_active_qso_count(active);
-            drive.operator.decide_at(now.timestamp())
+            drive.operator.decide_at(now.as_second())
         };
 
         let dx_parity = self.clock.parity();
@@ -1307,7 +1307,7 @@ impl Sim {
 
     /// PAN-280: report each frame drained since the last call as aired, the
     /// way the TX worker's `TxFrameSent` does in production.
-    async fn air_unconfirmed_sends(&mut self, now: DateTime<Utc>) {
+    async fn air_unconfirmed_sends(&mut self, now: UtcTimestamp) {
         for (qso_id, attempt_id, text, frequency) in std::mem::take(&mut self.unconfirmed_sends) {
             self.manager
                 .confirm_completion_aired(
@@ -1882,7 +1882,7 @@ mod tests {
         assert_eq!(clk.slot(), 1);
         assert_eq!(
             clk.now(),
-            SimClock::epoch() + ChronoDuration::seconds(SLOT_SECONDS)
+            SimClock::epoch() + SignedDuration::from_secs(SLOT_SECONDS)
         );
         assert_eq!(clk.parity(), SlotParity::Odd);
         // Sanity: the sim clock's parity matches pancetta-core's slot parity.

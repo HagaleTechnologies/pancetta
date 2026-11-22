@@ -1,5 +1,6 @@
 //! Decode alerts run inside the supervised Autonomous task, including manual mode.
 //! HTTP deliveries never hold up decode admission or TX decisions.
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -154,7 +155,7 @@ impl AlertDispatcher {
         }
         let payload = json!({
             "type": "decode_alert", "source": "pancetta", "version": 1,
-            "utc_time": chrono::DateTime::<chrono::Utc>::from(decoded.timestamp).to_rfc3339(),
+            "utc_time": UtcTimestamp::try_from(decoded.timestamp).expect("system time is within jiff's range").to_rfc3339(),
             "callsign": call,
             "entity": pancetta_core::dxcc::entity_for_callsign(&call).unwrap_or("unknown entity"),
             "band": band, "audio_offset_hz": decoded.frequency_offset,

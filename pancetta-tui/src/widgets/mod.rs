@@ -1,3 +1,5 @@
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{layout::Rect, widgets::Block};
 
 use crate::app::ColorCapability;
@@ -29,13 +31,9 @@ pub(crate) fn occupancy(
     col: usize,
     width: usize,
     freq_range: (f64, f64),
-    decoded: &[(
-        f64,
-        pancetta_core::slot::SlotParity,
-        chrono::DateTime<chrono::Utc>,
-    )],
+    decoded: &[(f64, pancetta_core::slot::SlotParity, UtcTimestamp)],
     tx_parity: Option<pancetta_core::slot::SlotParity>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) -> Occupancy {
     if width == 0 {
         return Occupancy::Clear;
@@ -43,13 +41,11 @@ pub(crate) fn occupancy(
     let (lo, hi) = freq_range;
     let bin_hz = (hi - lo) / width as f64;
     let center = lo + (col as f64 + 0.5) * bin_hz;
-    let cutoff = now - chrono::Duration::seconds(60);
+    let cutoff = now - SignedDuration::from_secs(60);
 
-    let in_band = |d: &(
-        f64,
-        pancetta_core::slot::SlotParity,
-        chrono::DateTime<chrono::Utc>,
-    )| { (d.0 - center).abs() <= 37.5 && d.2 >= cutoff };
+    let in_band = |d: &(f64, pancetta_core::slot::SlotParity, UtcTimestamp)| {
+        (d.0 - center).abs() <= 37.5 && d.2 >= cutoff
+    };
 
     let any_in_band = decoded.iter().any(in_band);
     if !any_in_band {
@@ -93,11 +89,7 @@ pub struct Waterfall<'a> {
     /// Terminal color capability — controls waterfall color palette
     color_capability: ColorCapability,
     /// Recent decodes (frequency, parity, timestamp) for the occupancy strip.
-    decoded_for_occupancy: &'a [(
-        f64,
-        pancetta_core::slot::SlotParity,
-        chrono::DateTime<chrono::Utc>,
-    )],
+    decoded_for_occupancy: &'a [(f64, pancetta_core::slot::SlotParity, UtcTimestamp)],
     /// Operator's resolved TX parity (None when Auto + idle).
     tx_parity: Option<pancetta_core::slot::SlotParity>,
     /// Theme tokens for the panel fill, strip, axis, markers and TX cursor.
@@ -169,11 +161,7 @@ impl<'a> Waterfall<'a> {
 
     pub fn decoded_for_occupancy(
         mut self,
-        decoded: &'a [(
-            f64,
-            pancetta_core::slot::SlotParity,
-            chrono::DateTime<chrono::Utc>,
-        )],
+        decoded: &'a [(f64, pancetta_core::slot::SlotParity, UtcTimestamp)],
     ) -> Self {
         self.decoded_for_occupancy = decoded;
         self
@@ -298,7 +286,7 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         }
 
         // Compute `now` once per render for the occupancy strip + cursor style.
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
 
         // Occupancy strip: top row of the waterfall.
         for col in 0..width {
@@ -403,30 +391,41 @@ mod tests {
 
     #[test]
     fn occupancy_own_parity_when_decode_in_own_parity() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
-        let now = Utc::now();
-        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(10))];
+        use pancetta_core::time::UtcTimestamp;
+        let now = UtcTimestamp::now();
+        let decoded = vec![(
+            1500.0,
+            SlotParity::Even,
+            now - SignedDuration::from_secs(10),
+        )];
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
         assert_eq!(c, Occupancy::OwnParity);
     }
 
     #[test]
     fn occupancy_other_parity_when_decode_in_other_parity_only() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
-        let now = Utc::now();
-        let decoded = vec![(1500.0, SlotParity::Odd, now - Duration::seconds(10))];
+        use pancetta_core::time::UtcTimestamp;
+        let now = UtcTimestamp::now();
+        let decoded = vec![(1500.0, SlotParity::Odd, now - SignedDuration::from_secs(10))];
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
         assert_eq!(c, Occupancy::OtherParity);
     }
 
     #[test]
     fn occupancy_drops_decodes_older_than_60s() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
-        let now = Utc::now();
-        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(120))];
+        use pancetta_core::time::UtcTimestamp;
+        let now = UtcTimestamp::now();
+        let decoded = vec![(
+            1500.0,
+            SlotParity::Even,
+            now - SignedDuration::from_secs(120),
+        )];
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
         // 60+s old decode should be excluded; column has no relevant decodes.
         // With an empty band-overall (all decodes filtered), returns Clear.
@@ -435,10 +434,15 @@ mod tests {
 
     #[test]
     fn occupancy_drops_decodes_outside_band() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
-        let now = Utc::now();
-        let decoded = vec![(2000.0, SlotParity::Even, now - Duration::seconds(10))];
+        use pancetta_core::time::UtcTimestamp;
+        let now = UtcTimestamp::now();
+        let decoded = vec![(
+            2000.0,
+            SlotParity::Even,
+            now - SignedDuration::from_secs(10),
+        )];
         // Column 40 in width 80 over (0,3000) = 1500 Hz ± 18.75. 2000 is well outside.
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
         // Decode exists but not in this column's band — column itself has
@@ -448,15 +452,16 @@ mod tests {
 
     #[test]
     fn waterfall_renders_occupancy_strip_top_row() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let data: Vec<Vec<f32>> = vec![vec![0.5; 64]; 30];
-        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(5))];
+        let decoded = vec![(1500.0, SlotParity::Even, now - SignedDuration::from_secs(5))];
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
 
@@ -492,10 +497,15 @@ mod tests {
 
     #[test]
     fn occupancy_other_parity_when_no_tx_parity_known() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
-        let now = Utc::now();
-        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(10))];
+        use pancetta_core::time::UtcTimestamp;
+        let now = UtcTimestamp::now();
+        let decoded = vec![(
+            1500.0,
+            SlotParity::Even,
+            now - SignedDuration::from_secs(10),
+        )];
         // tx_parity = None means we can't say "your" vs "their" — collapse
         // to OtherParity.
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, None, now);
@@ -504,15 +514,16 @@ mod tests {
 
     #[test]
     fn cursor_own_parity_when_offset_overlaps_busy_own_parity() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
-        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(5))];
+        let decoded = vec![(1500.0, SlotParity::Even, now - SignedDuration::from_secs(5))];
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
 
@@ -535,8 +546,9 @@ mod tests {
     /// label the cursor ` ✗` for own parity and ` ⚠` for other parity.
     #[test]
     fn tx_cursor_suffix_follows_occupancy_not_colour() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
@@ -545,12 +557,12 @@ mod tests {
             occupancy_own: Theme::DARK.occupancy_other,
             ..Theme::DARK
         };
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
         let area = Rect::new(0, 0, 80, 10);
 
         let render = |decode_parity: SlotParity| {
-            let decoded = vec![(1500.0, decode_parity, now - Duration::seconds(5))];
+            let decoded = vec![(1500.0, decode_parity, now - SignedDuration::from_secs(5))];
             let mut buf = Buffer::empty(area);
             Waterfall::new(&data)
                 .theme(&alike)

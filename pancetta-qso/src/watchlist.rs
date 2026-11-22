@@ -9,7 +9,8 @@
 //! cycle. Pins drive alerts only, never TX decisions.
 
 use crate::priority::PriorityTier;
-use chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::{BTreeSet, HashMap};
 
 /// One remembered near-miss.
@@ -18,24 +19,24 @@ pub struct DxWatchlistEntry {
     pub callsign: String,
     pub grid: Option<String>,
     pub tier: PriorityTier,
-    pub last_heard: DateTime<Utc>,
+    pub last_heard: UtcTimestamp,
 }
 
 /// Operator pins plus TTL memory of `PerBandDxccNew`+ near-miss CQs.
 #[derive(Debug, Clone)]
 pub struct DxWatchlist {
     entries: HashMap<String, DxWatchlistEntry>,
-    ttl: Duration,
+    ttl: SignedDuration,
     pinned: BTreeSet<String>,
 }
 
 impl DxWatchlist {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: SignedDuration) -> Self {
         Self::with_pinned(ttl, std::iter::empty::<&str>())
     }
 
     /// Seed persistent operator pins; transient entries keep their own TTL.
-    pub fn with_pinned<I, S>(ttl: Duration, pinned: I) -> Self
+    pub fn with_pinned<I, S>(ttl: SignedDuration, pinned: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -76,7 +77,7 @@ impl DxWatchlist {
         callsign: &str,
         grid: Option<&str>,
         tier: PriorityTier,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) {
         let key = callsign.to_uppercase();
         self.entries.insert(
@@ -91,10 +92,10 @@ impl DxWatchlist {
     }
 
     /// Drop entries not refreshed within the TTL.
-    pub fn prune(&mut self, now: DateTime<Utc>) {
+    pub fn prune(&mut self, now: UtcTimestamp) {
         let ttl = self.ttl;
         self.entries
-            .retain(|_, e| now.signed_duration_since(e.last_heard) < ttl);
+            .retain(|_, e| now.duration_since(e.last_heard) < ttl);
     }
 
     /// Remove a specific callsign immediately (e.g. once worked).
@@ -130,13 +131,13 @@ impl DxWatchlist {
 mod tests {
     use super::*;
 
-    fn t(secs: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
+    fn t(secs: i64) -> UtcTimestamp {
+        UtcTimestamp::from_parts(secs, 0).unwrap()
     }
 
     #[test]
     fn pins_survive_ttl_and_seed_normalizes_and_deduplicates() {
-        let mut wl = DxWatchlist::with_pinned(Duration::seconds(150), [" vp8pj ", "VP8PJ"]);
+        let mut wl = DxWatchlist::with_pinned(SignedDuration::from_secs(150), [" vp8pj ", "VP8PJ"]);
         wl.refresh("T88AA", None, PriorityTier::Atno, t(0));
         wl.prune(t(151));
         assert_eq!(wl.callsigns(), vec!["VP8PJ"]);
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn pin_union_is_sorted_and_unpin_removes_auto_entry_too() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("VP8PJ", None, PriorityTier::Atno, t(0));
         wl.pin("vp8pj");
         wl.pin("T88AA");
@@ -159,7 +160,7 @@ mod tests {
 
     #[test]
     fn refresh_inserts_new_entry() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", Some("PM95"), PriorityTier::PerBandDxccNew, t(0));
         assert_eq!(wl.len(), 1);
         assert_eq!(wl.callsigns(), vec!["JA1ABC".to_string()]);
@@ -167,14 +168,14 @@ mod tests {
 
     #[test]
     fn refresh_is_case_insensitive_and_uppercases_grid() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("ja1abc", Some("pm95"), PriorityTier::Atno, t(0));
         assert_eq!(wl.callsigns(), vec!["JA1ABC".to_string()]);
     }
 
     #[test]
     fn refresh_twice_updates_last_heard_without_duplicating() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
         wl.refresh("JA1ABC", None, PriorityTier::Atno, t(10));
         assert_eq!(wl.len(), 1, "same callsign must not duplicate");
@@ -182,7 +183,7 @@ mod tests {
 
     #[test]
     fn prune_removes_expired_entries() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
         wl.prune(t(151));
         assert!(wl.is_empty(), "entry older than TTL must be pruned");
@@ -190,7 +191,7 @@ mod tests {
 
     #[test]
     fn prune_keeps_entries_within_ttl() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
         wl.prune(t(149));
         assert_eq!(wl.len(), 1, "entry within TTL must survive prune");
@@ -198,7 +199,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_a_specific_entry() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
         wl.refresh("W1XYZ", None, PriorityTier::Atno, t(0));
         wl.remove("ja1abc");
@@ -207,7 +208,7 @@ mod tests {
 
     #[test]
     fn prune_removes_entry_at_exact_ttl_boundary() {
-        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        let mut wl = DxWatchlist::new(SignedDuration::from_secs(150));
         wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
         wl.prune(t(150));
         assert!(

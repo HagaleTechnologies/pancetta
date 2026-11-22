@@ -7,6 +7,8 @@
 //! waterfall snapshots so multi-stream TX picks clear audio offsets.
 
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,7 +85,7 @@ pub(crate) fn classify_autonomous_opening(
 ///
 /// `Some` only when a bridge is configured AND this process is not a
 /// `--replay` demo. Replayed decodes are historical off-air captures, but
-/// every `SpotReport` built from them is stamped `chrono::Utc::now()`, so
+/// every `SpotReport` built from them is stamped `UtcTimestamp::now()`, so
 /// posting them would inject fabricated "live" spots into cqdx.io's real
 /// dataset — the same failure mode the PSKReporter gate exists for (see
 /// [`crate::coordinator::ApplicationCoordinator::replay_mode`]).
@@ -645,18 +647,15 @@ fn should_repark(
 /// exactly what the old `tokio::time::interval_at(..., Duration::from_secs(15))`
 /// design ticked at) and the FT4/FT2 mid-run mode-change cases.
 fn poll_slot_deadline(
-    now: chrono::DateTime<chrono::Utc>,
-    deadline: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    deadline: UtcTimestamp,
     slot_ns: i64,
-) -> (bool, chrono::DateTime<chrono::Utc>) {
+) -> (bool, UtcTimestamp) {
     if now < deadline {
         (false, deadline)
     } else {
-        let next_deadline = pancetta_core::slot::next_slot_start_with_period(
-            now,
-            chrono::Duration::zero(),
-            slot_ns,
-        );
+        let next_deadline =
+            pancetta_core::slot::next_slot_start_with_period(now, SignedDuration::ZERO, slot_ns);
         (true, next_deadline)
     }
 }
@@ -715,11 +714,11 @@ fn poll_slot_deadline(
 /// and recomputes the next deadline from `now` (see [`SlotTicker`], which
 /// reports both directions to the call site).
 fn poll_slot_deadline_mode_aware(
-    now: chrono::DateTime<chrono::Utc>,
-    deadline: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    deadline: UtcTimestamp,
     deadline_slot_ns: i64,
     current_slot_ns: i64,
-) -> (bool, chrono::DateTime<chrono::Utc>, i64) {
+) -> (bool, UtcTimestamp, i64) {
     let (fired, next_deadline) = poll_slot_deadline(now, deadline, current_slot_ns);
     if fired {
         // Already due (whether or not `slot_ns` also mismatched this same
@@ -733,7 +732,7 @@ fn poll_slot_deadline_mode_aware(
         // being discarded by doing so.
         let next_deadline = pancetta_core::slot::next_slot_start_with_period(
             now,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             current_slot_ns,
         );
         return (false, next_deadline, current_slot_ns);
@@ -747,7 +746,7 @@ fn poll_slot_deadline_mode_aware(
     {
         let next_deadline = pancetta_core::slot::next_slot_start_with_period(
             now,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             current_slot_ns,
         );
         return (false, next_deadline, current_slot_ns);
@@ -763,9 +762,9 @@ fn poll_slot_deadline_mode_aware(
 /// one boundary in `(last_poll_now, now]` without replaying older boundaries.
 #[derive(Debug, Clone, Copy)]
 struct SlotTicker {
-    deadline: chrono::DateTime<chrono::Utc>,
+    deadline: UtcTimestamp,
     deadline_slot_ns: i64,
-    last_poll_now: chrono::DateTime<chrono::Utc>,
+    last_poll_now: UtcTimestamp,
 }
 
 /// One [`SlotTicker::poll`] result: `due` gates the per-slot body; `jump`
@@ -778,11 +777,11 @@ struct SlotTick {
 }
 
 impl SlotTicker {
-    fn new(now: chrono::DateTime<chrono::Utc>, slot_ns: i64) -> Self {
+    fn new(now: UtcTimestamp, slot_ns: i64) -> Self {
         Self {
             deadline: pancetta_core::slot::next_slot_start_with_period(
                 now,
-                chrono::Duration::zero(),
+                SignedDuration::ZERO,
                 slot_ns,
             ),
             deadline_slot_ns: slot_ns,
@@ -790,7 +789,7 @@ impl SlotTicker {
         }
     }
 
-    fn poll(&mut self, now: chrono::DateTime<chrono::Utc>, current_slot_ns: i64) -> SlotTick {
+    fn poll(&mut self, now: UtcTimestamp, current_slot_ns: i64) -> SlotTick {
         // Classify against the deadline's OWN period, so a mode switch
         // (FT8 → FT4 shrinks the period) is never mistaken for a jump.
         let jump = pancetta_core::slot_clock::classify_deadline_jump(
@@ -2439,7 +2438,7 @@ impl super::ApplicationCoordinator {
                 //
                 // 250ms: this loop's OTHER select arm (the decode-drain
                 // sub-future below) already busy-polls every scheduler
-                // pass, so this adds one `chrono::Utc::now()` call plus an
+                // pass, so this adds one `UtcTimestamp::now()` call plus an
                 // atomic load every 250ms -- negligible next to that
                 // existing cost -- while staying comfortably under FT2's
                 // 3.2s slot length (well under half, so a mode switch to
@@ -2458,13 +2457,13 @@ impl super::ApplicationCoordinator {
                 // jump (sleep/wake, NTP step) re-anchors to the current UTC
                 // slot grid instead of stalling.
                 let mut slot_ticker =
-                    SlotTicker::new(chrono::Utc::now(), active_slot_ns.load(Ordering::Relaxed));
+                    SlotTicker::new(UtcTimestamp::now(), active_slot_ns.load(Ordering::Relaxed));
 
                 loop {
                     tokio::select! {
                         _ = slot_poll_interval.tick() => {
                             let tick = slot_ticker.poll(
-                                chrono::Utc::now(),
+                                UtcTimestamp::now(),
                                 active_slot_ns.load(Ordering::Relaxed),
                             );
                             if let Some(jump) = tick.jump {
@@ -2498,7 +2497,7 @@ impl super::ApplicationCoordinator {
                                             frequency: spot_frequency_hz(msg, dial_freq),
                                             mode: "FT8".to_string(),
                                             snr: msg.snr,
-                                            timestamp: chrono::Utc::now(),
+                                            timestamp: UtcTimestamp::now(),
                                             reporter: spot_reporter_callsign.clone(),
                                             reporter_grid: spot_reporter_grid.clone(),
                                         })
@@ -2600,7 +2599,7 @@ impl super::ApplicationCoordinator {
                                 &slot_messages,
                                 evaluator.as_ref(),
                                 operating_frequency_hz.load(Ordering::Relaxed),
-                                chrono::Utc::now(),
+                                UtcTimestamp::now(),
                             );
 
                             // PAN-72: resolve and commit any mid-QSO
@@ -3972,13 +3971,12 @@ mod resolve_repark_active_qsos_tests {
 #[cfg(test)]
 mod poll_slot_deadline_tests {
     use super::*;
-    use chrono::TimeZone;
 
     const FT8_SLOT_NS: i64 = 15_000_000_000;
     const FT4_SLOT_NS: i64 = 7_500_000_000;
 
-    fn at(millis: i64) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc.timestamp_nanos(0) + chrono::Duration::milliseconds(millis)
+    fn at(millis: i64) -> UtcTimestamp {
+        UtcTimestamp::UNIX_EPOCH + SignedDuration::from_millis(millis)
     }
 
     #[test]
@@ -4148,14 +4146,14 @@ mod poll_slot_deadline_tests {
                                  // design's arbitrary first-poll instant
         let mut deadline = pancetta_core::slot::next_slot_start_with_period(
             now,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             FT8_SLOT_NS,
         );
         assert_eq!(deadline, at(15_000));
 
         let mut fired_at = Vec::new();
         for _ in 0..400 {
-            now += chrono::Duration::milliseconds(250);
+            now += SignedDuration::from_millis(250);
             let (fired, next_deadline) = poll_slot_deadline(now, deadline, FT8_SLOT_NS);
             if fired {
                 fired_at.push(deadline);
@@ -4218,7 +4216,7 @@ mod poll_slot_deadline_tests {
         let now0 = at(1_000);
         let deadline0 = pancetta_core::slot::next_slot_start_with_period(
             now0,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             FT8_SLOT_NS,
         );
         assert_eq!(deadline0, at(15_000));
@@ -4265,7 +4263,7 @@ mod poll_slot_deadline_tests {
         let mut now = at(3_200);
         let mut deadline = pancetta_core::slot::next_slot_start_with_period(
             now,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             FT8_SLOT_NS,
         );
         let mut deadline_slot_ns = FT8_SLOT_NS;
@@ -4273,7 +4271,7 @@ mod poll_slot_deadline_tests {
 
         let mut fired_at = Vec::new();
         for _ in 0..400 {
-            now += chrono::Duration::milliseconds(250);
+            now += SignedDuration::from_millis(250);
             let (fired, next_deadline, next_deadline_slot_ns) =
                 poll_slot_deadline_mode_aware(now, deadline, deadline_slot_ns, FT8_SLOT_NS);
             if fired {
@@ -4345,7 +4343,7 @@ mod poll_slot_deadline_tests {
     #[test]
     fn backward_ntp_step_reanchors_on_the_next_poll() {
         let deadline = at(1_000_030_000);
-        let now = deadline - chrono::Duration::seconds(602);
+        let now = deadline - SignedDuration::from_secs(602);
         let (fired, next_deadline, next_slot_ns) =
             poll_slot_deadline_mode_aware(now, deadline, FT8_SLOT_NS, FT8_SLOT_NS);
         assert!(!fired);
@@ -4353,20 +4351,20 @@ mod poll_slot_deadline_tests {
             next_deadline,
             pancetta_core::slot::next_slot_start_with_period(
                 now,
-                chrono::Duration::zero(),
+                SignedDuration::ZERO,
                 FT8_SLOT_NS
             )
         );
         assert_eq!(next_slot_ns, FT8_SLOT_NS);
         assert!(next_deadline > now);
-        assert!(next_deadline - now <= chrono::Duration::seconds(15));
+        assert!(next_deadline - now <= SignedDuration::from_secs(15));
     }
 
     #[test]
     fn small_backward_step_inside_one_period_is_waited_out_unchanged() {
         let now = at(100_000);
-        let deadline = now + chrono::Duration::seconds(10);
-        let stepped = now - chrono::Duration::seconds(3); // 13 s ahead
+        let deadline = now + SignedDuration::from_secs(10);
+        let stepped = now - SignedDuration::from_secs(3); // 13 s ahead
         assert_eq!(
             poll_slot_deadline_mode_aware(stepped, deadline, FT8_SLOT_NS, FT8_SLOT_NS),
             (false, deadline, FT8_SLOT_NS)
@@ -4378,46 +4376,46 @@ mod poll_slot_deadline_tests {
         // Mirror of the PAN-114 reproduction (0 fires before the fix).
         let seeded_at = at(1_000_003_200);
         let mut ticker = SlotTicker::new(seeded_at, FT8_SLOT_NS);
-        let step_at = seeded_at - chrono::Duration::seconds(600);
+        let step_at = seeded_at - SignedDuration::from_secs(600);
         let mut now = step_at;
         let mut fires = 0;
         let mut first_fire = None;
-        while now - step_at <= chrono::Duration::seconds(599) {
+        while now - step_at <= SignedDuration::from_secs(599) {
             let deadline_before = ticker.deadline;
             let tick = ticker.poll(now, FT8_SLOT_NS);
             if tick.due {
                 fires += 1;
                 first_fire.get_or_insert(now);
-                let ns = deadline_before.timestamp_nanos_opt().unwrap();
+                let ns = deadline_before.as_nanosecond_i64().unwrap();
                 assert_eq!(ns % FT8_SLOT_NS, 0, "fired off the UTC slot grid");
                 assert!(now >= deadline_before);
-                assert!(now - deadline_before < chrono::Duration::milliseconds(250));
+                assert!(now - deadline_before < SignedDuration::from_millis(250));
             }
-            now += chrono::Duration::milliseconds(250);
+            now += SignedDuration::from_millis(250);
         }
         assert!(
             fires >= 39,
             "only {fires} slot ticks after a 600 s backward step"
         );
         let first_fire = first_fire.expect("never fired after the step");
-        assert!(first_fire - step_at <= chrono::Duration::seconds(15));
+        assert!(first_fire - step_at <= SignedDuration::from_secs(15));
     }
 
     #[test]
     fn slot_ticker_forward_jump_fires_once_and_reports_the_jump() {
         let mut ticker = SlotTicker::new(at(3_200), FT8_SLOT_NS);
-        let mut now = ticker.deadline + chrono::Duration::milliseconds(3_604_321);
+        let mut now = ticker.deadline + SignedDuration::from_millis(3_604_321);
         let tick = ticker.poll(now, FT8_SLOT_NS);
         assert!(tick.due);
         assert_eq!(
             tick.jump,
             Some(pancetta_core::slot_clock::WallClockJump::Forward(
-                chrono::Duration::milliseconds(3_604_321)
+                SignedDuration::from_millis(3_604_321)
             ))
         );
         let mut later_fires = 0;
         for _ in 0..60 {
-            now += chrono::Duration::milliseconds(250);
+            now += SignedDuration::from_millis(250);
             let tick = ticker.poll(now, FT8_SLOT_NS);
             assert_eq!(tick.jump, None);
             if tick.due {
@@ -4433,14 +4431,14 @@ mod poll_slot_deadline_tests {
         let mut ticker = SlotTicker::new(start, FT8_SLOT_NS);
         let mut deadline = pancetta_core::slot::next_slot_start_with_period(
             start,
-            chrono::Duration::zero(),
+            SignedDuration::ZERO,
             FT8_SLOT_NS,
         );
         let mut ticker_fires = Vec::new();
         let mut plain_fires = Vec::new();
         let mut now = start;
         for _ in 0..(10 * 60 * 4) {
-            now += chrono::Duration::milliseconds(250);
+            now += SignedDuration::from_millis(250);
             let tick = ticker.poll(now, FT8_SLOT_NS);
             assert_eq!(tick.jump, None);
             if tick.due {
@@ -4460,9 +4458,9 @@ mod poll_slot_deadline_tests {
     fn slot_ticker_mode_switch_is_not_reported_as_a_jump() {
         let now = at(100_000);
         let mut ticker = SlotTicker {
-            deadline: now + chrono::Duration::seconds(14),
+            deadline: now + SignedDuration::from_secs(14),
             deadline_slot_ns: FT8_SLOT_NS,
-            last_poll_now: now - chrono::Duration::milliseconds(250),
+            last_poll_now: now - SignedDuration::from_millis(250),
         };
         let tick = ticker.poll(now, FT4_SLOT_NS);
         assert_eq!(
@@ -4476,7 +4474,7 @@ mod poll_slot_deadline_tests {
             ticker.deadline,
             pancetta_core::slot::next_slot_start_with_period(
                 now,
-                chrono::Duration::zero(),
+                SignedDuration::ZERO,
                 FT4_SLOT_NS
             )
         );
@@ -5854,7 +5852,7 @@ mod drain_pending_qso_offset_requests_tests {
             .last_call_at
             .unwrap();
         qso_manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
             .await;
         let qso = qso_manager.get_qso(qso_id).await.unwrap();
         assert_eq!(
@@ -5933,7 +5931,7 @@ mod drain_pending_qso_offset_requests_tests {
                         remote_binding: Some((false, None)),
                     },
                     // After the rearm's own TX slot has played out.
-                    chrono::Utc::now() + chrono::Duration::minutes(2),
+                    UtcTimestamp::now() + SignedDuration::from_mins(2),
                 )
                 .await
         );
@@ -6692,7 +6690,7 @@ mod drain_pending_qso_offset_requests_tests {
             .expect("start_cq records the first call");
         for i in 1..=2i64 {
             qso_manager
-                .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15 * i))
+                .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * i))
                 .await;
         }
         let streak = qso_manager
@@ -7301,12 +7299,12 @@ mod fq_f9_placement_feed_when_disabled_tests {
     }
 
     async fn pan302_wait_for_even_tx_slot() {
-        let now = chrono::Utc::now();
-        let mut next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        let now = pancetta_core::time::UtcTimestamp::now();
+        let mut next = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
         if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
             == pancetta_qso::SlotParity::Odd
         {
-            next += chrono::Duration::seconds(15);
+            next += jiff::SignedDuration::from_secs(15);
         }
         tokio::time::sleep(
             pancetta_core::slot::duration_until(next, now) + Duration::from_millis(2500),
@@ -7424,8 +7422,8 @@ mod fq_f9_placement_feed_when_disabled_tests {
     async fn pan302_reload_changes_next_pounce_decision() {
         // Feed the CQ in the RX slot immediately before the chosen Even
         // TX slot. An earlier Odd tick consumes its decode batch as usual.
-        let now = chrono::Utc::now();
-        let next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        let now = pancetta_core::time::UtcTimestamp::now();
+        let next = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
         if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
             == pancetta_qso::SlotParity::Odd
         {
@@ -7502,8 +7500,8 @@ mod fq_f9_placement_feed_when_disabled_tests {
     /// called.
     #[tokio::test]
     async fn pan292_cq_modifier_gate_reaches_the_bus_and_the_diagnostics_overlay() {
-        let now = chrono::Utc::now();
-        let next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        let now = pancetta_core::time::UtcTimestamp::now();
+        let next = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
         if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
             == pancetta_qso::SlotParity::Odd
         {
@@ -7889,8 +7887,8 @@ mod fq_f9_placement_feed_when_disabled_tests {
     /// (bounded to one FT8 slot, ~15s worst case) — see the module doc
     /// comment for why paused tokio time isn't used here.
     async fn wait_for_next_slot_tick() {
-        let now = chrono::Utc::now();
-        let next_slot = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        let now = pancetta_core::time::UtcTimestamp::now();
+        let next_slot = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
         let wait =
             pancetta_core::slot::duration_until(next_slot, now) + Duration::from_millis(2500);
         tokio::time::sleep(wait).await;

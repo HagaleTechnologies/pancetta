@@ -110,7 +110,10 @@ pub fn slot_impulsiveness(samples: &[f32]) -> SlotImpulsiveness {
 }
 
 fn valid_date(y: u32, m: u32, d: u32) -> bool {
-    chrono::NaiveDate::from_ymd_opt(y as i32, m, d).is_some()
+    match (i16::try_from(y), i8::try_from(m), i8::try_from(d)) {
+        (Ok(y), Ok(m), Ok(d)) => jiff::civil::Date::new(y, m, d).is_ok(),
+        _ => false,
+    }
 }
 
 /// Capture day (`YYYYMMDD`) from a recording file name: pancetta's

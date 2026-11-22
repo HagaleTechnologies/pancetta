@@ -2,8 +2,10 @@
 #![allow(clippy::expect_used)]
 mod common;
 use common::*;
+use jiff::SignedDuration;
 use pancetta_config::OperatingMode;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::TxPolicy;
 use pancetta_lib::coordinator::{
     active_tx_qso_key, compute_manual_tx_offset, try_switch_operating_mode, ModeSwitchError,
@@ -1922,7 +1924,7 @@ async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
 
     // Before the switch: one FT4 slot is a SUB-slot rearm under FT8.
     sim.manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::milliseconds(7_500))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_500))
         .await;
     assert_eq!(
         sim.manager
@@ -1955,7 +1957,7 @@ async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
     // under FT4 and does not under FT8, so this assertion fails outright if the
     // switch never reaches the QSO engine.
     sim.manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::milliseconds(7_600))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_600))
         .await;
     assert_eq!(
         sim.manager
@@ -2047,7 +2049,7 @@ async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_on
     // Retire it well past the 30s report_timeout (Auto RespondingToCq never
     // got a DX reply). This now fires BOTH a StateChanged -> Failed and a
     // QsoFailed for the SAME qso_id.
-    let now = chrono::Utc::now() + chrono::Duration::seconds(45);
+    let now = UtcTimestamp::now() + SignedDuration::from_secs(45);
     sim.manager.check_timeouts_at(now).await;
 
     // Both events must have been emitted (StateChanged->Failed AND QsoFailed)
@@ -2151,7 +2153,7 @@ async fn dropped_closing_73_is_not_logged_and_reopens() {
 async fn supersede_during_playback_unkeys_before_rekey() {
     // Submit during the opposite parity so the first waveform starts at the
     // boundary and leaves enough headroom for a same-slot replacement.
-    let into_cycle = chrono::Utc::now().timestamp_millis().rem_euclid(30_000) as u64;
+    let into_cycle = UtcTimestamp::now().as_millisecond().rem_euclid(30_000) as u64;
     if into_cycle < 15_000 {
         tokio::time::sleep(Duration::from_millis(15_000 - into_cycle)).await;
     }
@@ -2399,7 +2401,7 @@ async fn fox_two_hounds_share_one_type01_frame_on_60_hz_slots() {
 #[tokio::test]
 async fn key_time_late_cap_preserves_drop_and_offset() {
     for (elapsed_ms, should_air) in [(3_000, true), (3_001, false)] {
-        let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(UtcTimestamp::now()));
         let utc_clock: pancetta_core::time::UtcClock = {
             let clock = clock.clone();
             std::sync::Arc::new(move || *clock.lock().unwrap())
@@ -2423,11 +2425,11 @@ async fn key_time_late_cap_preserves_drop_and_offset() {
         assert_eq!(pending.len(), 1);
         let required_parity = pending[0].tx_parity.expect("latched parity");
         let target = pancetta_core::slot::next_slot_with_parity_with_period(
-            chrono::Utc::now() + chrono::Duration::seconds(15),
+            UtcTimestamp::now() + SignedDuration::from_secs(15),
             required_parity,
             15_000_000_000,
         );
-        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(500);
+        *clock.lock().unwrap() = target + SignedDuration::from_millis(500);
         let attempt_id = pending[0].attempt_id.expect("attempt identity");
         let gate = sim.ptt_sync_gate();
         let held = gate.lock().await;
@@ -2439,7 +2441,7 @@ async fn key_time_late_cap_preserves_drop_and_offset() {
         {
             panic!("Step 4b timeout: {:?}", sim.observations.lock().unwrap());
         }
-        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(elapsed_ms);
+        *clock.lock().unwrap() = target + SignedDuration::from_millis(elapsed_ms);
         drop(held);
         sim.drive_submitted_slot(pending).await;
         assert!(sim
@@ -2473,7 +2475,7 @@ async fn key_time_late_cap_preserves_drop_and_offset() {
 #[tokio::test]
 async fn final_dx_parity_gate_preserves_drop_and_offset() {
     for should_air in [false, true] {
-        let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(UtcTimestamp::now()));
         let utc_clock: pancetta_core::time::UtcClock = {
             let clock = clock.clone();
             std::sync::Arc::new(move || *clock.lock().unwrap())
@@ -2497,11 +2499,11 @@ async fn final_dx_parity_gate_preserves_drop_and_offset() {
         assert_eq!(pending.len(), 1);
         let required_parity = pending[0].tx_parity.expect("latched parity");
         let target = pancetta_core::slot::next_slot_with_parity_with_period(
-            chrono::Utc::now() + chrono::Duration::seconds(15),
+            UtcTimestamp::now() + SignedDuration::from_secs(15),
             required_parity,
             15_000_000_000,
         );
-        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(500);
+        *clock.lock().unwrap() = target + SignedDuration::from_millis(500);
         let attempt_id = pending[0].attempt_id.expect("attempt identity");
         let gate = sim.ptt_sync_gate();
         let held = gate.lock().await;
@@ -2522,7 +2524,7 @@ async fn final_dx_parity_gate_preserves_drop_and_offset() {
             required_parity
         };
         sim.record_dx_sighting("W1AW", sighting_parity, 14_074_000);
-        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(1_000);
+        *clock.lock().unwrap() = target + SignedDuration::from_millis(1_000);
         drop(held);
         sim.drive_submitted_slot(pending).await;
         assert!(sim

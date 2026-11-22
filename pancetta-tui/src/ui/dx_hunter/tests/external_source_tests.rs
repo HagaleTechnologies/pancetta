@@ -3,11 +3,12 @@
 // the `external` token's foreground.
 use super::*;
 use crate::app::DecodedMessageView;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::buffer::Buffer;
 
 fn external_view(call: &str, snr: i32) -> DecodedMessageView {
     DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: 14.074,
         mode: "FT8".to_string(),
         snr,

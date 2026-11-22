@@ -15,6 +15,7 @@
 //! [`AutonomousOutcome::Withheld`] and only rolls back its own ledger attempt.
 //! Both halves travel the durable tier (PAN-185).
 
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -117,7 +118,7 @@ pub(super) async fn settle_aired_frame(
                 qso_id,
                 message_text,
                 aired,
-                aired_at: chrono::Utc::now(),
+                aired_at: UtcTimestamp::now(),
                 attempt_id,
             }),
             Instant::now(),

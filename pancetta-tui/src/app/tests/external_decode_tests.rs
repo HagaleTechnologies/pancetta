@@ -2,6 +2,7 @@
 // UDP: `EXT` rows, the native upgrade, no downgrade, and the network merge.
 use super::tests::{fixture_app, fixture_view};
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 const ALL: [SpotSource; 5] = [
     SpotSource::Local,
@@ -28,8 +29,8 @@ fn spot(call: &str) -> crate::tui_runner::CqdxSpotInfo {
         reporter_count: 2,
         best_snr: Some(-10),
         confidence: 0.9,
-        first_seen: chrono::Utc::now().timestamp(),
-        last_seen: chrono::Utc::now().timestamp(),
+        first_seen: UtcTimestamp::now().as_second(),
+        last_seen: UtcTimestamp::now().as_second(),
         is_notable: false,
         notable_type: None,
         entity_name: "United States".to_string(),

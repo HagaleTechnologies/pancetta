@@ -5,6 +5,8 @@
 //! that the QSO completes + logs, and that autonomous QSOs do NOT
 //! auto-reply.
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 const OUR: &str = "K5ARH";
 const DX: &str = "K9ZZ";
@@ -76,7 +78,7 @@ async fn air_last_send(
                     frequency_hz: frequency,
                     remote_binding: None,
                 },
-                Utc::now(),
+                UtcTimestamp::now(),
             )
             .await;
         events.extend(drain(rx));
@@ -1160,8 +1162,8 @@ async fn seventy_three_after_grace_elapsed_opens_new_qso() {
         QsoState::Completed { completed_at, .. } => completed_at,
         other => panic!("expected Completed state, got {other:?}"),
     };
-    let just_within = completed_at + COMPLETED_QSO_REWORK_GRACE - Duration::seconds(1);
-    let just_past = completed_at + COMPLETED_QSO_REWORK_GRACE + Duration::seconds(1);
+    let just_within = completed_at + COMPLETED_QSO_REWORK_GRACE - SignedDuration::from_secs(1);
+    let just_past = completed_at + COMPLETED_QSO_REWORK_GRACE + SignedDuration::from_secs(1);
 
     assert_eq!(
         manager

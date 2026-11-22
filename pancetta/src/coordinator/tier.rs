@@ -47,6 +47,7 @@
 //! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`
 //! and `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`.
 
+use pancetta_core::time::UtcTimestamp;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -493,7 +494,7 @@ fn spawn_probe_worker(job: ProbeJob) {
                 p50_ms: result.p50.as_millis() as u64,
                 p95_ms: result.p95.as_millis() as u64,
                 p99_ms: result.p99.as_millis() as u64,
-                probed_at: chrono::Utc::now().to_rfc3339(),
+                probed_at: UtcTimestamp::now().to_rfc3339(),
             };
             save_cache(&path, &cache);
         }

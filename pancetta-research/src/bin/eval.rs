@@ -4,7 +4,7 @@
 //! vs cached jt9 baseline).
 
 use anyhow::Context;
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth_pair_corpus};
 use pancetta_research::curated::{load_curated_corpus, preflight_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{BudgetAnchor, DecoderUnderTest, Ft8Decoder, WindowTiming};
@@ -1986,8 +1986,8 @@ fn run_chrono_replay_tier(
         snapshot_at_start
     );
     for (i, entry) in entries.iter().enumerate() {
-        let at = chrono::DateTime::parse_from_rfc3339(&entry.wav_timestamp)?;
-        decoder.set_slot_time(at.with_timezone(&chrono::Utc).into());
+        let at = str::parse::<UtcTimestamp>(&entry.wav_timestamp)?;
+        decoder.set_slot_time(at.into());
 
         let baseline_path = workspace
             .join("research/baselines/ft8")
@@ -3252,7 +3252,7 @@ fn main() -> anyhow::Result<()> {
     let preflight_seconds_total: f64;
     let mut card = Scorecard {
         schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
-        generated_at: Utc::now(),
+        generated_at: UtcTimestamp::now(),
         mode: args.mode,
         git: git_info(&workspace),
         build: BuildInfo {
