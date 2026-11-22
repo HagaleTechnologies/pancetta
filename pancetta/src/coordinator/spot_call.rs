@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 use crate::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage, RigControlMessage,
 };
+use pancetta_core::types::band::{same_dial, SAME_DIAL_SLACK_HZ};
 use pancetta_tui::tui_runner::TuiMessage;
 
 /// The autonomous operator as the Autonomous task publishes it.
@@ -49,10 +50,6 @@ pub(crate) const SPOT_QSY_WAIT_CAP: Duration = Duration::from_secs(30);
 
 /// How often a parked spot call re-reads the keyed state.
 const SPOT_QSY_POLL: Duration = Duration::from_millis(100);
-
-/// Dial slack for "already there": absorbs rig readback rounding, far inside
-/// the 100 Hz relevance gate.
-const SAME_DIAL_SLACK_HZ: u64 = 10;
 
 /// `true` while the rig is keyed or a key-down is being enqueued. `ptt_active`
 /// is the TX worker's flag. Manual PTT and tune key through
@@ -92,13 +89,6 @@ pub(crate) async fn exchange_in_progress(manager: Option<pancetta_qso::QsoManage
         .collect();
     partners.extend(pending_close_partners);
     partners
-}
-
-/// `true` when the rig is already on `target_hz` (within
-/// [`SAME_DIAL_SLACK_HZ`]). A current dial of `0` is unknown and never
-/// counts as there.
-pub(crate) fn same_dial(current_hz: u64, target_hz: u64) -> bool {
-    current_hz != 0 && current_hz.abs_diff(target_hz) <= SAME_DIAL_SLACK_HZ
 }
 
 /// What to do with a spot call.

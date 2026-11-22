@@ -666,15 +666,36 @@ impl DxStation {
     }
 }
 
-/// Band of a local decode's dial frequency, which the decoded view carries
-/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
-/// out-of-band value has no band.
-fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+/// A dial frequency in MHz, as the decoded view and the station state carry
+/// it, rounded to whole Hz (PAN-443). A nonfinite or non-positive value is an
+/// unknown dial.
+fn hz_from_mhz(mhz: f64) -> Option<u64> {
     let hz = (mhz * 1_000_000.0).round();
     if !hz.is_finite() || hz <= 0.0 {
         return None;
     }
-    pancetta_core::Band::from_frequency(hz as u64)
+    Some(hz as u64)
+}
+
+/// Band of a local decode's dial frequency, which the decoded view carries
+/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
+/// out-of-band value has no band.
+fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+    hz_from_mhz(mhz).and_then(pancetta_core::Band::from_frequency)
+}
+
+/// A dial in Hz as exact MHz text for a status line (PAN-443): every Hz is
+/// kept, trailing zeros are trimmed down to three decimals, so two different
+/// dials never print alike (`14.074 MHz`, `14.0745 MHz`, `0.4742 MHz`).
+/// Integer arithmetic only.
+pub(crate) fn dial_label(hz: u64) -> String {
+    let mut text = format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000);
+    let three_decimals = text.len() - 3;
+    while text.len() > three_decimals && text.ends_with('0') {
+        text.pop();
+    }
+    text.push_str(" MHz");
+    text
 }
 
 /// Exact station identity for worked status: a resolved hash render matches
@@ -4713,25 +4734,22 @@ impl App {
         })
     }
 
-    /// PAN-435: the status line refusing Space or a directed reply on a
-    /// decode a same-host WSJT-X sent (PAN-381) whose band or mode differs
-    /// from pancetta's live dial and mode; `None` for a native decode or a
-    /// WSJT-X decode on pancetta's own band and mode. Pancetta's band is the
-    /// operating frequency's, and a rig readback that names another band
-    /// also refuses, because the readback lags a band key and the rig
-    /// transmits on its own dial. A band `pancetta_core::Band` cannot name
-    /// refuses, because a match cannot be shown.
+    /// PAN-435, PAN-443: the status line refusing Space or a directed reply
+    /// on a decode a same-host WSJT-X sent (PAN-381) unless WSJT-X heard it
+    /// on pancetta's dial and mode; `None` for a native decode or a WSJT-X
+    /// decode that passes. The dial rule is [`Self::external_origin_refusal`]'s.
     pub fn external_decode_refusal(&self, msg: &DecodedMessageView) -> Option<String> {
         if !msg.external {
             return None;
         }
         let call = msg.call_sign.as_deref().unwrap_or("this station");
-        self.external_origin_refusal(call, band_from_mhz(msg.frequency), &msg.mode)
+        self.external_origin_refusal(call, msg.frequency, &msg.mode)
     }
 
-    /// PAN-435: [`Self::external_decode_refusal`] for the row under the
-    /// focused panel's cursor, when that row is `callsign` and was heard only
-    /// through WSJT-X. An `EX+N` row with a network frequency keeps its
+    /// PAN-435, PAN-443: [`Self::external_decode_refusal`] for the row under
+    /// the focused panel's cursor, when that row is `callsign` and was heard
+    /// only through WSJT-X. A DX Hunter `EXT` row carries WSJT-X's dial in
+    /// MHz in `frequency`. An `EX+N` row with a network frequency keeps its
     /// existing spot-call path and uses the spot's dial.
     fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
         let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
@@ -4753,7 +4771,7 @@ impl App {
                     SpotSource::ExternalNetwork if row.spot_rf_hz.is_none() => {}
                     _ => return None,
                 }
-                self.external_origin_refusal(&row.call_sign, row.band, &row.mode)
+                self.external_origin_refusal(&row.call_sign, row.frequency, &row.mode)
             }
             ActivePanel::Callers => self
                 .selected_caller()
@@ -4763,37 +4781,55 @@ impl App {
         }
     }
 
-    /// PAN-435: refuse unless WSJT-X's `band` and `mode` are pancetta's live
-    /// band and mode.
+    /// PAN-435, PAN-443: refuse unless WSJT-X's dial (`wsjtx_dial_mhz`) is
+    /// within [`pancetta_core::types::band::SAME_DIAL_SLACK_HZ`] of
+    /// pancetta's dial and `mode` is pancetta's mode. Pancetta's dial is the
+    /// rig readback when known, else the operating frequency; no band name is
+    /// needed, so a shared dial on a band `pancetta_core::Band` cannot name
+    /// passes. A readback that is a band change from the operating frequency
+    /// also refuses, because the readback lags a band key and the rig
+    /// transmits on its own dial. Pancetta never retunes to WSJT-X's dial.
     fn external_origin_refusal(
         &self,
         callsign: &str,
-        band: Option<pancetta_core::Band>,
+        wsjtx_dial_mhz: f64,
         mode: &str,
     ) -> Option<String> {
-        let ours = band_from_mhz(self.station_info.operating_frequency);
-        let rig = self.radio_frequency.and_then(band_from_mhz);
-        let rig_agrees = rig.is_none() || rig == ours;
+        use pancetta_core::types::band::{is_band_change, same_dial};
+        let theirs = hz_from_mhz(wsjtx_dial_mhz);
+        let target = hz_from_mhz(self.station_info.operating_frequency);
+        let readback = self.radio_frequency.and_then(hz_from_mhz);
+        let ours = readback.or(target);
+        let rig_agrees = match (target, readback) {
+            (Some(t), Some(r)) => !is_band_change(t, r),
+            _ => true,
+        };
         let ours_mode = self.station_info.mode.as_str();
-        if band.is_some()
-            && band == ours
-            && rig_agrees
-            && mode.trim().eq_ignore_ascii_case(ours_mode.trim())
-        {
+        let mode_ok = mode.trim().eq_ignore_ascii_case(ours_mode.trim());
+        let dial_ok = matches!((ours, theirs), (Some(o), Some(t)) if same_dial(o, t));
+        if dial_ok && rig_agrees && mode_ok {
             return None;
         }
-        let rig_note = match rig {
-            Some(r) if !rig_agrees => format!(" (rig reads {r})"),
-            _ => String::new(),
+        let band_of = |hz: Option<u64>| hz.and_then(pancetta_core::Band::from_frequency);
+        let named_bands_differ = matches!(
+            (band_of(theirs), band_of(ours)),
+            (Some(a), Some(b)) if a != b
+        );
+        let by_band = !rig_agrees || named_bands_differ;
+        let label = |hz: Option<u64>| match (hz, band_of(hz)) {
+            (Some(_), Some(band)) if by_band => band.to_string(),
+            (Some(hz), _) => dial_label(hz),
+            (None, _) => "an unknown dial".to_string(),
         };
-        let name = |b: Option<pancetta_core::Band>| {
-            b.map_or_else(|| "an unknown band".to_string(), |b| b.to_string())
+        let (ours_label, rig_note) = if rig_agrees {
+            (label(ours), String::new())
+        } else {
+            (label(target), format!(" (rig reads {})", label(readback)))
         };
         Some(format!(
-            "Can't work {callsign}. WSJT-X heard it on {} {mode}. Pancetta is on {} \
+            "Can't work {callsign}. WSJT-X heard it on {} {mode}. Pancetta is on {ours_label} \
              {ours_mode}{rig_note}.",
-            name(band),
-            name(ours),
+            label(theirs),
         ))
     }
 
@@ -11957,3 +11993,7 @@ mod waterfall_panel_focus_tests;
 #[cfg(test)]
 #[path = "app/tests/external_decode_tests.rs"]
 mod external_decode_tests;
+
+#[cfg(test)]
+#[path = "app/tests/dial_label_tests.rs"]
+mod dial_label_tests;
