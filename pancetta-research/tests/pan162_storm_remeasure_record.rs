@@ -57,7 +57,10 @@ fn offair_record_rehashes_the_vendored_corpus() {
     for w in &card.wavs {
         let bytes = std::fs::read(root().join(&w.path)).unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
             w.sha256,
             "{}",
             w.path

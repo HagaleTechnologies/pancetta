@@ -102,7 +102,11 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 /// Task W0.4 (2026-07-07): the submode marker column (5th field) jt9

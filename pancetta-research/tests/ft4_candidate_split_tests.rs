@@ -108,7 +108,10 @@ fn fixture(dir: &std::path::Path) -> std::path::PathBuf {
     let m = SynthManifest::load(&manifest).unwrap();
     std::fs::create_dir_all(dir.join("baselines")).unwrap();
     for e in m.entries {
-        let sha = format!("{:x}", Sha256::digest(std::fs::read(&e.wav_path).unwrap()));
+        let sha = Sha256::digest(std::fs::read(&e.wav_path).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let cache = serde_json::json!({"schema_version":1,"wav_path":e.wav_path,"wav_sha256":sha,
             "decoder_identity":"test fixture (not jt9)","elapsed_seconds":0.0,
             "decodes":[{"message":e.encoded_message,"freq_hz":e.base_freq_hz,"dt_s":e.dt_s,"snr_db":e.snr_db}]});

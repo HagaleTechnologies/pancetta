@@ -585,7 +585,10 @@ fn run_offair(wav_dir: &str, output: &Path) -> Result<()> {
         .par_iter()
         .map(|p| {
             let bytes = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-            let sha = format!("{:x}", Sha256::digest(&bytes));
+            let sha = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let txt = std::fs::read_to_string(p.with_extension("txt"))?;
             let truth: HashSet<String> = parse_reference_txt(&txt)
                 .iter()
@@ -663,7 +666,10 @@ fn run_manifest(manifest: &Path, limit: Option<usize>, output: &Path) -> Result<
             // Truth is keyed by the manifest's hash; refuse a WAV whose bytes
             // no longer match it rather than score it against the wrong truth.
             let bytes = std::fs::read(wav).with_context(|| format!("read {wav}"))?;
-            let actual = format!("{:x}", Sha256::digest(&bytes));
+            let actual = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             ensure!(
                 actual == *sha,
                 "{wav}: sha256 {actual} != manifest wav_sha256 {sha}"
