@@ -1271,3 +1271,70 @@ re-vendor the upstream bytes, update the source revision and version assertion
 in `rig_api_conformance.rs`, and run `cargo test --locked -p pancetta-protocol
 --test rig_api_conformance`. The existing Workspace Tests CI lane runs this
 suite, including for a change to the vendored schema alone.
+
+## Two trust roots (PAN-362)
+
+Decision (Tony, 2026-11-07): keep zero-touch admission under cqdx
+auto-populate and document what it roots. C12, a later change, is meant to
+make station-local admission cheap; until it lands the residual below
+stands.
+
+Auto-populate has no switch of its own. It runs when `[network.cqdx]` has
+`enabled = true` and a non-empty `token` and the station agent is enabled,
+has `relay_url` and `pairing_api_url` set, and is paired (`has_relay_config`
+and `cqdx_will_poll`, `station_agent/mod.rs`), and pancetta is not running
+with `--replay`, which never starts the station agent.
+
+| Question | Static mode | cqdx auto-populate |
+|---|---|---|
+| Who may connect | `tx_allow_list` | `tx_allow_list` until the first successful poll, then cqdx authorization edges for this agent, delegated guests included, replacing the set on each successful poll |
+| Is the peer who it claims | msg1 proof of its own keys (PAN-95) | same |
+| What scope (`status`, `qsy`, `tx`) | hello token signed by the cqdx IdP key pinned at pairing | same |
+| Who may arm | `localTrust ∩ tx_allow_list` | `localTrust ∩ owner edges` |
+| What an arm needs | a signature that verifies against `clients/<keyId>.pub`, a TX-enabled token, `remote_tx_enabled` | same |
+
+- TX is rooted on the station. `verify_and_arm` needs the keyId in the arm
+  set and a device key from `<key_dir>/clients/<keyId>.pub`, which only
+  `pancetta trust-client` writes (PAN-309). cqdx can withhold TX by dropping
+  an owner edge but cannot grant it. The owner/delegate split is
+  cloud-asserted, so TX safety rests on the `.pub` file, not on `delegatedBy`.
+- Admission and non-TX control are rooted in cqdx under auto-populate. cqdx
+  decides who connects and signs the token that sets scope. The station adds
+  the identity proof, the per-action admission re-check (PAN-96), the PAN-252
+  refusals while keyed or while a station-run QSO is active, and the PAN-118
+  band-plan gate on every PTT-on. In static mode cqdx still signs scope but
+  cannot add a peer.
+- Cloud mode has no station-local admission veto. Removing a key from
+  `tx_allow_list` evicts it at once only if the static list held it, and
+  the next successful poll re-admits an edge cqdx still returns. The local
+  levers that hold are `enabled = false` in `[network.station_agent]` (all
+  station-agent remote access, applied live; the local gateway is a
+  separate channel), `remote_tx_enabled = false` and
+  `pancetta untrust-client` (TX only), and the TUI disarm. Turning
+  `[network.cqdx]` off or clearing its token is not a live reload for the
+  station agent: the poll keeps running until a restart. Cloud revocation
+  takes up to one poll interval plus two request times (default 45 s,
+  minimum 10 s; each request is bounded by the 30 s client timeout, and a
+  response cqdx built just before the revocation can still be in flight), a
+  failed poll keeps the last good set, and a scope downgrade lands at token
+  expiry (at most 900 s for non-TX tokens).
+
+Residual, accepted: whoever can add an authorization edge for this station
+on cqdx, a compromised cqdx included, can connect a key it holds, receive
+the display feed, `qsy` or `setSplit` an idle rig, `stopCq`, and
+`takeControl` from the operator's own remote client, which disarms that
+client and ends its QSOs (PAN-137). While `remote_tx_enabled` is on, a
+controller it holds can also send `txRequest`, which queues QSOs that
+cannot transmit without an arm. It cannot arm TX without a device key
+the operator trusted on the station. This replaces the relay-rooted Medium
+finding of `docs/security-review-remote-rig-2026-07-02.md`; see its PAN-362
+status update.
+
+Evidence: `cqdx_enabled_seeds_tx_arm_allow_list_empty_regardless_of_static_list`,
+`tx_arm_set_is_local_trust_intersect_owner_edges`,
+`poll_authorizations_loop_keeps_last_known_good_on_failure`,
+`real_poll_revocation_stops_qsy_split_and_reads` and
+`take_control_disarms_previous_controllers_arm`
+(`pancetta/src/coordinator/station_agent/tests/tests.rs`), and
+`unlisted_peer_is_refused_without_state` (`pancetta-agent/src/multi_session.rs`).
+PAN-362 changed documentation, comments and two warning strings only.
