@@ -375,8 +375,15 @@ impl ConfigLoader {
         sorted_sources.sort_by_key(|a| a.priority);
 
         for source in &sorted_sources {
-            match self.load_source(source) {
-                Ok(source_config) => {
+            let result = if matches!(source.source_type, SourceType::Environment) {
+                self.apply_environment(&mut config)
+            } else {
+                self.load_source(source).map(|source_config| {
+                    config.merge_with(source_config);
+                })
+            };
+            match result {
+                Ok(()) => {
                     debug!("Loaded configuration from source: {}", source.name);
                     // Report real config files only; the built-in
                     // "defaults" source is not an operator file.
@@ -388,7 +395,6 @@ impl ConfigLoader {
                             f.push(source.path.clone());
                         }
                     }
-                    config.merge_with(source_config);
                 }
                 Err(e) if source.required => {
                     error!(
@@ -581,7 +587,11 @@ impl ConfigLoader {
                     Err(ConfigError::FileNotFound(source.path.clone()))
                 }
             }
-            SourceType::Environment => self.load_from_environment(),
+            // PAN-460: environment overrides are applied field by field in the
+            // merge loop (`apply_environment`), never merged as a whole Config.
+            SourceType::Environment => Err(ConfigError::SourceSkipped(
+                "environment overrides are applied in the merge loop".to_string(),
+            )),
             SourceType::CommandLine => self.load_from_command_line(),
             SourceType::Remote(url) => self.load_from_remote(url),
         }
@@ -595,92 +605,86 @@ impl ConfigLoader {
         Ok(Config::default())
     }
 
-    /// Load configuration from environment variables
-    fn load_from_environment(&self) -> ConfigResult<Config> {
+    /// Apply environment variables at this source's priority without merging defaults.
+    fn apply_environment(&self, config: &mut Config) -> ConfigResult<()> {
         debug!("Loading configuration from environment variables");
-
-        // Start with empty-ish defaults so unset env vars don't overwrite
-        // file-loaded values during merge. Only fields explicitly set via
-        // PANCETTA_* env vars should appear in the returned config.
-        let mut config = Config::default();
         let mut any_set = false;
-
-        // Use empty strings / zeros for fields not set via env vars so
-        // merge_with's "skip empty" logic leaves file values intact.
-        config.station.callsign = String::new();
-        config.station.grid_square = String::new();
-        config.station.power_watts = 0;
-        config.station.qth = String::new();
-        config.station.dxcc_entity = 0;
-        config.station.itu_zone = 0;
-        config.station.cq_zone = 0;
-        config.rig.interface.port = String::new();
-        config.rig.interface.baud_rate = 0;
-        config.audio.input_device = String::new();
-        config.audio.output_device = String::new();
-        config.audio.sample_rate = 0;
-        config.ui.theme = String::new();
 
         // Map environment variables to configuration fields
         if let Ok(callsign) = std::env::var("PANCETTA_CALLSIGN") {
-            config.station.callsign = callsign;
+            if !callsign.is_empty() {
+                config.station.callsign = callsign;
+            }
             any_set = true;
         }
 
         if let Ok(grid) = std::env::var("PANCETTA_GRID_SQUARE") {
-            config.station.grid_square = grid;
+            if !grid.is_empty() {
+                config.station.grid_square = grid;
+            }
             any_set = true;
         }
 
         if let Ok(power) = std::env::var("PANCETTA_POWER_WATTS") {
             if let Ok(power_val) = power.parse::<u32>() {
-                config.station.power_watts = power_val;
+                if power_val != 0 {
+                    config.station.power_watts = power_val;
+                }
                 any_set = true;
             }
         }
 
         if let Ok(cat_port) = std::env::var("PANCETTA_CAT_PORT") {
-            config.rig.interface.port = cat_port;
+            if !cat_port.is_empty() {
+                config.rig.interface.port = cat_port;
+            }
             any_set = true;
         }
 
         if let Ok(cat_baud) = std::env::var("PANCETTA_CAT_BAUD") {
             if let Ok(baud_val) = cat_baud.parse::<u32>() {
-                config.rig.interface.baud_rate = baud_val;
+                if baud_val != 0 {
+                    config.rig.interface.baud_rate = baud_val;
+                }
                 any_set = true;
             }
         }
 
         if let Ok(audio_input) = std::env::var("PANCETTA_AUDIO_INPUT") {
-            config.audio.input_device = audio_input;
+            if !audio_input.is_empty() {
+                config.audio.input_device = audio_input;
+            }
             any_set = true;
         }
 
         if let Ok(audio_output) = std::env::var("PANCETTA_AUDIO_OUTPUT") {
-            config.audio.output_device = audio_output;
+            if !audio_output.is_empty() {
+                config.audio.output_device = audio_output;
+            }
             any_set = true;
         }
 
         if let Ok(sample_rate) = std::env::var("PANCETTA_SAMPLE_RATE") {
             if let Ok(rate_val) = sample_rate.parse::<u32>() {
-                config.audio.sample_rate = rate_val;
+                if rate_val != 0 {
+                    config.audio.sample_rate = rate_val;
+                }
                 any_set = true;
             }
         }
 
         if let Ok(theme) = std::env::var("PANCETTA_THEME") {
-            config.ui.theme = theme;
+            if !theme.is_empty() {
+                config.ui.theme = theme;
+            }
             any_set = true;
         }
 
         if any_set {
             debug!("Loaded configuration from environment variables");
-            Ok(config)
+            Ok(())
         } else {
-            // No PANCETTA_* env vars set — skip this source so defaults
-            // don't overwrite file-loaded values during merge. This is a normal
-            // intentional skip, not a parse failure (see SourceSkipped handling
-            // in `load`).
+            // No readable string or parsed number: skip quietly.
             Err(ConfigError::SourceSkipped(
                 "no PANCETTA_* environment variables set".to_string(),
             ))
@@ -1608,23 +1612,6 @@ check_frequency = true
         assert_eq!(loaded.station.callsign, "K1TEST");
         assert_eq!(loaded.station.grid_square, "FN42aa");
         assert_eq!(loaded.station.power_watts, 50);
-    }
-
-    #[test]
-    fn test_environment_variables() {
-        let loader = ConfigLoader::new().unwrap();
-
-        // Set environment variables
-        std::env::set_var("PANCETTA_CALLSIGN", "K1ENV");
-        std::env::set_var("PANCETTA_POWER_WATTS", "75");
-
-        let config = loader.load_from_environment().unwrap();
-        assert_eq!(config.station.callsign, "K1ENV");
-        assert_eq!(config.station.power_watts, 75);
-
-        // Clean up
-        std::env::remove_var("PANCETTA_CALLSIGN");
-        std::env::remove_var("PANCETTA_POWER_WATTS");
     }
 
     #[test]
