@@ -30,12 +30,13 @@ uses the first of `pancetta.toml`, `config.toml`, `pancetta.json`,
 
 | # | Linux | macOS | Windows |
 |---|---|---|---|
-| 1 | current directory | current directory | current directory |
-| 2 | `$XDG_CONFIG_HOME/pancetta` (only when set to something other than `~/.config`) | `~/Library/Application Support/pancetta` | `%APPDATA%\pancetta` |
-| 3 | `/etc/pancetta` | `/etc/pancetta` | `%APPDATA%\Pancetta` |
-| 4 | `/usr/local/etc/pancetta` | `/usr/local/etc/pancetta` | — |
-| 5 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
-| 6 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
+| 1 | `$XDG_CONFIG_HOME/pancetta` (only when set to something other than `~/.config`) | `~/Library/Application Support/pancetta` | `%APPDATA%\pancetta` |
+| 2 | `/etc/pancetta` | `/etc/pancetta` | `%APPDATA%\Pancetta` |
+| 3 | `/usr/local/etc/pancetta` | `/usr/local/etc/pancetta` | — |
+| 4 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
+| 5 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
+
+pancetta never reads a config file from the current directory unless you name it with `--config`.
 
 Every file found is loaded, and later rows override earlier ones. The
 override is per file, not per key: a later file's defaults also replace
@@ -48,8 +49,8 @@ a single file at `~/.pancetta/pancetta.toml`, and run
 needs the keys you change; every key you leave out keeps its default.
 
 With `--data-dir <DIR>` and no `--config`, pancetta searches only `DIR` for
-those four file names. It does not merge the current directory, the
-system directories, `~/.pancetta` or `~/.config/pancetta`, so a second
+those four file names. It does not merge the system directories,
+`~/.pancetta` or `~/.config/pancetta`, so a second
 station never picks up the first station's config. `PANCETTA_*`
 environment overrides still apply. With both `--config <path>` and
 `--data-dir <DIR>`, pancetta reads the `--config` file, and `DIR` holds

@@ -2430,13 +2430,8 @@ fn format_load_report(
             "No config file found. Searched these directories (lowest to highest \
              precedence) for pancetta.toml, config.toml, pancetta.json, config.json:"
         );
-        let cwd = std::env::current_dir().ok();
         for dir in &report.searched {
-            if cwd.as_deref() == Some(dir.as_path()) {
-                let _ = writeln!(out, "  {}   (current directory)", dir.display());
-            } else {
-                let _ = writeln!(out, "  {}", dir.display());
-            }
+            let _ = writeln!(out, "  {}", dir.display());
         }
         let _ = writeln!(
             out,
@@ -3893,9 +3888,9 @@ mod tests {
         assert_eq!(reloaded.station.callsign, "K1ABC");
     }
 
-    /// PAN-90 review (Codex P1): the backup name is predictable, and the
-    /// search path includes the cwd, so another user of a shared directory
-    /// can plant `<config>.bak` as a symlink. The backup must never follow
+    /// PAN-90 review (Codex P1): the backup name is predictable, and a
+    /// config directory can be shared, so another user can plant
+    /// `<config>.bak` as a symlink. The backup must never follow
     /// it (writing the plaintext config into the symlink's target), and must
     /// not be readable by anyone but the owner.
     #[cfg(unix)]
@@ -4095,20 +4090,28 @@ mod tests {
 
     #[test]
     fn format_load_report_with_no_files_lists_search_dirs_and_defaults_note() {
+        // PAN-360: even a searched directory that happens to be the cwd is
+        // listed plainly; the report never tags the current directory.
+        let cwd = std::env::current_dir().expect("test process has a cwd");
         let report = pancetta_config::LoadReport {
             files: vec![],
             searched: vec![
                 PathBuf::from("/etc/pancetta"),
                 PathBuf::from("/home/op/.pancetta"),
+                cwd.clone(),
             ],
             warnings: vec![],
         };
         let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"), None);
         assert!(text.starts_with("No config file found. Searched these directories"));
         assert!(
-            text.contains("\n  /etc/pancetta\n  /home/op/.pancetta\n"),
+            text.contains(&format!(
+                "\n  /etc/pancetta\n  /home/op/.pancetta\n  {}\n",
+                cwd.display()
+            )),
             "{text}"
         );
+        assert!(!text.contains("(current directory)"), "{text}");
         assert!(
             text.contains(
                 "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create \
