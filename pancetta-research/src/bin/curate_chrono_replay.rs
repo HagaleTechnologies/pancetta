@@ -125,7 +125,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut h = Sha256::new();
     h.update(&bytes);
-    Ok(format!("{:x}", h.finalize()))
+    Ok(h.finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 /// Parse an ISO-8601 UTC timestamp from a `ft8_YYYYMMDD_HHMMSS.wav` filename.

@@ -149,11 +149,9 @@ pub fn linear_bias() -> &'static [f32] {
 /// Phases 6-7) to stamp into each scorecard.
 #[cfg(any(feature = "transmit", feature = "benchmark"))]
 pub fn provenance_sha256() -> &'static str {
-    use sha2::{Digest, Sha256};
-
     static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SHA.get_or_init(|| {
-        let computed = format!("{:x}", Sha256::digest(RAW_BYTES));
+        let computed = sha256_hex(RAW_BYTES);
         let json: serde_json::Value =
             serde_json::from_str(include_str!("../assets/neural_osd_weights.provenance.json"))
                 .expect("neural_osd_weights.provenance.json must be valid JSON");
@@ -170,10 +168,47 @@ pub fn provenance_sha256() -> &'static str {
     })
 }
 
+/// SHA-256 of `bytes` as 64 lowercase hex characters, two digits per byte.
+#[cfg(any(test, feature = "transmit", feature = "benchmark"))]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn sha256_hex_known_vectors() {
+        // Literal digests from Python hashlib, not a second copy of the helper.
+        for (input, digest) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "286",
+                "00328ce57bbc14b33bd6695bc8eb32cdf2fb5f3a7d89ec14a42825e15d39df60",
+            ),
+            (
+                "88484",
+                "0000a456e7b5a5eb059e721fb431436883143101275c4077f83fe70298f5623d",
+            ),
+        ] {
+            let hex = sha256_hex(input.as_bytes());
+            assert_eq!(hex, digest, "sha256({input:?})");
+            assert_eq!(hex.len(), 64);
+            assert!(hex.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
+        }
+    }
 
     #[test]
     fn weights_load_with_expected_dimensions() {
@@ -199,7 +234,7 @@ mod tests {
             provenance["syndrome_normalization_divisor"],
             crate::syndrome::MAX_INCIDENT_CHECKS
         );
-        let digest = format!("{:x}", Sha256::digest(RAW_BYTES));
+        let digest = sha256_hex(RAW_BYTES);
         assert_eq!(provenance["sha256"], digest);
         let lengths: Vec<usize> = provenance["tensors"]
             .as_array()

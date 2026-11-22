@@ -42,13 +42,13 @@ def check(target):
         assert p['rust_version'] == expected, (p['name'], p['rust_version'], expected)
     # Check resolved direct edges too: a lone transitive version must not
     # conceal a member switching its declaration to a second, unused line.
-    aligned = {'tokio-tungstenite': '0.29.', 'dirs': '6.', 'signal-hook': '0.3.'}
+    aligned = {'tokio-tungstenite': '0.29.', 'dirs': '6.', 'signal-hook': '0.3.', 'sha2': '0.11.'}
     for key in members:
         for edge in nodes[key]['deps']:
             dependency = packages[edge['pkg']]
             prefix = aligned.get(dependency['name'])
             if prefix:
-                assert dependency['version'].startswith(prefix), (packages[key]['name'], dependency)
+                assert dependency['version'].startswith(prefix), (packages[key]['name'], dependency['name'], dependency['version'])
     for key in reached:
         p = packages[key]
         if p['name'].startswith('sqlx'):
@@ -82,5 +82,27 @@ assert 'pub mod error;' not in core and 'pub use error::' not in core
 assert tomllib.loads((ROOT / 'pancetta-config/Cargo.toml').read_text())['features']['cli'] == []
 for path in ['.catalyst/catalyst.toml', *[f'.github/workflows/{name}.yml' for name in ['ci', 'release', 'demo-assets']]]:
     assert 'libssl-dev' not in (ROOT / path).read_text(), path
+# PAN-415: every workspace member that declares sha2, in any dependency
+# section (target-specific tables included), declares the 0.11 line.
+# sha2 0.10 may stay in the graph only through upstream crates (deny.toml skip).
+def sha2_requirements(manifest):
+    tables = [manifest]
+    tables += list(manifest.get('target', {}).values())
+    for table in tables:
+        for section in ['dependencies', 'dev-dependencies', 'build-dependencies']:
+            spec = table.get(section, {}).get('sha2')
+            if spec is not None:
+                if isinstance(spec, dict) and spec.get('workspace'):
+                    spec = workspace.get('sha2', {})
+                yield section, spec if isinstance(spec, str) else spec.get('version')
+
+members = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['members']
+sha2_declarers = set()
+for member in members:
+    manifest = tomllib.loads((ROOT / member / 'Cargo.toml').read_text())
+    for section, requirement in sha2_requirements(manifest):
+        assert requirement is not None and requirement.startswith('0.11'), (member, section, requirement)
+        sha2_declarers.add(member)
+assert {'pancetta-agent', 'pancetta-ft8', 'pancetta-research'} <= sha2_declarers, sha2_declarers
 for target in [None, 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc']:
     check(target)
