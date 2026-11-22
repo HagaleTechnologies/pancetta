@@ -92,6 +92,7 @@ impl ColorCapability {
 struct DxStationLookupAdapter {
     needed: bool,
     atno: bool,
+    need_source: pancetta_qso::priority::NeedSource,
     band_needed: bool,
     worked_before: bool,
     /// Session failure history the relay's local rescore found (PAN-94).
@@ -116,6 +117,9 @@ impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
     }
     fn is_atno(&self, _callsign: &str) -> bool {
         self.atno
+    }
+    fn need_source(&self, _callsign: &str) -> pancetta_qso::priority::NeedSource {
+        self.need_source
     }
     fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
         self.band_needed
@@ -644,10 +648,26 @@ impl DxStation {
     /// relay's local rank applies too, so a QSO outcome lowers both sources
     /// (PAN-94).
     fn score_network_spot(&self, at: UtcTimestamp) -> RankedBy {
+        self.score_network_spot_with_need(
+            self.needed,
+            self.atno,
+            pancetta_qso::priority::NeedSource::Cqdx,
+            at,
+        )
+    }
+
+    fn score_network_spot_with_need(
+        &self,
+        needed: bool,
+        atno: bool,
+        need_source: pancetta_qso::priority::NeedSource,
+        at: UtcTimestamp,
+    ) -> RankedBy {
         let local = self.local_rank.and_then(|rank| rank.factors);
         let adapter = DxStationLookupAdapter {
-            needed: self.needed,
-            atno: self.atno,
+            needed,
+            atno,
+            need_source,
             band_needed: self.band_needed,
             worked_before: self.worked_before || local.is_some_and(|f| f.worked_on_band),
             recent_failure: local.is_some_and(|f| f.recent_failure),
@@ -2717,6 +2737,19 @@ impl App {
                     if message.external
                         && matches!(entry.source, SpotSource::Local | SpotSource::Both) => {}
                 Some(entry) => {
+                    // A network-only rank may have used the frame's local need
+                    // verdict. Once heard locally, keep the spot's cqdx rank
+                    // as the independent network half of the mixed row.
+                    if entry.local_rank.is_none()
+                        && entry.network_rank.is_some_and(|rank| {
+                            rank.factors.is_some_and(|f| {
+                                f.need_source == pancetta_qso::priority::NeedSource::LocalLogbook
+                            })
+                        })
+                    {
+                        let at = entry.network_rank.unwrap().at;
+                        entry.network_rank = Some(entry.score_network_spot(at));
+                    }
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
                     entry.band = band_from_mhz(message.frequency);
@@ -2821,6 +2854,7 @@ impl App {
         let adapter = DxStationLookupAdapter {
             needed: message.needed,
             atno: message.atno,
+            need_source: pancetta_qso::priority::NeedSource::Cqdx,
             band_needed: message.band_needed,
             worked_before: message.worked_before,
             recent_failure: false,
@@ -3152,6 +3186,45 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Reconcile network-only scores with the verdict used by this frame's
+        // marker. The spot fields remain cqdx's wire values.
+        for (key, row) in &mut self.dx_stations {
+            if row.local_rank.is_some() {
+                continue;
+            }
+            let Some(rank) = row.network_rank else {
+                continue;
+            };
+            let local = self.dx_need.get(dx_row_call(key)).filter(|need| {
+                need.dxcc_source == Some(pancetta_qso::priority::NeedSource::LocalLogbook)
+                    && need.unconfirmed_policy == Some(true)
+            });
+            let (needed, atno, source) =
+                if let Some(need) = local.and_then(|n| n.dxcc_needed.map(|needed| (n, needed))) {
+                    (
+                        need.1,
+                        need.1
+                            && need.0.entity_standing
+                                == Some(crate::dx_need::EntityStanding::NotWorked),
+                        pancetta_qso::priority::NeedSource::LocalLogbook,
+                    )
+                } else {
+                    (
+                        row.needed,
+                        row.atno,
+                        pancetta_qso::priority::NeedSource::Cqdx,
+                    )
+                };
+            if rank.factors.is_some_and(|f| {
+                f.needed_dxcc == needed && f.atno == atno && f.need_source == source
+            }) {
+                continue;
+            }
+            row.network_rank =
+                Some(row.score_network_spot_with_need(needed, atno, source, rank.at));
+            row.refresh_priority_score();
+        }
     }
 
     /// The DX-row key in its original case; a resolved hash-render (`"<K1ABC>"`)
@@ -3165,8 +3238,8 @@ impl App {
     /// is one, wins over the flags stored at decode or spot time, so both
     /// follow a list that loads or changes between decodes, as the Why view
     /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
-    /// too; a newly needed ATNO's `!` changes with the row's score, at its next
-    /// decode or spot. `atno` is the caller's ATNO input; DX Hunter passes
+    /// too; a network-only ATNO's `!` changes with its score on a frame refresh.
+    /// `atno` is the caller's ATNO input; DX Hunter passes
     /// `DxStation::ranked_atno` (PAN-399). With no verdict, the inputs stand.
     pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
         match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
@@ -5423,7 +5496,8 @@ impl App {
                     // TUI's cqdx network feed) has no access to the
                     // coordinator's CachedStationLookup that the local
                     // per-band QSO-DB cross-reference needs. Network spots
-                    // rely on cqdx's own `needed`/`atno` flags instead.
+                    // retain cqdx's own `needed`/`atno` flags. The frame
+                    // refresh can select a local display verdict.
                     band_needed: false,
                     priority_score: 0,
                     local_rank: None,
@@ -6563,6 +6637,7 @@ mod tests {
         let adapter = DxStationLookupAdapter {
             needed: true,
             atno: true,
+            need_source: pancetta_qso::priority::NeedSource::Cqdx,
             band_needed: false,
             worked_before: true,
             recent_failure: true,

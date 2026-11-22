@@ -122,7 +122,7 @@ from the rearm's prediction, so a manager test of a deferred frame drives it by
 calling that method with the slot the worker would pick. A real-worker test
 that needs a deterministic schedule should give the request the parity of the
 slot after `now` (it always defers to that slot's start), or wait into a slot
-past FT8's 1.7 s acceptance cap; see `pan223_scheduled_slot_worker_tests` in
+past FT8's 1.7 s acceptance cap; see `scheduled_slot_worker_tests` in
 `pancetta/src/coordinator/tx.rs`.
 
 Caller-admission gotcha (PAN-120): the QSO decode loop and autonomous initiation

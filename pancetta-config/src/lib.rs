@@ -2454,7 +2454,7 @@ mod merge_guard {
                 ),
                 (
                     "webhook",
-                    json!({"enabled":true,"min_tier":"per_band_dxcc_new","url":"https://localhost/hook"}),
+                    json!({"enabled":true,"min_tier":"per_band_dxcc_new","url":"https://localhost/hook","allow_private_targets":true,"max_per_minute":30}),
                 ),
             ],
             |a, b| a.merge_with(b),

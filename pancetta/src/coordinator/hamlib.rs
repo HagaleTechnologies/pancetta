@@ -9876,7 +9876,7 @@ mod receive_gain_tests {
     #[tokio::test]
     async fn pan302_reloaded_presets_apply_on_band_crossing() {
         use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
-        let mut h = super::super::tx::pan115_worker_gate_tests::worker_harness().await;
+        let mut h = super::super::tx::worker_gate_tests::worker_harness().await;
         let rig = MockRig::new(MockRigConfig {
             connection_delay_ms: 0,
             operation_delay_ms: 0,

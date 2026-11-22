@@ -12,7 +12,7 @@
 //! This module uses only items that exist before PAN-322, so it can be
 //! dropped onto the base commit to re-check the golden there.
 
-use super::pan115_worker_gate_tests::{worker_harness_with_clock, Harness};
+use super::worker_gate_tests::{worker_harness_with_clock, Harness};
 use crate::coordinator::active_tx_qso_key;
 use crate::message_bus::{
     ComponentId, ComponentMessage, ControlMessage, MessageType, QsoMessage, RigControlMessage,

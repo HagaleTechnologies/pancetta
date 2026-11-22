@@ -2462,6 +2462,11 @@ impl super::ApplicationCoordinator {
                 loop {
                     tokio::select! {
                         _ = slot_poll_interval.tick() => {
+                            // PAN-361: send the webhook alerts held over the
+                            // per-minute cap once the window has room. This
+                            // runs on the timer, not on decodes, so a band
+                            // that goes quiet still flushes the summary.
+                            let _summary = alerts.flush_due(Instant::now());
                             let tick = slot_ticker.poll(
                                 UtcTimestamp::now(),
                                 active_slot_ns.load(Ordering::Relaxed),
