@@ -1756,7 +1756,13 @@ fn watchdog_state_identity(state: &QsoState, now: UtcTimestamp) -> Option<Watchd
 
 /// QSO manager implementation
 pub struct QsoManager {
-    utc_clock: pancetta_core::time::UtcClock,
+    /// PAN-358: the one UTC slot clock. `now_utc` reads it, and the watchdog
+    /// takes its clock steps from it instead of a detector of its own. The
+    /// coordinator shares its clock through [`QsoManager::set_slot_clock`].
+    slot_clock: pancetta_core::SlotClock,
+    /// PAN-358: the latest slot-clock event epoch the watchdog has applied
+    /// (PAN-296 budget reset). Shared with the production loop's clone.
+    watchdog_clock_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Configuration
     config: QsoManagerConfig,
 
@@ -2227,17 +2233,40 @@ impl QsoManager {
     }
 
     fn now_utc(&self) -> UtcTimestamp {
-        (self.utc_clock)()
+        self.slot_clock.now()
     }
 
+    /// A manager on a virtual clock that never reports a step
+    /// (`SlotClock::without_step_detection` over `clock`).
     #[cfg(test)]
     pub fn with_clock_for_test(
         config: QsoManagerConfig,
         clock: pancetta_core::time::UtcClock,
     ) -> Self {
         let mut manager = Self::new(config);
-        manager.utc_clock = clock;
+        let slot_ns = manager.active_slot_ns.clone();
+        manager.set_slot_clock(pancetta_core::SlotClock::without_step_detection(
+            clock, slot_ns,
+        ));
         manager
+    }
+
+    /// PAN-358: read time from `clock` (the coordinator's one slot clock)
+    /// and take the watchdog's clock steps from its events. Also shares the
+    /// clock's slot-period source, like [`Self::set_active_slot_ns_source`].
+    /// Events the clock reported before this call are not applied. Must be
+    /// called before [`Self::start`].
+    pub fn set_slot_clock(&mut self, clock: pancetta_core::SlotClock) {
+        self.active_slot_ns = clock.slot_ns_source();
+        self.watchdog_clock_epoch
+            .store(clock.read().epoch, std::sync::atomic::Ordering::Release);
+        self.slot_clock = clock;
+    }
+
+    /// PAN-358: the latest slot-clock event epoch the watchdog applied.
+    pub fn applied_clock_epoch(&self) -> u64 {
+        self.watchdog_clock_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Create a new QSO manager using the system UTC clock.
@@ -2249,8 +2278,10 @@ impl QsoManager {
             .map(|c| c.starting_serial)
             .unwrap_or(1);
 
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS));
         Self {
-            utc_clock: pancetta_core::time::system_utc_clock(),
+            slot_clock: pancetta_core::SlotClock::system(active_slot_ns.clone()),
+            watchdog_clock_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
             watchdog_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2295,7 +2326,7 @@ impl QsoManager {
             hamlib_hard_muted: Arc::new(|| false),
             // Default FT8 slot: with no injected source the rearm/stall
             // cadence is the historical 15 s (see the field's doc comment).
-            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
+            active_slot_ns,
             // Default late-start window: the documented operator default
             // (see the field's doc comment).
             tx_late_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_TX_LATE_MAX_MS)),
@@ -4856,18 +4887,10 @@ impl QsoManager {
     }
 
     async fn timeout_check_loop(&self) {
-        let mut detector = pancetta_core::slot_clock::ClockStepDetector::new(self.now_utc());
-        let mut last_mono = std::time::Instant::now();
         let mut interval_timer = interval(TokioDuration::from_secs(5));
         loop {
             interval_timer.tick().await;
-            self.watchdog_pass_at(
-                self.now_utc(),
-                std::time::Instant::now(),
-                &mut detector,
-                &mut last_mono,
-            )
-            .await;
+            self.watchdog_pass().await;
         }
     }
 
@@ -4912,7 +4935,8 @@ impl QsoManager {
 impl Clone for QsoManager {
     fn clone(&self) -> Self {
         Self {
-            utc_clock: self.utc_clock.clone(),
+            slot_clock: self.slot_clock.clone(),
+            watchdog_clock_epoch: Arc::clone(&self.watchdog_clock_epoch),
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
             watchdog_anchors: Arc::clone(&self.watchdog_anchors),

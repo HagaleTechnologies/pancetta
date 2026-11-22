@@ -2088,9 +2088,9 @@ impl AutonomousOperator {
         // slot boundary must not be attributed to the next slot just because
         // this function happens to run after the boundary. Messages without
         // a tracked parity (test scaffolding / untracked decodes) fall back
-        // to the wall-clock parity, preserving existing behavior for callers
-        // that don't set `slot_parity`.
-        let current_parity = SlotParity::of_time_with_period(UtcTimestamp::now(), self.slot_ns());
+        // to the parity of the caller's `now` (PAN-358: the coordinator passes
+        // its slot-clock reading, so this never re-reads the system clock).
+        let current_parity = SlotParity::of_time_with_period(now, self.slot_ns());
         let mut even_count: u32 = 0;
         let mut odd_count: u32 = 0;
         let mut untracked_count: u32 = 0;
@@ -9095,3 +9095,7 @@ mod dx_busy_tests {
 #[cfg(test)]
 #[path = "autonomous/tests/band_hop_tests.rs"]
 mod band_hop_tests;
+
+#[cfg(test)]
+#[path = "autonomous/tests/slot_parity_clock_tests.rs"]
+mod slot_parity_clock_tests;

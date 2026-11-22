@@ -54,6 +54,7 @@ mod replay;
 mod restart_budget;
 mod session_state;
 mod shutdown;
+mod slot_clock_driver;
 mod spot_call;
 pub mod station_agent;
 mod swr_guard;
@@ -1529,6 +1530,19 @@ pub struct ApplicationCoordinator {
     /// once and not mutated at runtime (a live mode switch is a later task).
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
+    /// PAN-358: the one UTC slot clock, over `active_slot_ns`. Every slot
+    /// consumer reads time through it, and it is the only wall-clock step
+    /// detector, so a step is observed by every consumer under one epoch.
+    slot_clock: pancetta_core::SlotClock,
+
+    /// PAN-358: the latest clock event, published by the slot-clock driver
+    /// task so event-driven consumers (queued-call TTL) wake on a step.
+    slot_clock_events: tokio::sync::watch::Sender<Option<pancetta_core::slot_clock::ClockEvent>>,
+
+    /// PAN-358: the slot-clock driver task. `None` until `run()` starts it
+    /// (never for `--wav`); aborted on shutdown.
+    slot_clock_driver_handle: Option<JoinHandle<()>>,
+
     /// Active digital-mode protocol (FT8 / FT4 / FT2), encoded as
     /// `pancetta_config::OperatingMode::as_u8()`. Seeded once at startup from
     /// `[rig].mode`; from this task onward it is also written by
@@ -2369,6 +2383,8 @@ impl ApplicationCoordinator {
         };
         let active_protocol = protocol_from_mode(active_operating_mode);
         let active_slot_ns_init = active_protocol.slot_ns();
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init));
+        let slot_clock = pancetta_core::SlotClock::system(active_slot_ns.clone());
         // Decode phase (ns) the parity-stamping sites subtract to recover the
         // slot start — same value the DSP thread derives (FT8 → 13e9).
         let active_decode_phase_ns_init = derive_dsp_timing(
@@ -2572,7 +2588,10 @@ impl ApplicationCoordinator {
             tx_offset_hold_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Active protocol slot length, derived from [rig].mode above
             // (default 15e9 for FT8). Set once; read by the decode/DSP paths.
-            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init)),
+            active_slot_ns,
+            slot_clock,
+            slot_clock_events: tokio::sync::watch::channel(None).0,
+            slot_clock_driver_handle: None,
             // Active digital-mode protocol from [rig].mode (default Ft8),
             // encoded for atomic storage. Written by `try_switch_operating_mode`
             // when the operator cycles mode live (Task 7).
@@ -2735,6 +2754,19 @@ impl ApplicationCoordinator {
             let path = wav_path.clone();
             return self.run_wav_playback(path).await;
         }
+
+        // PAN-358: publish slot-clock events (read every 250 ms) so an
+        // event-driven consumer wakes on a step even when no other consumer
+        // reads the clock. Unsupervised and advisory, like the clock monitor.
+        // The guard stops it if `run()` returns early on a startup error.
+        let slot_clock_driver = slot_clock_driver::spawn_slot_clock_driver(
+            self.slot_clock(),
+            self.slot_clock_events.clone(),
+            self.shutdown_signal.clone(),
+        );
+        let _slot_clock_driver_guard =
+            slot_clock_driver::AbortDriverOnDrop::new(&slot_clock_driver);
+        self.slot_clock_driver_handle = Some(slot_clock_driver);
 
         // Start all components in dependency order using point-to-point channels
         self.start_pipeline().await?;
@@ -3026,7 +3058,7 @@ impl ApplicationCoordinator {
                 self.shutdown_signal.clone(),
                 clock_monitor::ClockMonitorSchedule::default(),
                 Arc::new(|| sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string())),
-                Arc::new(UtcTimestamp::now),
+                self.slot_clock(),
             ));
         }
 
@@ -3052,6 +3084,9 @@ impl ApplicationCoordinator {
         // before the component teardown (or an early error return) rather
         // than waiting out its tick.
         if let Some(handle) = self.clock_monitor_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.slot_clock_driver_handle.take() {
             handle.abort();
         }
         // Cleanup runs even if either the main loop or experiment failed.
@@ -3159,6 +3194,18 @@ impl ApplicationCoordinator {
     /// decode loop's parity-stamping sites (`SlotParity::of_with_period`).
     pub(crate) fn active_slot_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_slot_ns.clone()
+    }
+
+    /// PAN-358: the coordinator's one UTC slot clock (a shared handle).
+    pub(crate) fn slot_clock(&self) -> pancetta_core::SlotClock {
+        self.slot_clock.clone()
+    }
+
+    /// PAN-358: a receiver for the slot-clock driver's published events.
+    pub(crate) fn slot_clock_events(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<pancetta_core::slot_clock::ClockEvent>> {
+        self.slot_clock_events.subscribe()
     }
 
     /// Active protocol's decode-phase atomic in nanoseconds (FT8 → 13e9,
@@ -5797,6 +5844,10 @@ mod active_qso_freq_tests {
 #[cfg(test)]
 #[path = "tests/waterfall_session_restore_tests.rs"]
 mod waterfall_session_restore_tests;
+
+#[cfg(test)]
+#[path = "tests/slot_clock_consumers_tests.rs"]
+mod slot_clock_consumers_tests;
 
 #[cfg(test)]
 #[path = "tests/data_dir_tests.rs"]
