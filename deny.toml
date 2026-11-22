@@ -31,11 +31,14 @@ ignore = [
     # Remove this once sqlx accepts libsqlite3-sys >= 0.39 and bump sqlx.
     { id = "RUSTSEC-2026-0459", reason = "no sqlx release accepts patched libsqlite3-sys >=0.39; local-only, needs write access to the user's data dir (PAN-390)" },
 
-    # `chrono` is unmaintained (all versions). It has no known vulnerability;
-    # 13 workspace crates use it directly and sqlx pulls it in. Accepted by
-    # the owner on PAN-430/PAN-431 (2026-11-17). Remove this once the
-    # workspace has moved to jiff or time and sqlx no longer pulls chrono.
-    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; workspace-wide chrono migration tracked separately (PAN-430/PAN-431)" },
+    # `chrono` is unmaintained (all versions). It has no known vulnerability.
+    # The only remaining paths are direct: 10 workspace crates (pancetta,
+    # pancetta-config, pancetta-core, pancetta-cqdx, pancetta-dx,
+    # pancetta-hamlib, pancetta-protocol, pancetta-qso, pancetta-research,
+    # pancetta-tui) depend on it. sqlx no longer pulls it: PAN-441 turned off
+    # sqlx's unused `chrono` feature. Accepted by the owner on PAN-430/PAN-431
+    # (2026-11-17). Remove this once those crates have moved to jiff (PAN-441).
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; only direct workspace dependencies remain, sqlx no longer pulls it (PAN-441)" },
 ]
 
 [licenses]
