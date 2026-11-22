@@ -89,6 +89,8 @@ topic = "dx"
 enabled = true
 min_tier = "per_band_dxcc_new"
 url = "http://localhost/hook"
+allow_private_targets = true
+max_per_minute = 30
 "#,
     )
     .unwrap();
@@ -111,4 +113,6 @@ url = "http://localhost/hook"
     assert!(merged.alerts.webhook.enabled);
     assert_eq!(merged.alerts.webhook.min_tier, DxTier::PerBandDxccNew);
     assert_eq!(merged.alerts.webhook.url, "http://localhost/hook");
+    assert!(merged.alerts.webhook.allow_private_targets);
+    assert_eq!(merged.alerts.webhook.max_per_minute, 30);
 }
