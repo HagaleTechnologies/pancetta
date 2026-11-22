@@ -7,11 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 - PAN-362: SECURITY.md and the configuration docs state that with cqdx.io integration on, cqdx.io decides who may connect to the station agent and use non-TX control (QSY, split, stop CQ, take control); remote TX still needs a device key stored with `pancetta trust-client`. The `remote_tx_enabled` config warning no longer says an empty `tx_allow_list` blocks all remote TX, and the `station_agent.enabled` warning now says that turning on cqdx.io integration lets cqdx.io decide who may connect and use non-TX control.
-=======
 - PAN-363: Debug output of the network config now shows `<redacted>` for the cqdx token and for every value in a custom service's headers, parameters, auth parameters and credentials. The LoTW password marker changes from `[REDACTED]` to `<redacted>`. Proxy and client-certificate secrets were already dropped at load since PAN-303. No config or serialized output changes.
->>>>>>> 8d6f6c6f4440455633d82bdaffe9d3e6860f5218
 - PAN-415: `pancetta-ft8` and `pancetta-research` use sha2 0.11, the line `pancetta-agent` already uses, and the Supply Chain dependency policy now fails if a workspace member declares another sha2 line. SHA-256 identifiers are unchanged: the neural OSD weight provenance hash, research WAV and manifest hashes, and baseline cache file names. sha2 0.10 stays in the build only through snow and sqlx-core.
 - PAN-384: `pancetta-ft8` 0.9.7 and `pancetta-core` 0.9.7 are ready for crates.io; neither is published yet. They publish together (`cargo publish -p pancetta-core -p pancetta-ft8`). The `pancetta-ft8` package contains the ft8_lib C sources it compiles, its README, both license files and a notice with the ft8_lib MIT and kissfft BSD-3-Clause texts: 76 files, about 1.1 MB (including the 360 KB off-air WAV the PAN-369 tier probe embeds). A packaged `pancetta-ft8` without the C sources now fails to build instead of building the stub decoder. `pancetta-core` has its own version, starting at 0.9.7. Both need Rust 1.88. CI runs the publish dry-run on every code change.
 - PAN-378: capture cqdx `X-QSO-Id` on fresh and duplicate uploads and retain the latest 100 accepted IDs in the upload outbox.
