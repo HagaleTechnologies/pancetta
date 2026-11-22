@@ -112,7 +112,7 @@ async fn cqdx_activation_reaches_logged_record() {
         serde_json::json!({"groups": []}),
     )
     .await;
-    let spot_time = chrono::Utc::now().to_rfc3339();
+    let spot_time = UtcTimestamp::now().to_rfc3339();
     mount(
         &server,
         "/api/v1/pota",
@@ -152,7 +152,7 @@ async fn cqdx_activation_reaches_logged_record() {
     );
     let mut filled = false;
     for _ in 0..100 {
-        if book.lookup("DL1ABC", chrono::Utc::now()).is_some() {
+        if book.lookup("DL1ABC", UtcTimestamp::now()).is_some() {
             filled = true;
             break;
         }
@@ -201,7 +201,7 @@ async fn cqdx_activation_reaches_logged_record() {
                 frequency_hz: 1500.0,
                 remote_binding: None,
             },
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         )
         .await;
     assert_eq!(aired, CompletionAired::Committed);
@@ -284,7 +284,7 @@ async fn activation_feed_failure_does_not_stop_spot_polling() {
         handle.abort();
         server.verify().await;
         assert!(
-            book.lookup("DL1ABC", chrono::Utc::now()).is_none(),
+            book.lookup("DL1ABC", UtcTimestamp::now()).is_none(),
             "status {status} wrote nothing"
         );
     }
@@ -321,6 +321,6 @@ async fn rejected_token_stops_activation_fetches() {
             !in_flight.load(Ordering::Acquire),
             "status {status}: the in-flight flag is cleared"
         );
-        assert!(book.lookup("DL1ABC", chrono::Utc::now()).is_none());
+        assert!(book.lookup("DL1ABC", UtcTimestamp::now()).is_none());
     }
 }

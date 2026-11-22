@@ -5,8 +5,9 @@
 //! producers, appends the emitted metadata with `AdifLogWriter` the way the
 //! coordinator does, parses `qsos.adi` back and asserts on the record.
 
-use chrono::{Duration, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::ResponseStep;
 use pancetta_qso::{
     ActivationReference, AdifLogWriter, AdifProcessor, CompletionAired, MessageType, QsoEvent,
@@ -80,7 +81,7 @@ async fn complete_held(manager: &QsoManager) -> QsoMetadata {
                 frequency_hz: FREQ,
                 remote_binding: None,
             },
-            Utc::now(),
+            UtcTimestamp::now(),
         )
         .await;
     assert_eq!(aired, CompletionAired::Committed);
@@ -142,7 +143,7 @@ fn pota_book(seen_minutes_ago: i64) -> WorkedReferenceBook {
                 sig_info: "DA-0123".into(),
             },
         )],
-        Utc::now() - Duration::minutes(seen_minutes_ago),
+        UtcTimestamp::now() - SignedDuration::from_mins(seen_minutes_ago),
     );
     book
 }
@@ -259,7 +260,7 @@ async fn no_sig_without_a_fresh_matching_activation() {
                 sig_info: "K-0001".into(),
             },
         )],
-        Utc::now(),
+        UtcTimestamp::now(),
     );
     // Last seen 31 minutes before the QSO ends.
     for book in [other, pota_book(31)] {

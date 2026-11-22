@@ -121,16 +121,15 @@ fn feed_reference(raw: &str) -> Option<String> {
 /// `type` `pota` maps to `SIG=POTA` and `sota` to `SIG=SOTA` (ASCII
 /// case-insensitive); other programmes and rows whose callsign or reference
 /// fails [`feed_callsign`] / [`feed_reference`] are skipped. When a callsign
-/// has several rows the newest RFC 3339 `spotTime` wins; a missing or
-/// unparseable time ranks oldest, and a tie keeps the first row. Output
-/// keeps the order in which each callsign first appeared.
+/// has several rows the newest `spotTime` wins, read as [`UtcTimestamp`]
+/// reads RFC 3339 (it also reads the looser forms chrono's reader took,
+/// such as a trailing `UTC`); a missing or unreadable time ranks oldest,
+/// and a tie keeps the first row. Output keeps the order in which each
+/// callsign first appeared.
 pub(crate) fn worked_references_from_activations(
     rows: &[Activation],
 ) -> Vec<(String, WorkedReference)> {
-    type Ranked = (
-        Option<chrono::DateTime<chrono::FixedOffset>>,
-        WorkedReference,
-    );
+    type Ranked = (Option<UtcTimestamp>, WorkedReference);
     let mut order: Vec<String> = Vec::new();
     let mut best: HashMap<String, Ranked> = HashMap::new();
     for row in rows {
@@ -147,7 +146,7 @@ pub(crate) fn worked_references_from_activations(
         let spotted = row
             .spot_time
             .as_deref()
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok());
+            .and_then(|t| t.trim().parse::<UtcTimestamp>().ok());
         let candidate = WorkedReference {
             sig: sig.to_string(),
             sig_info: reference,
@@ -201,7 +200,7 @@ async fn refresh_worked_references(
                 rows.len(),
                 entries.len()
             );
-            book.record_feed(entries, chrono::Utc::now());
+            book.record_feed(entries, UtcTimestamp::now());
         }
         Ok(None) => {
             if !not_offered_logged.swap(true, Ordering::Relaxed) {

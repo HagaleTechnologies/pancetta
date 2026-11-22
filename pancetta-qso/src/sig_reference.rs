@@ -14,8 +14,9 @@
 //!
 //! Neither source overwrites a tag already on the QSO's metadata.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
 use pancetta_core::callsign::{base_callsign, resolve_hash_render};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -33,9 +34,8 @@ pub const SIG_INFO_TAG: &str = "SIG_INFO";
 /// listed it, measured to the QSO's end time (PAN-359 D5).
 pub const WORKED_REFERENCE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-fn max_age() -> chrono::Duration {
-    chrono::Duration::from_std(WORKED_REFERENCE_MAX_AGE)
-        .unwrap_or_else(|_| chrono::Duration::zero())
+fn max_age() -> SignedDuration {
+    SignedDuration::try_from(WORKED_REFERENCE_MAX_AGE).unwrap_or(SignedDuration::ZERO)
 }
 
 /// Trim `value`; a blank result means "unset".
@@ -62,8 +62,8 @@ fn stamp_tag(tags: &mut HashMap<String, String>, key: &str, value: Option<&str>)
 /// Bounded in both directions, so a sighting stamped ahead of `at` (the
 /// wall clock stepped back after the fetch) cannot stay fresh for longer
 /// than the window either.
-fn within_window(at: DateTime<Utc>, seen_at: DateTime<Utc>) -> bool {
-    at.signed_duration_since(seen_at).abs() <= max_age()
+fn within_window(at: UtcTimestamp, seen_at: UtcTimestamp) -> bool {
+    at.duration_since(seen_at).abs() <= max_age()
 }
 
 /// The operator's own activation: `[station] my_sig` / `my_sig_info`.
@@ -121,7 +121,7 @@ impl WorkedReference {
 #[derive(Debug, Clone)]
 struct BookEntry {
     reference: WorkedReference,
-    seen_at: DateTime<Utc>,
+    seen_at: UtcTimestamp,
 }
 
 /// Normalize a callsign for the book: trimmed and upper-case.
@@ -155,7 +155,7 @@ impl WorkedReferenceBook {
     pub fn record_feed(
         &self,
         entries: impl IntoIterator<Item = (String, WorkedReference)>,
-        seen_at: DateTime<Utc>,
+        seen_at: UtcTimestamp,
     ) {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         for (callsign, reference) in entries {
@@ -178,7 +178,7 @@ impl WorkedReferenceBook {
     /// one fresh entry sharing the call's base callsign (`DL1ABC` for
     /// `DL1ABC/P`) matches when one of the two is that bare base call; two
     /// or more such entries match nothing.
-    pub fn lookup(&self, callsign: &str, at: DateTime<Utc>) -> Option<WorkedReference> {
+    pub fn lookup(&self, callsign: &str, at: UtcTimestamp) -> Option<WorkedReference> {
         let normalized = normalize_call(callsign);
         let call = resolve_hash_render(&normalized)?;
         if call.is_empty() {
