@@ -24,7 +24,7 @@
 //! committed `#[ignore]` with a `// KNOWN BUG:` note (assertion left intact), to
 //! become the fix list for a coordinated engine follow-up.
 
-use chrono::TimeZone;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::sim::Sim;
 use pancetta_qso::{AutonomousConfig, AutonomousOperator, DecodedMessageInfo, DxEvaluator};
 
@@ -140,20 +140,11 @@ async fn b1_autonomous_yields_to_busy_dx() {
             },
         ],
         &AlwaysWorthIt,
-        chrono::Utc
-            .timestamp_opt(0, 0)
-            .single()
-            .expect("epoch valid"),
+        UtcTimestamp::from_parts(0, 0).expect("epoch valid"),
     );
 
     assert!(
-        op.is_dx_busy(
-            "VB7F",
-            chrono::Utc
-                .timestamp_opt(0, 0)
-                .single()
-                .expect("epoch valid")
-        ),
+        op.is_dx_busy("VB7F", UtcTimestamp::from_parts(0, 0).expect("epoch valid")),
         "VB7F mid-exchange with a third party must read as busy"
     );
 

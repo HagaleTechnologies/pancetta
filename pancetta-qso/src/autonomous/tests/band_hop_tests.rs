@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::band_scheduler::{BandHopReason, BandOpportunity, BandPlanEntry, OpportunitySnapshot};
-use chrono::TimeZone;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::utc_window::UtcWindow;
 use pancetta_core::Band;
 use std::collections::HashSet;
@@ -66,12 +67,12 @@ fn window(utc: &str, bands: &[Band]) -> BandPlanEntry {
     }
 }
 
-fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(y, mo, d, h, mi, s).unwrap()
 }
 
-fn secs(n: i64) -> ChronoDuration {
-    ChronoDuration::seconds(n)
+fn secs(n: i64) -> SignedDuration {
+    SignedDuration::from_secs(n)
 }
 
 fn cq(call: &str, grid: &str) -> DecodedMessageInfo {
@@ -93,7 +94,7 @@ fn two_cqs() -> Vec<DecodedMessageInfo> {
     vec![cq("W2AAA", "FN31"), cq("W3BBB", "FM19")]
 }
 
-fn snap(as_of: DateTime<Utc>, counts: &[(Band, u32, u32)]) -> OpportunitySnapshot {
+fn snap(as_of: UtcTimestamp, counts: &[(Band, u32, u32)]) -> OpportunitySnapshot {
     OpportunitySnapshot {
         as_of,
         bands: counts
@@ -157,7 +158,7 @@ impl Harness {
 
     fn slot(
         &mut self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         messages: &[DecodedMessageInfo],
         snapshot: Option<OpportunitySnapshot>,
     ) -> Vec<OperatorAction> {
@@ -173,11 +174,11 @@ impl Harness {
 const AC1_BANDS: &[(u64, &str)] = &[(14_074_000, "20m"), (18_100_000, "17m")];
 
 /// 2026-06-21 15:00 UTC: an even slot, no grey-line at FN42.
-fn t0() -> DateTime<Utc> {
+fn t0() -> UtcTimestamp {
     utc(2026, 6, 21, 15, 0, 0)
 }
 
-fn ac1_snapshot(now: DateTime<Utc>) -> OpportunitySnapshot {
+fn ac1_snapshot(now: UtcTimestamp) -> OpportunitySnapshot {
     snap(now, &[(Band::Band17m, 2, 0), (Band::Band20m, 0, 0)])
 }
 
@@ -189,7 +190,7 @@ const AC1_TEXT: &str = "Band hop 20m -> 17m: needed activity; 2 needed entities 
 fn first_hop_slot(
     h: &mut Harness,
     last: i64,
-    snapshot: impl Fn(DateTime<Utc>) -> Option<OpportunitySnapshot>,
+    snapshot: impl Fn(UtcTimestamp) -> Option<OpportunitySnapshot>,
 ) -> Option<(i64, u64, BandHopReason)> {
     for k in 0..=last {
         let now = t0() + secs(15 * k);
@@ -287,7 +288,7 @@ fn pan385_needed_hop_needs_fresh_strictly_better_spots() {
     }
 }
 
-type SnapFn = Box<dyn Fn(DateTime<Utc>) -> Option<OpportunitySnapshot>>;
+type SnapFn = Box<dyn Fn(UtcTimestamp) -> Option<OpportunitySnapshot>>;
 type TweakFn = Box<dyn Fn(&mut AutonomousConfig)>;
 
 #[test]
@@ -555,7 +556,7 @@ fn pan385_unexecuted_hop_is_retried_next_slot() {
 /// inside an active plan window.
 #[test]
 fn pan385_waited_low_activity_hop_is_retried_next_slot() {
-    fn first_low_activity_hop(h: &mut Harness, start: DateTime<Utc>) -> Option<(i64, u64)> {
+    fn first_low_activity_hop(h: &mut Harness, start: UtcTimestamp) -> Option<(i64, u64)> {
         (0..30).find_map(|k| {
             hop_of(&h.slot(start + secs(15 * k), &[], None)).map(|(dial, reason)| {
                 assert!(
@@ -844,8 +845,8 @@ fn pan385_grey_line_breaks_ties_toward_low_bands() {
     // Ten minutes on 20m ending at `at`; returns the hop at `at`, if any.
     let run = |grid: Option<&str>,
                grey_line: bool,
-               at: DateTime<Utc>,
-               snapshot: &dyn Fn(DateTime<Utc>) -> OpportunitySnapshot|
+               at: UtcTimestamp,
+               snapshot: &dyn Fn(UtcTimestamp) -> OpportunitySnapshot|
      -> Option<(u64, BandHopReason)> {
         let mut h = Harness::new(bands, vec![], grid, |c| {
             c.band_hopping.grey_line = grey_line;

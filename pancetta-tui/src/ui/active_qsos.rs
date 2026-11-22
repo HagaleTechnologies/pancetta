@@ -7,6 +7,8 @@
 //! The widget is purely a renderer — no derived state, no caching.
 
 use crate::app::App;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::Rect,
     style::Modifier,
@@ -64,7 +66,7 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(
         "QSO: ",
@@ -75,7 +77,7 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut used: usize = spans.iter().map(Span::width).sum();
     let mut shown = 0usize;
     for (idx, q) in qsos.iter().enumerate() {
-        let elapsed = (now - q.started_at).num_seconds().max(0);
+        let elapsed = (now - q.started_at).as_secs().max(0);
         let mm = elapsed / 60;
         let ss = elapsed % 60;
         let separator = if idx > 0 { "  │  " } else { "" };
@@ -194,7 +196,7 @@ mod tests {
         crate::app::ActiveQsoBanner {
             their_callsign: call.to_string(),
             state: "wait rpt".to_string(),
-            started_at: chrono::Utc::now() - chrono::Duration::seconds(started_secs_ago),
+            started_at: UtcTimestamp::now() - SignedDuration::from_secs(started_secs_ago),
             frequency_hz: 1500.0,
             tx_parity: None,
             last_tx_text: None,

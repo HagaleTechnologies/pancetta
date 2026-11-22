@@ -70,8 +70,9 @@ pub(crate) fn build_date(
                 format!("SOURCE_DATE_EPOCH must be whole seconds since 1970-01-01 UTC, got {raw:?}")
             })?
     };
-    chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|date| date.format("%Y-%m-%d").to_string())
+    jiff::Timestamp::from_second(seconds)
+        .ok()
+        .map(|date| date.strftime("%Y-%m-%d").to_string())
         .ok_or_else(|| format!("SOURCE_DATE_EPOCH is out of range: {seconds}"))
 }
 

@@ -8,6 +8,7 @@
 //! resend) lands within that unchanged 30s window and does NOT make the
 //! QSO immortal.
 use super::*;
+use jiff::SignedDuration;
 
 const OUR: &str = "W1ABC"; // test_config()'s our_callsign
 const DX: &str = "K1DEF";
@@ -68,7 +69,7 @@ async fn auto_responding_to_cq_gets_one_bounded_resend_then_retires_at_30s() {
 
     // At +15s (one FT8 slot): the bounded Auto resend fires.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     let resent = sends(&drain(&mut rx));
     assert_eq!(
@@ -85,7 +86,7 @@ async fn auto_responding_to_cq_gets_one_bounded_resend_then_retires_at_30s() {
     // At +30s (another slot): the cap (AUTO_RESEND_MAX_CALLS = 2) must
     // now block any further resend — call_count is already 2.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(30))
         .await;
     assert!(
         sends(&drain(&mut rx)).is_empty(),
@@ -100,7 +101,7 @@ async fn auto_responding_to_cq_gets_one_bounded_resend_then_retires_at_30s() {
         "QSO should still be alive exactly at the 30s boundary"
     );
     manager
-        .check_timeouts_at(opened_at + Duration::seconds(31))
+        .check_timeouts_at(opened_at + SignedDuration::from_secs(31))
         .await;
     assert!(
         matches!(
@@ -153,7 +154,7 @@ async fn auto_sending_report_gets_one_bounded_resend_then_retires_at_30s() {
     // Some on this rung), so the rearm arm re-sends ReportAck, not a
     // plain SignalReport (see the SendingReport rearm arm's own comment).
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(15))
         .await;
     let resent = sends(&drain(&mut rx));
     assert_eq!(
@@ -165,7 +166,7 @@ async fn auto_sending_report_gets_one_bounded_resend_then_retires_at_30s() {
 
     // +30s: capped, no further resend.
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(30))
         .await;
     assert!(sends(&drain(&mut rx)).is_empty(), "resend must be capped");
 
@@ -174,12 +175,12 @@ async fn auto_sending_report_gets_one_bounded_resend_then_retires_at_30s() {
     // do not stamp `last_call_at` — see `process_message_for_qso`'s
     // Manual-only gate), which lands a fraction of a millisecond BEFORE
     // the SendingReport state's own `started_at` (stamped moments later
-    // by the SignalReport transition). `chrono::Duration::num_seconds`
+    // by the SignalReport transition). `SignedDuration::num_seconds`
     // truncates towards zero, so a tight +31s margin can read as 30
     // (e.g. 30.9996s) and spuriously miss the boundary — use a
     // comfortable +33s margin instead.
     manager
-        .check_timeouts_at(entered_at + Duration::seconds(33))
+        .check_timeouts_at(entered_at + SignedDuration::from_secs(33))
         .await;
     assert!(
         matches!(

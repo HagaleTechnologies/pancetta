@@ -126,7 +126,7 @@ impl ServerEvent {
 mod tests {
     use super::*;
     use crate::dto::DecodedView;
-    use chrono::Utc;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_core::TxPolicy;
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
 
         let d = ServerEvent::Decoded {
             decoded: DecodedView {
-                timestamp: Utc::now(),
+                timestamp: UtcTimestamp::now(),
                 frequency_hz: 14_075_931.0,
                 snr: -8,
                 delta_time: 0.2,
@@ -213,7 +213,7 @@ mod tests {
                         bin_width_hz: 5.86,
                         mags_db: vec![-104.2, -98.1],
                         seq: 1,
-                        timestamp: Utc::now(),
+                        timestamp: UtcTimestamp::now(),
                     },
                 },
             ),

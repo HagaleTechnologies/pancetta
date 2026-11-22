@@ -3,6 +3,7 @@ use super::scoring::{
     ContestContactFact, ContestPeriod, ContestScoringContext, ContestScoringStamp,
 };
 use crate::states::{ContestInfo, ContestSerials, QsoMetadata};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -29,7 +30,7 @@ pub struct LoggedContestContext {
     pub evidence: ContestEvidence,
     /// Exact live start time; standard ADIF TIME_ON has only whole seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contact_start: Option<chrono::DateTime<chrono::Utc>>,
+    pub contact_start: Option<UtcTimestamp>,
 }
 
 /// Decode only supported, complete evidence. Callers must keep raw tags even
@@ -241,7 +242,7 @@ pub fn fact(
     let start = logged
         .contact_start
         .unwrap_or(metadata.contact_started_at());
-    if start.timestamp() != metadata.contact_started_at().timestamp() {
+    if start.as_second() != metadata.contact_started_at().as_second() {
         return Err("contest: contact start conflicts with logged QSO time".into());
     }
     let evidence = resolved_evidence(&logged, &metadata.tags, metadata.their_state.as_deref());

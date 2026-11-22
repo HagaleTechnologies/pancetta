@@ -10,7 +10,7 @@
 //! `pancetta import --undo` can remove exactly that block (PAN-214).
 
 use crate::adif::{freq_hz_to_band, AdifParse, AdifProcessor, AdifQso, AdifRecord};
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,17 +53,17 @@ enum Source {
 /// A contact already known, bucketed under its (callsign, mode).
 struct Seen {
     band: Option<String>,
-    start: DateTime<Utc>,
+    start: UtcTimestamp,
     source: Source,
 }
 
 impl Seen {
-    fn matches(&self, band: &Option<String>, start: DateTime<Utc>) -> bool {
+    fn matches(&self, band: &Option<String>, start: UtcTimestamp) -> bool {
         let same_band = match (&self.band, band) {
             (Some(a), Some(b)) => a == b,
             _ => true,
         };
-        same_band && (self.start - start).num_seconds().abs() <= DUPLICATE_WINDOW_MINUTES * 60
+        same_band && (self.start - start).as_secs().abs() <= DUPLICATE_WINDOW_MINUTES * 60
     }
 }
 
@@ -229,7 +229,7 @@ pub struct ImportReceipt {
     pub version: u32,
     pub logbook: PathBuf,
     pub import_file: PathBuf,
-    pub imported_at: DateTime<Utc>,
+    pub imported_at: UtcTimestamp,
     pub contacts: usize,
     /// The copy of the logbook taken before the import; `None` for a new logbook.
     pub backup: Option<PathBuf>,
@@ -239,7 +239,7 @@ pub struct ImportReceipt {
     pub added: String,
     /// When `--undo` removed the block; `None` while it is still in the logbook.
     #[serde(default)]
-    pub undone_at: Option<DateTime<Utc>>,
+    pub undone_at: Option<UtcTimestamp>,
 }
 
 /// Why bytes are not a readable [`ImportReceipt`] (PAN-214).

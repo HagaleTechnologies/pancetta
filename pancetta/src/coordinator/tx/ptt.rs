@@ -1,4 +1,7 @@
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 /// PAN-114 (lane5 H-16): one evaluation of the pre-PTT wait, re-derived
 /// from a fresh wall-clock read each chunk. The old single monotonic sleep
@@ -18,9 +21,9 @@ pub(super) enum PttWaitStep {
 /// `target_slot` (a forward jump past the late-start policy). A request that
 /// was already late when the wait began keeps today's path exactly.
 pub(super) fn ptt_wait_step(
-    now: chrono::DateTime<chrono::Utc>,
-    ptt_target: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    ptt_target: UtcTimestamp,
+    target_slot: UtcTimestamp,
     waited_from_before_target: bool,
     late_max_ms: u64,
     slot_ns: i64,
@@ -28,10 +31,10 @@ pub(super) fn ptt_wait_step(
     use pancetta_core::slot_clock::WallClockJump;
     let remaining = ptt_target - now;
     // schedule_tx never targets more than two slots ahead.
-    if remaining > chrono::Duration::nanoseconds(2 * slot_ns) {
+    if remaining > SignedDuration::from_nanos(2 * slot_ns) {
         return PttWaitStep::ClockJumped(WallClockJump::Backward(remaining));
     }
-    if remaining > chrono::Duration::zero() {
+    if remaining > SignedDuration::ZERO {
         let chunk = remaining
             .to_std()
             .unwrap_or(Duration::ZERO)
@@ -39,7 +42,7 @@ pub(super) fn ptt_wait_step(
         return PttWaitStep::Sleep(chunk);
     }
     if waited_from_before_target
-        && now - target_slot > chrono::Duration::milliseconds(late_max_ms as i64)
+        && now - target_slot > SignedDuration::from_millis(late_max_ms as i64)
     {
         return PttWaitStep::ClockJumped(WallClockJump::Forward(now - ptt_target));
     }
@@ -59,11 +62,11 @@ pub(super) fn ptt_wait_step(
 /// current-slot late starts. Mid-wait clock jumps stay covered by
 /// PAN-114's `ptt_wait_step` above.
 pub(super) fn key_time_too_late(
-    now: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    target_slot: UtcTimestamp,
     late_max_ms: u64,
 ) -> bool {
-    now - target_slot > chrono::Duration::milliseconds(late_max_ms as i64)
+    now - target_slot > SignedDuration::from_millis(late_max_ms as i64)
 }
 
 /// Outcome of [`wait_for_ptt_instant`].
@@ -86,13 +89,13 @@ pub(super) enum PttWait {
 /// jump this returns `Reached` at the same wall instant the old monotonic
 /// sleep ended.
 pub(super) async fn wait_for_ptt_instant(
-    ptt_target: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
+    ptt_target: UtcTimestamp,
+    target_slot: UtcTimestamp,
     late_max_ms: u64,
     slot_ns: i64,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    wall_now: impl Fn() -> chrono::DateTime<chrono::Utc>,
+    wall_now: impl Fn() -> UtcTimestamp,
 ) -> PttWait {
     use std::sync::atomic::Ordering;
     let mut waited_from_before_target: Option<bool> = None;
@@ -477,7 +480,7 @@ pub(super) fn send_ptt_command_with_attempt(
         }
         admitted = message_bus
             .receive_gain
-            .admit_ptt(chrono::Utc::now().timestamp_millis());
+            .admit_ptt(UtcTimestamp::now().as_millisecond());
         admitted
     });
     if admitted && outcome != SendIfOutcome::Enqueued {

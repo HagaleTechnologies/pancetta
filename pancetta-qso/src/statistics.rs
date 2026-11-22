@@ -6,7 +6,8 @@
 use crate::async_database::{
     AsyncDatabaseError, DateRange, QsoDatabase, QsoDatabaseRecord, QsoFilter, QueryOptions,
 };
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
@@ -90,10 +91,10 @@ pub struct BasicStatistics {
     pub by_hour: BTreeMap<u8, u64>,
 
     /// First QSO date
-    pub first_qso: Option<DateTime<Utc>>,
+    pub first_qso: Option<UtcTimestamp>,
 
     /// Last QSO date
-    pub last_qso: Option<DateTime<Utc>>,
+    pub last_qso: Option<UtcTimestamp>,
 
     /// Average QSO duration (seconds)
     pub avg_qso_duration: f64,
@@ -128,7 +129,7 @@ pub struct DailyStatistics {
     pub max_in_day: u64,
 
     /// Date of maximum activity
-    pub max_day: Option<DateTime<Utc>>,
+    pub max_day: Option<UtcTimestamp>,
 
     /// Days with QSO activity
     pub active_days: u64,
@@ -217,10 +218,10 @@ pub struct SeasonalDistribution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityPeak {
     /// Start time of peak
-    pub start: DateTime<Utc>,
+    pub start: UtcTimestamp,
 
     /// End time of peak
-    pub end: DateTime<Utc>,
+    pub end: UtcTimestamp,
 
     /// Number of QSOs in peak
     pub qso_count: u64,
@@ -336,7 +337,7 @@ pub struct DistanceStatistics {
 pub struct DistanceRecord {
     pub callsign: String,
     pub distance_km: f64,
-    pub qso_date: DateTime<Utc>,
+    pub qso_date: UtcTimestamp,
     pub frequency: f64,
     pub mode: String,
     pub our_grid: String,
@@ -438,7 +439,7 @@ pub struct ErrorRateStatistics {
 /// Error trend over time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorTrend {
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
     pub error_rate: f64,
     pub total_qsos: u64,
 }
@@ -495,7 +496,7 @@ pub struct ContestRecord {
     pub qso_count: u64,
     pub multipliers: u64,
     pub total_points: u64,
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
 }
 
 /// QSO rate statistics for contests
@@ -537,7 +538,7 @@ pub struct ContestTrends {
 /// Contest activity data point
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContestActivityPoint {
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
     pub contest_count: u64,
     pub total_qsos: u64,
 }
@@ -545,7 +546,7 @@ pub struct ContestActivityPoint {
 /// Performance trend data point
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformancePoint {
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
     pub qso_rate: f64,
     pub completion_rate: f64,
     pub error_rate: f64,
@@ -649,7 +650,7 @@ pub struct CustomAchievement {
     pub progress: u64,
     pub target: u64,
     pub completed: bool,
-    pub completion_date: Option<DateTime<Utc>>,
+    pub completion_date: Option<UtcTimestamp>,
 }
 
 /// Performance metrics
@@ -690,7 +691,7 @@ pub struct EfficiencyMetrics {
 /// Efficiency trend data point
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EfficiencyPoint {
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
     pub qsos_per_hour: f64,
     pub session_duration: f64,
 }
@@ -768,7 +769,7 @@ pub struct ImprovementArea {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceMilestone {
     pub description: String,
-    pub achieved_date: DateTime<Utc>,
+    pub achieved_date: UtcTimestamp,
     pub value: f64,
     pub milestone_type: MilestoneType,
 }
@@ -915,7 +916,7 @@ pub struct TrendPredictions {
 /// Activity prediction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityPrediction {
-    pub date: DateTime<Utc>,
+    pub date: UtcTimestamp,
     pub predicted_qsos: f64,
     pub confidence: f64,
     pub factors: Vec<String>,
@@ -925,7 +926,7 @@ pub struct ActivityPrediction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AchievementPrediction {
     pub achievement: String,
-    pub predicted_date: DateTime<Utc>,
+    pub predicted_date: UtcTimestamp,
     pub confidence: f64,
     pub requirements: Vec<String>,
 }
@@ -1000,8 +1001,8 @@ impl StatisticsCalculator {
     /// Calculate statistics for a specific time period
     pub async fn calculate_period_statistics(
         &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: UtcTimestamp,
+        end: UtcTimestamp,
     ) -> Result<QsoStatistics, StatisticsError> {
         if start >= end {
             return Err(StatisticsError::InvalidDateRange {
@@ -1025,10 +1026,8 @@ impl StatisticsCalculator {
         hour: u32,
         min: u32,
         sec: u32,
-    ) -> Result<DateTime<Utc>, StatisticsError> {
-        chrono::NaiveDate::from_ymd_opt(year, month, day)
-            .and_then(|d| d.and_hms_opt(hour, min, sec))
-            .map(|dt| dt.and_utc())
+    ) -> Result<UtcTimestamp, StatisticsError> {
+        UtcTimestamp::from_ymd_hms(year, month, day, hour, min, sec)
             .ok_or(StatisticsError::InvalidDate { year })
     }
 
@@ -1100,9 +1099,9 @@ impl StatisticsCalculator {
             *by_year.entry(qso_time.year() as u32).or_insert(0) += 1;
             *by_month.entry(qso_time.month() as u8).or_insert(0) += 1;
             *by_day_of_week
-                .entry(qso_time.weekday().num_days_from_sunday() as u8)
+                .entry(qso_time.to_civil().weekday().to_sunday_zero_offset() as u8)
                 .or_insert(0) += 1;
-            *by_hour.entry(qso_time.time().hour() as u8).or_insert(0) += 1;
+            *by_hour.entry(qso_time.hour() as u8).or_insert(0) += 1;
 
             // First/last QSO
             if first_qso.is_none_or(|t| qso_time < t) {
@@ -1112,9 +1111,9 @@ impl StatisticsCalculator {
                 last_qso = Some(qso_time);
             }
 
-            // Duration statistics
+            // SignedDuration statistics
             if let Some(end_time) = record.metadata.end_time {
-                let duration = (end_time - record.metadata.start_time).num_seconds() as u64;
+                let duration = (end_time - record.metadata.start_time).as_secs() as u64;
                 total_duration += duration;
                 duration_count += 1;
             }
@@ -1149,13 +1148,19 @@ impl StatisticsCalculator {
         // Calculate daily statistics
         let mut daily_counts = BTreeMap::new();
         for record in records {
-            let date = record.metadata.start_time.date_naive();
+            let date = record.metadata.start_time.to_civil().date();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
 
         let total_days = if let (Some(first), Some(last)) = (records.first(), records.last()) {
-            (last.metadata.start_time.date_naive() - first.metadata.start_time.date_naive())
-                .num_days()
+            (last
+                .metadata
+                .start_time
+                .to_civil()
+                .date()
+                .duration_since(first.metadata.start_time.to_civil().date())
+                .as_hours()
+                / 24)
                 .abs()
                 + 1
         } else {
@@ -1170,8 +1175,7 @@ impl StatisticsCalculator {
             .iter()
             .max_by_key(|(_, &count)| count)
             .and_then(|(date, _)| {
-                date.and_hms_opt(0, 0, 0)
-                    .map(|dt| chrono::Utc.from_utc_datetime(&dt))
+                UtcTimestamp::from_civil(date.to_datetime(jiff::civil::Time::midnight()))
             });
         let activity_percentage = (active_days as f64 / total_days as f64) * 100.0;
 
@@ -1280,9 +1284,9 @@ impl StatisticsCalculator {
 
         for record in records {
             let time = record.metadata.start_time;
-            *hour_counts.entry(time.time().hour() as u8).or_insert(0) += 1;
+            *hour_counts.entry(time.hour() as u8).or_insert(0) += 1;
             *dow_counts
-                .entry(time.weekday().num_days_from_sunday() as u8)
+                .entry(time.to_civil().weekday().to_sunday_zero_offset() as u8)
                 .or_insert(0) += 1;
             *month_counts.entry(time.month() as u8).or_insert(0) += 1;
         }
@@ -1598,7 +1602,7 @@ impl StatisticsCalculator {
         let mut session_qsos = Vec::new();
         let mut session_durations = Vec::new();
         let mut current_session: Vec<&QsoDatabaseRecord> = Vec::new();
-        let session_gap = Duration::hours(1); // 1 hour gap defines new session
+        let session_gap = SignedDuration::from_hours(1); // 1 hour gap defines new session
 
         for record in records {
             if let Some(last) = current_session.last() {
@@ -1622,10 +1626,10 @@ impl StatisticsCalculator {
                                     .expect("checked non-empty")
                                     .metadata
                                     .start_time
-                                    + Duration::minutes(2),
+                                    + SignedDuration::from_mins(2),
                             );
                         session_durations
-                            .push((session_end - session_start).num_seconds() as f64 / 3600.0);
+                            .push((session_end - session_start).as_secs() as f64 / 3600.0);
                         // hours
                     }
                     current_session.clear();
@@ -1652,9 +1656,9 @@ impl StatisticsCalculator {
                         .expect("checked non-empty")
                         .metadata
                         .start_time
-                        + Duration::minutes(2),
+                        + SignedDuration::from_mins(2),
                 );
-            session_durations.push((session_end - session_start).num_seconds() as f64 / 3600.0);
+            session_durations.push((session_end - session_start).as_secs() as f64 / 3600.0);
         }
 
         let qsos_per_session = if !session_qsos.is_empty() {
@@ -1706,9 +1710,9 @@ impl StatisticsCalculator {
             let mut setup_times = Vec::new();
             for window in records.windows(2) {
                 let time_diff = (window[1].metadata.start_time - window[0].metadata.start_time)
-                    .num_seconds() as f64;
+                    .as_secs() as f64;
                 // Only consider gaps less than session_gap as setup time
-                if time_diff < session_gap.num_seconds() as f64 && time_diff > 0.0 {
+                if time_diff < session_gap.as_secs() as f64 && time_diff > 0.0 {
                     setup_times.push(time_diff);
                 }
             }
@@ -1971,7 +1975,7 @@ impl StatisticsCalculator {
         // Group QSOs by day
         let mut daily_counts = BTreeMap::new();
         for record in records {
-            let date = record.metadata.start_time.date_naive();
+            let date = record.metadata.start_time.to_civil().date();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
 
@@ -2054,7 +2058,7 @@ impl StatisticsCalculator {
         // Get unique activity days
         let mut activity_days: Vec<_> = records
             .iter()
-            .map(|r| r.metadata.start_time.date_naive())
+            .map(|r| r.metadata.start_time.to_civil().date())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -2067,13 +2071,13 @@ impl StatisticsCalculator {
         let mut longest_streak = 1u64;
         let mut current_streak_len = 1u64;
         let mut current_streak = 1u64;
-        let today = Utc::now().date_naive();
+        let today = UtcTimestamp::now().to_civil().date();
 
         for i in 1..activity_days.len() {
             let prev_date = activity_days[i - 1];
             let curr_date = activity_days[i];
 
-            if (curr_date - prev_date).num_days() == 1 {
+            if curr_date.duration_since(prev_date).as_hours() / 24 == 1 {
                 // Consecutive day
                 current_streak_len += 1;
             } else {
@@ -2087,7 +2091,7 @@ impl StatisticsCalculator {
 
         // Calculate current streak (active if last activity was today or yesterday)
         if let Some(&last_day) = activity_days.last() {
-            let days_since_last = (today - last_day).num_days();
+            let days_since_last = today.duration_since(last_day).as_hours() / 24;
             if days_since_last <= 1 {
                 current_streak = current_streak_len;
             } else {
@@ -2252,11 +2256,11 @@ mod tests {
 
     async fn create_test_records() -> Vec<QsoDatabaseRecord> {
         let mut records = Vec::new();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
 
         for i in 0..10 {
             let qso_id = Uuid::new_v4();
-            let start_time = now - Duration::days(i as i64);
+            let start_time = now - SignedDuration::from_hours(24 * i as i64);
 
             let metadata = QsoMetadata {
                 qso_id,
@@ -2267,7 +2271,7 @@ mod tests {
                 mode: "FT8".to_string(),
                 first_answer_at: None,
                 start_time,
-                end_time: Some(start_time + Duration::minutes(2)),
+                end_time: Some(start_time + SignedDuration::from_mins(2)),
                 reports: SignalReports {
                     sent: Some(-15 + (i as i8)),
                     received: Some(-12 + (i as i8)),
@@ -2304,7 +2308,7 @@ mod tests {
 
             let adif_data = crate::adif::AdifQso {
                 qso_date: start_time,
-                qso_date_off: Some(start_time + Duration::minutes(2)),
+                qso_date_off: Some(start_time + SignedDuration::from_mins(2)),
                 call: format!("K1DE{}", i),
                 mode: "DATA".to_string(),
                 submode: Some("FT8".to_string()),
@@ -2346,7 +2350,7 @@ mod tests {
                     our_report: -15 + (i as i8),
                     frequency: 14074000.0 + (i as f64 * 1000.0),
                     grid_square: Some(format!("FN{}{}", 30 + i, 10 + i)),
-                    completed_at: start_time + Duration::minutes(2),
+                    completed_at: start_time + SignedDuration::from_mins(2),
                     duration_seconds: 120,
                 },
                 progress_data: None,
@@ -2628,7 +2632,7 @@ mod tests {
 
         let mut daily_counts = BTreeMap::new();
         for record in records {
-            let date = record.metadata.start_time.date_naive();
+            let date = record.metadata.start_time.to_civil().date();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
 

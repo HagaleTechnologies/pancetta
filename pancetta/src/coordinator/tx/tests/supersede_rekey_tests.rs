@@ -1,5 +1,6 @@
 use super::*;
 use crate::message_bus::MessageBus;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ fn ptt_offs(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> usize {
         .count()
 }
 
-fn viable_single_replace(now: chrono::DateTime<chrono::Utc>) -> (MessageType, TxSchedule) {
+fn viable_single_replace(now: UtcTimestamp) -> (MessageType, TxSchedule) {
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -77,7 +78,7 @@ async fn supersede_into_a_full_hamlib_channel_keeps_the_guard_armed() {
         ))
         .await
         .unwrap());
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let (new_request, mut schedule) = viable_single_replace(now);
     let mut message_text = "OLD TEXT".to_string();
     let mut frequency_offset = 1000.0;
@@ -215,7 +216,7 @@ async fn supersede_and_rekey_updates_state_when_viable() {
     // Hamlib channel so the helper's PTT-OFF send has a receiver.
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -329,7 +330,7 @@ async fn supersede_rekeys_audio_to_new_message_not_stale() {
     // Real Hamlib channel: the helper's abort PTT-OFF lands here.
     let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -480,7 +481,7 @@ async fn supersede_returns_bundle_when_concurrent() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -577,7 +578,7 @@ async fn supersede_refuses_to_bundle_across_consent_channels() {
         let bus = MessageBus::new(16).unwrap();
         let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
             pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
             pancetta_core::slot::SLOT_NS,
@@ -673,7 +674,7 @@ async fn supersede_bundle_gives_the_new_item_the_new_requests_binding() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -771,7 +772,7 @@ async fn supersede_refuses_to_bundle_mismatched_remote_clients() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -887,7 +888,7 @@ async fn supersede_bundle_replaces_matching_qso_item_on_frequency_hop() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -1006,7 +1007,7 @@ async fn supersede_falls_back_to_replace_when_bundle_would_exceed_cap() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -1120,7 +1121,7 @@ async fn supersede_bundle_cap_does_not_count_manual_items() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -1240,7 +1241,7 @@ async fn supersede_replace_carries_superseding_requests_origin() {
         let bus = MessageBus::new(16).unwrap();
         let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
             pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
             pancetta_core::slot::SLOT_NS,
@@ -1371,7 +1372,7 @@ async fn supersede_bundle_folds_origin_failsafe() {
         let bus = MessageBus::new(16).unwrap();
         let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
             pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
             pancetta_core::slot::SLOT_NS,
@@ -1466,7 +1467,7 @@ async fn supersede_declines_multi_transmit_request() {
     let mut message_text = "OLD TEXT".to_string();
     let mut frequency_offset = 1000.0;
     let mut schedule = super::schedule_tx(
-        chrono::Utc::now(),
+        UtcTimestamp::now(),
         pancetta_core::slot::SlotParity::Even,
         8000,
         12_000,
@@ -1497,7 +1498,7 @@ async fn supersede_declines_multi_transmit_request() {
             12_000,
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         ),
         2,
         &super::SupersedeInFlight {
@@ -1605,7 +1606,7 @@ async fn multi_reenqueue_deasserts_ptt_and_reenqueues_superseding_bundle() {
             12_000,
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         ),
         2,
         super::SupersedeIo {
@@ -1700,7 +1701,7 @@ async fn multi_reenqueue_preserves_in_flight_bundle_when_new_request_would_excee
     ];
 
     // A THIRD, genuinely new QSO request supersedes.
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -1843,7 +1844,7 @@ async fn multi_reenqueue_keys_the_new_request_on_identity_conflict_instead_of_pr
     ];
 
     // Control has transferred to client-b, whose request supersedes.
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -2002,7 +2003,7 @@ fn pan279_parities() -> (
     pancetta_core::slot::SlotParity,
     pancetta_core::slot::SlotParity,
 ) {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -2060,7 +2061,7 @@ async fn pan279_multi(
             12_000,
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         ),
         max_concurrent_qsos,
         super::SupersedeIo {
@@ -2295,7 +2296,7 @@ async fn pan279_notviable_returns_the_deferred_superseder_intact() {
     let mut message_text = "K1ABC N0CALL FN20".to_string();
     let mut frequency_offset = 1000.0;
     let mut schedule = super::schedule_tx(
-        chrono::Utc::now(),
+        UtcTimestamp::now(),
         pancetta_core::slot::SlotParity::Even,
         8000,
         12_000,
@@ -2328,7 +2329,7 @@ async fn pan279_notviable_returns_the_deferred_superseder_intact() {
             12_000,
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         ),
         2,
         &super::SupersedeInFlight {
@@ -2375,7 +2376,7 @@ async fn multi_reenqueue_bundle_success_preserves_bundle_parity() {
         remote_client_key_id: None,
     }];
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -2533,7 +2534,7 @@ async fn pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two() {
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,
@@ -2651,7 +2652,7 @@ async fn pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream
     let bus = MessageBus::new(16).unwrap();
     let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,

@@ -30,12 +30,13 @@ uses the first of `pancetta.toml`, `config.toml`, `pancetta.json`,
 
 | # | Linux | macOS | Windows |
 |---|---|---|---|
-| 1 | current directory | current directory | current directory |
-| 2 | `$XDG_CONFIG_HOME/pancetta` (only when set to something other than `~/.config`) | `~/Library/Application Support/pancetta` | `%APPDATA%\pancetta` |
-| 3 | `/etc/pancetta` | `/etc/pancetta` | `%APPDATA%\Pancetta` |
-| 4 | `/usr/local/etc/pancetta` | `/usr/local/etc/pancetta` | — |
-| 5 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
-| 6 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
+| 1 | `$XDG_CONFIG_HOME/pancetta` (only when set to something other than `~/.config`) | `~/Library/Application Support/pancetta` | `%APPDATA%\pancetta` |
+| 2 | `/etc/pancetta` | `/etc/pancetta` | `%APPDATA%\Pancetta` |
+| 3 | `/usr/local/etc/pancetta` | `/usr/local/etc/pancetta` | — |
+| 4 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
+| 5 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
+
+pancetta never reads a config file from the current directory unless you name it with `--config`.
 
 Every file found is loaded, and later rows override earlier ones. The
 override is per file, not per key: a later file's defaults also replace
@@ -48,8 +49,8 @@ a single file at `~/.pancetta/pancetta.toml`, and run
 needs the keys you change; every key you leave out keeps its default.
 
 With `--data-dir <DIR>` and no `--config`, pancetta searches only `DIR` for
-those four file names. It does not merge the current directory, the
-system directories, `~/.pancetta` or `~/.config/pancetta`, so a second
+those four file names. It does not merge the system directories,
+`~/.pancetta` or `~/.config/pancetta`, so a second
 station never picks up the first station's config. `PANCETTA_*`
 environment overrides still apply. With both `--config <path>` and
 `--data-dir <DIR>`, pancetta reads the `--config` file, and `DIR` holds
@@ -288,7 +289,7 @@ baud_rate = 38400
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `model` | string | `"Generic"` | A model name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, ...) or a numeric Hamlib model ID (`"1045"`). Case, hyphens and spaces are ignored; ambiguous names require the numeric ID; for an all-digit model name include the manufacturer (`"Barrett 950"`). Unknown, malformed or ambiguous values fail validation with the closest matches and numeric-ID hint. Empty and `"Generic"` stay placeholders (no model check). See [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md). |
-| `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
+| `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. `rig.ptt.method` is checked only while it is true. |
 | `interface.port` | string | `"/dev/ttyUSB0"` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
 
@@ -341,6 +342,14 @@ to disable automatic mode control.
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
+
+### `[rig.ptt]` — how a transmission keys the rig
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `method` | string | `"none"` | `"none"` and `"cat"` key through rigctld (`T 1`/`T 0`). `"serial_rts"` (or `"serial-rts"`) asserts RTS on `device` for each transmission; rigctld still sets frequency and reads meters. With `[rig.interface].enabled = true`, `"serial"`, `"vox"`, `"parallel"`, `"usb"`, `"sound_card"` and `"network"` fail validation as not implemented. Restart to apply. |
+| `device` | string | absent | Serial port whose RTS line keys the rig. Required by `"serial_rts"`; must not be `[rig.interface].port`. |
+| `polarity` | string | `"positive"` | `"serial_rts"` asserts RTS to transmit; `"negative"` is refused for it. |
 
 ### `[rig.receive_overload_guard]` receive overload protection
 
@@ -1947,6 +1956,11 @@ min_tier = "atno"
 enabled = false
 url = ""
 min_tier = "atno"
+# Accept plain http://, loopback, private, link-local, CGNAT and unspecified
+# addresses, and localhost/.local/.home.arpa/.internal/single-label names.
+allow_private_targets = false
+# Webhook POSTs allowed in any 60 s, summaries included (1 to 600).
+max_per_minute = 10
 ```
 
 `ttl_secs` governs automatically remembered near-miss stations; operator pins
@@ -1956,10 +1970,25 @@ or focused callsign. Pins are saved in `~/.pancetta/pancetta.toml`.
 Alerts trigger on CQs meeting the channel's tier, or on any decode of a pinned
 callsign. `dedupe_secs` suppresses repeats per channel, callsign and band.
 Both duration fields must be at least 1. Enabled ntfy requires a non-empty
-topic and an HTTP(S) server; enabled webhook requires an HTTP(S) URL.
+topic and an HTTP(S) server. An enabled webhook must be an `https://` URL on
+a public host: plain `http://`, loopback, private, link-local, CGNAT,
+unspecified and broadcast addresses (including IPv4 inside IPv6), and
+`localhost`, `.localhost`, `.local`, `.home.arpa`, `.internal` and
+single-label names fail validation unless `allow_private_targets = true`.
+Validation does not resolve names. Instead, the webhook client checks every
+address a name resolves to when it posts and connects only to public unicast
+addresses, so a public name that resolves, or is rebound, to a private address
+is refused at delivery and counts as a failed delivery. Without the opt-in the
+webhook client also ignores `HTTP_PROXY`/`HTTPS_PROXY`, because a proxy would
+resolve the name itself. URL errors never print the URL.
 Bell emits terminal BEL in TUI mode. Every raised alert produces an INFO
 line naming the call, entity, band and audio offset. The webhook receives
-one JSON POST per alert; ntfy receives a JSON notification. Failed requests
+one JSON POST per alert, at most `max_per_minute` (1 to 600, default 10) in
+any 60 s. Alerts over the cap are held and sent as one `decode_alert_summary`
+POST (`count`, `window_secs`, `max_per_minute`, and the rarest 20 alerts)
+when the window has room, or as a plain `decode_alert` when only one was
+held; the summary counts toward the cap, and a paused target delays it.
+Ntfy receives a JSON notification. Failed requests
 are logged without retry; three consecutive failures pause that target for
 five minutes. Tier alerts suppress uncertain cqdx fallback evidence during
 need-list outages, while locally established band needs and pins remain usable.

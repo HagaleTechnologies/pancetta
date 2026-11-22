@@ -8,6 +8,8 @@
 // sequential assignment reads clearer than a struct-update splat.
 #![allow(clippy::field_reassign_with_default)]
 
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{
     DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES,
 };
@@ -1120,12 +1122,11 @@ fn test_two_simultaneous_qsos_loopback() {
 /// non-empty audio buffer with a cursor offset of 4500ms × sample_rate.
 #[test]
 fn schedule_tx_late_press_targets_current_opposite_slot() {
-    use chrono::TimeZone;
     use pancetta_core::slot::SlotParity;
     use pancetta_lib::coordinator::schedule_tx;
 
-    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let now = base + chrono::Duration::milliseconds(20_000); // :20.0
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = base + SignedDuration::from_millis(20_000); // :20.0
     let s = schedule_tx(
         now,
         SlotParity::Odd,
@@ -1134,7 +1135,7 @@ fn schedule_tx_late_press_targets_current_opposite_slot() {
         pancetta_core::slot::SLOT_NS,
     );
     // The Odd slot at :15 ends at :30. We want to land in *that* slot.
-    assert_eq!((s.target_slot - base).num_seconds(), 15);
+    assert_eq!((s.target_slot - base).as_secs(), 15);
     assert_eq!(s.cursor_offset_samples, 4_500 * 12);
     assert_eq!(s.silent_pad_samples, 0);
 }
@@ -1144,12 +1145,11 @@ fn schedule_tx_late_press_targets_current_opposite_slot() {
 /// for the original bug.
 #[test]
 fn schedule_tx_no_collision_on_late_press_near_boundary() {
-    use chrono::TimeZone;
     use pancetta_core::slot::SlotParity;
     use pancetta_lib::coordinator::schedule_tx;
 
-    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let now = base + chrono::Duration::milliseconds(14_600); // :14.6
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = base + SignedDuration::from_millis(14_600); // :14.6
     let s = schedule_tx(
         now,
         SlotParity::Odd,
@@ -1157,7 +1157,7 @@ fn schedule_tx_no_collision_on_late_press_near_boundary() {
         12_000,
         pancetta_core::slot::SLOT_NS,
     );
-    let secs = (s.target_slot - base).num_seconds();
+    let secs = (s.target_slot - base).as_secs();
     // MUST be :15 (Odd), NOT :30 (Even — would collide with DX).
     assert_eq!(secs, 15);
     assert_ne!(secs, 30);
@@ -1687,7 +1687,7 @@ async fn genuinely_unresolvable_caller_hash_never_resolves_but_retires_cleanly()
     );
 
     manager_dx
-        .check_timeouts_at(start + chrono::Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
     assert!(
         matches!(

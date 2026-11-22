@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -805,7 +806,7 @@ impl super::ApplicationCoordinator {
                     }
                     output_recovery.poll_pending(Instant::now());
 
-                    playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
+                    playback_watch.poll(|m| audio_manager.output_mark_state(m), UtcTimestamp::now);
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
                         Ok(command) => {
@@ -824,7 +825,7 @@ impl super::ApplicationCoordinator {
                                     mark,
                                     ack,
                                     |m| audio_manager.output_mark_state(m),
-                                    chrono::Utc::now,
+                                    UtcTimestamp::now,
                                 ),
                                 Ok(None) => {}
                                 Err(e) => {
@@ -840,7 +841,7 @@ impl super::ApplicationCoordinator {
                         }
                     }
 
-                    playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
+                    playback_watch.poll(|m| audio_manager.output_mark_state(m), UtcTimestamp::now);
                     match audio_manager.process_audio() {
                         Ok(Some(samples)) => {
                             let dropped = audio_manager.dropped_samples();
@@ -1157,7 +1158,7 @@ mod pan135_tx_audio_command_tests {
             waiter.wait_for(Duration::from_millis(1)).await,
             PlaybackStartState::Pending
         );
-        let at = chrono::Utc::now();
+        let at = pancetta_core::time::UtcTimestamp::now();
         returned.started(at);
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,

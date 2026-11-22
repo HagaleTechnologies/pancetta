@@ -1,4 +1,6 @@
 use super::*;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 /// Read the current global TX policy from the shared atomic.
 pub(super) fn current_tx_policy(
@@ -702,12 +704,12 @@ pub(super) fn relocation_epoch_stale(
 /// dropped rather than keyed (the QSO engine's existing retry timers own
 /// the re-send).
 pub(super) fn key_time_gate_denial(
-    now: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    target_slot: UtcTimestamp,
     late_max_ms: u64,
 ) -> Option<FinalGateDenial> {
     key_time_too_late(now, target_slot, late_max_ms).then(|| FinalGateDenial::TooLateToDecode {
-        elapsed_ms: (now - target_slot).num_milliseconds().max(0) as u64,
+        elapsed_ms: (now - target_slot).as_millis_i64().max(0) as u64,
         late_max_ms,
     })
 }

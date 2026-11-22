@@ -9,6 +9,7 @@
 //! alone does not carry. The component calls [`decoded_to_view`] directly with
 //! that enriched context and emits `ServerEvent::decoded(view)` itself.
 
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::DecodedMessage;
 use pancetta_protocol::{
     DecodedView, PendingCall, Placement, PlacementSlice, QsoProgress, ServerEvent, Spectrum,
@@ -84,7 +85,8 @@ pub(crate) fn decoded_to_view(
     atno: bool,
 ) -> DecodedView {
     DecodedView {
-        timestamp: chrono::DateTime::<chrono::Utc>::from(msg.timestamp),
+        timestamp: UtcTimestamp::try_from(msg.timestamp)
+            .expect("system time is within jiff's range"),
         frequency_hz: dial_hz + msg.frequency_offset,
         snr: msg.snr_db.round() as i32,
         delta_time: msg.time_offset as f32,
@@ -125,7 +127,7 @@ pub(crate) fn spectrum_row_to_event(
     audio_bin_start_hz: f64,
     bin_width_hz: f64,
     mags_db: &[f32],
-    timestamp: chrono::DateTime<chrono::Utc>,
+    timestamp: UtcTimestamp,
     dial_hz: f64,
     seq: u64,
 ) -> ServerEvent {
@@ -216,8 +218,8 @@ pub(crate) fn server_event_from_bus(msg: &MessageType) -> Option<ServerEvent> {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use pancetta_core::slot::SlotParity;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_ft8::{DecodedMessage, Ft8Message};
 
     // ── directed_at_us ───────────────────────────────────────────────────────
@@ -279,7 +281,7 @@ mod tests {
             max_calls: 25,
             watchdog_deadline: None,
             dx_last_activity: Some("\u{2192} us -12".into()),
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             hound: false,
             pending_freq_drift_hz: None,
             pending_freq_drift_since: None,
@@ -453,7 +455,7 @@ mod tests {
     #[test]
     fn spectrum_row_downsamples_and_converts_to_rf_absolute() {
         let mags: Vec<f32> = vec![-100.0, -90.0, -80.0, -70.0];
-        let ts = Utc::now();
+        let ts = UtcTimestamp::now();
         let event = spectrum_row_to_event(0.0, 2.9296875, &mags, ts, 14_074_000.0, 7);
 
         match event {
@@ -471,7 +473,7 @@ mod tests {
     #[test]
     fn spectrum_row_handles_odd_bin_count() {
         let mags: Vec<f32> = vec![-100.0, -90.0, -80.0];
-        let event = spectrum_row_to_event(0.0, 2.93, &mags, Utc::now(), 14_074_000.0, 0);
+        let event = spectrum_row_to_event(0.0, 2.93, &mags, UtcTimestamp::now(), 14_074_000.0, 0);
 
         match event {
             ServerEvent::Spectrum { spectrum } => {
@@ -484,7 +486,8 @@ mod tests {
 
     #[test]
     fn spectrum_row_adds_dial_to_nonzero_audio_offset() {
-        let event = spectrum_row_to_event(1500.0, 2.93, &[-100.0], Utc::now(), 7_074_000.0, 0);
+        let event =
+            spectrum_row_to_event(1500.0, 2.93, &[-100.0], UtcTimestamp::now(), 7_074_000.0, 0);
         match event {
             ServerEvent::Spectrum { spectrum } => {
                 assert_eq!(spectrum.bin_start_hz, 7_074_000.0 + 1500.0);

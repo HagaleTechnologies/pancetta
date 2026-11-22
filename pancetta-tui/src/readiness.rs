@@ -14,7 +14,7 @@
 //!   ack is pruned, so a recurrence shows again.
 //! - **Notice** (cyan): informational states; config permission persists until changed.
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 
 use crate::app::{App, RigConnDisplay};
 
@@ -253,7 +253,7 @@ pub struct Alert {
     /// acknowledged.
     pub code: Option<u32>,
     pub count: u32,
-    pub first_at: DateTime<Utc>,
+    pub first_at: UtcTimestamp,
     pub acknowledged: bool,
 }
 
@@ -652,7 +652,7 @@ fn alert_items(app: &App) -> Vec<ReadinessItem> {
                 "{} (×{}, first {})",
                 a.text,
                 a.count,
-                a.first_at.format("%H:%M:%S")
+                a.first_at.strftime("%H:%M:%S")
             ),
             acknowledged: a.acknowledged,
         })
@@ -765,7 +765,7 @@ mod tests {
             pancetta_core::DiagnosticLevel::Info,
         );
         app.add_decoded_message(crate::app::DecodedMessageView {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".into(),
             snr: -10,

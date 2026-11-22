@@ -12,7 +12,7 @@
 //! This module uses only items that exist before PAN-322, so it can be
 //! dropped onto the base commit to re-check the golden there.
 
-use super::pan115_worker_gate_tests::{worker_harness_with_clock, Harness};
+use super::worker_gate_tests::{worker_harness_with_clock, Harness};
 use crate::coordinator::active_tx_qso_key;
 use crate::message_bus::{
     ComponentId, ComponentMessage, ControlMessage, MessageType, QsoMessage, RigControlMessage,
@@ -22,6 +22,7 @@ use crossbeam_channel::Receiver;
 use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
 use pancetta_config::Config;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,7 +263,7 @@ impl Recorder {
 const SLOT_MS: i64 = 15_000;
 
 fn ms_into_slot() -> i64 {
-    chrono::Utc::now().timestamp_millis().rem_euclid(SLOT_MS)
+    UtcTimestamp::now().as_millisecond().rem_euclid(SLOT_MS)
 }
 
 /// Waits until the wall clock is 4 to 10 s into a 15 s slot, so a frame sent
@@ -429,7 +430,7 @@ async fn run_cell(cell: Cell) -> Recorded {
             .store(true, Ordering::Release),
         Reason::Disarm => elapsed.store(600_000, Ordering::SeqCst),
         Reason::Supersede => {
-            let parity = SlotParity::of(chrono::Utc::now());
+            let parity = SlotParity::of(UtcTimestamp::now());
             h.coordinator
                 .message_bus
                 .send_message(ComponentMessage::new(

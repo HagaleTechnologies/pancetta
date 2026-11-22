@@ -1,0 +1,2 @@
+# PAN-441 byte fixtures are compared byte for byte; never convert line endings.
+pancetta-qso/tests/fixtures/pan441/* -text

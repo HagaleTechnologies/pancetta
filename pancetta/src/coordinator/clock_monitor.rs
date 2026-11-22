@@ -20,7 +20,8 @@ use crate::clock_skew::{
     ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, ClockStatus, SkewDiag, SNTP_TIMEOUT,
 };
 use crate::message_bus::{ComponentId, DiagnosticLevel, MessageBus};
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +75,7 @@ impl ClockMonitorSchedule {
 pub(crate) type ClockProbe = Arc<dyn Fn() -> Result<f64, String> + Send + Sync>;
 
 /// Wall-clock source (injected so tests can step it).
-pub(crate) type WallClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub(crate) type WallClock = Arc<dyn Fn() -> UtcTimestamp + Send + Sync>;
 
 /// Spawn the monitor task. It exits on the first tick after `shutdown` is
 /// set.
@@ -259,12 +260,12 @@ mod tests {
         }
     }
 
-    /// `Utc::now()` plus a test-controlled offset in milliseconds.
+    /// `UtcTimestamp::now()` plus a test-controlled offset in milliseconds.
     fn offset_wall_clock() -> (WallClock, Arc<AtomicI64>) {
         let offset_ms = Arc::new(AtomicI64::new(0));
         let off = offset_ms.clone();
         let wall: WallClock = Arc::new(move || {
-            Utc::now() + chrono::Duration::milliseconds(off.load(Ordering::SeqCst))
+            UtcTimestamp::now() + SignedDuration::from_millis(off.load(Ordering::SeqCst))
         });
         (wall, offset_ms)
     }

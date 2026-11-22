@@ -8,7 +8,8 @@
 //! a missing entry is `Unknown`, never success, and an empty captured
 //! target set is `Disabled`, never "all accepted".
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 /// One upload destination. Display order is fixed: QRZ, ClubLog, eQSL,
 /// cqdx.io, LoTW — the fixed target letters identify services even when
@@ -230,7 +231,7 @@ pub struct CompletionToast {
     /// already been shown for this contact.
     pub terminal_shown: bool,
     /// When the current text was first shown.
-    pub since: DateTime<Utc>,
+    pub since: UtcTimestamp,
 }
 
 impl CompletionToast {
@@ -240,7 +241,7 @@ impl CompletionToast {
         uuid: &str,
         callsign: &str,
         status: Option<&QsoUploadStatus>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Self {
         let v = status.map(verdict).unwrap_or(UploadVerdict::Queued);
         let terminal = matches!(
@@ -260,7 +261,7 @@ impl CompletionToast {
     /// transition is shown once, restarting the timer; nonterminal
     /// rewordings replace the text in place without restarting it, and
     /// duplicate/pending snapshots change nothing.
-    pub fn apply_status(&mut self, status: &QsoUploadStatus, now: DateTime<Utc>) {
+    pub fn apply_status(&mut self, status: &QsoUploadStatus, now: UtcTimestamp) {
         if status.uuid != self.uuid {
             return;
         }
@@ -295,8 +296,8 @@ impl CompletionToast {
     }
 
     /// The visible text, or `None` once expired.
-    pub fn text_at(&self, now: DateTime<Utc>) -> Option<&str> {
-        if now.signed_duration_since(self.since).num_seconds() >= TOAST_SECS {
+    pub fn text_at(&self, now: UtcTimestamp) -> Option<&str> {
+        if now.duration_since(self.since).as_secs() >= TOAST_SECS {
             None
         } else {
             Some(self.text.as_str())
@@ -459,7 +460,7 @@ mod tests {
     /// AC8: toast timing, replacement and deduplication with injected times.
     #[test]
     fn pan344_toast_lifecycle() {
-        let t0 = Utc::now();
+        let t0 = UtcTimestamp::now();
         let mut toast = CompletionToast::start("u-1", "K1ABC", None, t0);
         assert_eq!(toast.text, "K1ABC logged \u{b7} uploads queued");
         assert_eq!(
@@ -474,12 +475,12 @@ mod tests {
             1,
             vec![(UploadTarget::Qrz, TargetUploadStatus::pending("queued"))],
         );
-        toast.apply_status(&pending, t0 + chrono::Duration::seconds(2));
+        toast.apply_status(&pending, t0 + SignedDuration::from_secs(2));
         assert_eq!(toast.since, t0);
         assert!(!toast.terminal_shown);
 
         // Expiry hides the text.
-        assert_eq!(toast.text_at(t0 + chrono::Duration::seconds(6)), None);
+        assert_eq!(toast.text_at(t0 + SignedDuration::from_secs(6)), None);
 
         // A terminal transition arriving after expiry shows once, for six
         // seconds from the transition.
@@ -492,16 +493,16 @@ mod tests {
                 TargetUploadStatus::new(UploadState::Accepted, "accepted"),
             )],
         );
-        toast.apply_status(&accepted, t0 + chrono::Duration::seconds(7));
+        toast.apply_status(&accepted, t0 + SignedDuration::from_secs(7));
         assert_eq!(toast.text, "K1ABC uploaded");
         assert_eq!(
-            toast.text_at(t0 + chrono::Duration::seconds(7)),
+            toast.text_at(t0 + SignedDuration::from_secs(7)),
             Some("K1ABC uploaded")
         );
-        assert_eq!(toast.text_at(t0 + chrono::Duration::seconds(13)), None);
+        assert_eq!(toast.text_at(t0 + SignedDuration::from_secs(13)), None);
 
         // A later regression snapshot cannot rewrite a shown terminal text.
-        toast.apply_status(&pending, t0 + chrono::Duration::seconds(8));
+        toast.apply_status(&pending, t0 + SignedDuration::from_secs(8));
         assert_eq!(toast.text, "K1ABC uploaded");
 
         // A snapshot for another contact never steals the toast.
@@ -514,7 +515,7 @@ mod tests {
                 TargetUploadStatus::new(UploadState::Accepted, "accepted"),
             )],
         );
-        toast.apply_status(&other, t0 + chrono::Duration::seconds(9));
+        toast.apply_status(&other, t0 + SignedDuration::from_secs(9));
         assert_eq!(toast.text, "K1ABC uploaded");
 
         // A needs-attention transition replaces the queued wording in place.
@@ -528,21 +529,21 @@ mod tests {
                 TargetUploadStatus::new(UploadState::Rejected, "record rejected"),
             )],
         );
-        toast2.apply_status(&rejected, t0 + chrono::Duration::seconds(1));
+        toast2.apply_status(&rejected, t0 + SignedDuration::from_secs(1));
         assert_eq!(toast2.text, "W2XYZ logged \u{b7} uploads need attention");
         assert_eq!(toast2.since, t0);
         let mut recovered = rejected.clone();
         recovered.targets[0].1 = TargetUploadStatus::new(UploadState::Accepted, "");
-        toast2.apply_status(&recovered, t0 + chrono::Duration::seconds(8));
+        toast2.apply_status(&recovered, t0 + SignedDuration::from_secs(8));
         assert_eq!(toast2.text, "W2XYZ uploaded");
-        assert_eq!(toast2.since, t0 + chrono::Duration::seconds(8));
-        toast2.apply_status(&recovered, t0 + chrono::Duration::seconds(9));
-        assert_eq!(toast2.since, t0 + chrono::Duration::seconds(8));
+        assert_eq!(toast2.since, t0 + SignedDuration::from_secs(8));
+        toast2.apply_status(&recovered, t0 + SignedDuration::from_secs(9));
+        assert_eq!(toast2.since, t0 + SignedDuration::from_secs(8));
 
         // A confirmed empty target set rewords to disabled, in place.
         let mut toast3 = CompletionToast::start("u-3", "N3ABC", None, t0);
         let disabled = status("u-3", "N3ABC", 1, Vec::new());
-        toast3.apply_status(&disabled, t0 + chrono::Duration::seconds(1));
+        toast3.apply_status(&disabled, t0 + SignedDuration::from_secs(1));
         assert_eq!(toast3.text, "N3ABC logged \u{b7} uploads disabled");
         assert_eq!(toast3.since, t0);
     }

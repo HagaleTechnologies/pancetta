@@ -1,7 +1,7 @@
 //! Lossless, conservative merging of a local LoTW confirmation report.
 use crate::adif::{freq_hz_to_band, AdifProcessor, AdifRecord};
 use crate::adif_import::DUPLICATE_WINDOW_MINUTES;
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use jiff::civil;
 use std::collections::BTreeMap;
 
 /// A validated replacement and one category for every report record.
@@ -23,9 +23,9 @@ fn value<'a>(record: &'a AdifRecord, name: &str) -> Option<&'a str> {
 fn positive(value: &str) -> bool {
     value.eq_ignore_ascii_case("Y") || value.eq_ignore_ascii_case("V")
 }
-fn date(value: &str) -> Option<NaiveDate> {
+fn date(value: &str) -> Option<civil::Date> {
     (value.len() == 8 && value.bytes().all(|b| b.is_ascii_digit()) && !value.starts_with("0000"))
-        .then(|| NaiveDate::parse_from_str(value, "%Y%m%d").ok())
+        .then(|| civil::Date::strptime("%Y%m%d", value).ok())
         .flatten()
 }
 #[derive(Debug)]
@@ -33,7 +33,7 @@ struct Identity {
     call: String,
     band: String,
     mode: String,
-    start: NaiveDateTime,
+    start: civil::DateTime,
 }
 fn identity(record: &AdifRecord) -> Option<Identity> {
     let call = value(record, "CALL")?.to_uppercase();
@@ -113,18 +113,18 @@ fn identity(record: &AdifRecord) -> Option<Identity> {
     } else {
         raw_time.to_string()
     };
-    let time = NaiveTime::parse_from_str(&time, "%H%M%S").ok()?;
+    let time = civil::Time::strptime("%H%M%S", &time).ok()?;
     Some(Identity {
         call,
         band,
         mode,
-        start: day.and_time(time),
+        start: day.to_datetime(time),
     })
 }
-fn report_date(record: &AdifRecord) -> Result<NaiveDate, &'static str> {
+fn report_date(record: &AdifRecord) -> Result<civil::Date, &'static str> {
     let explicit =
         value(record, "LOTW_QSL_RCVD").is_some() || value(record, "LOTW_QSLRDATE").is_some();
-    let pair = |flag, day| -> Result<NaiveDate, &'static str> {
+    let pair = |flag, day| -> Result<civil::Date, &'static str> {
         let flag = value(record, flag).ok_or("not a positive LoTW confirmation")?;
         if !positive(flag) {
             return Err("not a positive LoTW confirmation");
@@ -211,7 +211,7 @@ pub fn plan_confirmations(logbook: &[u8], report: &[u8]) -> Result<ConfirmationP
         patched: logbook.to_vec(),
         ..Default::default()
     };
-    let mut updates: BTreeMap<usize, (NaiveDate, usize)> = BTreeMap::new();
+    let mut updates: BTreeMap<usize, (civil::Date, usize)> = BTreeMap::new();
     for (i, record) in incoming.records.iter().enumerate() {
         let record = match record {
             Ok(r) => r,
@@ -275,7 +275,7 @@ pub fn plan_confirmations(logbook: &[u8], report: &[u8]) -> Result<ConfirmationP
                         other.call == id.call
                             && other.band == id.band
                             && other.mode == id.mode
-                            && (other.start - id.start).num_seconds().abs()
+                            && other.start.duration_since(id.start).as_secs().abs()
                                 <= DUPLICATE_WINDOW_MINUTES * 60
                     })
                     .map(|_| index)
@@ -306,7 +306,7 @@ pub fn plan_confirmations(logbook: &[u8], report: &[u8]) -> Result<ConfirmationP
         let day = value(record, "LOTW_QSLRDATE")
             .and_then(date)
             .map_or(day, |old| old.min(day))
-            .format("%Y%m%d")
+            .strftime("%Y%m%d")
             .to_string();
         let flag = if value(record, "LOTW_QSL_RCVD").is_some_and(|s| s.eq_ignore_ascii_case("V")) {
             "V"

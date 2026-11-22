@@ -32,7 +32,7 @@ include = [
 # Workspace dependencies
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]

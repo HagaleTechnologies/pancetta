@@ -463,7 +463,7 @@ fn c19_live_safe_section_change_applies_even_mid_qso() {
 
 #[test]
 fn c19_no_change_is_noop() {
-    // `Config::default()` stamps `metadata.last_modified = Utc::now()`, so two
+    // `Config::default()` stamps `metadata.last_modified = UtcTimestamp::now()`, so two
     // fresh defaults are NOT byte-identical. Clone one and clear the metadata so
     // the two configs are genuinely identical — a true no-op reload.
     let mut old = Config::default();

@@ -1,0 +1,1150 @@
+{
+  "ticket": "PAN-213",
+  "generated_utc": "2026-11-22T13:32:56Z",
+  "roots": {
+    "repository": "/private/tmp/pan213.Vckt",
+    "corpus_dir": "/Users/thagale/.pancetta/corpus",
+    "nas_dir": "/Users/Shared/maersk/offload/pancetta-wav-corpus"
+  },
+  "month_shards_searched": [
+    "2026-07",
+    "2026-08",
+    "2026-09",
+    "2026-10",
+    "2026-11"
+  ],
+  "counts": {
+    "distinct_wavs": {
+      "referenced": 2166,
+      "resolved_local": 2073,
+      "resolved_nas": 0,
+      "retained_stable": 0,
+      "dropped": 93
+    },
+    "references": {
+      "total": 2286,
+      "resolved_local": 2193,
+      "resolved_nas": 0,
+      "retained_stable": 0,
+      "dropped": 93
+    }
+  },
+  "dropped": [
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003330.wav",
+      "expected_sha256": "773b009bbe928612f117e90d547fc9d9fce42282b9cd6d41ebc9c966b1359e4b",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 3
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002745.wav",
+      "expected_sha256": "91121b336c2c0e657454b9d24b7a8b4dd8ad3d2c6cf0a92e58240b3dd7f439da",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 4
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002630.wav",
+      "expected_sha256": "166fe3b7673c1b89db388479dbe203cd3873a57f1e14b4517bd5b866bafed1dc",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 5
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005413.wav",
+      "expected_sha256": "1c53284d8f08a5a0105fd9039c65a197f3d2ad98b267932a09640f23c232807a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 6
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002700.wav",
+      "expected_sha256": "06fec54c745c787ce8231d2a200c7b2821540492a057d09ef272eb200fca1780",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 7
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003630.wav",
+      "expected_sha256": "c6c0684db3207ea0dce1a21df74a9342880b4e2e9fa38abe00ea8d0c784cabc2",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 8
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005828.wav",
+      "expected_sha256": "5ba100a8df172d99a67711aa9f1c7b1c46402a928cb62e34a819b3242e051f22",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 9
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005713.wav",
+      "expected_sha256": "969967dbd52cc42a6d6ef9b312eb702bcab0b2d376d061b1c53e61e9c6438ca1",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 10
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005528.wav",
+      "expected_sha256": "17c4b25a92a1f13cbcee1722334a7048870a09431905445901390457b402a4cf",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 11
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002900.wav",
+      "expected_sha256": "2dd06e9841aa7dbc8154f9d1abbaf7eabb287899b44b169b6db93733e7b595f3",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 12
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011158.wav",
+      "expected_sha256": "f372884bb881aecc346ef8e3a1ffd43e3bcab9c600ce1d473ac5c502eac9d9cc",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 13
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003615.wav",
+      "expected_sha256": "53783baa59d7404dd2e44649adfb1f4391c552beda7248ebd4b3d71c91c59833",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 14
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010843.wav",
+      "expected_sha256": "3e5a11b4ccbd2df92644685c4d400c9659a8bfcccf4f0583196dac5529e3823d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 15
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010044.wav",
+      "expected_sha256": "c0e03eaaff054cbed6e95404c003e8f1b15eb4aa4bf6852905c198fbf1cc8903",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 16
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011028.wav",
+      "expected_sha256": "545081d2880ea992594290656bd24a9d68b9a0cc86e537e430b51039a5bbc27b",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 17
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004514.wav",
+      "expected_sha256": "5b04dd2c9c3f4b5f201b78b9c30590f1cb3c155c5e11ce36e282461cd3c2f1c9",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 18
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005428.wav",
+      "expected_sha256": "4feabe92785f9128493607fa2a5854e051a10cbac3ecd87bcce546cd3ce5444b",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 19
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010543.wav",
+      "expected_sha256": "72dec25f30af21771d1446af77a41e5643c173a8fa55868889515e8574a4e2d1",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 20
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002615.wav",
+      "expected_sha256": "3c0f167c0477aee31ca709e411a0dfe2594c62ce98c42cef9df999a2a136c9d6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 21
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010828.wav",
+      "expected_sha256": "1153d12c9a699aea23afbfd5d118044bc6568650bd8f5fcbdb6e660facdb222f",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 22
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005858.wav",
+      "expected_sha256": "2fd20708cf934b58021c5f77111a5c277bbf21059a07bcf7c502451f2a360bf4",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 23
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010858.wav",
+      "expected_sha256": "63c895296bc4f73caaa577d4f2662ba327085a9d22a92078b47540a8241a5501",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 24
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010713.wav",
+      "expected_sha256": "7dfd61f7ede3055d8018cf83bdf4c9518452d05180f52d0330f8a3eb4851c743",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 25
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010813.wav",
+      "expected_sha256": "df1bfa5d977d3bf31bf170299245014b800e1c650b9361ca22cc9dc51a184908",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 26
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011058.wav",
+      "expected_sha256": "8396309c25afaffe8a7099c8f1a1f9caffd8f5c88dab893e6f08da714ccaca26",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 27
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004000.wav",
+      "expected_sha256": "7882622fa7102f38fadd3c7d7e29cbda422afd5ac5d4636887eb9f51361a4518",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 28
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003845.wav",
+      "expected_sha256": "e26226971661845cee112ee83708c672a0fdf3130a8e9bc3fc0ba7a2ca70080d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 29
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_015913.wav",
+      "expected_sha256": "202f38b8a77290094176c7500295d429bb134e75de2b7f54358aef5742811ac1",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 30
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004015.wav",
+      "expected_sha256": "6100352384b62eaeaddb7bea0c51e3d3e7d95ddc5551dcc474f608da8c438936",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 31
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011128.wav",
+      "expected_sha256": "7ad426a8e937d5d4a501d79f9c679b63f15316e85c8d2929f6047e3df4416614",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 32
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003345.wav",
+      "expected_sha256": "c08e6126c8a4be368bd2c3c1f6fc722835482c106d0319009b0d2aa1d3947f33",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 33
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005213.wav",
+      "expected_sha256": "2b2fd1a80a61e1c0e1049faffb69549b92d8c7620d92ff322f2a0a0218bbd707",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 34
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002545.wav",
+      "expected_sha256": "0a37a501a153bf071404c6e48d7929e4ae7c5dbcc4d2edbffabbb8eb21d84454",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 35
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005458.wav",
+      "expected_sha256": "f975236cc4580bf6582f3c1e56ecaba5dc7c9fd4b2dbaa0ea7fb6a30c3741d40",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 36
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005728.wav",
+      "expected_sha256": "57c63a417f3ed279d68ca465a7c94782a5421941e5e20f57e2f776037504b13d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 37
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005928.wav",
+      "expected_sha256": "7079eca01d47a42dac723f4e6142fa6ac4742f60f21b254e8ae609291fed5d37",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 38
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002715.wav",
+      "expected_sha256": "869cff497b9b3a0ab1631329df9f7213cfd222df23db615193ffa71a717c09a5",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 39
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003815.wav",
+      "expected_sha256": "a76f751eb0181e93801cc7208cf600c71cba4e250e5eb8aa961feb73774d0c9a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 40
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024658.wav",
+      "expected_sha256": "903adfff628274162f0a0d7b4378e9b924c4a407cab515531e080bb12bebd32e",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 41
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010928.wav",
+      "expected_sha256": "c7f220efea8776899e9137326e6a2d3922cb8bd30315b0fb6b784f6b98b0e1a6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 43
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003515.wav",
+      "expected_sha256": "6dac30ab28da96b1605c8778b3331187c3b902fb01e1ce95f85d38a6946dcb8e",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 44
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_023358.wav",
+      "expected_sha256": "abe3e5900c6a3547896c49b05d60fc1e9a695c91653b8e67d0d2283277636c16",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 45
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004030.wav",
+      "expected_sha256": "26c38282bc636090db5478e09f6d4caded9c661a8dda060c7d3aaf5b02642224",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 46
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010743.wav",
+      "expected_sha256": "e01f812912dc067582775d03fa834bb2e1ec9db1b32aa9b17c12b14e7b07626a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 47
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003715.wav",
+      "expected_sha256": "f60da148fe16a6a8aee0ffc0897b71585345138081f070f7b3f4f2e2e1a3167d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 48
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002915.wav",
+      "expected_sha256": "ac07db234020b115ad584033b553c8d15fd2047c7313ff2f0816da4e3e40768e",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 49
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003830.wav",
+      "expected_sha256": "fbeddac8fb4266a65ed88a2bcea3ee0a204d53c639e49b8ffa5e72c229ef3ac6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 50
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003600.wav",
+      "expected_sha256": "eb762156b2316ab5cb707b9480242e0d9e82d06f0e9a48dadf24a4d0aa4de90a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 51
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024528.wav",
+      "expected_sha256": "5c54066c3b9fd8ef35faf1497a733e7186d73f67f2af3c859258974c5c36e855",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 52
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_015813.wav",
+      "expected_sha256": "5a1e5a58cb42a96f65931dce42daf869e05e5b958cad984800770b6872f27c12",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 53
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010513.wav",
+      "expected_sha256": "ae04beefaa86e7f05e1c7b2e070acd6704a7fff411036d788e7727167f7560fe",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 54
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005628.wav",
+      "expected_sha256": "7eae9ecd4b32b8cb4e5cdb82a3520fcd794b39fd2a0a639519c11aa55e8a1ee6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 55
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_020813.wav",
+      "expected_sha256": "a55b130deaac45b6d7fb0c19e659765920b673d4a1a9d5419b9e48ee035754a3",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 56
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_023958.wav",
+      "expected_sha256": "97dc017756b52b94d9d32450009ec5ab9e8c41778760c6db71e457af5be00bf9",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 57
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024158.wav",
+      "expected_sha256": "a0eb8030a7dcb68c2ce3a1fc358c903493b55784ca8c1388161c6f7b00791966",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 58
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003745.wav",
+      "expected_sha256": "fa4acd929d51642e7309f4d3429e65fd2daf90c3a3e824929202f8d937a5fbd6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 59
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005558.wav",
+      "expected_sha256": "01a6b67f47ff8fb7555a07d53da73f9e1a8e7e9988732305f9a7191efb507555",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 60
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_023728.wav",
+      "expected_sha256": "863dee5410c094586a5dd1409c5b45e78beb7f82da68f2a07215d6fccb52c726",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 61
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024428.wav",
+      "expected_sha256": "4982bb3295984fa729bde210e56b21cf01328d09f20236a099fb0edcfc863434",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 62
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004558.wav",
+      "expected_sha256": "cb36bfc430af5ed5242ad3e53cd7abbcabbdf4604ef54da36dda9ed2b4fc49a7",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 63
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002600.wav",
+      "expected_sha256": "9e5b9243b432ca7660a68b78dc4fa293cf4bea3fcb3792bca1da4bd7b3374aba",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 64
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003730.wav",
+      "expected_sha256": "24acc7134e34192230a9fd0220996b3a243e34315af0a20eb3cf817de4aaebae",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 65
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_023828.wav",
+      "expected_sha256": "285e9b2ee1dcedb5581a61b48d9c3f9f2836e6c66d89ab1f0dfa8ff19b70cc40",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 66
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010958.wav",
+      "expected_sha256": "125406a75ac6543cf30997c300cb7c453e9a5a5ccb1b8617a6b6c80e9c3f7262",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 67
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004928.wav",
+      "expected_sha256": "cad26712204b63e61f1263ac5b6c29d041cd8012f0dace5f28b667d1b64b3681",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 68
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002645.wav",
+      "expected_sha256": "1bd3e87f3f4394d3324a445391b9f00a3e7212ba1923a5de74455f5eca97bcb6",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 69
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003930.wav",
+      "expected_sha256": "c328dfb5289d9cad4e0280f5ddac3a7c2f82427ccfb708aa4667044fa9a2ec5a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 70
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_023628.wav",
+      "expected_sha256": "38cef62f96e57195c7f82368bf974157154b99b3e6404a139fc69476cae012c5",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 71
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002730.wav",
+      "expected_sha256": "dce2ea002c6bbef9a64ea216f258ed648042aeb85275d26ab382b5ef4f38baf1",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 72
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011143.wav",
+      "expected_sha256": "1ef0e5a588ae4b9c8bdb4bdb6b13c4126b544961dde0d2329da7eaea1711b6ec",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 74
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005843.wav",
+      "expected_sha256": "f8b30245f833b812795145267087b147b579e436999b8f01af5b8ff2319bf12d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 75
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003645.wav",
+      "expected_sha256": "baa9a81c41b5b4784ba43d28c7e8a43a4193a139132c27e98dfd966e5785771a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 76
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_020143.wav",
+      "expected_sha256": "c3d2fc2690d5d2471cf214542fa835b9822a4db1f6921571c9a3ddfadfe71bdf",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 77
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002815.wav",
+      "expected_sha256": "19820265c0b08989858129b079f430b6b30a834766717577f1e78c93312a7731",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 78
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004543.wav",
+      "expected_sha256": "c3175142e7c133f7c49ad861c1e9e414df2cc735a725a64c14b2fe0653e44a87",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 79
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005643.wav",
+      "expected_sha256": "50a53397557ab4518f9c3838d69e07f7a0918ff603013250a5cf0fafb6f0a129",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 80
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005743.wav",
+      "expected_sha256": "dade39795b3a9dec81eec79dc6f003e15fb6694d36bd2b5e0d36e70b714c6879",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 81
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005943.wav",
+      "expected_sha256": "c0f5758354f3589552bcc89142df7178899d1625f18c930e4f2f879ce2dda2f9",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 82
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010113.wav",
+      "expected_sha256": "75e51857f8860afb60864b1303935c9d1d2a0cec8338640611103262e9d017a7",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 83
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_015928.wav",
+      "expected_sha256": "def7c7f70a5ec7380c55039bfaef9ceec3e1b28df6a44eecbf9b266f16e98fe0",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 84
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_015858.wav",
+      "expected_sha256": "6717ea3998d9f63e825b009c4c3aa0b6ebbaf29d50a34fa1170bf79ef78947c2",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 85
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_005758.wav",
+      "expected_sha256": "8e17abbbcc95017a3c510f40b5832d42daff52da7092b45a6f73a018dda8fef4",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 86
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_003530.wav",
+      "expected_sha256": "566cf9fc928d7de3f45929f8f9acf7bd494a626da49f02b3f1a72d2bd7cce0fa",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 88
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024358.wav",
+      "expected_sha256": "a68a4a0c7bf062d938e6e67ede2ca699d3fc5f45828711a7e3c7549831fcdc9a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 90
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_015843.wav",
+      "expected_sha256": "bea8fef83060b2ea5e95eee816b241a9c1dd16000f295b57ab8df74819873601",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 91
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004728.wav",
+      "expected_sha256": "ff31e8852f365e9ab78fa1d672618617d6c3ad5ebee0aafb1d7a1e8463fd063a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 92
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_010913.wav",
+      "expected_sha256": "e90205380ecd12769dd0ec3f7425c609476dbfe7db958cd53b74fbf18ced683d",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 93
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_002845.wav",
+      "expected_sha256": "75e84f8e3b18cabd0e8d18fa0f34bc928201b9d8a5cad3b3ceae476d97ee9b69",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 94
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_020543.wav",
+      "expected_sha256": "4d580622a02afda926a5890bf16c7e9b85420aad16ac2b1e58abc1718fee2435",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 95
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_004658.wav",
+      "expected_sha256": "871d6f82ce2df8c0a4757de0ac70f073456374b342bf320a3335c51d809b43ca",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 96
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_011043.wav",
+      "expected_sha256": "c2613224afddaaeec6e1faf54ad27bdc744665b9270d66babc6fafa32c8c0a4a",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 97
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024628.wav",
+      "expected_sha256": "ef5f9d8967f9c81f784e8caafa722afd42841f31dbb173fb92052c7ddfae4cbc",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 98
+        }
+      ]
+    },
+    {
+      "old_wav_path": "~/.pancetta/recordings/ft8_20260420_024558.wav",
+      "expected_sha256": "6ea5be6a8a8339609d2fd4559756f62fb32145c166728024764a9d5c37a1d792",
+      "reason": "no_candidate",
+      "rejected_candidates": [],
+      "occurrences": [
+        {
+          "manifest": "research/corpus/surveys/2026-05-30/existing_top100.entries.json",
+          "row_index": 99
+        }
+      ]
+    }
+  ]
+}

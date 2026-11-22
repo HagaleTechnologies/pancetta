@@ -16,6 +16,8 @@
 //!   `last_call_at` and `call_count` alone: the rearm paces and counts its
 //!   own re-sends, exactly as it does while the DX is silent (PAN-129).
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 const OUR: &str = "K5ARH";
 const DX: &str = "K9ZZ";
@@ -256,7 +258,7 @@ async fn manual_sending_report_repeated_report_stays_and_resends() {
     // A slot after our last call, rearm re-sends our R-report: it paces
     // from its own last call, exactly as it does while the DX is silent.
     manager
-        .rearm_manual_calls_at(last + Duration::seconds(15))
+        .rearm_manual_calls_at(last + SignedDuration::from_secs(15))
         .await;
     let rearmed = sends(&drain(&mut rx));
     assert_eq!(rearmed.len(), 1, "rearm re-sends R, got {:?}", rearmed);
@@ -293,7 +295,7 @@ async fn repeated_report_leaves_call_count_and_last_call_at_alone() {
         .unwrap();
     // Pin `last_call_at` well away from "now" so a restamp to the decode
     // time cannot coincide with it, and arm a C3 reprieve to cancel.
-    let pinned_last_call_at = Utc::now() - Duration::seconds(20);
+    let pinned_last_call_at = UtcTimestamp::now() - SignedDuration::from_secs(20);
     {
         let mut qsos = manager.qsos.write().await;
         let progress = qsos.get_mut(&qso_id).unwrap();
@@ -379,7 +381,7 @@ async fn engaged_sending_report_survives_call_cap_and_completes_on_rr73() {
     // reached. A repeated report itself spends no call (PAN-129), so the
     // cap is reached through the rearm's real re-sends, one own TX slot
     // (30 s) apart, starting a slot after the regression's re-send.
-    let mut rearm_at: Option<DateTime<Utc>> = None;
+    let mut rearm_at: Option<UtcTimestamp> = None;
     for _ in 0..6 {
         manager
             .process_message(
@@ -395,7 +397,7 @@ async fn engaged_sending_report_survives_call_cap_and_completes_on_rr73() {
             .await
             .unwrap();
         let at = match rearm_at {
-            Some(previous) => previous + Duration::seconds(30),
+            Some(previous) => previous + SignedDuration::from_secs(30),
             None => {
                 manager
                     .get_qso(qso_id)
@@ -404,7 +406,7 @@ async fn engaged_sending_report_survives_call_cap_and_completes_on_rr73() {
                     .metadata
                     .last_call_at
                     .unwrap()
-                    + Duration::seconds(15)
+                    + SignedDuration::from_secs(15)
             }
         };
         manager.rearm_manual_calls_at(at).await;
@@ -425,7 +427,7 @@ async fn engaged_sending_report_survives_call_cap_and_completes_on_rr73() {
 
     // Within the time window: the cap must NOT retire an engaged QSO.
     manager
-        .check_timeouts_at(first + Duration::minutes(1))
+        .check_timeouts_at(first + SignedDuration::from_mins(1))
         .await;
     assert!(
         manager.get_qso(qso_id).await.is_ok(),
@@ -485,7 +487,7 @@ async fn engaged_sending_report_still_retires_on_time_watchdog() {
         .unwrap();
     // Past the 5-min watchdog → retired even though "engaged".
     manager
-        .check_timeouts_at(first + Duration::minutes(6))
+        .check_timeouts_at(first + SignedDuration::from_mins(6))
         .await;
     assert!(
         matches!(

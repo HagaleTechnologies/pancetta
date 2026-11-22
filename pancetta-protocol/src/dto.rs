@@ -5,8 +5,8 @@
 //! pancetta-core enum types with PascalCase serialization use `wire_serde`
 //! helpers to re-map them to the schema's camelCase values.
 use crate::wire_serde;
-use chrono::{DateTime, Utc};
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 
 /// A DX-Hunter row (a spotted/decoded station).
@@ -45,7 +45,7 @@ pub struct DxRow {
     #[serde(with = "wire_serde::slot_parity_opt")]
     pub slot_parity: Option<SlotParity>,
     /// When the station was last heard or spotted (UTC).
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: UtcTimestamp,
     /// "local" | "network" | "both" (string for forward-compat).
     pub source: String,
 }
@@ -91,7 +91,7 @@ pub struct QsoProgress {
     /// (for example `"CQ"` or `"→ us -09"`); `None` when nothing recent was heard.
     pub dx_last_activity: Option<String>,
     /// When this QSO started (UTC).
-    pub started_at: DateTime<Utc>,
+    pub started_at: UtcTimestamp,
 }
 
 /// A manual call parked in the cross-parity queue.
@@ -124,7 +124,7 @@ pub struct Spectrum {
     /// Sequence number, monotone per display-feed session, so consumers can detect drops.
     pub seq: u64,
     /// Time of the waterfall row (UTC).
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
 }
 
 /// One ranked TX-placement candidate — dispensa Q-0026.
@@ -167,7 +167,7 @@ pub struct Placement {
 #[serde(rename_all = "camelCase")]
 pub struct DecodedView {
     /// When the frame was decoded (UTC).
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     /// RF-absolute frequency in Hz: the RX dial plus the frame's audio offset.
     pub frequency_hz: f64,
     /// Signal-to-noise ratio in dB, rounded to the nearest integer.
@@ -219,7 +219,7 @@ mod tests {
             rarity_tier: Some("rare".into()),
             audio_offset_hz: Some(1934),
             slot_parity: Some(SlotParity::Even),
-            last_seen: Utc::now(),
+            last_seen: UtcTimestamp::now(),
             source: "local".into(),
         };
         let j = serde_json::to_string(&r).unwrap();
@@ -259,7 +259,7 @@ mod tests {
             report_sent: Some(-9),
             report_received: Some(-12),
             dx_last_activity: Some("\u{2192} us -12".into()),
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let j = serde_json::to_string(&q).unwrap();
         assert!(j.contains(r#""qsoId""#), "expected qsoId in: {j}");
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<PendingCall>(&pj).unwrap(), p);
 
         let d = DecodedView {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency_hz: 14_075_931.0,
             snr: -8,
             delta_time: 0.2,
@@ -336,7 +336,7 @@ mod tests {
             bin_width_hz: 5.86,
             mags_db: vec![-104.2, -98.1, -110.0],
             seq: 1234,
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains(r#""binStartHz""#), "expected binStartHz in: {j}");

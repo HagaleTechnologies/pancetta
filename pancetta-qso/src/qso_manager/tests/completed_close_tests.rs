@@ -3,7 +3,9 @@
 //! id through `resend_completed_close`, however long ago it completed,
 //! and never opens a second QSO or emits a second `QsoCompleted`.
 use super::*;
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::ResponseStep;
 use std::sync::atomic::AtomicBool;
 
@@ -101,7 +103,7 @@ async fn resend_completed_close_past_the_grace_rekeys_the_same_qso() {
     ));
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     let before = call_count(&manager, id).await;
@@ -165,7 +167,7 @@ async fn resend_completed_close_sends_a_73_when_the_last_sent_frame_is_a_report(
             .messages
             .retain(|m| m.direction != MessageDirection::Sent);
         progress.messages.push(QsoMessage {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             direction: MessageDirection::Sent,
             message_type: MessageType::ReportAck {
                 to_station: DX.into(),
@@ -179,7 +181,7 @@ async fn resend_completed_close_sends_a_73_when_the_last_sent_frame_is_a_report(
     }
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     let mut rx = manager.subscribe();
@@ -216,7 +218,7 @@ async fn resend_completed_close_addresses_the_73_to_the_worked_call() {
         .their_callsign = Some(format!("EA8/{DX}"));
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     let mut rx = manager.subscribe();
@@ -287,7 +289,7 @@ async fn resend_completed_close_refuses_what_it_must_not_rekey() {
         .initiated_by = CallInitiation::Auto;
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     assert_refused(&manager, id, FREQ).await;
@@ -312,7 +314,7 @@ async fn resend_completed_close_refuses_what_it_must_not_rekey() {
     let id = complete_manual(&manager, false, None).await;
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     dial.store(7_074_000, Ordering::Relaxed);
@@ -334,7 +336,7 @@ async fn resend_completed_close_denied_remote_client_charges_nothing() {
     let id = complete_manual(&manager, true, Some("client-a".into())).await;
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     let before = call_count(&manager, id).await;
@@ -365,7 +367,7 @@ async fn backdate_completion_for_test_moves_only_completed_qsos() {
     let manager = manager();
     assert!(
         !manager
-            .backdate_completion_for_test(Uuid::new_v4(), Duration::seconds(60))
+            .backdate_completion_for_test(Uuid::new_v4(), SignedDuration::from_secs(60))
             .await
     );
 
@@ -377,7 +379,7 @@ async fn backdate_completion_for_test_moves_only_completed_qsos() {
     let before = other.get_qso(active).await.unwrap();
     assert!(
         !other
-            .backdate_completion_for_test(active, Duration::seconds(60))
+            .backdate_completion_for_test(active, SignedDuration::from_secs(60))
             .await
     );
     let after = other.get_qso(active).await.unwrap();
@@ -397,11 +399,11 @@ async fn backdate_completion_for_test_moves_only_completed_qsos() {
     );
     assert!(
         manager
-            .backdate_completion_for_test(id, Duration::seconds(60))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(60))
             .await
     );
     let moved = completed_at(manager.get_qso(id).await.unwrap());
-    assert_eq!(original - moved, Duration::seconds(60));
+    assert_eq!(original - moved, SignedDuration::from_secs(60));
     assert_eq!(
         manager
             .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)

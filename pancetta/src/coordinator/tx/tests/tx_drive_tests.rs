@@ -1,4 +1,5 @@
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 fn assert_db(baseline: &[f32], adjusted: &[f32], expected_db: f32) {
     assert_eq!(baseline.len(), adjusted.len());
@@ -92,7 +93,7 @@ fn saved_drive_is_used_by_the_first_buffer_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_drive_scales_real_worker_audio() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::{request, worker_harness_with_config};
+    use crate::coordinator::tx::worker_gate_tests::{request, worker_harness_with_config};
     use crate::message_bus::{ComponentId, MessageType};
     use std::time::Duration;
 
@@ -228,7 +229,7 @@ fn overdrive_backs_off_the_next_burst_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_meter_summary_scales_the_next_real_worker_burst() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use std::sync::atomic::Ordering;
 
     let mut config = pancetta_config::Config::default();
@@ -279,7 +280,7 @@ async fn clean_meter_summary_scales_the_next_real_worker_burst() {
     );
 }
 
-type WorkerHarness = crate::coordinator::tx::pan115_worker_gate_tests::Harness;
+type WorkerHarness = crate::coordinator::tx::worker_gate_tests::Harness;
 
 /// One worker burst: request `text`, wait for its keyed waveform, confirm the
 /// key-down and start playback as Hamlib and Audio would, feed `alc` as the
@@ -295,7 +296,7 @@ async fn transmit_readings(
     Vec<String>,
     Vec<crate::message_bus::RigControlMessage>,
 ) {
-    use crate::coordinator::tx::pan115_worker_gate_tests::request;
+    use crate::coordinator::tx::worker_gate_tests::request;
     use crate::message_bus::{MessageType, RigControlMessage};
     use std::time::{Duration, Instant};
     request(h, text).await;
@@ -331,7 +332,7 @@ async fn transmit_readings(
     .await
     .expect("worker sent one keyed waveform");
     attempt.confirm();
-    playback.expect("audio ack").started(chrono::Utc::now());
+    playback.expect("audio ack").started(UtcTimestamp::now());
     for level in alc {
         attempt.sample(pancetta_core::tx_meter::TxMeterReading {
             alc: *level,
@@ -419,7 +420,7 @@ fn saved(db: f32) -> super::super::tx_drive::SavedTxDrive {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_burst_uses_the_split_aware_tx_bands_drive() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use std::sync::atomic::Ordering;
     let mut config = pancetta_config::Config::default();
     config.audio.auto_drive.enabled = true;
@@ -462,7 +463,7 @@ async fn first_burst_uses_the_split_aware_tx_bands_drive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlearned_band_starts_at_minus_six_and_ramps() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use std::sync::atomic::Ordering;
     let mut config = pancetta_config::Config::default();
     config.audio.auto_drive.enabled = true;
@@ -481,7 +482,7 @@ async fn unlearned_band_starts_at_minus_six_and_ramps() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_or_invalid_alc_does_not_change_drive() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use crate::message_bus::RigControlMessage;
     use std::sync::atomic::Ordering;
     let mut config = pancetta_config::Config::default();
@@ -520,7 +521,7 @@ async fn missing_or_invalid_alc_does_not_change_drive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn learned_drive_scales_the_first_worker_buffer_after_restart() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_in_home;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_in_home;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     let home = tempfile::tempdir().unwrap();
@@ -564,7 +565,7 @@ async fn learned_drive_scales_the_first_worker_buffer_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bundle_burst_steps_drive_once_with_one_key_down() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use crate::message_bus::{
         ComponentId, ComponentMessage, MessageType, RigControlMessage, TransmitRequestItem,
         TxOrigin,
@@ -646,7 +647,7 @@ async fn bundle_burst_steps_drive_once_with_one_key_down() {
                 .1
                 .take()
                 .expect("audio ack")
-                .started(chrono::Utc::now());
+                .started(UtcTimestamp::now());
             attempt.sample(alc_sample(0.02));
             attempt.sample(alc_sample(0.03));
         }
@@ -708,7 +709,7 @@ fn a_stale_burst_summary_cannot_undo_calibration() {
 
 #[tokio::test]
 async fn calibrated_drive_scales_the_next_real_burst() {
-    use crate::coordinator::tx::pan115_worker_gate_tests::worker_harness_with;
+    use crate::coordinator::tx::worker_gate_tests::worker_harness_with;
     use std::sync::atomic::Ordering;
     let mut config = pancetta_config::Config::default();
     config.audio.auto_drive.enabled = true;

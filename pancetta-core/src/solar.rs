@@ -10,7 +10,9 @@
 //! far-east station's sunrise can fall on the previous UTC date and a
 //! far-west station's sunset on the next one.
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use crate::time::UtcTimestamp;
+use jiff::civil;
+use jiff::SignedDuration;
 
 /// Zenith angle of the sun's centre at sunrise and sunset, in degrees.
 const SUNRISE_ZENITH_DEG: f64 = 90.833;
@@ -32,9 +34,9 @@ pub const GREY_LINE_WINDOW_SECS: i64 = 1800;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SunEvents {
     /// Sunrise before local solar noon, or `None` during polar day or night.
-    pub sunrise: Option<DateTime<Utc>>,
+    pub sunrise: Option<UtcTimestamp>,
     /// Sunset after local solar noon, or `None` during polar day or night.
-    pub sunset: Option<DateTime<Utc>>,
+    pub sunset: Option<UtcTimestamp>,
 }
 
 /// Which grey-line transition a station is in.
@@ -134,13 +136,13 @@ fn event_minutes(
 }
 
 /// Convert minutes after `date` 00:00 UTC to an instant, rounded to the second.
-fn minutes_to_utc(date: NaiveDate, minutes: f64) -> Option<DateTime<Utc>> {
-    let midnight = date.and_hms_opt(0, 0, 0)?.and_utc();
+fn minutes_to_utc(date: civil::Date, minutes: f64) -> Option<UtcTimestamp> {
+    let midnight = UtcTimestamp::from_civil(date.to_datetime(civil::Time::midnight()))?;
     let secs = (minutes * 60.0).round();
     if !secs.is_finite() {
         return None;
     }
-    midnight.checked_add_signed(Duration::seconds(secs as i64))
+    midnight.checked_add(SignedDuration::from_secs(secs as i64))
 }
 
 /// Sunrise and sunset at (`lat_deg`, `lon_deg`; north and east positive)
@@ -150,7 +152,7 @@ fn minutes_to_utc(date: NaiveDate, minutes: f64) -> Option<DateTime<Utc>> {
 /// so either may fall on a neighbouring UTC date (Sydney's sunrise for
 /// 2026-06-21 is about 21:00 UTC on 2026-06-20). An event is `None` during
 /// polar day or polar night, or when the coordinates are not finite.
-pub fn sun_events(lat_deg: f64, lon_deg: f64, date: NaiveDate) -> SunEvents {
+pub fn sun_events(lat_deg: f64, lon_deg: f64, date: civil::Date) -> SunEvents {
     let none = SunEvents {
         sunrise: None,
         sunset: None,
@@ -158,10 +160,10 @@ pub fn sun_events(lat_deg: f64, lon_deg: f64, date: NaiveDate) -> SunEvents {
     if !lat_deg.is_finite() || !lon_deg.is_finite() {
         return none;
     }
-    let Some(midnight) = date.and_hms_opt(0, 0, 0) else {
+    let Some(midnight) = UtcTimestamp::from_civil(date.to_datetime(civil::Time::midnight())) else {
         return none;
     };
-    let jd_midnight = midnight.and_utc().timestamp() as f64 / 86_400.0 + UNIX_EPOCH_JD;
+    let jd_midnight = midnight.as_second() as f64 / 86_400.0 + UNIX_EPOCH_JD;
     let noon = solar_noon_minutes(jd_midnight, lon_deg);
 
     let at = |sign: f64| {
@@ -184,14 +186,14 @@ pub fn sun_events(lat_deg: f64, lon_deg: f64, date: NaiveDate) -> SunEvents {
 pub fn grey_line_phase(
     lat_deg: f64,
     lon_deg: f64,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     window_secs: i64,
 ) -> Option<GreyLinePhase> {
     if window_secs < 0 {
         return None;
     }
-    let today = now.date_naive();
-    let dates = [today.pred_opt(), Some(today), today.succ_opt()];
+    let today = now.to_civil().date();
+    let dates = [today.yesterday().ok(), Some(today), today.tomorrow().ok()];
 
     let mut best: Option<(i64, GreyLinePhase)> = None;
     for date in dates.into_iter().flatten() {
@@ -201,7 +203,7 @@ pub fn grey_line_phase(
             (events.sunset, GreyLinePhase::Sunset),
         ] {
             let Some(at) = event else { continue };
-            let distance = (at - now).num_seconds().abs();
+            let distance = (at - now).as_secs().abs();
             if distance <= window_secs && best.is_none_or(|(d, _)| distance < d) {
                 best = Some((distance, phase));
             }
