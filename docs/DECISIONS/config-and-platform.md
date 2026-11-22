@@ -614,6 +614,10 @@ binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; docto
   NTP steps and, where the monotonic clock stops in suspend (Linux, macOS), sleep/wake. A step
   clears the warning at once, logs a `clock.step` Warn (at most one per 60 s), and schedules a
   re-check at `max(last_probe + 30 min, step + 30 s)`.
+  PAN-358: the monitor no longer has a detector of its own. It reads the coordinator's
+  `pancetta_core::SlotClock` each tick and reports that clock's events; a step under 1 s reads
+  "under 1 s, slot timing kept" instead of "re-anchored to UTC". The QSO watchdog takes its
+  PAN-296 budget resets from the same clock.
 - **Surfacing.** Each `clock.skew` / `clock.step` entry goes to the Diagnostics overlay through
   `emit_diagnostic_full` **and** to `tracing` (`clock skew:` / `clock step:`), because headless mode
   drops the TUI bus receiver. An unreachable server logs one Info entry and shows no chip.
