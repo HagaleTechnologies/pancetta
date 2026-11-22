@@ -1,5 +1,6 @@
 use super::snapshot_item_from_progress;
-use chrono::{Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{
     GridSquares, MessageDirection, QsoMetadata, QsoProgress, QsoState, SignalReports,
 };
@@ -7,11 +8,11 @@ use pancetta_qso::{
 /// Build a QsoProgress mid-exchange: we called them, sent our grid,
 /// and just received their report.
 fn fixture_progress() -> QsoProgress {
-    let start = Utc::now() - Duration::seconds(45);
+    let start = UtcTimestamp::now() - SignedDuration::from_secs(45);
     let their_call = "JA1ABC".to_string();
     let messages = vec![
         pancetta_qso::states::QsoMessage {
-            timestamp: start + Duration::seconds(15),
+            timestamp: start + SignedDuration::from_secs(15),
             direction: MessageDirection::Sent,
             message_type: pancetta_qso::states::MessageType::CqResponse {
                 calling_station: their_call.clone(),
@@ -23,7 +24,7 @@ fn fixture_progress() -> QsoProgress {
             frequency: 1500.0,
         },
         pancetta_qso::states::QsoMessage {
-            timestamp: start + Duration::seconds(30),
+            timestamp: start + SignedDuration::from_secs(30),
             direction: MessageDirection::Received,
             message_type: pancetta_qso::states::MessageType::SignalReport {
                 to_station: "K5ARH".to_string(),
@@ -123,7 +124,7 @@ fn snapshot_derives_detail_fields_from_progress() {
 fn snapshot_picks_latest_message_per_direction() {
     let mut progress = fixture_progress();
     progress.messages.push(pancetta_qso::states::QsoMessage {
-        timestamp: Utc::now(),
+        timestamp: UtcTimestamp::now(),
         direction: MessageDirection::Sent,
         message_type: pancetta_qso::states::MessageType::ReportAck {
             to_station: "JA1ABC".to_string(),
@@ -148,7 +149,7 @@ fn snapshot_skips_qso_without_callsign() {
     let mut progress = fixture_progress();
     progress.state = QsoState::CallingCq {
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
         call_count: 1,
     };
     progress.metadata.their_callsign = None;
@@ -173,7 +174,7 @@ fn snapshot_handles_empty_message_history() {
 #[test]
 fn snapshot_surfaces_watchdog_for_manual_keep_calling() {
     let mut progress = fixture_progress();
-    let start = Utc::now() - Duration::seconds(20);
+    let start = UtcTimestamp::now() - SignedDuration::from_secs(20);
     progress.state = QsoState::RespondingToCq {
         target_callsign: "JA1ABC".to_string(),
         frequency: 1500.0,
@@ -188,7 +189,7 @@ fn snapshot_surfaces_watchdog_for_manual_keep_calling() {
     let deadline = item.watchdog_deadline.expect("deadline");
     assert_eq!(
         deadline,
-        start + Duration::minutes(TEST_WATCHDOG_MIN as i64)
+        start + SignedDuration::from_mins(TEST_WATCHDOG_MIN as i64)
     );
 }
 
@@ -199,7 +200,7 @@ fn snapshot_no_watchdog_for_auto_qso() {
     let mut progress = fixture_progress();
     progress.metadata.initiated_by = pancetta_qso::CallInitiation::Auto;
     progress.metadata.call_count = 3;
-    progress.metadata.first_call_at = Some(Utc::now());
+    progress.metadata.first_call_at = Some(UtcTimestamp::now());
     let item = snap(&progress).expect("item");
     assert_eq!(item.call_count, 0);
     assert_eq!(item.max_calls, 0);
@@ -274,10 +275,10 @@ fn recent_qso_outcome_completed_carries_callsign_and_reports() {
         outcome.brief_timeline[0],
         format!(
             "JA1ABC started at {}",
-            metadata.start_time.format("%H:%M:%S")
+            metadata.start_time.strftime("%H:%M:%S")
         )
     );
-    metadata.first_answer_at = Some(metadata.start_time + chrono::Duration::minutes(4));
+    metadata.first_answer_at = Some(metadata.start_time + SignedDuration::from_mins(4));
     let answered = super::recent_qso_outcome(
         &their_call,
         crate::message_bus::QsoOutcome::Completed,
@@ -287,7 +288,7 @@ fn recent_qso_outcome_completed_carries_callsign_and_reports() {
         answered.brief_timeline[0],
         format!(
             "JA1ABC started at {}",
-            metadata.first_answer_at.unwrap().format("%H:%M:%S")
+            metadata.first_answer_at.unwrap().strftime("%H:%M:%S")
         )
     );
     assert_eq!(outcome.callsign, "JA1ABC");

@@ -6,6 +6,7 @@
 
 use crate::autonomous::DxEvaluator;
 use pancetta_core::callsign::is_plausible_callsign;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 
 /// Weights for each scoring factor.
@@ -487,7 +488,7 @@ impl PriorityScorer {
 
         // Staleness multiplier: deprioritize stale network spots
         let staleness = if let Some(last_seen) = self.lookup.network_last_seen(callsign) {
-            let now = chrono::Utc::now().timestamp();
+            let now = UtcTimestamp::now().as_second();
             let age_secs = (now - last_seen).max(0);
             match age_secs {
                 0..=300 => 1.0,   // <5 min: fresh
@@ -554,7 +555,7 @@ impl PriorityScorer {
         freq_hz: f64,
     ) -> ExplainedScore {
         const NETWORK_SNR_BONUS: f64 = 0.1;
-        let now = chrono::Utc::now().timestamp();
+        let now = UtcTimestamp::now().as_second();
         let plausible_callsign = is_plausible_callsign(callsign);
         let needed_dxcc = self.lookup.is_needed_dxcc(callsign);
         let dxcc_new_on_band = self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
@@ -1507,7 +1508,7 @@ mod tests {
                     flags: 1 << bit,
                     rarity: 0.85,
                     network: Some((5, -10)),
-                    last_seen: Some(chrono::Utc::now().timestamp() + 60),
+                    last_seen: Some(UtcTimestamp::now().as_second() + 60),
                 }),
             );
             let factors = scorer

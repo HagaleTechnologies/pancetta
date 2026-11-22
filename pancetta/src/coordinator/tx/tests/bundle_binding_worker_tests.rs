@@ -183,7 +183,7 @@ async fn collect(
 fn arm_client(h: &Harness, client_key: &str) -> tokio::task::JoinHandle<()> {
     use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
     let jti = format!("pan136-{client_key}");
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
     {
         let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
         arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);

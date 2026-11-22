@@ -429,7 +429,7 @@ async fn replay_mode_tx_log_is_disabled_and_creates_no_file() {
     let log = coordinator.ensure_tx_frame_log();
     assert_eq!(log.path(), None);
     let record = TxFrameRecord::new(
-        chrono::Utc::now(),
+        pancetta_core::time::UtcTimestamp::now(),
         pancetta_ft8::Protocol::Ft8,
         0,
         1500.0,

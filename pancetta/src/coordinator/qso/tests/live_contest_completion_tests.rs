@@ -6,15 +6,15 @@ async fn manual_completion_survives_real_writers_and_adif_index_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let adif = dir.path().join("qsos.adi");
     let index = dir.path().join("qso.db");
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let context = ContestScoringContext::new(
         "live",
         "us-state-qso-party",
         KSQP_FT_2026,
         "KS",
         vec![ContestPeriod {
-            start: now - chrono::Duration::minutes(1),
-            end: now + chrono::Duration::minutes(10),
+            start: now - SignedDuration::from_mins(1),
+            end: now + SignedDuration::from_mins(10),
         }],
     )
     .unwrap();
@@ -95,7 +95,7 @@ async fn manual_completion_survives_real_writers_and_adif_index_rebuild() {
         rebuilt.contest_ledger(&context, "W1ABC").await.unwrap()
     );
     assert_eq!(
-        reduce_contest_score(&context, &facts, chrono::Utc::now())
+        reduce_contest_score(&context, &facts, UtcTimestamp::now())
             .unwrap()
             .score,
         1

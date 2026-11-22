@@ -282,7 +282,7 @@ fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingMan
                 .mono
                 .checked_sub(age)
                 .expect("Instant underflow in test"),
-            wall: now.wall - chrono::Duration::from_std(age).expect("age fits chrono"),
+            wall: now.wall - jiff::SignedDuration::try_from(age).expect("age fits chrono"),
         },
         hound: false,
         fox_freq_hz: None,
@@ -356,7 +356,7 @@ fn empty_queue_partition_expired_is_noop() {
 fn stamp_after(
     s: QueueStamp,
     mono_elapsed: std::time::Duration,
-    wall_elapsed: chrono::Duration,
+    wall_elapsed: jiff::SignedDuration,
 ) -> QueueStamp {
     QueueStamp {
         mono: s.mono + mono_elapsed,
@@ -375,7 +375,7 @@ fn call_queued_before_sleep_expires_on_wall_clock() {
     let now = stamp_after(
         s,
         std::time::Duration::from_secs(10),
-        chrono::Duration::seconds(610),
+        jiff::SignedDuration::from_secs(610),
     );
     let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
     assert!(
@@ -395,7 +395,7 @@ fn backward_wall_step_does_not_extend_ttl() {
     let now = stamp_after(
         s,
         std::time::Duration::from_secs(610),
-        chrono::Duration::seconds(-3600),
+        jiff::SignedDuration::from_secs(-3600),
     );
     let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
     assert!(kept.is_empty());
@@ -412,7 +412,7 @@ fn fresh_call_survives_backward_wall_step() {
     let now = stamp_after(
         s,
         std::time::Duration::from_secs(10),
-        chrono::Duration::seconds(-3600),
+        jiff::SignedDuration::from_secs(-3600),
     );
     assert_eq!(s.age_at(now), std::time::Duration::from_secs(10));
     let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
@@ -588,7 +588,7 @@ async fn promotion_discards_expired_call_instead_of_starting_it() {
     let mut stale = call("JA1AAA", SlotParity::Odd);
     stale.queued_at = QueueStamp {
         mono: std::time::Instant::now(),
-        wall: chrono::Utc::now() - chrono::Duration::minutes(11),
+        wall: pancetta_core::time::UtcTimestamp::now() - jiff::SignedDuration::from_mins(11),
     };
     let fresh = even_dx_call_at("JA2BBB", 1500.0);
     let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([stale, fresh])));

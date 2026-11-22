@@ -5,7 +5,8 @@
 
 use crate::adif::{AdifProcessor, AdifQso, AdifRecord};
 use crate::states::*;
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{
@@ -65,8 +66,8 @@ pub struct QsoFilter {
 /// Date range filter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DateRange {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: UtcTimestamp,
+    pub end: UtcTimestamp,
 }
 
 /// Frequency range filter (Hz)
@@ -150,7 +151,7 @@ pub struct WorkedContact {
     pub mode: String,
     /// QSL_RCVD or LOTW_QSL_RCVD is Y or V. eQSL does not count.
     pub confirmed: bool,
-    pub start_time: DateTime<Utc>,
+    pub start_time: UtcTimestamp,
 }
 
 /// PAN-347: an ADIF QSL_RCVD / LOTW_QSL_RCVD value that confirms the contact.
@@ -197,10 +198,10 @@ pub struct QsoDatabaseRecord {
     pub adif_data: AdifQso,
 
     /// Created timestamp
-    pub created_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
 
     /// Updated timestamp
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: UtcTimestamp,
 
     /// Checksum for integrity verification
     pub checksum: String,
@@ -234,10 +235,10 @@ pub struct DatabaseStats {
     pub qsos_by_year: HashMap<u32, u64>,
 
     /// First QSO date
-    pub first_qso: Option<DateTime<Utc>>,
+    pub first_qso: Option<UtcTimestamp>,
 
     /// Last QSO date
-    pub last_qso: Option<DateTime<Utc>>,
+    pub last_qso: Option<UtcTimestamp>,
 
     /// Database size in bytes
     pub database_size: u64,
@@ -264,7 +265,7 @@ pub struct QsoTimelineRecord {
     /// Every message sent/received over the life of the QSO.
     pub messages: Vec<QsoMessage>,
     /// When this timeline record was written.
-    pub created_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
 }
 
 /// An ADIF log converted exactly as the index replay converts it.
@@ -580,7 +581,7 @@ impl QsoDatabase {
         // Record schema version
         sqlx::query("INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)")
             .bind(self.schema_version as i64)
-            .bind(Utc::now().to_rfc3339())
+            .bind(UtcTimestamp::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
 
@@ -593,7 +594,8 @@ impl QsoDatabase {
 
     /// Insert a new QSO record
     pub async fn insert_qso(&self, progress: &QsoProgress) -> Result<i64, AsyncDatabaseError> {
-        self.insert_qso_with(&self.pool, progress, Utc::now()).await
+        self.insert_qso_with(&self.pool, progress, UtcTimestamp::now())
+            .await
     }
 
     /// [`Self::insert_qso`] on any executor, so a batch can share one
@@ -604,7 +606,7 @@ impl QsoDatabase {
         &self,
         executor: E,
         progress: &QsoProgress,
-        created_at: DateTime<Utc>,
+        created_at: UtcTimestamp,
     ) -> Result<i64, AsyncDatabaseError>
     where
         E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -619,7 +621,7 @@ impl QsoDatabase {
             .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
         let adif_json = serde_json::to_string(&adif_qso)?;
 
-        let now = Utc::now().to_rfc3339();
+        let now = UtcTimestamp::now().to_rfc3339();
         let created_at = created_at.to_rfc3339();
         let checksum = Self::calculate_checksum(&metadata_json, &state_json, &adif_json);
 
@@ -656,7 +658,7 @@ impl QsoDatabase {
             .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
         let adif_json = serde_json::to_string(&adif_qso)?;
 
-        let now = Utc::now().to_rfc3339();
+        let now = UtcTimestamp::now().to_rfc3339();
         let checksum = Self::calculate_checksum(&metadata_json, &state_json, &adif_json);
 
         let rows_affected = sqlx::query(
@@ -893,23 +895,21 @@ impl QsoDatabase {
         let qsos_by_band = HashMap::new();
         let qsos_by_year = HashMap::new();
 
-        let first_qso: Option<DateTime<Utc>> = sqlx::query_scalar::<_, Option<String>>(
+        let first_qso: Option<UtcTimestamp> = sqlx::query_scalar::<_, Option<String>>(
             "SELECT created_at FROM qsos ORDER BY created_at ASC LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?
         .flatten()
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| str::parse::<UtcTimestamp>(&s).ok());
 
-        let last_qso: Option<DateTime<Utc>> = sqlx::query_scalar::<_, Option<String>>(
+        let last_qso: Option<UtcTimestamp> = sqlx::query_scalar::<_, Option<String>>(
             "SELECT created_at FROM qsos ORDER BY created_at DESC LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?
         .flatten()
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| str::parse::<UtcTimestamp>(&s).ok());
 
         Ok(DatabaseStats {
             total_qsos,
@@ -927,17 +927,21 @@ impl QsoDatabase {
     }
 
     /// Check a rolling window by callsign and optional band, independent of audio offset.
-    /// Metadata is serialized from DateTime<Utc> as UTC RFC3339. Pad its optional
+    /// Metadata is serialized from UtcTimestamp as UTC RFC3339. Pad its optional
     /// fractional seconds to nine digits for exact comparisons without SQLite's
     /// millisecond rounding. The startup history read validates stored dates.
     pub async fn check_duplicate(
         &self,
         callsign: &str,
         band: Option<&str>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         time_window_hours: u32,
     ) -> Result<Option<QsoId>, AsyncDatabaseError> {
-        let cutoff = now - chrono::Duration::hours(time_window_hours as i64);
+        // jiff stops at year -9999; a larger window than that covers every
+        // contact, as chrono's far-past cutoff did, instead of panicking.
+        let cutoff = now
+            .checked_sub(SignedDuration::from_hours(i64::from(time_window_hours)))
+            .unwrap_or(UtcTimestamp::MIN);
         let id: Option<String> = sqlx::query_scalar(
             "WITH contacts AS (
                  SELECT qso_id, json_extract(metadata, '$.start_time') AS started FROM qsos
@@ -953,8 +957,8 @@ impl QsoDatabase {
         .bind(callsign.trim().to_uppercase())
         .bind(band.map(|b| b.trim().to_uppercase()))
         .bind(band.map(|b| b.trim().to_uppercase()))
-        .bind(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
-        .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .bind(cutoff.to_rfc3339_nanos())
+        .bind(now.to_rfc3339_nanos())
         .fetch_optional(&self.pool)
         .await?;
         id.map(|id| {
@@ -990,11 +994,11 @@ impl QsoDatabase {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for (band, band_tag, call, date, mode, qsl, lotw) in rows {
-            let start_time = DateTime::parse_from_rfc3339(&date)
-                .map_err(|e| AsyncDatabaseError::InvalidQuery {
+            let start_time = str::parse::<UtcTimestamp>(&date).map_err(|e| {
+                AsyncDatabaseError::InvalidQuery {
                     message: format!("Invalid QSO start date {date}: {e}"),
-                })?
-                .with_timezone(&Utc);
+                }
+            })?;
             let confirmed = qsl.as_deref().is_some_and(is_confirmed_qsl_value)
                 || lotw.as_deref().is_some_and(is_confirmed_qsl_value);
             out.push(WorkedContact {
@@ -1112,8 +1116,8 @@ impl QsoDatabase {
                 serde_json::from_str::<QsoMetadata>(&metadata_json),
                 serde_json::from_str::<QsoState>(&state_json),
                 serde_json::from_str::<crate::adif::AdifQso>(&adif_json),
-                DateTime::parse_from_rfc3339(&created_at_str),
-                DateTime::parse_from_rfc3339(&updated_at_str),
+                str::parse::<UtcTimestamp>(&created_at_str),
+                str::parse::<UtcTimestamp>(&updated_at_str),
             ) {
                 records.push(QsoDatabaseRecord {
                     id,
@@ -1122,8 +1126,8 @@ impl QsoDatabase {
                     final_state,
                     progress_data,
                     adif_data,
-                    created_at: created_at.with_timezone(&Utc),
-                    updated_at: updated_at.with_timezone(&Utc),
+                    created_at,
+                    updated_at,
                     checksum,
                 });
             }
@@ -1533,13 +1537,13 @@ impl QsoDatabase {
         #[derive(Deserialize)]
         struct ContactFields {
             their_callsign: Option<String>,
-            start_time: DateTime<Utc>,
-            first_answer_at: Option<DateTime<Utc>>,
+            start_time: UtcTimestamp,
+            first_answer_at: Option<UtcTimestamp>,
         }
-        fn key(call: Option<&str>, time: DateTime<Utc>) -> Option<(String, i64)> {
+        fn key(call: Option<&str>, time: UtcTimestamp) -> Option<(String, i64)> {
             call.map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|c| (c.to_uppercase(), time.timestamp()))
+                .map(|c| (c.to_uppercase(), time.as_second()))
         }
         let mut counts = HashMap::<_, i64>::new();
         for record in &snapshot.records {
@@ -1695,11 +1699,7 @@ impl QsoDatabase {
             let completed_at = metadata.end_time.unwrap_or(metadata.start_time);
             let duration_seconds = metadata
                 .end_time
-                .map(|end| {
-                    end.signed_duration_since(metadata.start_time)
-                        .num_seconds()
-                        .max(0) as u32
-                })
+                .map(|end| end.duration_since(metadata.start_time).as_secs().max(0) as u32)
                 .unwrap_or(0);
 
             // Signal reports default to -15 dB (middling FT8) when the source
@@ -1879,7 +1879,7 @@ impl QsoDatabase {
     ) -> Result<i64, AsyncDatabaseError> {
         let state_history_json = serde_json::to_string(state_history)?;
         let messages_json = serde_json::to_string(messages)?;
-        let now = Utc::now().to_rfc3339();
+        let now = UtcTimestamp::now().to_rfc3339();
 
         let result = sqlx::query(
             "INSERT INTO qso_events (qso_id, callsign, outcome, reason, state_history,
@@ -1951,13 +1951,13 @@ impl QsoDatabase {
                 let state_history: Vec<StateTransition> =
                     serde_json::from_str(&state_history_json)?;
                 let messages: Vec<QsoMessage> = serde_json::from_str(&messages_json)?;
-                let created_at = DateTime::parse_from_rfc3339(&created_at)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| AsyncDatabaseError::InvalidQuery {
+                let created_at = str::parse::<UtcTimestamp>(&created_at).map_err(|e| {
+                    AsyncDatabaseError::InvalidQuery {
                         message: format!(
                             "stored created_at {created_at} is not valid RFC3339: {e}"
                         ),
-                    })?;
+                    }
+                })?;
                 Ok(Some(QsoTimelineRecord {
                     qso_id,
                     callsign,
@@ -1974,6 +1974,10 @@ impl QsoDatabase {
 }
 
 // QsoDatabase is automatically Send + Sync thanks to SqlitePool
+
+#[cfg(test)]
+#[path = "async_database/tests/stored_timestamp_bytes_tests.rs"]
+mod stored_timestamp_bytes_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2201,7 +2205,7 @@ mod tests {
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 first_answer_at: None,
-                start_time: Utc::now(),
+                start_time: UtcTimestamp::now(),
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
@@ -2322,7 +2326,7 @@ mod tests {
                 our_report: -12,
                 frequency,
                 grid_square: None,
-                completed_at: Utc::now(),
+                completed_at: UtcTimestamp::now(),
                 duration_seconds: 60,
             },
             state_history: vec![],
@@ -2335,7 +2339,7 @@ mod tests {
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 first_answer_at: None,
-                start_time: Utc::now() - chrono::Duration::minutes(5),
+                start_time: UtcTimestamp::now() - SignedDuration::from_mins(5),
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
@@ -2431,9 +2435,7 @@ mod tests {
     #[tokio::test]
     async fn pan260_band_window_and_history() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-11-04T14:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = str::parse::<UtcTimestamp>("2026-11-04T14:30:00Z").unwrap();
         assert!(db.worked_history().await.unwrap().is_empty());
         for (age_seconds, expected) in [
             (1800, true),
@@ -2443,7 +2445,7 @@ mod tests {
             (-1, false),
         ] {
             let mut p = duplicate_check_test_progress("k1abc", 14_075_200.0);
-            p.metadata.start_time = now - chrono::Duration::seconds(age_seconds);
+            p.metadata.start_time = now - SignedDuration::from_secs(age_seconds);
             db.insert_qso(&p).await.unwrap();
             assert_eq!(
                 db.check_duplicate("K1ABC", Some("20M"), now, 24)
@@ -2474,7 +2476,7 @@ mod tests {
         for (delta, expected) in [(-1, true), (0, false), (1, false)] {
             let mut p = duplicate_check_test_progress("K1ABC", 14_075_200.0);
             p.metadata.start_time =
-                now - chrono::Duration::hours(24) - chrono::Duration::nanoseconds(delta);
+                now - SignedDuration::from_hours(24) - SignedDuration::from_nanos(delta);
             db.insert_qso(&p).await.unwrap();
             assert_eq!(
                 db.check_duplicate("k1abc", Some("20m"), now, 24)
@@ -2486,7 +2488,7 @@ mod tests {
             db.delete_qso(p.metadata.qso_id).await.unwrap();
         }
         let mut future = duplicate_check_test_progress("K1ABC", 14_075_800.0);
-        future.metadata.start_time = now + chrono::Duration::nanoseconds(1);
+        future.metadata.start_time = now + SignedDuration::from_nanos(1);
         db.insert_qso(&future).await.unwrap();
         assert!(db
             .check_duplicate("k1abc", Some("20m"), now, 24)
@@ -2496,7 +2498,7 @@ mod tests {
         db.delete_qso(future.metadata.qso_id).await.unwrap();
         for (rf, age) in [(14_075_200.0, 60), (14_075_800.0, 30), (7_075_200.0, 10)] {
             let mut p = duplicate_check_test_progress("k1abc", rf);
-            p.metadata.start_time = now - chrono::Duration::minutes(age);
+            p.metadata.start_time = now - SignedDuration::from_mins(age);
             db.insert_qso(&p).await.unwrap();
         }
         sqlx::query("UPDATE qsos SET adif_data = json_set(adif_data, '$.band', lower(json_extract(adif_data, '$.band')))").execute(&db.pool).await.unwrap();
@@ -2513,7 +2515,7 @@ mod tests {
             .filter(|r| r.band == "20M" && r.callsign == "K1ABC")
             .map(|r| r.start_time)
             .max();
-        assert_eq!(latest_20m, Some(now - chrono::Duration::minutes(30)));
+        assert_eq!(latest_20m, Some(now - SignedDuration::from_mins(30)));
         assert!(history
             .iter()
             .any(|r| r.band == "40M" && r.callsign == "K1ABC"));
@@ -2546,7 +2548,7 @@ mod tests {
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 first_answer_at: None,
-                start_time: Utc::now(),
+                start_time: UtcTimestamp::now(),
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
@@ -2587,7 +2589,7 @@ mod tests {
             our_report: -15,
             frequency: 14074000.0,
             grid_square: Some("FN42".to_string()),
-            completed_at: Utc::now(),
+            completed_at: UtcTimestamp::now(),
             duration_seconds: 120,
         };
 
@@ -3056,7 +3058,6 @@ mod tests {
     /// lands at the moment it was logged.
     #[tokio::test]
     async fn imported_rows_are_searchable_by_their_qso_date() {
-        use chrono::TimeZone;
         let adif = "<CALL:5>W1ABC <QSO_DATE:8>20200315 <TIME_ON:6>120000 <MODE:3>FT8 \
                     <FREQ:9>14.074000 <EOR>\n";
         let processor = AdifProcessor::new();
@@ -3068,7 +3069,7 @@ mod tests {
         let live = duplicate_check_test_progress("K9DEF", 14_074_000.0);
         db.insert_qso(&live).await.unwrap();
 
-        let in_range = |start: DateTime<Utc>, end: DateTime<Utc>| QsoFilter {
+        let in_range = |start: UtcTimestamp, end: UtcTimestamp| QsoFilter {
             date_range: Some(DateRange { start, end }),
             ..Default::default()
         };
@@ -3081,12 +3082,12 @@ mod tests {
             calls
         };
         let year_2020 = in_range(
-            Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2020, 12, 31, 23, 59, 59).unwrap(),
+            UtcTimestamp::from_ymd_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+            UtcTimestamp::from_ymd_hms(2020, 12, 31, 23, 59, 59).unwrap(),
         );
         let today = in_range(
-            Utc::now() - chrono::Duration::hours(1),
-            Utc::now() + chrono::Duration::hours(1),
+            UtcTimestamp::now() - SignedDuration::from_hours(1),
+            UtcTimestamp::now() + SignedDuration::from_hours(1),
         );
         let options = QueryOptions::default();
 
@@ -3292,7 +3293,7 @@ mod tests {
 
     /// A non-trivial state_history: Idle -> RespondingToCq -> SendingReport
     /// -> Completed, driven by a mix of received/sent transitions.
-    fn sample_state_history(now: DateTime<Utc>) -> Vec<StateTransition> {
+    fn sample_state_history(now: UtcTimestamp) -> Vec<StateTransition> {
         vec![
             StateTransition {
                 from_state: QsoState::Idle,
@@ -3317,7 +3318,7 @@ mod tests {
                     frequency: 1500.0,
                     started_at: now,
                 },
-                timestamp: now + chrono::Duration::seconds(15),
+                timestamp: now + SignedDuration::from_secs(15),
                 reason: TransitionReason::MessageReceived(MessageType::CqResponse {
                     calling_station: "K1DEF".to_string(),
                     responding_station: "W1ABC".to_string(),
@@ -3338,10 +3339,10 @@ mod tests {
                     our_report: -12,
                     frequency: 1500.0,
                     grid_square: Some("FN42".to_string()),
-                    completed_at: now + chrono::Duration::seconds(45),
+                    completed_at: now + SignedDuration::from_secs(45),
                     duration_seconds: 45,
                 },
-                timestamp: now + chrono::Duration::seconds(45),
+                timestamp: now + SignedDuration::from_secs(45),
                 reason: TransitionReason::MessageReceived(MessageType::SeventyThree {
                     to_station: "W1ABC".to_string(),
                     from_station: "K1DEF".to_string(),
@@ -3350,7 +3351,7 @@ mod tests {
         ]
     }
 
-    fn sample_messages(now: DateTime<Utc>) -> Vec<QsoMessage> {
+    fn sample_messages(now: UtcTimestamp) -> Vec<QsoMessage> {
         vec![
             QsoMessage {
                 timestamp: now,
@@ -3365,7 +3366,7 @@ mod tests {
                 frequency: 1500.0,
             },
             QsoMessage {
-                timestamp: now + chrono::Duration::seconds(15),
+                timestamp: now + SignedDuration::from_secs(15),
                 direction: MessageDirection::Received,
                 message_type: MessageType::SignalReport {
                     to_station: "W1ABC".to_string(),
@@ -3377,7 +3378,7 @@ mod tests {
                 frequency: 1500.0,
             },
             QsoMessage {
-                timestamp: now + chrono::Duration::seconds(45),
+                timestamp: now + SignedDuration::from_secs(45),
                 direction: MessageDirection::Received,
                 message_type: MessageType::SeventyThree {
                     to_station: "W1ABC".to_string(),
@@ -3394,7 +3395,7 @@ mod tests {
     async fn qso_timeline_round_trips_state_history_and_messages_for_failed_qso() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let state_history = sample_state_history(now);
         let messages = sample_messages(now);
 
@@ -3430,7 +3431,7 @@ mod tests {
     async fn qso_timeline_round_trips_for_completed_qso() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let state_history = sample_state_history(now);
         let messages = sample_messages(now);
 
@@ -3464,7 +3465,7 @@ mod tests {
         // than one row for the same qso_id; the most recent must win.
         let db = QsoDatabase::new_in_memory().await.unwrap();
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
 
         db.insert_qso_timeline(
             qso_id,
@@ -3703,7 +3704,7 @@ mod pan282_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = seed(Path::new(":memory:"), &[]).await;
         let mut records = snapshot(dir.path(), &["w1aw"]).await.records;
-        records[0].start_time += chrono::Duration::milliseconds(611);
+        records[0].start_time += SignedDuration::from_millis(611);
         db.insert_converted(records).await.unwrap();
         assert!(db
             .drift_from(&snapshot(dir.path(), &["W1AW"]).await)
@@ -3750,10 +3751,8 @@ mod pan282_tests {
         // stores and rebuilds the index from ADIF.
         let dir = tempfile::tempdir().unwrap();
         let db = QsoDatabase::new_in_memory().await.unwrap();
-        let cq_start = DateTime::parse_from_rfc3339("2026-11-13T18:21:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let first_answer = cq_start + chrono::Duration::minutes(4);
+        let cq_start = str::parse::<UtcTimestamp>("2026-11-13T18:21:00Z").unwrap();
+        let first_answer = cq_start + SignedDuration::from_mins(4);
         db.insert_qso(&live_cq_progress(cq_start, first_answer))
             .await
             .unwrap();
@@ -3765,7 +3764,7 @@ mod pan282_tests {
             .unwrap()
             .is_current());
     }
-    fn live_cq_progress(cq_start: DateTime<Utc>, first_answer: DateTime<Utc>) -> QsoProgress {
+    fn live_cq_progress(cq_start: UtcTimestamp, first_answer: UtcTimestamp) -> QsoProgress {
         let frequency = 14_074_200.0;
         QsoProgress {
             state: QsoState::Completed {
@@ -3774,7 +3773,7 @@ mod pan282_tests {
                 our_report: -12,
                 frequency,
                 grid_square: None,
-                completed_at: first_answer + chrono::Duration::minutes(2),
+                completed_at: first_answer + SignedDuration::from_mins(2),
                 duration_seconds: 360,
             },
             state_history: vec![],
@@ -3788,7 +3787,7 @@ mod pan282_tests {
                 mode: "FT8".to_string(),
                 first_answer_at: Some(first_answer),
                 start_time: cq_start,
-                end_time: Some(first_answer + chrono::Duration::minutes(2)),
+                end_time: Some(first_answer + SignedDuration::from_mins(2)),
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
                 their_state: None,

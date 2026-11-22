@@ -142,8 +142,8 @@ fn parse_wav_timestamp(path: &str) -> Option<i64> {
     let h: u32 = parts[2][0..2].parse().ok()?;
     let mi: u32 = parts[2][2..4].parse().ok()?;
     let s: u32 = parts[2][4..6].parse().ok()?;
-    let dt = chrono::NaiveDate::from_ymd_opt(y, mo, d)?.and_hms_opt(h, mi, s)?;
-    Some(dt.and_utc().timestamp())
+    let dt = pancetta_core::time::UtcTimestamp::from_ymd_hms(y, mo, d, h, mi, s)?;
+    Some(dt.as_second())
 }
 
 /// A parsed jt9 truth decode.

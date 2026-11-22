@@ -169,12 +169,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "Start time: {}",
-        metadata.start_time.format("%Y-%m-%d %H:%M:%S UTC")
+        metadata.start_time.strftime("%Y-%m-%d %H:%M:%S UTC")
     );
 
     if let Some(end_time) = metadata.end_time {
-        let duration = (end_time - metadata.start_time).num_seconds();
-        println!("End time: {}", end_time.format("%Y-%m-%d %H:%M:%S UTC"));
+        let duration = (end_time - metadata.start_time).as_secs();
+        println!("End time: {}", end_time.strftime("%Y-%m-%d %H:%M:%S UTC"));
         println!("Duration: {} seconds", duration);
     }
 
@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "{}: [{}] {} - {}",
             i + 1,
-            message.timestamp.format("%H:%M:%S"),
+            message.timestamp.strftime("%H:%M:%S"),
             match message.direction {
                 MessageDirection::Sent => "TX",
                 MessageDirection::Received => "RX",

@@ -12,7 +12,7 @@ const LAG_LINE: &str =
     "ADIF subscriber lagged by 3 QSO events; any QSO completed among them is not in qsos.adi";
 
 fn completed(call: &str) -> QsoEvent {
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let qso_id = pancetta_qso::QsoId::new_v4();
     QsoEvent::QsoCompleted {
         qso_id,
@@ -63,7 +63,7 @@ fn state_changed() -> QsoEvent {
         qso_id: pancetta_qso::QsoId::new_v4(),
         old_state: QsoState::Idle,
         new_state: QsoState::Idle,
-        timestamp: chrono::Utc::now(),
+        timestamp: pancetta_core::time::UtcTimestamp::now(),
     }
 }
 

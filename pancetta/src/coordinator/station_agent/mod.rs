@@ -107,6 +107,7 @@
 
 pub mod net;
 
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -542,7 +543,7 @@ fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
 /// Unix milliseconds now, for audit timestamps on arm-timing-free paths
 /// (explicit disarms). Deadline checks use an [`ArmTime`] sample instead.
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    UtcTimestamp::now().as_millisecond()
 }
 
 /// Turn the effects of an arm transition into durable audits and, when the

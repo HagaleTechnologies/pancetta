@@ -2,7 +2,9 @@
 
 use crate::app::{App, DxStation, RankOrigin};
 use crate::dx_need::{canonical_grid_square, DxNeedStatus};
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::priority::{NeedSource, PortableSuffix, PriorityTier, TIER_BAND_WIDTH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,11 +190,7 @@ fn age_text(seconds: i64) -> String {
     }
 }
 
-pub fn reason_for(
-    station: &DxStation,
-    need: Option<&DxNeedStatus>,
-    now: DateTime<Utc>,
-) -> DxReason {
+pub fn reason_for(station: &DxStation, need: Option<&DxNeedStatus>, now: UtcTimestamp) -> DxReason {
     let Some((origin, rank)) = station.rank_basis() else {
         return DxReason {
             headline: Headline::NotScored,
@@ -258,7 +256,7 @@ pub fn reason_for(
             cautions.push(Caution::OneReporter);
         }
         if let Some(last_seen) = station.last_seen_network {
-            let age = now.timestamp().saturating_sub(last_seen);
+            let age = now.as_second().saturating_sub(last_seen);
             if age > 300 {
                 cautions.push(Caution::StaleSpot { age: age_text(age) });
             }
@@ -278,19 +276,16 @@ pub fn reason_for(
     });
     let heard = station.local_rank.map(|local| {
         let snr = local.factors.map_or(station.snr, |f| i32::from(f.snr_db));
-        let elapsed = now.signed_duration_since(local.at);
+        let elapsed = now.duration_since(local.at);
         let slot_ms = if station.mode.eq_ignore_ascii_case("FT4") {
             7500
         } else {
             15000
         };
-        if elapsed.num_milliseconds() < slot_ms {
+        if elapsed.as_millis_i64() < slot_ms {
             format!("heard this slot at {snr:+} dB")
         } else {
-            format!(
-                "heard {} ago at {snr:+} dB",
-                age_text(elapsed.num_seconds())
-            )
+            format!("heard {} ago at {snr:+} dB", age_text(elapsed.as_secs()))
         }
     });
     let mode = station.mode.trim().to_uppercase();
@@ -342,14 +337,13 @@ pub enum FocusedReason<'a> {
     Ranked(String, &'a DxStation),
 }
 
-pub fn focused(app: &App, now: DateTime<Utc>) -> FocusedReason<'_> {
+pub fn focused(app: &App, now: UtcTimestamp) -> FocusedReason<'_> {
     let Some(call) = app.focused_callsign() else {
         return FocusedReason::NoFocus;
     };
     match app.dx_station_for(&call) {
         Some(station)
-            if now.signed_duration_since(station.last_seen).num_seconds()
-                <= App::DX_HUNTER_STALE_SECS =>
+            if now.duration_since(station.last_seen).as_secs() <= App::DX_HUNTER_STALE_SECS =>
         {
             FocusedReason::Ranked(call.to_owned(), station)
         }
@@ -364,7 +358,7 @@ pub fn focused(app: &App, now: DateTime<Utc>) -> FocusedReason<'_> {
 fn needed_entity_row(
     scored_needed: bool,
     need: Option<&DxNeedStatus>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (String, String) {
     let yes_no = |v: bool| if v { "yes" } else { "no" };
     let local = need.and_then(|n| n.dxcc_source) == Some(NeedSource::LocalLogbook);
@@ -403,7 +397,7 @@ fn needed_entity_row(
                     format!(
                         "cqdx needed list, {}, {} old",
                         list.band.as_deref().unwrap_or("all bands"),
-                        age_text(now.signed_duration_since(list.fetched_at).num_seconds())
+                        age_text(now.duration_since(list.fetched_at).as_secs())
                     )
                 },
             );
@@ -420,7 +414,7 @@ pub struct WhyDetail {
 pub fn detail_for(
     station: &DxStation,
     need: Option<&DxNeedStatus>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> WhyDetail {
     let Some((origin, rank)) = station.rank_basis() else {
         return WhyDetail { lines: vec![format!("{} has not been scored yet: it came from the DX cluster with no decode or cqdx data.", station.call_sign)] };
@@ -615,13 +609,13 @@ mod tests {
     use super::*;
     use crate::app::{RankedBy, SpotSource};
     use crate::dx_need::NeedListSource;
-    use chrono::Duration;
+    use jiff::SignedDuration;
     use pancetta_qso::priority::{
         NullLookup, PriorityScorer, PriorityWeights, WorkedStationLookup,
     };
 
-    fn now() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    fn now() -> UtcTimestamp {
+        UtcTimestamp::from_parts(1_800_000_000, 0).unwrap()
     }
     fn station(call: &str) -> DxStation {
         let explained = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup))
@@ -844,7 +838,7 @@ mod tests {
     }
     #[test]
     fn needed_entity_detail_row_names_value_and_provenance() {
-        let list = |band: Option<&str>, age: Duration| NeedListSource {
+        let list = |band: Option<&str>, age: SignedDuration| NeedListSource {
             band: band.map(str::to_owned),
             fetched_at: now() - age,
         };
@@ -864,28 +858,28 @@ mod tests {
         for (dxcc_needed, dxcc_list, scored, value, source) in [
             (
                 Some(true),
-                Some(list(Some("20M"), Duration::minutes(4))),
+                Some(list(Some("20M"), SignedDuration::from_mins(4))),
                 true,
                 "yes",
                 "cqdx needed list, 20M, 4m old",
             ),
             (
                 Some(false),
-                Some(list(None, Duration::hours(2))),
+                Some(list(None, SignedDuration::from_hours(2))),
                 false,
                 "no",
                 "cqdx needed list, all bands, 2h old",
             ),
             (
                 Some(false),
-                Some(list(Some("20M"), Duration::minutes(4))),
+                Some(list(Some("20M"), SignedDuration::from_mins(4))),
                 true,
                 "yes",
                 "scored before the cqdx list changed (now no)",
             ),
             (
                 Some(true),
-                Some(list(Some("20M"), Duration::minutes(4))),
+                Some(list(Some("20M"), SignedDuration::from_mins(4))),
                 false,
                 "no",
                 "scored before the cqdx list changed (now yes)",
@@ -948,7 +942,7 @@ mod tests {
         let mut s = station("K1ABC");
         s.network_rank = s.local_rank.take();
         s.reporter_count = Some(1);
-        s.last_seen_network = Some((now() - Duration::seconds(400)).timestamp());
+        s.last_seen_network = Some((now() - SignedDuration::from_secs(400)).as_second());
         assert_eq!(
             reason_for(&s, None, now())
                 .cautions
@@ -961,7 +955,7 @@ mod tests {
                 "network spot 6m old"
             ]
         );
-        s.last_seen_network = Some((now() - Duration::seconds(299)).timestamp());
+        s.last_seen_network = Some((now() - SignedDuration::from_secs(299)).as_second());
         assert_eq!(reason_for(&s, None, now()).cautions.len(), 2);
     }
 
@@ -972,7 +966,7 @@ mod tests {
         spot.score += 1;
         s.network_rank = Some(spot);
         s.reporter_count = Some(1);
-        s.last_seen_network = Some((now() - Duration::seconds(400)).timestamp());
+        s.last_seen_network = Some((now() - SignedDuration::from_secs(400)).as_second());
         let texts = |s: &DxStation| {
             reason_for(s, None, now())
                 .cautions
@@ -994,7 +988,7 @@ mod tests {
             ("FT4", 8, "heard 8s ago at -7 dB"),
         ] {
             s.mode = mode.into();
-            s.local_rank.as_mut().unwrap().at = now() - Duration::seconds(age);
+            s.local_rank.as_mut().unwrap().at = now() - SignedDuration::from_secs(age);
             assert_eq!(reason_for(&s, None, now()).heard.as_deref(), Some(expected));
         }
         s.local_rank = None;

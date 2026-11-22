@@ -1,15 +1,14 @@
 use super::*;
-use chrono::TimeZone;
 use pancetta_core::slot::{SlotParity, SLOT_NS};
 
 /// FT4 slot period in nanoseconds (7.5s). FT8 is `SLOT_NS` (15s).
 const FT4_SLOT_NS: i64 = 7_500_000_000;
 
-fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
+fn at(seconds: f64) -> UtcTimestamp {
     // Reference: 2026-01-01 00:00:00 UTC. timestamp() = 1767225600,
     // divisible by 15. Slot 0 is Even (= 1767225600 / 15 % 2 = 0).
-    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    base + SignedDuration::from_nanos((seconds * 1_000_000_000.0) as i64)
 }
 
 #[test]
@@ -18,7 +17,7 @@ fn early_pads_silent_no_skip() {
     // (wrong), so we advance to next Odd = :15. mstr_relative_to_target
     // = max(0, :05 - :15) = 0. 0 < 500 → pad 500ms, cursor 0.
     let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
     assert_eq!(s.silent_pad_samples, 500 * 12); // 12 samples/ms at 12kHz
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -29,7 +28,7 @@ fn on_time_no_pad_no_skip() {
     // mstr_in_current_slot = 500ms ≤ 8000 → target current slot :15.
     // mstr_relative_to_target = 500 = DELAY_MS → pad 0, cursor 0.
     let s = schedule_tx(at(15.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
     assert_eq!(s.silent_pad_samples, 0);
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -40,7 +39,7 @@ fn late_skips_cursor_in_current_slot() {
     // mstr_in_current_slot = 5000 ≤ 8000 → target current slot :15.
     // mstr_relative_to_target = 5000 > 500 → cursor = 4500ms × SR.
     let s = schedule_tx(at(20.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
     assert_eq!(s.silent_pad_samples, 0);
     assert_eq!(s.cursor_offset_samples, 4500 * 12);
 }
@@ -52,7 +51,7 @@ fn too_late_defers_to_next_opposite_slot() {
     // advance to next Odd = :45. mstr_relative_to_target = 0 (target
     // is in future) → pad 500ms, cursor 0.
     let s = schedule_tx(at(24.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 45_000);
     assert_eq!(s.silent_pad_samples, 500 * 12);
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -65,8 +64,8 @@ fn collision_avoidance_does_not_pick_same_parity() {
     // cursor 0. Most importantly: target is :15, NEVER :30 (the
     // collision case the original bug produced).
     let s = schedule_tx(at(14.6), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
-    assert_ne!((s.target_slot - at(0.0)).num_milliseconds(), 30_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
+    assert_ne!((s.target_slot - at(0.0)).as_millis_i64(), 30_000);
     assert_eq!(s.silent_pad_samples, 500 * 12);
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -77,7 +76,7 @@ fn at_exact_boundary_targets_current_slot() {
     // and we're 0ms in — fully viable. Target the current slot,
     // pad 500ms before audio starts.
     let s = schedule_tx(at(15.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
     assert_eq!(s.silent_pad_samples, 500 * 12);
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -88,7 +87,7 @@ fn current_slot_correct_parity_but_too_late_defers() {
     // Even though parity matches, we're too late for skip-ahead.
     // Defer to next Odd = :45.
     let s = schedule_tx(at(29.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 45_000);
     assert_eq!(s.silent_pad_samples, 500 * 12);
     assert_eq!(s.cursor_offset_samples, 0);
 }
@@ -103,10 +102,10 @@ fn ft4_period_targets_7_5s_grid_boundary() {
     // pad 500ms, cursor 0. The target MUST land on a 7.5s-grid
     // boundary of the requested (Odd) parity — :07.5, NOT :15.
     let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 7_500);
     // boundary lands on the 7.5s grid
     assert_eq!(
-        (s.target_slot - at(0.0)).num_milliseconds() % 7_500,
+        (s.target_slot - at(0.0)).as_millis_i64() % 7_500,
         0,
         "target must sit on a 7.5s slot boundary"
     );
@@ -126,7 +125,7 @@ fn ft4_period_late_skips_cursor_in_current_slot() {
     // ≤ 8000 → target current slot :07.5. mstr_relative_to_target
     // = 2500 > 500 → cursor = 2000ms × SR; no defer to :22.5.
     let s = schedule_tx(at(10.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 7_500);
     assert_eq!(s.silent_pad_samples, 0);
     assert_eq!(s.cursor_offset_samples, 2_000 * 12);
 }
@@ -1160,7 +1159,7 @@ fn key_time_gate_denial_flags_key_time_late_frame() {
     let target_slot = at(30.0);
     assert_eq!(
         super::key_time_gate_denial(
-            target_slot + chrono::Duration::seconds(9),
+            target_slot + SignedDuration::from_secs(9),
             target_slot,
             3000
         ),
@@ -1172,7 +1171,7 @@ fn key_time_gate_denial_flags_key_time_late_frame() {
     );
     assert_eq!(
         super::key_time_gate_denial(
-            target_slot + chrono::Duration::milliseconds(3001),
+            target_slot + SignedDuration::from_millis(3001),
             target_slot,
             3000
         ),
@@ -1183,7 +1182,7 @@ fn key_time_gate_denial_flags_key_time_late_frame() {
     );
     assert!(super::key_time_gate_denial(target_slot, target_slot, 3000).is_none());
     assert!(super::key_time_gate_denial(
-        target_slot + chrono::Duration::milliseconds(3000),
+        target_slot + SignedDuration::from_millis(3000),
         target_slot,
         3000
     )
@@ -1618,10 +1617,10 @@ fn adaptive_cap_zero_for_non_transmit_request() {
 const PTT_LEAD_MS: i64 = 80;
 
 /// `(ptt_target, target_slot)` for an FT8 frame keyed at `slot_s`.
-fn ptt_and_slot(slot_s: f64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+fn ptt_and_slot(slot_s: f64) -> (UtcTimestamp, UtcTimestamp) {
     let target_slot = at(slot_s);
     (
-        target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS),
+        target_slot - SignedDuration::from_millis(PTT_LEAD_MS),
         target_slot,
     )
 }
@@ -1629,12 +1628,12 @@ fn ptt_and_slot(slot_s: f64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime
 #[test]
 fn ptt_wait_sleeps_in_chunks_until_the_target() {
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let far = ptt_target - chrono::Duration::seconds(20);
+    let far = ptt_target - SignedDuration::from_secs(20);
     assert_eq!(
         ptt_wait_step(far, ptt_target, target_slot, true, 8000, SLOT_NS),
         PttWaitStep::Sleep(Duration::from_millis(50))
     );
-    let near = ptt_target - chrono::Duration::milliseconds(30);
+    let near = ptt_target - SignedDuration::from_millis(30);
     assert_eq!(
         ptt_wait_step(near, ptt_target, target_slot, true, 8000, SLOT_NS),
         PttWaitStep::Sleep(Duration::from_millis(30))
@@ -1655,7 +1654,7 @@ fn ptt_wait_already_late_request_keeps_todays_path() {
     // A request that was already a late start when the wait began keeps
     // today's path, even past late_max: schedule_tx already decided it.
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = target_slot + chrono::Duration::seconds(9);
+    let now = target_slot + SignedDuration::from_secs(9);
     assert_eq!(
         ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
         PttWaitStep::Reached
@@ -1669,19 +1668,19 @@ fn key_time_too_late_boundary_is_inclusive() {
     // Exactly at cap: keys (matches schedule_tx's `mstr <= tx_late_max_ms`).
     let (_, target_slot) = ptt_and_slot(30.0);
     assert!(!key_time_too_late(
-        target_slot + chrono::Duration::milliseconds(3000),
+        target_slot + SignedDuration::from_millis(3000),
         target_slot,
         3000
     ));
     // 1ms past cap: drops.
     assert!(key_time_too_late(
-        target_slot + chrono::Duration::milliseconds(3001),
+        target_slot + SignedDuration::from_millis(3001),
         target_slot,
         3000
     ));
     // Deferred target (slot in the future): never late.
     assert!(!key_time_too_late(
-        target_slot - chrono::Duration::seconds(5),
+        target_slot - SignedDuration::from_secs(5),
         target_slot,
         3000
     ));
@@ -1692,7 +1691,7 @@ fn key_time_too_late_covers_the_ticket_scenario() {
     // The PAN-117 gherkin: several seconds of slot elapsed, default-ish cap.
     let (_, target_slot) = ptt_and_slot(30.0);
     assert!(key_time_too_late(
-        target_slot + chrono::Duration::seconds(9),
+        target_slot + SignedDuration::from_secs(9),
         target_slot,
         3000
     ));
@@ -1734,7 +1733,7 @@ fn current_slot_acceptance_reserves_the_base_coalesce_wait() {
     );
     assert!(s.deferred, "2.3s arrival must defer at the 3000ms default");
     assert_eq!(
-        (s.target_slot - at(0.0)).num_milliseconds(),
+        (s.target_slot - at(0.0)).as_millis_i64(),
         30_000,
         "deferral targets the next Even slot, 30s out"
     );
@@ -1748,7 +1747,7 @@ fn current_slot_acceptance_reserves_the_base_coalesce_wait() {
     );
     assert!(!s.deferred, "a 1.0s arrival still makes the current slot");
     assert_eq!(
-        (s.target_slot - at(0.0)).num_milliseconds(),
+        (s.target_slot - at(0.0)).as_millis_i64(),
         0,
         "same-slot acceptance targets the current Even slot"
     );
@@ -1803,7 +1802,7 @@ fn multi_tx_acceptance_reserves_the_base_wait_only_for_coalesced_bundles() {
         SLOT_NS,
     );
     assert!(!s.deferred, "a direct 2.0s bundle makes the current slot");
-    assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 0);
+    assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 0);
     // A coalesced bundle frozen at the same instant already lost 800ms
     // to the base wait, so it still defers.
     let s = schedule_tx(
@@ -1819,7 +1818,7 @@ fn multi_tx_acceptance_reserves_the_base_wait_only_for_coalesced_bundles() {
 #[test]
 fn ptt_wait_forward_jump_within_late_policy_ships_late() {
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = target_slot + chrono::Duration::seconds(5);
+    let now = target_slot + SignedDuration::from_secs(5);
     assert_eq!(
         ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
         PttWaitStep::Reached
@@ -1829,7 +1828,7 @@ fn ptt_wait_forward_jump_within_late_policy_ships_late() {
 #[test]
 fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = target_slot + chrono::Duration::seconds(3600);
+    let now = target_slot + SignedDuration::from_secs(3600);
     match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
         PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
             assert_eq!(d, now - ptt_target);
@@ -1841,10 +1840,10 @@ fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
 #[test]
 fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = ptt_target - chrono::Duration::seconds(620);
+    let now = ptt_target - SignedDuration::from_secs(620);
     match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
         PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-            assert_eq!(d, chrono::Duration::seconds(620));
+            assert_eq!(d, SignedDuration::from_secs(620));
         }
         other => panic!("expected ClockJumped(Backward), got {other:?}"),
     }
@@ -1854,7 +1853,7 @@ fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
 fn ptt_wait_small_backward_step_is_waited_out() {
     // 25 s ahead is inside schedule_tx's two-slot horizon (30 s for FT8).
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = ptt_target - chrono::Duration::seconds(25);
+    let now = ptt_target - SignedDuration::from_secs(25);
     assert_eq!(
         ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
         PttWaitStep::Sleep(Duration::from_millis(50))
@@ -1865,7 +1864,7 @@ fn ptt_wait_small_backward_step_is_waited_out() {
 fn ptt_wait_bounds_scale_with_ft4() {
     // 16 s ahead: beyond FT4's 2 × 7.5 s horizon, inside FT8's 30 s.
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
-    let now = ptt_target - chrono::Duration::seconds(16);
+    let now = ptt_target - SignedDuration::from_secs(16);
     assert!(matches!(
         ptt_wait_step(now, ptt_target, target_slot, true, 8000, FT4_SLOT_NS),
         PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(_))
@@ -1885,16 +1884,11 @@ fn ptt_hold_bound_allows_normal_lead_and_rejects_a_step() {
 }
 
 /// Injectable wall clock for the `wait_for_ptt_instant` tests.
-fn test_wall_clock(
-    start: chrono::DateTime<chrono::Utc>,
-) -> std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>> {
+fn test_wall_clock(start: UtcTimestamp) -> std::sync::Arc<std::sync::Mutex<UtcTimestamp>> {
     std::sync::Arc::new(std::sync::Mutex::new(start))
 }
 
-fn shift_clock(
-    clock: &std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
-    by: chrono::Duration,
-) {
+fn shift_clock(clock: &std::sync::Arc<std::sync::Mutex<UtcTimestamp>>, by: SignedDuration) {
     let mut now = clock.lock().unwrap();
     *now += by;
 }
@@ -1911,11 +1905,11 @@ async fn wait_for_ptt_instant_reaches_target_on_the_wall_clock() {
     let ticker = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            shift_clock(&ticker_clock, chrono::Duration::milliseconds(20));
+            shift_clock(&ticker_clock, SignedDuration::from_millis(20));
         }
     });
-    let ptt_target = start_wall + chrono::Duration::milliseconds(200);
-    let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+    let ptt_target = start_wall + SignedDuration::from_millis(200);
+    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
     let reader = clock.clone();
     let started = std::time::Instant::now();
     let outcome = wait_for_ptt_instant(
@@ -1952,10 +1946,10 @@ async fn wait_for_ptt_instant_detects_a_backward_step_mid_wait() {
     let stepper_clock = clock.clone();
     let stepper = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
-        shift_clock(&stepper_clock, -chrono::Duration::seconds(600));
+        shift_clock(&stepper_clock, -SignedDuration::from_secs(600));
     });
-    let ptt_target = start_wall + chrono::Duration::milliseconds(200);
-    let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+    let ptt_target = start_wall + SignedDuration::from_millis(200);
+    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
     let reader = clock.clone();
     let started = std::time::Instant::now();
     let outcome = wait_for_ptt_instant(
@@ -1972,7 +1966,7 @@ async fn wait_for_ptt_instant_detects_a_backward_step_mid_wait() {
     let _ = stepper.await;
     match outcome {
         PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-            assert!(d > chrono::Duration::seconds(600), "jump size {d:?}");
+            assert!(d > SignedDuration::from_secs(600), "jump size {d:?}");
         }
         other => panic!("expected ClockJumped(Backward), got {other:?}"),
     }
@@ -1994,10 +1988,10 @@ async fn wait_for_ptt_instant_detects_a_forward_jump_mid_wait() {
     let jumper_clock = clock.clone();
     let jumper = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
-        shift_clock(&jumper_clock, chrono::Duration::seconds(3600));
+        shift_clock(&jumper_clock, SignedDuration::from_secs(3600));
     });
-    let ptt_target = start_wall + chrono::Duration::seconds(10);
-    let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+    let ptt_target = start_wall + SignedDuration::from_secs(10);
+    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
     let reader = clock.clone();
     let started = std::time::Instant::now();
     let outcome = wait_for_ptt_instant(
@@ -2014,7 +2008,7 @@ async fn wait_for_ptt_instant_detects_a_forward_jump_mid_wait() {
     let _ = jumper.await;
     match outcome {
         PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
-            assert_eq!(d, chrono::Duration::seconds(3590));
+            assert_eq!(d, SignedDuration::from_secs(3590));
         }
         other => panic!("expected ClockJumped(Forward), got {other:?}"),
     }
@@ -2031,8 +2025,8 @@ async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
     // A frozen wall clock 10 s short of the target: only a flag can end
     // the wait.
     let start_wall = at(10.0);
-    let ptt_target = start_wall + chrono::Duration::seconds(10);
-    let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+    let ptt_target = start_wall + SignedDuration::from_secs(10);
+    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
 
     for flip_shutdown in [false, true] {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2078,7 +2072,7 @@ async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
         SLOT_NS,
         &shutdown,
         &abort,
-        || -> chrono::DateTime<chrono::Utc> { panic!("clock read after abort") },
+        || -> UtcTimestamp { panic!("clock read after abort") },
     )
     .await;
     assert_eq!(outcome, PttWait::Interrupted);

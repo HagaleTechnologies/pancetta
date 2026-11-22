@@ -108,15 +108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "android_system_properties"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,20 +641,6 @@ dependencies = [
  "cipher",
  "poly1305",
  "zeroize",
-]
-
-[[package]]
-name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
-dependencies = [
- "iana-time-zone",
- "js-sys",
- "num-traits",
- "serde",
- "wasm-bindgen",
- "windows-link",
 ]
 
 [[package]]
@@ -1974,30 +1951,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iana-time-zone"
-version = "0.1.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
-dependencies = [
- "android_system_properties",
- "core-foundation-sys",
- "iana-time-zone-haiku",
- "js-sys",
- "log",
- "wasm-bindgen",
- "windows-core",
-]
-
-[[package]]
-name = "iana-time-zone-haiku"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2218,6 +2171,41 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jiff"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "jni"
@@ -2993,7 +2981,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "block2",
- "chrono",
  "clap",
  "cpal",
  "criterion",
@@ -3003,6 +2990,7 @@ dependencies = [
  "futures-util",
  "geographiclib-rs",
  "hound",
+ "jiff",
  "libc",
  "num_cpus",
  "objc2",
@@ -3088,8 +3076,8 @@ name = "pancetta-config"
 version = "0.9.6"
 dependencies = [
  "anyhow",
- "chrono",
  "dirs",
+ "jiff",
  "notify",
  "pancetta-core",
  "pancetta-hamlib",
@@ -3112,9 +3100,9 @@ name = "pancetta-core"
 version = "0.9.7"
 dependencies = [
  "approx",
- "chrono",
  "criterion",
  "dirs",
+ "jiff",
  "serde",
  "serde_json",
  "tempfile",
@@ -3124,7 +3112,7 @@ dependencies = [
 name = "pancetta-cqdx"
 version = "0.9.6"
 dependencies = [
- "chrono",
+ "jiff",
  "pancetta-core",
  "reqwest",
  "rustls",
@@ -3162,9 +3150,9 @@ name = "pancetta-dx"
 version = "0.9.6"
 dependencies = [
  "approx",
- "chrono",
  "encoding_rs",
  "futures-util",
+ "jiff",
  "pancetta-core",
  "quick-xml",
  "reqwest",
@@ -3217,7 +3205,6 @@ version = "0.9.6"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "futures",
  "pancetta-core",
  "parking_lot",
@@ -3236,7 +3223,6 @@ name = "pancetta-protocol"
 version = "0.9.6"
 dependencies = [
  "boon",
- "chrono",
  "pancetta-core",
  "serde",
  "serde_json",
@@ -3247,8 +3233,8 @@ name = "pancetta-qso"
 version = "0.9.6"
 dependencies = [
  "anyhow",
- "chrono",
  "dirs",
+ "jiff",
  "lazy_static",
  "pancetta-config",
  "pancetta-core",
@@ -3273,11 +3259,12 @@ version = "0.9.6"
 dependencies = [
  "anyhow",
  "bitvec",
- "chrono",
  "dirs",
  "hound",
+ "jiff",
  "libc",
  "num-complex",
+ "pancetta-core",
  "pancetta-dsp",
  "pancetta-ft8",
  "pancetta-qso",
@@ -3296,10 +3283,10 @@ name = "pancetta-tui"
 version = "0.9.6"
 dependencies = [
  "anyhow",
- "chrono",
  "crossbeam-channel",
  "crossterm",
  "dirs",
+ "jiff",
  "pancetta-config",
  "pancetta-core",
  "pancetta-qso",
@@ -4709,7 +4696,6 @@ checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -4786,7 +4772,6 @@ dependencies = [
  "bitflags 2.13.1",
  "byteorder",
  "bytes",
- "chrono",
  "crc",
  "digest 0.10.7",
  "dotenvy",
@@ -4829,7 +4814,6 @@ dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
  "byteorder",
- "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -4865,7 +4849,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
- "chrono",
  "flume",
  "futures-channel",
  "futures-core",

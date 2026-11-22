@@ -10,6 +10,9 @@
 //! panic in the audio output path would leave the rig stuck on TX.
 
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -132,11 +135,8 @@ impl SlotTimingContext {
     }
 
     /// The PTT engage instant: `target_slot` minus `ptt_lead_ms`.
-    fn ptt_target(
-        &self,
-        target_slot: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
-        target_slot - chrono::Duration::milliseconds(self.ptt_lead_ms as i64)
+    fn ptt_target(&self, target_slot: UtcTimestamp) -> UtcTimestamp {
+        target_slot - SignedDuration::from_millis(self.ptt_lead_ms as i64)
     }
 }
 
@@ -149,7 +149,7 @@ impl SlotTimingContext {
         sample_rate: u32,
         slot_ns: i64,
         tx_self_parity: pancetta_config::station::TxSelfParity,
-        request_received_at: chrono::DateTime<chrono::Utc>,
+        request_received_at: UtcTimestamp,
     ) -> Self {
         Self {
             active_protocol: pancetta_ft8::Protocol::Ft8,

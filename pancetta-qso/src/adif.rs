@@ -5,7 +5,8 @@
 //! amateur radio logging format.
 
 use crate::states::*;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use jiff::civil;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -168,7 +169,7 @@ pub struct AdifHeader {
     pub program_version: String,
 
     /// Creation timestamp
-    pub created_timestamp: DateTime<Utc>,
+    pub created_timestamp: UtcTimestamp,
 
     /// Additional header fields
     pub fields: HashMap<String, AdifField>,
@@ -178,10 +179,10 @@ pub struct AdifHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdifQso {
     /// QSO start date and time (UTC)
-    pub qso_date: DateTime<Utc>,
+    pub qso_date: UtcTimestamp,
 
     /// QSO end date and time (UTC)
-    pub qso_date_off: Option<DateTime<Utc>>,
+    pub qso_date_off: Option<UtcTimestamp>,
 
     /// Called station callsign
     pub call: String,
@@ -588,7 +589,7 @@ impl AdifProcessor {
             created_timestamp: header_fields
                 .get("CREATED_TIMESTAMP")
                 .and_then(|f| self.parse_datetime(&f.value).ok())
-                .unwrap_or_else(Utc::now),
+                .unwrap_or_else(UtcTimestamp::now),
             fields: header_fields,
         }
     }
@@ -613,7 +614,7 @@ impl AdifProcessor {
             "Generated on {}\n\n",
             file.header
                 .created_timestamp
-                .format("%Y-%m-%d %H:%M:%S UTC")
+                .strftime("%Y-%m-%d %H:%M:%S UTC")
         ));
 
         // Write header fields
@@ -626,7 +627,7 @@ impl AdifProcessor {
                 &file
                     .header
                     .created_timestamp
-                    .format("%Y%m%d %H%M%S")
+                    .strftime("%Y%m%d %H%M%S")
                     .to_string(),
             )?,
         );
@@ -1041,12 +1042,12 @@ impl AdifProcessor {
         self.add_field(
             &mut fields,
             "QSO_DATE",
-            &qso.qso_date.format("%Y%m%d").to_string(),
+            &qso.qso_date.strftime("%Y%m%d").to_string(),
         );
         self.add_field(
             &mut fields,
             "TIME_ON",
-            &qso.qso_date.format("%H%M%S").to_string(),
+            &qso.qso_date.strftime("%H%M%S").to_string(),
         );
         self.add_field(&mut fields, "MODE", &qso.mode);
 
@@ -1122,12 +1123,12 @@ impl AdifProcessor {
             self.add_field(
                 &mut fields,
                 "QSO_DATE_OFF",
-                &end_time.format("%Y%m%d").to_string(),
+                &end_time.strftime("%Y%m%d").to_string(),
             );
             self.add_field(
                 &mut fields,
                 "TIME_OFF",
-                &end_time.format("%H%M%S").to_string(),
+                &end_time.strftime("%H%M%S").to_string(),
             );
         }
 
@@ -1235,13 +1236,16 @@ impl AdifProcessor {
         })
     }
 
-    fn parse_datetime(&self, datetime: &str) -> Result<DateTime<Utc>, AdifError> {
+    fn parse_datetime(&self, datetime: &str) -> Result<UtcTimestamp, AdifError> {
         // Try different datetime formats
         let formats = vec!["%Y%m%d %H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d_%H%M%S"];
 
         for format in formats {
-            if let Ok(naive_dt) = NaiveDateTime::parse_from_str(datetime, format) {
-                return Ok(Utc.from_utc_datetime(&naive_dt));
+            if let Some(ts) = civil::DateTime::strptime(format, datetime)
+                .ok()
+                .and_then(UtcTimestamp::from_civil)
+            {
+                return Ok(ts);
             }
         }
 
@@ -1250,7 +1254,7 @@ impl AdifProcessor {
         })
     }
 
-    fn parse_qso_datetime(&self, record: &AdifRecord) -> Result<DateTime<Utc>, AdifError> {
+    fn parse_qso_datetime(&self, record: &AdifRecord) -> Result<UtcTimestamp, AdifError> {
         let date = self.get_required_field(record, "QSO_DATE")?;
         let time = self
             .get_field_value(record, "TIME_ON")
@@ -1266,7 +1270,7 @@ impl AdifProcessor {
         record: &AdifRecord,
         date_field: &str,
         time_field: &str,
-    ) -> Result<Option<DateTime<Utc>>, AdifError> {
+    ) -> Result<Option<UtcTimestamp>, AdifError> {
         if let Some(date) = self.get_field_value(record, date_field) {
             let time = self
                 .get_field_value(record, time_field)
@@ -1371,7 +1375,7 @@ impl AdifProcessor {
             &self
                 .format_field(
                     "CREATED_TIMESTAMP",
-                    &chrono::Utc::now().format("%Y%m%d %H%M%S").to_string(),
+                    &UtcTimestamp::now().strftime("%Y%m%d %H%M%S").to_string(),
                 )
                 .unwrap_or_default(),
         );
@@ -1654,6 +1658,10 @@ impl fmt::Display for AdifField {
 }
 
 #[cfg(test)]
+#[path = "adif/tests/stored_timestamp_bytes_tests.rs"]
+mod stored_timestamp_bytes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1737,7 +1745,7 @@ ADIF Export for Test Program
         let processor = AdifProcessor::new();
 
         let qso = AdifQso {
-            qso_date: Utc::now(),
+            qso_date: UtcTimestamp::now(),
             qso_date_off: None,
             call: "W1ABC".to_string(),
             mode: "DATA".to_string(),
@@ -1977,7 +1985,7 @@ ADIF Export for Test Program
 
     fn hound_adif_metadata(hound: bool, notes: Option<&str>) -> crate::states::QsoMetadata {
         use crate::states::{CallInitiation, GridSquares, QsoRole, SignalReports};
-        use chrono::Utc;
+        use pancetta_core::time::UtcTimestamp;
         use uuid::Uuid;
 
         crate::states::QsoMetadata {
@@ -1988,7 +1996,7 @@ ADIF Export for Test Program
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
             first_answer_at: None,
-            start_time: Utc::now(),
+            start_time: UtcTimestamp::now(),
             end_time: None,
             reports: SignalReports {
                 sent: Some(-12),
@@ -2508,11 +2516,11 @@ ADIF Export for Test Program
 
         assert_eq!(
             qso.qso_date,
-            Utc.with_ymd_and_hms(2024, 1, 1, 12, 30, 0).unwrap()
+            UtcTimestamp::from_ymd_hms(2024, 1, 1, 12, 30, 0).unwrap()
         );
         assert_eq!(
             qso.qso_date_off,
-            Some(Utc.with_ymd_and_hms(2024, 1, 1, 12, 31, 0).unwrap())
+            Some(UtcTimestamp::from_ymd_hms(2024, 1, 1, 12, 31, 0).unwrap())
         );
     }
 
@@ -3000,7 +3008,7 @@ ADIF Export for Test Program
                 version: "3.1.0".to_string(),
                 program_id: "TestProg".to_string(),
                 program_version: "1.2".to_string(),
-                created_timestamp: Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap(),
+                created_timestamp: UtcTimestamp::from_ymd_hms(2024, 1, 1, 12, 0, 0).unwrap(),
                 fields: HashMap::new(),
             },
             records: vec![record("W1AW"), record("K1ABC")],

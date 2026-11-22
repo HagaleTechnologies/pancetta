@@ -1,12 +1,12 @@
 use super::merge_qrz_lookup;
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_dx::QrzLookup;
 use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
 
 /// Build a completed QSO metadata with the given their-grid / notes so the
 /// "only fill when missing" merge policy can be exercised in isolation.
 fn metadata(their_grid: Option<&str>, notes: Option<&str>) -> QsoMetadata {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: pancetta_qso::QsoId::new_v4(),
         our_callsign: "K5ARH".to_string(),
@@ -16,7 +16,7 @@ fn metadata(their_grid: Option<&str>, notes: Option<&str>) -> QsoMetadata {
         mode: "FT8".to_string(),
         first_answer_at: None,
         start_time: now,
-        end_time: Some(now + chrono::Duration::seconds(90)),
+        end_time: Some(now + jiff::SignedDuration::from_secs(90)),
         reports: SignalReports {
             sent: Some(-8),
             received: Some(-12),

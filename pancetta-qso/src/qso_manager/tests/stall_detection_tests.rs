@@ -16,23 +16,26 @@
 //! still on the known-good offset (or none is recorded yet), `Revert` if
 //! we're on some other (previously-switched) offset.
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 fn clocked_manager(config: QsoManagerConfig) -> QsoManager {
     QsoManager::with_clock_for_test(config, PinnedClock::new().source())
 }
 
 #[derive(Clone)]
-struct PinnedClock(Arc<std::sync::Mutex<DateTime<Utc>>>);
+struct PinnedClock(Arc<std::sync::Mutex<UtcTimestamp>>);
 impl PinnedClock {
     fn new() -> Self {
         Self(Arc::new(std::sync::Mutex::new(
             pancetta_core::time::slot_grid_origin(),
         )))
     }
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> UtcTimestamp {
         *self.0.lock().unwrap()
     }
-    fn advance(&self, by: Duration) {
+    fn advance(&self, by: SignedDuration) {
         *self.0.lock().unwrap() += by;
     }
     fn source(&self) -> pancetta_core::time::UtcClock {
@@ -66,10 +69,10 @@ async fn check_completed_time_on(bare: bool) {
     let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
     let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
     let created = clock.now();
-    clock.advance(Duration::minutes(4));
+    clock.advance(SignedDuration::from_mins(4));
     let answered = clock.now();
     time_on_answer(&manager, bare, OUR).await;
-    clock.advance(Duration::seconds(30));
+    clock.advance(SignedDuration::from_secs(30));
     manager
         .process_message(
             MessageType::ReportAck {
@@ -83,7 +86,7 @@ async fn check_completed_time_on(bare: bool) {
         )
         .await
         .unwrap();
-    clock.advance(Duration::seconds(30));
+    clock.advance(SignedDuration::from_secs(30));
     manager
         .process_message(
             MessageType::SeventyThree {
@@ -123,14 +126,14 @@ async fn cqer_time_on_rejected_and_repeated_answers() {
     let clock = PinnedClock::new();
     let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
     let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
-    clock.advance(Duration::minutes(4));
+    clock.advance(SignedDuration::from_mins(4));
     time_on_answer(&manager, false, "W9XYZ").await;
     let qso = manager.get_qso(id).await.unwrap();
     assert!(matches!(qso.state, QsoState::CallingCq { .. }));
     assert_eq!(qso.metadata.first_answer_at, None);
     time_on_answer(&manager, false, OUR).await;
     let answered = clock.now();
-    clock.advance(Duration::seconds(30));
+    clock.advance(SignedDuration::from_secs(30));
     time_on_answer(&manager, false, OUR).await;
     assert_eq!(
         manager.get_qso(id).await.unwrap().metadata.first_answer_at,
@@ -141,21 +144,21 @@ async fn cqer_time_on_rejected_and_repeated_answers() {
 #[tokio::test]
 async fn manual_cq_time_on_rolls_over_utc_midnight() {
     let clock = PinnedClock::new();
-    clock.advance(Duration::hours(23) + Duration::minutes(58));
+    clock.advance(SignedDuration::from_hours(23) + SignedDuration::from_mins(58));
     let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
     let id = manager
         .start_cq_manual(FREQ, None, false, None)
         .await
         .unwrap();
     let created = clock.now();
-    clock.advance(Duration::minutes(4));
+    clock.advance(SignedDuration::from_mins(4));
     time_on_answer(&manager, false, OUR).await;
     let metadata = manager.get_qso(id).await.unwrap().metadata;
     assert_eq!(metadata.start_time, created);
     assert_eq!(metadata.first_answer_at, Some(clock.now()));
     let adif = crate::adif::AdifProcessor::new().qso_to_adif(&metadata, None);
     assert_eq!(adif.qso_date, clock.now());
-    assert_ne!(adif.qso_date.date_naive(), created.date_naive());
+    assert_ne!(adif.qso_date.to_civil().date(), created.to_civil().date());
 }
 
 #[tokio::test]
@@ -173,7 +176,7 @@ async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
         "TX",
         vec![ContestPeriod {
             start: created,
-            end: created + Duration::hours(1),
+            end: created + SignedDuration::from_hours(1),
         }],
     )
     .unwrap();
@@ -184,7 +187,7 @@ async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
         .start_cq_manual(FREQ, None, false, None)
         .await
         .unwrap();
-    clock.advance(Duration::minutes(4) + Duration::milliseconds(123));
+    clock.advance(SignedDuration::from_mins(4) + SignedDuration::from_millis(123));
     let answered = clock.now();
     time_on_answer(&manager, false, OUR).await;
     for message in [
@@ -198,7 +201,7 @@ async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
             from_station: DX.into(),
         },
     ] {
-        clock.advance(Duration::seconds(30));
+        clock.advance(SignedDuration::from_secs(30));
         manager
             .process_message(message, format!("{OUR} {DX}"), FREQ, Some(-11.0))
             .await
@@ -250,7 +253,7 @@ async fn responding_qso_time_on_unchanged() {
         )
         .await
         .unwrap();
-    clock.advance(Duration::seconds(30));
+    clock.advance(SignedDuration::from_secs(30));
     time_on_answer(&manager, true, OUR).await;
     let metadata = manager.get_qso(id).await.unwrap().metadata;
     assert_eq!(metadata.first_answer_at, None);
@@ -271,21 +274,21 @@ async fn creation_reads_the_injected_clock() {
         .await
         .unwrap();
     let a = first.get_qso(id).await.unwrap().metadata;
-    clock.advance(Duration::seconds(30));
+    clock.advance(SignedDuration::from_secs(30));
     let second = QsoManager::with_clock_for_test(test_config(), clock.source());
     let id = second
         .start_cq_manual(FREQ, None, false, None)
         .await
         .unwrap();
     let b = second.get_qso(id).await.unwrap().metadata;
-    assert_eq!((b.start_time - a.start_time).num_milliseconds(), 30_000);
+    assert_eq!((b.start_time - a.start_time).as_millis_i64(), 30_000);
     assert_eq!(a.tx_parity, b.tx_parity);
     assert_eq!(b.start_time, clock.now());
 }
 
 #[tokio::test]
 async fn stall_module_is_replay_deterministic() {
-    async fn replay() -> (Vec<String>, DateTime<Utc>, Option<DateTime<Utc>>) {
+    async fn replay() -> (Vec<String>, UtcTimestamp, Option<UtcTimestamp>) {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
@@ -394,7 +397,7 @@ async fn confirm_last_frame_aired(manager: &QsoManager, qso_id: QsoId, frequency
 /// When the pending trigger's own TX slot has played out — the earliest
 /// a `TxFrameSent` for it can carry — or far in the future when no
 /// trigger is recorded.
-fn trigger_slot_played_out(manager: &QsoManager, qso_id: QsoId) -> DateTime<Utc> {
+fn trigger_slot_played_out(manager: &QsoManager, qso_id: QsoId) -> UtcTimestamp {
     manager
         .keep_call_ledger
         .lock()
@@ -402,8 +405,8 @@ fn trigger_slot_played_out(manager: &QsoManager, qso_id: QsoId) -> DateTime<Utc>
         .get(&qso_id)
         .and_then(|entry| entry.pending_stall_trigger.as_ref())
         .and_then(|trigger| trigger.tx_slot)
-        .map_or(manager.now_utc() + Duration::days(1), |slot| {
-            slot + Duration::seconds(13)
+        .map_or(manager.now_utc() + SignedDuration::from_hours(24), |slot| {
+            slot + SignedDuration::from_secs(13)
         })
 }
 
@@ -415,7 +418,7 @@ fn trigger_slot_played_out(manager: &QsoManager, qso_id: QsoId) -> DateTime<Utc>
 async fn stall_on_two_own_parity_slots(
     manager: &QsoManager,
     qso_id: QsoId,
-    opened_at: DateTime<Utc>,
+    opened_at: UtcTimestamp,
 ) {
     let tx_parity = manager
         .get_qso(qso_id)
@@ -424,10 +427,10 @@ async fn stall_on_two_own_parity_slots(
         .metadata
         .tx_parity
         .expect("manual QSOs latch a TX parity at creation");
-    let own_slot = next_own_ft8_slot(opened_at + Duration::seconds(15), tx_parity);
+    let own_slot = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), tx_parity);
     for k in [0i64, 2] {
         manager
-            .rearm_manual_calls_at(own_slot + Duration::seconds(1 + 15 * k))
+            .rearm_manual_calls_at(own_slot + SignedDuration::from_secs(1 + 15 * k))
             .await;
     }
 }
@@ -483,7 +486,7 @@ async fn silence_increments_stall_cycles_via_rearm_and_emits_switch_at_threshold
 
     // First rearm tick: one slot after the initial call, no DX response.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -502,7 +505,7 @@ async fn silence_increments_stall_cycles_via_rearm_and_emits_switch_at_threshold
     // DISTINCT own-parity TX slot (PAN-128): threshold (2) hit ->
     // Switch.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(45))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(45))
         .await;
 
     let mut saw_switch = false;
@@ -568,7 +571,7 @@ async fn threshold_streak_survives_a_refused_relocation_and_clears_on_commit() {
 
     for slot in [1i64, 3] {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * slot))
             .await;
     }
     assert_eq!(
@@ -634,7 +637,7 @@ async fn rolling_back_the_threshold_attempt_revokes_its_queued_stall_action() {
         .unwrap();
     let _ = drain(&mut rx);
 
-    let rearm_at = opened_at + Duration::seconds(15);
+    let rearm_at = opened_at + SignedDuration::from_secs(15);
     manager.rearm_manual_calls_at(rearm_at).await;
     let raised_at_generation = drain(&mut rx)
         .into_iter()
@@ -658,7 +661,7 @@ async fn rolling_back_the_threshold_attempt_revokes_its_queued_stall_action() {
 
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + SignedDuration::from_secs(1))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -717,13 +720,13 @@ async fn pivot_rollback_undoes_the_replaced_offset_not_the_frame_that_aired() {
         .last_call_at
         .unwrap();
 
-    let replaced_at = opened_at + Duration::seconds(15);
+    let replaced_at = opened_at + SignedDuration::from_secs(15);
     manager.rearm_manual_calls_at(replaced_at).await;
     manager
         .apply_tx_offset_switch(qso_id, FREQ + 300.0, OffsetRelocationOrigin::OperatorForced)
         .await
         .expect("precondition: the move commits");
-    let aired_at = opened_at + Duration::seconds(30);
+    let aired_at = opened_at + SignedDuration::from_secs(30);
     manager.rearm_manual_calls_at(aired_at).await;
     let before = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(before.metadata.call_count, 3);
@@ -744,7 +747,7 @@ async fn pivot_rollback_undoes_the_replaced_offset_not_the_frame_that_aired() {
                 &text,
                 Some(&replaced),
                 None,
-                aired_at + Duration::seconds(1),
+                aired_at + SignedDuration::from_secs(1),
             )
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
@@ -777,7 +780,7 @@ async fn pivot_rollback_undoes_the_replaced_offset_not_the_frame_that_aired() {
                 &text,
                 Some(&replaced),
                 None,
-                aired_at + Duration::seconds(2),
+                aired_at + SignedDuration::from_secs(2),
             )
             .await,
         UnsentAttemptRollback::NoMatchingAttempt
@@ -858,7 +861,7 @@ async fn a_qso_bound_to_a_different_client_than_the_one_armed_does_not_count_as_
 
     for slot in 1..=4 {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * slot))
             .await;
     }
 
@@ -898,7 +901,7 @@ async fn a_disarmed_remote_qso_does_not_count_rearm_cycles_as_stalls() {
     armed.store(false, std::sync::atomic::Ordering::Relaxed);
     for slot in 1..=4 {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * slot))
             .await;
     }
 
@@ -925,7 +928,7 @@ async fn a_disarmed_remote_qso_does_not_count_rearm_cycles_as_stalls() {
     // Re-arming resumes normal stall accounting from where it left off.
     armed.store(true, std::sync::atomic::Ordering::Relaxed);
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * 5))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -958,7 +961,7 @@ async fn a_disarmed_arm_gate_does_not_suppress_local_qso_stall_counting() {
         .unwrap();
 
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
 
     assert_eq!(
@@ -1002,7 +1005,7 @@ async fn a_hamlib_hard_muted_rearm_does_not_count_as_a_stall_cycle() {
     // stall_cycles at all.
     for slot in 1..=4 {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * slot))
             .await;
     }
     assert_eq!(
@@ -1020,7 +1023,7 @@ async fn a_hamlib_hard_muted_rearm_does_not_count_as_a_stall_cycle() {
     // Once the mute clears, stall accounting resumes from zero.
     muted.store(false, std::sync::atomic::Ordering::Relaxed);
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * 5))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1051,7 +1054,7 @@ async fn the_default_hamlib_hard_muted_source_never_suppresses_stall_counting() 
         .unwrap();
 
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
 
     assert_eq!(
@@ -1095,7 +1098,7 @@ async fn ft4_counts_stalls_on_its_own_75_second_slot_cadence() {
     // distinct own-parity FT4 TX slot (PAN-128).
     for slot in [1i64, 3] {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_500 * slot))
             .await;
     }
 
@@ -1132,7 +1135,7 @@ async fn ft8_slot_cadence_is_unchanged_at_fifteen_seconds() {
 
     // 14.999 s: still inside the slot, must not count.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::milliseconds(14_999))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(14_999))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1142,7 +1145,7 @@ async fn ft8_slot_cadence_is_unchanged_at_fifteen_seconds() {
 
     // Exactly one slot: counts.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1186,15 +1189,15 @@ fn the_default_slot_source_is_exactly_the_ft8_slot() {
 fn pre_switch_offset_grace_scales_with_the_active_slot() {
     assert_eq!(
         pre_switch_offset_grace_from_slot_ns(15_000_000_000),
-        Duration::milliseconds(30_000)
+        SignedDuration::from_millis(30_000)
     );
     assert_eq!(
         pre_switch_offset_grace_from_slot_ns(7_500_000_000),
-        Duration::milliseconds(15_000)
+        SignedDuration::from_millis(15_000)
     );
     assert_eq!(
         pre_switch_offset_grace_from_slot_ns(3_200_000_000),
-        Duration::milliseconds(6_400)
+        SignedDuration::from_millis(6_400)
     );
 }
 
@@ -1206,7 +1209,7 @@ fn the_default_pre_switch_offset_grace_is_unchanged() {
     let manager = clocked_manager(test_config());
     assert_eq!(
         manager.pre_switch_offset_grace(),
-        Duration::milliseconds(30_000)
+        SignedDuration::from_millis(30_000)
     );
 }
 
@@ -1239,7 +1242,7 @@ async fn injected_active_slot_ns_drives_the_rearm_cadence() {
 
     for slot in [1i64, 3] {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_500 * slot))
             .await;
     }
 
@@ -1279,7 +1282,7 @@ async fn a_live_slot_change_after_the_clone_is_observed_by_the_rearm_loop() {
     // FT8 → FT4 while the loop is already running.
     slot_ns.store(7_500_000_000, std::sync::atomic::Ordering::Relaxed);
     rearm_loop
-        .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_500))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1291,7 +1294,7 @@ async fn a_live_slot_change_after_the_clone_is_observed_by_the_rearm_loop() {
     // sub-slot rearm and must not count.
     slot_ns.store(15_000_000_000, std::sync::atomic::Ordering::Relaxed);
     rearm_loop
-        .rearm_manual_calls_at(opened_at + Duration::milliseconds(15_000))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(15_000))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1306,7 +1309,7 @@ async fn a_live_slot_change_after_the_clone_is_observed_by_the_rearm_loop() {
     // by slot key, so an exactly-one-slot rearm can land on the same
     // key across the switch for some wall-clock phases.
     rearm_loop
-        .rearm_manual_calls_at(opened_at + Duration::milliseconds(37_500))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(37_500))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1350,7 +1353,7 @@ async fn a_runtime_switch_back_to_ft8_restores_the_fifteen_second_cadence() {
     // One FT4 slot after the opening call. Under FT8 (the mode we are now
     // actually operating) this is a SUB-slot rearm and must not count.
     rearm_loop
-        .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_millis(7_500))
         .await;
 
     assert_eq!(
@@ -1393,7 +1396,7 @@ async fn a_muted_tx_path_does_not_count_rearm_cycles_as_stalls() {
     // Four muted rearm cycles — twice the switch threshold.
     for slot in 1..=4 {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * slot))
             .await;
     }
 
@@ -1422,7 +1425,7 @@ async fn a_muted_tx_path_does_not_count_rearm_cycles_as_stalls() {
         std::sync::atomic::Ordering::Relaxed,
     );
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * 5))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1452,7 +1455,7 @@ async fn forward_advance_resets_stall_cycles_and_records_known_good_offset() {
 
     // One silent rearm cycle: stall_cycles -> 1 (below threshold).
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -1501,10 +1504,10 @@ async fn second_stall_on_switched_offset_reverts_to_known_good() {
     // distinct own-parity TX slot — PAN-128) on the (still known-good)
     // offset -> Switch.
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(45))
         .await;
     let first_action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -1533,10 +1536,10 @@ async fn second_stall_on_switched_offset_reverts_to_known_good() {
     // (non-known-good) offset -> Revert back to the known-good offset,
     // not another Switch.
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(75))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(75))
         .await;
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(105))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(105))
         .await;
     let second_action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -1581,7 +1584,7 @@ async fn cqer_flow_advance_resets_stall_cycles_and_records_known_good_offset() {
     // (still below the default-shaped threshold of 4).
     for i in [1i64, 3, 5] {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * i))
             .await;
     }
     assert_eq!(
@@ -1694,10 +1697,10 @@ async fn hound_qsy_reanchors_the_known_good_offset_so_a_stall_never_reverts_it()
     let entered_at = after.metadata.last_call_at.unwrap();
     let _ = drain(&mut rx);
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(45))
         .await;
     let action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -2135,7 +2138,7 @@ async fn an_operator_nudge_survives_an_advance_that_stays_retransmittable() {
 
     let mut rx = manager.subscribe();
     manager
-        .rearm_manual_calls_at(manager.now_utc() + Duration::seconds(60))
+        .rearm_manual_calls_at(manager.now_utc() + SignedDuration::from_secs(60))
         .await;
     let sent_at: Vec<f64> = drain(&mut rx)
         .into_iter()
@@ -2268,7 +2271,7 @@ async fn hold_mode_never_emits_tx_offset_action_needed() {
     // Well past the threshold (2) worth of silent rearm cycles.
     for i in 1..=6i64 {
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
+            .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15 * i))
             .await;
     }
 
@@ -2384,7 +2387,7 @@ async fn stall_switch_does_not_relatch_back_onto_the_abandoned_offset() {
         "a DX sitting exactly where we left it is not a drift candidate"
     );
     manager
-        .maybe_confirm_frequency_drift_at(&report, FREQ, t0 + Duration::seconds(6))
+        .maybe_confirm_frequency_drift_at(&report, FREQ, t0 + SignedDuration::from_secs(6))
         .await;
 
     let after = manager.get_qso(qso_id).await.unwrap();
@@ -2498,10 +2501,10 @@ async fn cq_stall_switch_leaves_partner_freq_none_and_keeps_answering_callers_ro
     // so the stall detector trips and asks for a Switch off this
     // offset.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(45))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(45))
         .await;
     let action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -2595,10 +2598,10 @@ async fn a_caller_answering_the_pre_switch_resend_still_routes_to_the_cq() {
     // re-emits our CQ at FREQ (the frame a caller can answer) and trips
     // the stall threshold.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(45))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(45))
         .await;
     let events = drain(&mut rx);
     assert!(
@@ -2875,7 +2878,9 @@ async fn the_pre_switch_rx_baseline_lapses_with_its_grace() {
 
     progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
         offset_hz: FREQ,
-        left_at: manager.now_utc() - manager.pre_switch_offset_grace() - Duration::seconds(1),
+        left_at: manager.now_utc()
+            - manager.pre_switch_offset_grace()
+            - SignedDuration::from_secs(1),
         operator_forced: true,
     });
     assert!(
@@ -3339,10 +3344,10 @@ async fn a_stall_after_an_operator_nudge_on_a_simplex_qso_switches_instead_of_re
     // Two silent rearms, two slots apart, so each feeds a distinct
     // own-parity TX slot (PAN-128) and the second trips the threshold.
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(45))
         .await;
     let action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -3363,11 +3368,11 @@ async fn a_stall_after_an_operator_nudge_on_a_simplex_qso_switches_instead_of_re
 /// aired in R-1; reporting it 2 s before "now" lands inside
 /// `answered_frame_offset_hz`'s window for any test that finishes within
 /// one slot.
-fn reply_window_now() -> (pancetta_core::slot::SlotParity, DateTime<Utc>) {
+fn reply_window_now() -> (pancetta_core::slot::SlotParity, UtcTimestamp) {
     let now = pancetta_core::time::slot_grid_origin();
     (
         pancetta_core::slot::SlotParity::of_with_period(now, DEFAULT_SLOT_NS),
-        now - Duration::seconds(2),
+        now - SignedDuration::from_secs(2),
     )
 }
 
@@ -3376,7 +3381,7 @@ async fn report_aired(
     manager: &QsoManager,
     qso_id: QsoId,
     frequency_hz: f64,
-    aired_at: DateTime<Utc>,
+    aired_at: UtcTimestamp,
 ) {
     manager
         .confirm_stall_trigger_aired(
@@ -3591,10 +3596,10 @@ async fn a_stall_after_a_nudge_whose_reply_answered_the_old_offset_reverts_to_it
     // Two silent rearms, two slots apart, so each feeds a distinct
     // own-parity TX slot (PAN-128) and the second trips the threshold.
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+        .rearm_manual_calls_at(entered_at + SignedDuration::from_secs(45))
         .await;
     let action = drain(&mut rx).into_iter().find_map(|e| match e {
         QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -3620,7 +3625,13 @@ async fn a_nudge_whose_new_offset_aired_before_the_reply_credits_the_new_offset(
         .await
         .unwrap();
     let (parity, aired_at) = reply_window_now();
-    report_aired(&manager, qso_id, FREQ, aired_at - Duration::seconds(30)).await;
+    report_aired(
+        &manager,
+        qso_id,
+        FREQ,
+        aired_at - SignedDuration::from_secs(30),
+    )
+    .await;
     let nudged = FREQ + 400.0;
     manager
         .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
@@ -3672,10 +3683,10 @@ async fn a_chained_stall_relocation_credits_the_offset_its_trigger_aired_on() {
     // Two silent rearm cycles trip the stall on 1900; the second holds
     // the action on its own trigger frame (PAN-182).
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(45))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(45))
         .await;
     confirm_last_frame_aired(&manager, qso_id, 1900.0).await;
 
@@ -3717,7 +3728,7 @@ async fn an_aired_frame_outside_the_reply_window_falls_back_to_provenance() {
         &manager,
         qso_id,
         FREQ,
-        manager.now_utc() - Duration::seconds(32),
+        manager.now_utc() - SignedDuration::from_secs(32),
     )
     .await;
     let nudged = FREQ + 400.0;
@@ -3881,7 +3892,7 @@ async fn the_dx_s_first_report_advances_a_sending_report_qso() {
     // A silent slot: we re-send our report, the DX says nothing. Partial
     // stall streak, below the threshold.
     manager
-        .rearm_manual_calls_at(answered_at + Duration::seconds(16))
+        .rearm_manual_calls_at(answered_at + SignedDuration::from_secs(16))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -3961,7 +3972,7 @@ async fn first_dx_report_grants_exactly_one_expired_watchdog_reprieve() {
         .await
         .unwrap();
     let now = manager.now_utc();
-    let first_call_at = now - Duration::minutes(2);
+    let first_call_at = now - SignedDuration::from_mins(2);
     {
         let mut qsos = manager.qsos.write().await;
         let progress = qsos.get_mut(&qso_id).unwrap();
@@ -3997,7 +4008,9 @@ async fn first_dx_report_grants_exactly_one_expired_watchdog_reprieve() {
         "the reprieve must not emit a timeout"
     );
 
-    manager.check_timeouts_at(now + Duration::seconds(5)).await;
+    manager
+        .check_timeouts_at(now + SignedDuration::from_secs(5))
+        .await;
     assert!(manager.get_qso(qso_id).await.is_err());
     assert!(
         drain(&mut rx).iter().any(|event| matches!(
@@ -4035,7 +4048,7 @@ async fn a_repeated_dx_report_is_still_not_forward_progress() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(reported_at + Duration::seconds(16))
+        .rearm_manual_calls_at(reported_at + SignedDuration::from_secs(16))
         .await;
     let stalled = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(
@@ -4089,22 +4102,21 @@ async fn a_repeated_dx_report_is_still_not_forward_progress() {
 /// The first own-parity FT8 slot start strictly after `opened_at + one
 /// slot` — the anchor the PAN-128 cadence tests rearm relative to.
 fn next_own_ft8_slot(
-    after: DateTime<Utc>,
+    after: UtcTimestamp,
     tx_parity: pancetta_core::slot::SlotParity,
-) -> DateTime<Utc> {
+) -> UtcTimestamp {
     pancetta_core::slot::next_slot_with_parity_with_period(after, tx_parity, 15_000_000_000)
 }
 
 #[test]
 fn keep_call_tx_slot_uses_the_scheduler_current_slot_acceptance() {
-    use chrono::TimeZone;
     use pancetta_core::slot::SlotParity;
 
     // 2026-01-01T00:00:00Z is timestamp 1767225600 = 15 * 117815040 —
     // an Even slot start under both the FT8 (15 s) and FT4 (7.5 s)
     // grids, so every expectation below is grid-aligned.
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let s = Duration::seconds;
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let s = SignedDuration::from_secs;
 
     // The FT8 acceptance cap at the 3000 ms default is
     // 3000 - 800 - 500 = 1700 ms; FT4's is 1500 - 400 - 500 = 600 ms;
@@ -4139,7 +4151,7 @@ fn keep_call_tx_slot_uses_the_scheduler_current_slot_acceptance() {
     );
     assert_eq!(
         keep_call_tx_slot(
-            base + Duration::milliseconds(1_700),
+            base + SignedDuration::from_millis(1_700),
             15_000,
             3000,
             Some(SlotParity::Even)
@@ -4161,11 +4173,11 @@ fn keep_call_tx_slot_uses_the_scheduler_current_slot_acceptance() {
     // slots at +7.5 s/+22.5 s, Even at +15 s.
     assert_eq!(
         keep_call_tx_slot(base + s(1), 7_500, 3000, Some(SlotParity::Odd)),
-        base + Duration::milliseconds(7_500)
+        base + SignedDuration::from_millis(7_500)
     );
     assert_eq!(
         keep_call_tx_slot(
-            base + Duration::milliseconds(500),
+            base + SignedDuration::from_millis(500),
             7_500,
             3000,
             Some(SlotParity::Even)
@@ -4211,11 +4223,11 @@ async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_our_slot(
     let opened_at = opened.metadata.last_call_at.unwrap();
     let _ = drain(&mut rx);
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     let mut first_action_on_rearm = None;
     for k in 0..8i64 {
         manager
-            .rearm_manual_calls_at(x + Duration::seconds(1 + 15 * k))
+            .rearm_manual_calls_at(x + SignedDuration::from_secs(1 + 15 * k))
             .await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
@@ -4268,13 +4280,13 @@ async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_their_slo
         .unwrap();
     let _ = drain(&mut rx);
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // x+16 s lands in the off-parity slot before the own slot x+30 —
     // and is always past the one-slot rearm gate relative to opened_at.
     let mut first_action_on_rearm = None;
     for k in 0..8i64 {
         manager
-            .rearm_manual_calls_at(x + Duration::seconds(16 + 15 * k))
+            .rearm_manual_calls_at(x + SignedDuration::from_secs(16 + 15 * k))
             .await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
@@ -4326,11 +4338,11 @@ async fn in_window_rearm_shares_its_slot_key_with_the_off_parity_predecessor() {
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // A, one second into the off-parity slot before the own slot
     // x+30: deferred by the scheduler, so it feeds x+30.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4342,7 +4354,7 @@ async fn in_window_rearm_shares_its_slot_key_with_the_off_parity_predecessor() {
     // `tx_late_max_ms` window, exactly where `schedule_tx` targets
     // the CURRENT slot. Same real TX opportunity as A.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(31))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(31))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4377,11 +4389,11 @@ async fn rearm_past_the_acceptance_cap_shares_its_deferred_slot_with_the_next_re
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // A, 2 s into own slot x: inside the raw 3 s window but past the
     // 1.7 s acceptance cap, so the worker defers it to x+30.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(2))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(2))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4390,7 +4402,7 @@ async fn rearm_past_the_acceptance_cap_shares_its_deferred_slot_with_the_next_re
     );
     // B, in the off-parity slot before x+30: the same deferred slot.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(17))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(17))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4411,7 +4423,7 @@ async fn rearm_past_the_acceptance_cap_shares_its_deferred_slot_with_the_next_re
 
 /// Threshold 2, a manual QSO latched to the Even TX parity, and `x`, the
 /// first own slot a full protocol slot after it opened.
-async fn pan223_open(threshold: u32) -> (QsoManager, QsoId, DateTime<Utc>) {
+async fn pan223_open(threshold: u32) -> (QsoManager, QsoId, UtcTimestamp) {
     use pancetta_core::slot::SlotParity;
 
     let mut config = test_config();
@@ -4428,7 +4440,7 @@ async fn pan223_open(threshold: u32) -> (QsoManager, QsoId, DateTime<Utc>) {
         .metadata
         .last_call_at
         .unwrap();
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     (manager, qso_id, x)
 }
 
@@ -4458,7 +4470,7 @@ async fn pan223_in_cap_rearm_the_worker_deferred_counts_once_with_its_off_parity
 
     let (manager, qso_id, x) = pan223_open(2).await;
     let mut rx = manager.subscribe();
-    let ms = Duration::milliseconds;
+    let ms = SignedDuration::from_millis;
 
     // A, 1.6 s into own slot x: inside the 1.7 s cap, so the rearm
     // predicts x.
@@ -4469,12 +4481,12 @@ async fn pan223_in_cap_rearm_the_worker_deferred_counts_once_with_its_off_parity
     // frame to the next own slot.
     assert_eq!(
         keep_call_tx_slot(x + ms(1_800), 15_000, 3000, Some(SlotParity::Even)),
-        x + Duration::seconds(30),
+        x + SignedDuration::from_secs(30),
         "precondition: a dequeue past the cap targets the next own slot"
     );
     assert_eq!(
         manager
-            .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+            .record_scheduled_tx_slot(qso_id, a, x + SignedDuration::from_secs(30))
             .await,
         ScheduledTxSlot::CountMoved
     );
@@ -4496,8 +4508,8 @@ async fn pan223_in_cap_rearm_the_worker_deferred_counts_once_with_its_off_parity
     assert_eq!(
         manager.keep_call_attempt_slots(qso_id),
         vec![
-            (a, true, Some(x + Duration::seconds(30))),
-            (b, false, Some(x + Duration::seconds(30))),
+            (a, true, Some(x + SignedDuration::from_secs(30))),
+            (b, false, Some(x + SignedDuration::from_secs(30))),
         ]
     );
 }
@@ -4506,7 +4518,7 @@ async fn pan223_in_cap_rearm_the_worker_deferred_counts_once_with_its_off_parity
 async fn pan223_schedule_report_after_the_successor_removes_the_duplicate_count() {
     let (manager, qso_id, x) = pan223_open(2).await;
     let mut rx = manager.subscribe();
-    let ms = Duration::milliseconds;
+    let ms = SignedDuration::from_millis;
 
     manager.rearm_manual_calls_at(x + ms(1_600)).await;
     let a = pan223_last_attempt(&manager, qso_id);
@@ -4529,7 +4541,7 @@ async fn pan223_schedule_report_after_the_successor_removes_the_duplicate_count(
 
     assert_eq!(
         manager
-            .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+            .record_scheduled_tx_slot(qso_id, a, x + SignedDuration::from_secs(30))
             .await,
         ScheduledTxSlot::DuplicateCountRemoved { stall_cycles: 1 }
     );
@@ -4537,8 +4549,8 @@ async fn pan223_schedule_report_after_the_successor_removes_the_duplicate_count(
     assert_eq!(
         manager.keep_call_attempt_slots(qso_id),
         vec![
-            (a, false, Some(x + Duration::seconds(30))),
-            (b, true, Some(x + Duration::seconds(30))),
+            (a, false, Some(x + SignedDuration::from_secs(30))),
+            (b, true, Some(x + SignedDuration::from_secs(30))),
         ]
     );
     let result = manager
@@ -4562,10 +4574,10 @@ async fn pan223_schedule_report_after_the_successor_removes_the_duplicate_count(
 #[tokio::test]
 async fn pan223_ledger_slot_is_the_worker_target_slot() {
     let (manager, qso_id, x) = pan223_open(2).await;
-    let s = Duration::seconds;
+    let s = SignedDuration::from_secs;
 
     manager
-        .rearm_manual_calls_at(x + Duration::milliseconds(1_600))
+        .rearm_manual_calls_at(x + SignedDuration::from_millis(1_600))
         .await;
     let a = pan223_last_attempt(&manager, qso_id);
     assert_eq!(manager.keep_call_attempt_slots(qso_id)[0].2, Some(x));
@@ -4595,7 +4607,7 @@ async fn pan223_ledger_slot_is_the_worker_target_slot() {
 #[tokio::test]
 async fn pan223_matching_prediction_and_unknown_ids_change_nothing() {
     let (manager, qso_id, x) = pan223_open(2).await;
-    let s = Duration::seconds;
+    let s = SignedDuration::from_secs;
 
     manager.rearm_manual_calls_at(x + s(16)).await;
     let p = pan223_last_attempt(&manager, qso_id);
@@ -4641,7 +4653,7 @@ async fn pan223_unslotted_and_reset_retired_attempts_are_never_rekeyed() {
     let resend = pan223_last_attempt(&manager, qso_id);
     assert_eq!(
         manager
-            .record_scheduled_tx_slot(qso_id, resend, x + Duration::seconds(30))
+            .record_scheduled_tx_slot(qso_id, resend, x + SignedDuration::from_secs(30))
             .await,
         ScheduledTxSlot::NoSlotKey
     );
@@ -4658,7 +4670,7 @@ async fn pan223_unslotted_and_reset_retired_attempts_are_never_rekeyed() {
     assert_eq!(pan223_stall(&manager, qso_id).await, 0);
     assert_eq!(
         manager
-            .record_scheduled_tx_slot(qso_id, pre_reset, rearm_at + Duration::seconds(30))
+            .record_scheduled_tx_slot(qso_id, pre_reset, rearm_at + SignedDuration::from_secs(30))
             .await,
         ScheduledTxSlot::NoSlotKey,
         "a stall reset retires the slot key with the count"
@@ -4669,7 +4681,7 @@ async fn pan223_unslotted_and_reset_retired_attempts_are_never_rekeyed() {
 #[tokio::test]
 async fn pan223_uncounted_rekey_never_adds_a_count() {
     let (manager, qso_id, x) = pan223_open(2).await;
-    let s = Duration::seconds;
+    let s = SignedDuration::from_secs;
 
     // P (off-parity) holds x+30's count; A, 1 s into x+30, shares it.
     manager.rearm_manual_calls_at(x + s(16)).await;
@@ -4690,7 +4702,7 @@ async fn pan223_uncounted_rekey_never_adds_a_count() {
 #[tokio::test]
 async fn pan223_a_surviving_same_slot_sibling_keeps_the_old_slot_count() {
     let (manager, qso_id, x) = pan223_open(2).await;
-    let s = Duration::seconds;
+    let s = SignedDuration::from_secs;
 
     manager.rearm_manual_calls_at(x + s(16)).await;
     let p = pan223_last_attempt(&manager, qso_id);
@@ -4711,10 +4723,10 @@ async fn pan223_a_surviving_same_slot_sibling_keeps_the_old_slot_count() {
 #[tokio::test]
 async fn pan223_a_held_trigger_follows_its_attempt_to_the_worker_slot() {
     let (manager, qso_id, x) = pan223_open(1).await;
-    let s = Duration::seconds;
+    let s = SignedDuration::from_secs;
 
     manager
-        .rearm_manual_calls_at(x + Duration::milliseconds(1_600))
+        .rearm_manual_calls_at(x + SignedDuration::from_millis(1_600))
         .await;
     assert_eq!(pan223_stall(&manager, qso_id).await, 1);
     let a = pan223_last_attempt(&manager, qso_id);
@@ -4745,7 +4757,7 @@ async fn pan223_a_held_trigger_follows_its_attempt_to_the_worker_slot() {
 #[tokio::test]
 async fn pan223_removing_a_trigger_duplicate_moves_the_hold_to_the_slot_holder() {
     let (manager, qso_id, x) = pan223_open(1).await;
-    let ms = Duration::milliseconds;
+    let ms = SignedDuration::from_millis;
 
     manager.rearm_manual_calls_at(x + ms(1_600)).await;
     let a = pan223_last_attempt(&manager, qso_id);
@@ -4755,7 +4767,7 @@ async fn pan223_removing_a_trigger_duplicate_moves_the_hold_to_the_slot_holder()
 
     assert_eq!(
         manager
-            .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+            .record_scheduled_tx_slot(qso_id, a, x + SignedDuration::from_secs(30))
             .await,
         ScheduledTxSlot::DuplicateCountRemoved { stall_cycles: 1 }
     );
@@ -4804,7 +4816,7 @@ async fn ft4_stall_counts_once_per_own_parity_ft4_slot() {
     let _ = drain(&mut rx);
 
     let x = next_slot_with_parity_with_period(
-        opened_at + Duration::milliseconds(7_500),
+        opened_at + SignedDuration::from_millis(7_500),
         SlotParity::Even,
         7_500_000_000,
     );
@@ -4814,7 +4826,7 @@ async fn ft4_stall_counts_once_per_own_parity_ft4_slot() {
     let mut switched = false;
     for k in 0..3i64 {
         manager
-            .rearm_manual_calls_at(x + Duration::milliseconds(1_000 + 7_500 * k))
+            .rearm_manual_calls_at(x + SignedDuration::from_millis(1_000 + 7_500 * k))
             .await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
@@ -4854,14 +4866,14 @@ async fn rolling_back_the_uncounted_twin_keeps_the_stall_count() {
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // Both emissions feed the own-parity slot at x+30: A from the
     // off-parity slot before it, B from inside its late-start window.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(31))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(31))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4881,7 +4893,7 @@ async fn rolling_back_the_uncounted_twin_keeps_the_stall_count() {
     // Newest-first matching removes the uncounted twin.
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(35))
+            .roll_back_unsent_attempt_at(qso_id, &text, x + SignedDuration::from_secs(35))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -4894,7 +4906,7 @@ async fn rolling_back_the_uncounted_twin_keeps_the_stall_count() {
     // Now the counted attempt itself: no same-slot sibling survives.
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(36))
+            .roll_back_unsent_attempt_at(qso_id, &text, x + SignedDuration::from_secs(36))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -4925,14 +4937,14 @@ async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() 
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // Emission A (at FREQ, from the off-parity slot before x+30) is
     // counted; then a TX pivot changes only the offset (no commit, so
     // no streak reset); emission B (at FREQ+100, inside x+30's
     // late-start window) feeds the SAME own-parity slot and stays
     // uncounted.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     manager
         .qsos
@@ -4943,7 +4955,7 @@ async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() 
         .metadata
         .frequency = FREQ + 100.0;
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(31))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(31))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -4972,7 +4984,7 @@ async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() 
                 &text,
                 Some(&replaced),
                 None,
-                x + Duration::seconds(35)
+                x + SignedDuration::from_secs(35)
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -4995,7 +5007,7 @@ async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() 
                 &text,
                 Some(&aired),
                 None,
-                x + Duration::seconds(36)
+                x + SignedDuration::from_secs(36)
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -5026,9 +5038,9 @@ async fn a_rolled_back_slot_counts_again_when_a_later_rearm_feeds_it() {
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -5045,7 +5057,7 @@ async fn a_rolled_back_slot_counts_again_when_a_later_rearm_feeds_it() {
         .clone();
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(qso_id, &text, x + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -5057,7 +5069,7 @@ async fn a_rolled_back_slot_counts_again_when_a_later_rearm_feeds_it() {
     // One protocol slot later, inside the late-start window of the
     // same own-parity slot at x+30 the rolled-back attempt fed.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(31))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(31))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -5091,15 +5103,15 @@ async fn heir_does_not_cross_a_committed_switch_reset() {
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // Feeds the own-parity slot at x (inside its late-start window) …
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(1))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(1))
         .await;
     // … and P, in the off-parity slot before x+60, feeds x+60 and
     // trips threshold 2.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(46))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(46))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -5119,7 +5131,7 @@ async fn heir_does_not_cross_a_committed_switch_reset() {
     // R, inside x+60's late-start window, feeds the same slot P fed
     // and is the only COUNTED attempt since the reset.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(61))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(61))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -5136,7 +5148,7 @@ async fn heir_does_not_cross_a_committed_switch_reset() {
         .clone();
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(62))
+            .roll_back_unsent_attempt_at(qso_id, &text, x + SignedDuration::from_secs(62))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -5170,7 +5182,7 @@ struct KeepCallSchedule {
     /// `MessageToSend` emissions for the QSO.
     emissions: usize,
     /// The own-parity TX slots those emissions feed.
-    fed_tx_slots: std::collections::BTreeSet<DateTime<Utc>>,
+    fed_tx_slots: std::collections::BTreeSet<UtcTimestamp>,
     /// DX repeats decoded before the first `TxOffsetActionNeeded`.
     repeats_before_first_action: Option<usize>,
 }
@@ -5217,16 +5229,16 @@ async fn run_keep_call_schedule(
 
     let slot_ms = slot_ns / 1_000_000;
     let anchor = next_slot_with_parity_with_period(
-        manager.now_utc() + Duration::seconds(120),
+        manager.now_utc() + SignedDuration::from_secs(120),
         dx_parity,
         slot_ns,
     );
     // Repeat k goes out in the DX slot starting 2k slots after the
     // anchor and decodes `decode_offset_ms` after that slot ends.
-    let decodes: Vec<DateTime<Utc>> = (0..PAN129_REPEATS)
-        .map(|k| anchor + Duration::milliseconds((2 * k + 1) * slot_ms + decode_offset_ms))
+    let decodes: Vec<UtcTimestamp> = (0..PAN129_REPEATS)
+        .map(|k| anchor + SignedDuration::from_millis((2 * k + 1) * slot_ms + decode_offset_ms))
         .collect();
-    let end = anchor + Duration::milliseconds(2 * PAN129_REPEATS * slot_ms);
+    let end = anchor + SignedDuration::from_millis(2 * PAN129_REPEATS * slot_ms);
 
     let mut rx = manager.subscribe();
     let mut outcome = KeepCallSchedule {
@@ -5236,7 +5248,7 @@ async fn run_keep_call_schedule(
         repeats_before_first_action: None,
     };
     let mut decoded = 0usize;
-    let mut next_tick = anchor + Duration::milliseconds(tick_phase_ms);
+    let mut next_tick = anchor + SignedDuration::from_millis(tick_phase_ms);
     loop {
         let next_decode = decodes.get(decoded).copied().filter(|_| dx_repeats);
         let tick_due = next_tick < end;
@@ -5259,7 +5271,7 @@ async fn run_keep_call_schedule(
             _ if tick_due => {
                 let tick_at = next_tick;
                 manager.rearm_manual_calls_at(tick_at).await;
-                next_tick += Duration::milliseconds(PAN129_TICK_MS);
+                next_tick += SignedDuration::from_millis(PAN129_TICK_MS);
                 tick_at
             }
             _ => break,
@@ -5342,7 +5354,7 @@ async fn repeating_dx_trips_the_stall_switch_on_the_silence_cadence() {
 /// Threshold 1, one silent rearm: the rearm's emission raises the
 /// action and becomes its pending trigger. Returns the QSO, the
 /// rearm's timestamp and the trigger frame's text.
-async fn pan182_raise(manager: &QsoManager) -> (QsoId, DateTime<Utc>, String) {
+async fn pan182_raise(manager: &QsoManager) -> (QsoId, UtcTimestamp, String) {
     let qso_id = manager
         .respond_to_cq_manual(DX.into(), FREQ, None)
         .await
@@ -5354,7 +5366,7 @@ async fn pan182_raise(manager: &QsoManager) -> (QsoId, DateTime<Utc>, String) {
         .metadata
         .last_call_at
         .unwrap();
-    let rearm_at = opened_at + Duration::seconds(15);
+    let rearm_at = opened_at + SignedDuration::from_secs(15);
     manager.rearm_manual_calls_at(rearm_at).await;
     let qso = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(
@@ -5438,7 +5450,7 @@ async fn pan182_unsent_trigger_roll_back_still_revokes_and_keeps_the_qso_on_the_
 
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + SignedDuration::from_secs(1))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -5529,7 +5541,7 @@ async fn pan182_aged_unresolved_trigger_expires_instead_of_committing() {
         .get_mut(&qso_id)
         .and_then(|entry| entry.pending_stall_trigger.as_mut())
         .expect("the raise recorded a trigger")
-        .emitted_at = manager.now_utc() - Duration::milliseconds(5 * slot_millis);
+        .emitted_at = manager.now_utc() - SignedDuration::from_millis(5 * slot_millis);
 
     let result = manager
         .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
@@ -5556,12 +5568,12 @@ fn pan182_stall_trigger_hold_expires_at_four_slots() {
     let slot = 15_000;
     assert!(!stall_trigger_hold_expired(
         emitted_at,
-        emitted_at + Duration::milliseconds(4 * slot - 1),
+        emitted_at + SignedDuration::from_millis(4 * slot - 1),
         slot
     ));
     assert!(stall_trigger_hold_expired(
         emitted_at,
-        emitted_at + Duration::milliseconds(4 * slot),
+        emitted_at + SignedDuration::from_millis(4 * slot),
         slot
     ));
 }
@@ -5575,7 +5587,7 @@ async fn pan182_a_re_raise_re_arms_an_expired_hold() {
     let slot_millis = manager.rearm_slot_millis();
 
     // Still fresh: a later re-raise leaves the threshold frame's hold.
-    let fresh = rearm_at + Duration::milliseconds(slot_millis);
+    let fresh = rearm_at + SignedDuration::from_millis(slot_millis);
     manager.rearm_manual_calls_at(fresh).await;
     let trigger_at = |manager: &QsoManager| {
         manager
@@ -5589,7 +5601,7 @@ async fn pan182_a_re_raise_re_arms_an_expired_hold() {
     assert_eq!(trigger_at(&manager), Some(rearm_at));
 
     // Expired by the next re-raise: it takes over.
-    let late = rearm_at + Duration::milliseconds(4 * slot_millis);
+    let late = rearm_at + SignedDuration::from_millis(4 * slot_millis);
     manager.rearm_manual_calls_at(late).await;
     assert_eq!(trigger_at(&manager), Some(late));
     assert!(
@@ -5679,13 +5691,13 @@ async fn pan182_rolled_back_trigger_with_a_surviving_heir_keeps_the_hold() {
         .metadata
         .last_call_at
         .unwrap();
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // Trigger A (at FREQ, from the off-parity slot before x+30) trips
     // threshold 1; a pivot then changes only the offset; twin B (at
     // FREQ+100, inside x+30's late-start window) feeds the same slot
     // uncounted and only re-raises.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     manager
         .qsos
@@ -5696,7 +5708,7 @@ async fn pan182_rolled_back_trigger_with_a_surviving_heir_keeps_the_hold() {
         .metadata
         .frequency = FREQ + 100.0;
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(31))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(31))
         .await;
     let qso = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(
@@ -5712,7 +5724,7 @@ async fn pan182_rolled_back_trigger_with_a_surviving_heir_keeps_the_hold() {
                 &text,
                 Some(&aired_on(FREQ)),
                 None,
-                x + Duration::seconds(35)
+                x + SignedDuration::from_secs(35)
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -5783,10 +5795,10 @@ async fn pan182_an_earlier_same_text_frame_airing_does_not_release_the_hold() {
         .metadata
         .last_call_at
         .unwrap();
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // 10 s into own slot x: past the acceptance cap, so it feeds x+30.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(10))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(10))
         .await;
     let text = manager
         .get_qso(qso_id)
@@ -5805,13 +5817,18 @@ async fn pan182_an_earlier_same_text_frame_airing_does_not_release_the_hold() {
             .get(&qso_id)
             .and_then(|entry| entry.pending_stall_trigger.as_ref())
             .and_then(|trigger| trigger.tx_slot),
-        Some(x + Duration::seconds(30)),
+        Some(x + SignedDuration::from_secs(30)),
         "precondition: the trigger feeds the next own-parity slot"
     );
 
     assert!(
         !manager
-            .confirm_stall_trigger_aired(qso_id, &text, &aired_on(FREQ), x + Duration::seconds(13))
+            .confirm_stall_trigger_aired(
+                qso_id,
+                &text,
+                &aired_on(FREQ),
+                x + SignedDuration::from_secs(13)
+            )
             .await,
         "slot x's frame finishing is not the trigger airing"
     );
@@ -5824,7 +5841,12 @@ async fn pan182_an_earlier_same_text_frame_airing_does_not_release_the_hold() {
     ));
     assert!(
         manager
-            .confirm_stall_trigger_aired(qso_id, &text, &aired_on(FREQ), x + Duration::seconds(43))
+            .confirm_stall_trigger_aired(
+                qso_id,
+                &text,
+                &aired_on(FREQ),
+                x + SignedDuration::from_secs(43)
+            )
             .await,
         "the trigger's own slot played out"
     );
@@ -5870,7 +5892,7 @@ async fn pan182_lost_race_commit_attempt_then_not_sent_report_never_moves_the_of
     );
     assert!(matches!(
         manager
-            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+            .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + SignedDuration::from_secs(1))
             .await,
         UnsentAttemptRollback::RolledBack { .. }
     ));
@@ -5925,7 +5947,7 @@ async fn pan183_pending_stall_trigger_matches_by_id() {
                 &text,
                 None,
                 Some(sibling),
-                rearm_at + Duration::seconds(1)
+                rearm_at + SignedDuration::from_secs(1)
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -5947,7 +5969,7 @@ async fn pan183_pending_stall_trigger_matches_by_id() {
                 &text,
                 None,
                 Some(trigger),
-                rearm_at + Duration::seconds(1)
+                rearm_at + SignedDuration::from_secs(1)
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -5983,14 +6005,14 @@ async fn pan182_trigger_roll_back_above_threshold_moves_the_hold_to_the_newer_co
         .last_call_at
         .unwrap();
 
-    let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+    let x = next_own_ft8_slot(opened_at + SignedDuration::from_secs(15), SlotParity::Even);
     // Counts 1 and 2: the second rearm trips threshold 2 and arms the
     // PAN-182 trigger on its own emission (feeding the x+30 slot).
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(1))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(1))
         .await;
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(16))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(16))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -6021,7 +6043,7 @@ async fn pan182_trigger_roll_back_above_threshold_moves_the_hold_to_the_newer_co
         .frequency = nudged;
     // Count 3: a later own-parity slot, at the nudged offset.
     manager
-        .rearm_manual_calls_at(x + Duration::seconds(46))
+        .rearm_manual_calls_at(x + SignedDuration::from_secs(46))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -6041,7 +6063,7 @@ async fn pan182_trigger_roll_back_above_threshold_moves_the_hold_to_the_newer_co
                     remote_binding: Some((false, None)),
                 }),
                 None,
-                x + Duration::seconds(50),
+                x + SignedDuration::from_secs(50),
             )
             .await,
         UnsentAttemptRollback::RolledBack { .. }
@@ -6138,7 +6160,7 @@ async fn confirm_stall_trigger_aired_keeps_the_most_recently_reported_frame() {
         .await
         .unwrap();
     let later_aired_at = manager.now_utc();
-    let earlier_aired_at = later_aired_at - Duration::seconds(10);
+    let earlier_aired_at = later_aired_at - SignedDuration::from_secs(10);
     let payload = UnsentAttemptPayload {
         frequency_hz: FREQ,
         remote_binding: Some((false, None)),

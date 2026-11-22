@@ -2,12 +2,13 @@
 // `EXT `; pancetta's own decodes render exactly as before.
 use super::*;
 use crate::app::{ActivePanel, App, DecodedMessageView};
+use pancetta_core::time::UtcTimestamp;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
 fn view(message: &str, call: &str) -> DecodedMessageView {
     DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: 14.074,
         mode: "FT8".to_string(),
         snr: -5,

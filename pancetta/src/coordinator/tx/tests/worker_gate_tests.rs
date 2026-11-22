@@ -4,6 +4,7 @@ use super::super::ApplicationCoordinator;
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType, RigControlMessage, TxOrigin};
 use crossbeam_channel::Receiver;
 use pancetta_config::Config;
+use pancetta_core::time::SignedDurationExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -445,7 +446,7 @@ async fn pan302_new_attempt_uses_live_timing_preferences() {
         let start = tokio::time::Instant::now();
         let base = pancetta_core::time::slot_grid_origin();
         let clock: pancetta_core::time::UtcClock =
-            Arc::new(move || base + chrono::Duration::from_std(start.elapsed()).unwrap());
+            Arc::new(move || base + jiff::SignedDuration::try_from(start.elapsed()).unwrap());
         let mut config = Config::default();
         config.station.tx_self_parity = TxSelfParity::Even;
         let h = build_worker_harness(
@@ -515,7 +516,7 @@ async fn pan302_new_attempt_uses_live_timing_preferences() {
         }
         wait_for_ptt_gate(&h).await;
         if target > base {
-            let lead = (target - clock()).num_milliseconds();
+            let lead = (target - clock()).as_millis_i64();
             assert!(
                 (450..=500).contains(&lead),
                 "sleep retains its scheduled 500ms lead: {lead}"
@@ -540,7 +541,7 @@ async fn pan302_queued_self_cq_refuses_after_disable_but_manual_cq_keys() {
     for autonomous in [false, true] {
         let mut config = Config::default();
         config.station.tx_late_max_ms = 8000;
-        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
         let h = build_worker_harness(
             config,
             |_| {},
@@ -614,7 +615,7 @@ async fn pan302_unmarked_autonomous_source_cq_still_keys_after_disable() {
     // `source == Autonomous` and `Config::default()`, and must key.
     let mut config = Config::default();
     config.station.tx_late_max_ms = 8000;
-    let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+    let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
     let h = build_worker_harness(
         config,
         |_| {},
@@ -680,7 +681,7 @@ async fn pan302_queued_frame_uses_live_late_cap_on_rekey() {
     let mut config = Config::default();
     config.station.tx_late_max_ms = 8000;
     config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
-    let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+    let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
     let h = build_worker_harness(
         config,
         |_| {},
@@ -777,7 +778,7 @@ async fn pan302_queued_frame_uses_live_late_cap() {
         let mut config = Config::default();
         config.station.tx_late_max_ms = 8000;
         config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
-        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
         let h = build_worker_harness(
             config,
             |_| {},

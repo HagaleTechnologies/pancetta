@@ -4,6 +4,7 @@
 //! so the backoff and watchdog-edge-detection policies are unit-testable
 //! without a real `AudioManager`.
 
+use pancetta_core::time::UtcTimestamp;
 use std::time::{Duration, Instant};
 
 /// One outstanding buffer mark. The TX worker normally waits for each ack
@@ -23,7 +24,7 @@ impl<M: Copy> PlaybackStartWatch<M> {
         mark: M,
         ack: crate::message_bus::PlaybackStartAck,
         state: impl FnOnce(M) -> pancetta_audio::OutputMarkState,
-        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+        now: impl FnOnce() -> UtcTimestamp,
     ) {
         self.poll(state, now);
         if let Some((_, previous)) = self.pending.take() {
@@ -35,7 +36,7 @@ impl<M: Copy> PlaybackStartWatch<M> {
     pub(crate) fn poll(
         &mut self,
         state: impl FnOnce(M) -> pancetta_audio::OutputMarkState,
-        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+        now: impl FnOnce() -> UtcTimestamp,
     ) {
         let Some((mark, ack)) = self.pending.as_ref() else {
             return;
@@ -654,13 +655,13 @@ mod pan71_playback_watch_tests {
     async fn watch_reports_started_at_the_observation_instant() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let mut watch = PlaybackStartWatch::new();
-        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
-        watch.poll(|_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, UtcTimestamp::now);
+        watch.poll(|_| OutputMarkState::Waiting, UtcTimestamp::now);
         assert_eq!(
             waiter.wait_for(Duration::from_millis(1)).await,
             PlaybackStartState::Pending
         );
-        let at = chrono::Utc::now();
+        let at = UtcTimestamp::now();
         watch.poll(
             |m| {
                 assert_eq!(m, 7);
@@ -695,7 +696,7 @@ mod pan71_playback_watch_tests {
     async fn watch_reports_not_started_for_a_discarded_mark() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let mut watch = PlaybackStartWatch::new();
-        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, UtcTimestamp::now);
         watch.poll(|_| OutputMarkState::Discarded, || panic!("clock read"));
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,
@@ -707,7 +708,7 @@ mod pan71_playback_watch_tests {
     async fn arming_a_new_mark_settles_a_still_waiting_one_as_not_started() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let mut watch = PlaybackStartWatch::new();
-        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, UtcTimestamp::now);
         let (next, _) = PlaybackStartAck::new();
         watch.arm(
             8,
@@ -725,9 +726,9 @@ mod pan71_playback_watch_tests {
     async fn arming_a_new_mark_settles_an_already_played_one_as_started() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let mut watch = PlaybackStartWatch::new();
-        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, UtcTimestamp::now);
         let (next, _) = PlaybackStartAck::new();
-        let at = chrono::Utc::now();
+        let at = UtcTimestamp::now();
         watch.arm(8, next, |_| OutputMarkState::Played, || at);
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,
@@ -739,7 +740,7 @@ mod pan71_playback_watch_tests {
     async fn dropping_the_watch_reports_dropped() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let mut watch = PlaybackStartWatch::new();
-        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, UtcTimestamp::now);
         drop(watch);
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,

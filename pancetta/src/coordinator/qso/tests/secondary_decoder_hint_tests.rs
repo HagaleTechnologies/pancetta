@@ -1,5 +1,6 @@
 use super::secondary_decoder_hint_freq_for;
-use chrono::{Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::states::PreSwitchOffset;
 use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReports};
 
@@ -8,7 +9,7 @@ use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReport
 const FT8_SLOT_NS: i64 = 15_000_000_000;
 
 fn calling_cq_progress(pre_switch_offset: Option<PreSwitchOffset>) -> QsoProgress {
-    let start = Utc::now() - Duration::seconds(5);
+    let start = UtcTimestamp::now() - SignedDuration::from_secs(5);
     QsoProgress {
         state: QsoState::CallingCq {
             frequency: 1900.0,
@@ -68,7 +69,7 @@ fn no_pre_switch_offset_yields_no_secondary() {
 
 #[test]
 fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
-    let left_at = Utc::now();
+    let left_at = UtcTimestamp::now();
     let progress = calling_cq_progress(Some(PreSwitchOffset {
         offset_hz: 1500.0,
         left_at,
@@ -92,7 +93,7 @@ fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
 fn a_relocation_past_its_grace_yields_no_secondary() {
     let progress = calling_cq_progress(Some(PreSwitchOffset {
         offset_hz: 1500.0,
-        left_at: Utc::now() - Duration::seconds(31),
+        left_at: UtcTimestamp::now() - SignedDuration::from_secs(31),
         operator_forced: true,
     }));
     assert_eq!(
@@ -109,7 +110,7 @@ fn the_grace_scales_with_the_injected_slot_ns() {
     const FT2_SLOT_NS: i64 = 3_200_000_000; // -> 6.4s grace
     let progress = calling_cq_progress(Some(PreSwitchOffset {
         offset_hz: 1500.0,
-        left_at: Utc::now() - Duration::seconds(10),
+        left_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
         operator_forced: false,
     }));
     assert_eq!(
@@ -133,13 +134,13 @@ fn the_grace_scales_with_the_injected_slot_ns() {
 fn an_established_qso_never_gets_a_secondary_hint() {
     let mut progress = calling_cq_progress(Some(PreSwitchOffset {
         offset_hz: 1500.0,
-        left_at: Utc::now(),
+        left_at: UtcTimestamp::now(),
         operator_forced: true,
     }));
     progress.state = QsoState::RespondingToCq {
         target_callsign: "K9ZZ".to_string(),
         frequency: 1900.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     assert_eq!(
         secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),

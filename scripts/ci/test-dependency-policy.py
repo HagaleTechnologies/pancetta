@@ -27,7 +27,8 @@ def check(target):
     for key in reached:
         p = packages[key]
         versions.setdefault(p['name'], set()).add(p['version'])
-    for name in ['native-tls', 'tokio-native-tls', 'openssl', 'openssl-sys']:
+    # PAN-441: chrono is unmaintained (RUSTSEC-2026-0543); the workspace uses jiff.
+    for name in ['native-tls', 'tokio-native-tls', 'openssl', 'openssl-sys', 'chrono']:
         assert name not in versions, (target, name)
     for name in ['rustls', 'tokio-tungstenite', 'tungstenite', 'dirs', 'signal-hook']:
         assert len(versions.get(name, set())) == 1, (target, name, versions.get(name))
@@ -53,6 +54,8 @@ def check(target):
         p = packages[key]
         if p['name'].startswith('sqlx'):
             assert not any('tls' in f for f in nodes[key]['features']), nodes[key]
+            # PAN-441: sqlx's unused `chrono` feature stays off.
+            assert 'chrono' not in nodes[key]['features'], nodes[key]
     print(f'{target or "all targets"}: dependency policy passed')
 
 workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['dependencies']

@@ -718,7 +718,7 @@ mod tests {
     fn card(host: &str, cores: usize, elapsed: f64) -> Scorecard {
         Scorecard {
             schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
-            generated_at: chrono::Utc::now(),
+            generated_at: pancetta_core::time::UtcTimestamp::now(),
             mode: pancetta_research::Mode::Ft8,
             git: GitInfo {
                 branch: "test".into(),

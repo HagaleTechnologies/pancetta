@@ -1,6 +1,5 @@
 use super::*;
 use crate::message_bus::{ComponentId, MessageBus, MessageType};
-use chrono::TimeZone;
 
 #[tokio::test]
 async fn log_tx_frame_emits_the_given_fields_and_timestamp() {
@@ -10,7 +9,7 @@ async fn log_tx_frame_emits_the_given_fields_and_timestamp() {
     // A late-but-viable key: the caller passes the ACTUAL audio-start
     // instant, which can be well past the nominal slot boundary — this
     // must round-trip untouched, not get snapped to any slot grid.
-    let actual_audio_start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 22).unwrap();
+    let actual_audio_start = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 22).unwrap();
     log_tx_frame(
         &bus,
         "K5ARH JA1ABC -12".to_string(),
@@ -49,7 +48,7 @@ async fn cq_frame_qso_id_is_none() {
         "CQ K5ARH EM10".to_string(),
         1200.0,
         None,
-        chrono::Utc::now(),
+        UtcTimestamp::now(),
     )
     .await;
 

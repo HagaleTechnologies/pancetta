@@ -14,7 +14,7 @@ fn virtual_clock() -> pancetta_core::time::UtcClock {
     let origin = tokio::time::Instant::now();
     Arc::new(move || {
         pancetta_core::time::slot_grid_origin()
-            + chrono::Duration::from_std(origin.elapsed()).unwrap()
+            + SignedDuration::try_from(origin.elapsed()).unwrap()
     })
 }
 
@@ -49,9 +49,9 @@ enum Behaviour {
 
 #[derive(Clone, Debug)]
 struct Seen {
-    received_at: chrono::DateTime<chrono::Utc>,
+    received_at: UtcTimestamp,
     flush_first: bool,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<UtcTimestamp>,
 }
 
 struct FakeAudio {
@@ -88,7 +88,7 @@ async fn spawn_fake_audio_thread(h: &Harness, behaviour: Behaviour) -> FakeAudio
                     let ack = playback_started.expect("logged frame must carry an ack");
                     let received_at = utc_clock();
                     let started_at = if let Behaviour::StartAfter(d) = behaviour {
-                        Some(received_at + chrono::Duration::from_std(d).unwrap())
+                        Some(received_at + SignedDuration::try_from(d).unwrap())
                     } else {
                         None
                     };
@@ -114,7 +114,7 @@ async fn spawn_fake_audio_thread(h: &Harness, behaviour: Behaviour) -> FakeAudio
     FakeAudio { seen, task }
 }
 
-async fn await_event(h: &Harness, wanted: &str) -> chrono::DateTime<chrono::Utc> {
+async fn await_event(h: &Harness, wanted: &str) -> UtcTimestamp {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         while let Ok(msg) = h.tui_rx.try_recv() {
@@ -220,23 +220,14 @@ async fn rekeyed_frame_is_stamped_at_the_replacement_audios_playback_start() {
 }
 
 /// One frame through `h`: `(stamp, when the event was observed, what audio saw)`.
-async fn fallback_event(
-    h: &Harness,
-    behaviour: Behaviour,
-) -> (
-    chrono::DateTime<chrono::Utc>,
-    chrono::DateTime<chrono::Utc>,
-    Seen,
-) {
+async fn fallback_event(h: &Harness, behaviour: Behaviour) -> (UtcTimestamp, UtcTimestamp, Seen) {
     let audio = spawn_fake_audio_thread(h, behaviour).await;
     request(h, TEXT).await;
     let at = await_event(h, TEXT).await;
     let observed = (h.utc_clock)();
     let seen = audio.seen.lock().unwrap()[0].clone();
     // The enqueue instant, not the timeout instant a bound later.
-    assert!(
-        at <= seen.received_at + chrono::Duration::from_std(TX_PLAYBACK_START_WAIT / 2).unwrap()
-    );
+    assert!(at <= seen.received_at + SignedDuration::try_from(TX_PLAYBACK_START_WAIT / 2).unwrap());
     (at, observed, seen)
 }
 
@@ -252,7 +243,7 @@ async fn assert_fallback(behaviour: Behaviour) {
     let h = worker_harness().await;
     if matches!(behaviour, Behaviour::Hold) {
         let (at, observed, _) = fallback_event(&h, behaviour).await;
-        assert!(observed - at >= chrono::Duration::milliseconds(98));
+        assert!(observed - at >= SignedDuration::from_millis(98));
         assert_eq!(await_record(&h).await.utc, at);
         return;
     }
@@ -267,7 +258,7 @@ async fn assert_fallback(behaviour: Behaviour) {
         fallback_event(&timed, behaviour)
     );
     assert!(
-        observed - seen.received_at < chrono::Duration::from_std(TX_PLAYBACK_START_WAIT).unwrap()
+        observed - seen.received_at < SignedDuration::try_from(TX_PLAYBACK_START_WAIT).unwrap()
     );
     assert_eq!(await_record(&h).await.utc, at);
 }
@@ -402,8 +393,8 @@ async fn bundle_keys_without_waiting_on_wall_time() {
     assert_eq!(waveforms.len(), 2);
     assert_ne!(waveforms[0], waveforms[1], "supersede changes the waveform");
     assert_eq!(
-        starts[0].timestamp().div_euclid(15),
-        starts[1].timestamp().div_euclid(15),
+        starts[0].as_second().div_euclid(15),
+        starts[1].as_second().div_euclid(15),
         "replacement must requeue into the same FT8 slot"
     );
     assert_eq!(
@@ -460,7 +451,7 @@ async fn bundle_items_share_the_reported_playback_start() {
 async fn frame_log_instant_started_uses_reported_time() {
     let (ack, mut waiter) = PlaybackStartAck::new();
     let fallback = pancetta_core::time::slot_grid_origin();
-    let at = fallback + chrono::Duration::milliseconds(37);
+    let at = fallback + SignedDuration::from_millis(37);
     ack.started(at);
     assert_eq!(frame_log_instant(&mut waiter, fallback, TEXT).await, at);
 }

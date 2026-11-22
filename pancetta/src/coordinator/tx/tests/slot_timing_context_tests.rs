@@ -13,7 +13,7 @@ fn ctx(
         ptt_lead_ms,
         sample_rate: 12_000,
         slot_ns: pancetta_core::slot::SLOT_NS,
-        request_received_at: chrono::Utc::now(),
+        request_received_at: pancetta_core::time::UtcTimestamp::now(),
     }
 }
 
@@ -36,11 +36,11 @@ fn late_cap_matches_tx_late_max_ms_effective_for_every_protocol() {
 
 #[test]
 fn ptt_target_is_target_slot_minus_ptt_lead() {
-    let target_slot = chrono::Utc::now();
+    let target_slot = pancetta_core::time::UtcTimestamp::now();
     for lead_ms in [80u64, 2000] {
         assert_eq!(
             ctx(pancetta_ft8::Protocol::Ft8, 3000, lead_ms).ptt_target(target_slot),
-            target_slot - chrono::Duration::milliseconds(lead_ms as i64)
+            target_slot - jiff::SignedDuration::from_millis(lead_ms as i64)
         );
     }
 }

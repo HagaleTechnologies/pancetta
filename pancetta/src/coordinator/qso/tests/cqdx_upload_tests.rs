@@ -1,6 +1,6 @@
 use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata, logbook_upload_enabled};
-use chrono::Utc;
 use pancetta_config::network::CqdxConfig;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
 
 /// Default cqdx config (disabled, no token) must NOT enable the upload —
@@ -50,7 +50,7 @@ fn upload_off_when_disabled_even_with_token() {
 }
 
 fn metadata_with_call(call: Option<&str>) -> QsoMetadata {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: pancetta_qso::QsoId::new_v4(),
         our_callsign: "K5ARH".to_string(),
@@ -60,7 +60,7 @@ fn metadata_with_call(call: Option<&str>) -> QsoMetadata {
         mode: "FT8".to_string(),
         first_answer_at: None,
         start_time: now,
-        end_time: Some(now + chrono::Duration::seconds(90)),
+        end_time: Some(now + jiff::SignedDuration::from_secs(90)),
         reports: SignalReports {
             sent: Some(-8),
             received: Some(-12),
@@ -430,7 +430,7 @@ fn record_maps_metadata_fields() {
     assert_eq!(rec.rst_received.as_deref(), Some("-12"));
     assert_eq!(rec.start_time, md.start_time);
     assert_eq!(rec.end_time, md.end_time.unwrap());
-    md.first_answer_at = Some(md.start_time + chrono::Duration::minutes(4));
+    md.first_answer_at = Some(md.start_time + jiff::SignedDuration::from_mins(4));
     let rec = cqdx_record_from_metadata(&md).expect("answered record");
     assert_eq!(rec.start_time, md.first_answer_at.unwrap());
 }

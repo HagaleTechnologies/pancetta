@@ -27,7 +27,7 @@
 //! ## Harness limits relevant to Batch C
 //!
 //! - **The manual watchdog's *time* bound is not usable in this harness.** The
-//!   engine stamps `first_call_at` with real `Utc::now()`, but the watchdog
+//!   engine stamps `first_call_at` with real `UtcTimestamp::now()`, but the watchdog
 //!   compares it to the *virtual* `now`, which runs `slot * 15 s` ahead of real
 //!   now. A minutes-bound watchdog would therefore spuriously fire on any QSO
 //!   opened at a high slot index. The **call-count** bound is timestamp-free
@@ -258,7 +258,7 @@ async fn c3_watchdog_vs_just_in_time_answer_same_slot() {
 #[tokio::test]
 async fn c4_reengage_after_watchdog_failure_fresh_qso() {
     // HARNESS NOTE: we retire attempt 1 by the CALL-COUNT bound, not the
-    // minutes bound. The engine stamps `first_call_at` with real `Utc::now()`,
+    // minutes bound. The engine stamps `first_call_at` with real `UtcTimestamp::now()`,
     // while the watchdog compares it to the *virtual* `now` (which runs ahead
     // by `slot * 15 s`); a minutes-bound watchdog would therefore spuriously
     // fire on any QSO opened at a high slot index. The call-count bound is

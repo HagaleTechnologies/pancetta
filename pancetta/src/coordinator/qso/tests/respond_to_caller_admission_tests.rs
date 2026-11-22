@@ -141,7 +141,7 @@ async fn tx_frame_sent_releases_a_held_stall_switch() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
         .await;
     let qso = manager.get_qso(id).await.unwrap();
     let text = qso.messages.last().unwrap().raw_text.clone();
@@ -170,7 +170,7 @@ async fn tx_frame_sent_releases_a_held_stall_switch() {
                         remote_binding: Some((false, None)),
                     },
                     // After the rearm's own TX slot has played out.
-                    aired_at: opened + chrono::Duration::minutes(2),
+                    aired_at: opened + jiff::SignedDuration::from_mins(2),
                     attempt_id: None,
                 }),
                 Instant::now(),
@@ -216,7 +216,7 @@ async fn check_tx_frame_not_sent(malformed_first: bool) {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
         .await;
     let before = manager.get_qso(id).await.unwrap();
     assert_eq!(before.metadata.call_count, 2);
@@ -338,7 +338,7 @@ async fn pan183_latest_tx_intent_carries_attempt_id() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
         .await;
     let mut emitted = None;
     while let Ok(event) = events.try_recv() {
@@ -399,7 +399,7 @@ async fn pan183_tx_frame_not_sent_rolls_back_the_reported_attempt_not_a_newer_re
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
         .await;
     let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
     manager.resend_last_tx(id).await.unwrap();
@@ -489,17 +489,17 @@ async fn pan223_tx_frame_scheduled_reaches_the_keep_call_ledger() {
         .expect("a manual QSO latches its TX parity");
     let s0 = opened.stall_cycles;
     let x = pancetta_core::slot::next_slot_with_parity_with_period(
-        opened.last_call_at.unwrap() + chrono::Duration::seconds(15),
+        opened.last_call_at.unwrap() + jiff::SignedDuration::from_secs(15),
         own,
         15_000_000_000,
     );
     manager
-        .rearm_manual_calls_at(x + chrono::Duration::milliseconds(1_600))
+        .rearm_manual_calls_at(x + jiff::SignedDuration::from_millis(1_600))
         .await;
     let (_, a) = pan183_next_transmit_request(&tx, &qso).await;
     let a = a.expect("the rearm records a ledger attempt");
     manager
-        .rearm_manual_calls_at(x + chrono::Duration::milliseconds(16_600))
+        .rearm_manual_calls_at(x + jiff::SignedDuration::from_millis(16_600))
         .await;
     assert_eq!(
         manager.get_qso(id).await.unwrap().metadata.stall_cycles,
@@ -515,7 +515,7 @@ async fn pan223_tx_frame_scheduled_reaches_the_keep_call_ledger() {
             MessageType::QsoMessage(QsoMessage::TxFrameScheduled {
                 qso_id: qso.clone(),
                 attempt_id: a,
-                target_slot: x + chrono::Duration::seconds(30),
+                target_slot: x + jiff::SignedDuration::from_secs(30),
             }),
             Instant::now(),
         ))
@@ -568,7 +568,7 @@ async fn pan185_qso_loop_applies_a_parked_tx_frame_not_sent() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
         .await;
     let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
     let before = manager.get_qso(id).await.unwrap();
@@ -1492,10 +1492,10 @@ async fn tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_reques
     // distinct own-parity TX slot — the stall counter counts own TX
     // slots, not protocol slots.
     manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(15))
         .await;
     manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(45))
+        .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(45))
         .await;
 
     let mut found = false;
@@ -1628,7 +1628,7 @@ async fn a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions()
     // would feed a distinct own-parity TX slot (PAN-128).
     for slot in [15i64, 45, 75, 105] {
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(slot))
+            .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(slot))
             .await;
     }
 
@@ -1664,10 +1664,10 @@ async fn a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions()
         .tx_restart_inhibit
         .store(0, std::sync::atomic::Ordering::Relaxed);
     manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(135))
+        .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(135))
         .await;
     manager
-        .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(165))
+        .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(165))
         .await;
     assert_eq!(
         manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -2073,7 +2073,7 @@ async fn an_applied_offset_switch_recenters_the_decoder_on_an_unanswered_cq() {
                  frame is not dropped by the band-collapse filter"
             );
             assert!(
-                expires_at > chrono::Utc::now(),
+                expires_at > pancetta_core::time::UtcTimestamp::now(),
                 "the secondary hint's expires_at must still be in the future \
                  immediately after the switch"
             );

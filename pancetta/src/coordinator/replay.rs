@@ -1,4 +1,6 @@
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -165,8 +167,8 @@ pub(crate) fn interleave_mono(mono: &[f32], channels: u16) -> Vec<f32> {
 /// decoder buffers incoming audio into windows keyed to the real wall clock,
 /// so starting the feed loop mid-slot would misalign every subsequent
 /// window. Waiting for the next boundary re-establishes that alignment.
-pub(crate) fn replay_preroll_wait(now: chrono::DateTime<chrono::Utc>) -> Duration {
-    let next_boundary = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+pub(crate) fn replay_preroll_wait(now: UtcTimestamp) -> Duration {
+    let next_boundary = pancetta_core::slot::next_slot_start(now, SignedDuration::ZERO);
     pancetta_core::slot::duration_until(next_boundary, now)
 }
 
@@ -332,7 +334,7 @@ impl super::ApplicationCoordinator {
                 info!("Replay: shutdown requested before the QSO component was ready; nothing fed");
                 return Ok(());
             }
-            let preroll_wait = replay_preroll_wait(chrono::Utc::now());
+            let preroll_wait = replay_preroll_wait(UtcTimestamp::now());
             if preroll_wait > Duration::ZERO {
                 info!(
                     "Replay: waiting {:?} for next UTC slot boundary before starting feed",
@@ -415,7 +417,6 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn write_test_wav(path: &Path, sample_rate: u32, n_samples: usize) {
         let spec = hound::WavSpec {
@@ -674,7 +675,7 @@ mod tests {
     fn replay_preroll_wait_lands_on_next_boundary_mid_slot() {
         // 7s into a slot that started at :00:00 -> next boundary is :00:15,
         // so the wait should be exactly 8s.
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 7).unwrap();
+        let now = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 7).unwrap();
         let wait = replay_preroll_wait(now);
         assert_eq!(wait, Duration::from_secs(8));
     }
@@ -685,7 +686,7 @@ mod tests {
         // boundary even when `now` is exactly on one (see
         // pancetta-core/src/slot.rs `slot_boundary_aligned_picks_next`), so
         // starting replay exactly at :00:00 should wait the full 15s.
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let wait = replay_preroll_wait(now);
         assert_eq!(wait, Duration::from_secs(15));
     }

@@ -143,7 +143,7 @@ async fn supersede_sleep_carries_siphoned_messages_on_abort_by_disarm() {
     ))
     .unwrap();
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut st = pancetta_agent::arm::ArmState::new();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -174,7 +174,7 @@ async fn supersede_sleep_carries_siphoned_messages_on_abort_by_disarm() {
         arm_clone
             .lock()
             .unwrap()
-            .disarm(chrono::Utc::now().timestamp_millis());
+            .disarm(UtcTimestamp::now().as_millisecond());
     });
 
     let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -239,7 +239,7 @@ async fn supersede_sleep_returns_only_already_siphoned_messages_on_abort_by_disa
     ))
     .unwrap();
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut st = pancetta_agent::arm::ArmState::new();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -290,7 +290,7 @@ async fn supersede_sleep_returns_only_already_siphoned_messages_on_abort_by_disa
         arm_clone
             .lock()
             .unwrap()
-            .disarm(chrono::Utc::now().timestamp_millis());
+            .disarm(UtcTimestamp::now().as_millisecond());
     });
 
     let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -340,7 +340,7 @@ async fn supersede_sleep_aborts_by_disarm_when_remote_arm_disarms_mid_sleep() {
     let (_tx, rx) = crossbeam_channel::unbounded();
     let pivoted_once = std::collections::HashMap::new();
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut st = pancetta_agent::arm::ArmState::new();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -371,7 +371,7 @@ async fn supersede_sleep_aborts_by_disarm_when_remote_arm_disarms_mid_sleep() {
         arm_clone
             .lock()
             .unwrap()
-            .disarm(chrono::Utc::now().timestamp_millis());
+            .disarm(UtcTimestamp::now().as_millisecond());
     });
 
     let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -1031,7 +1031,7 @@ async fn supersede_sleep_keeps_a_refresh_whose_item_binding_changed_under_the_sa
         ))
         .unwrap();
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut st = pancetta_agent::arm::ArmState::new();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -1060,7 +1060,7 @@ async fn supersede_sleep_keeps_a_refresh_whose_item_binding_changed_under_the_sa
         arm_clone
             .lock()
             .unwrap()
-            .disarm(chrono::Utc::now().timestamp_millis());
+            .disarm(UtcTimestamp::now().as_millisecond());
     });
 
     let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());

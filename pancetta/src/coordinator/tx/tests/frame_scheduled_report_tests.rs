@@ -1,14 +1,13 @@
 // PAN-223. Formerly the inline module `pan223_frame_scheduled_report_tests`.
 use super::*;
-use chrono::TimeZone;
 use pancetta_core::slot::{SlotParity, SLOT_NS};
 use pancetta_qso::TxAttemptId;
 
 /// 2026-01-01 00:00:00 UTC is an Even FT8 slot start (as in
 /// `schedule_tx_tests::at`).
-fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
-    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+fn at(seconds: f64) -> UtcTimestamp {
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    base + SignedDuration::from_nanos((seconds * 1_000_000_000.0) as i64)
 }
 
 /// 2.3 s into own slot 0: past FT8's 1.7 s acceptance cap, so deferred

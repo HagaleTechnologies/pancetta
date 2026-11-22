@@ -35,7 +35,7 @@ mod tx_send_authorized_tests {
 
     fn armed_client_a() -> Arc<std::sync::Mutex<ArmState>> {
         let mut state = ArmState::new();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
         state.arm(
             VerifiedArmGrant {
@@ -85,7 +85,7 @@ mod tx_send_authorized_tests {
         arm.lock().unwrap().set_channel_consent(
             ConsentChannel::StationAgent,
             false,
-            chrono::Utc::now().timestamp_millis(),
+            UtcTimestamp::now().as_millisecond(),
         );
         assert!(!tx_send_authorized(
             TxOrigin::Remote,
@@ -211,7 +211,7 @@ async fn pre_ptt_denial_uses_denied_wording_not_mid_transmission_wording() {
     // mismatch, exactly like a stale Step 4b-arm success gone bad in the
     // pre-PTT gap.
     let mut st = pancetta_agent::arm::ArmState::new();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
         true,

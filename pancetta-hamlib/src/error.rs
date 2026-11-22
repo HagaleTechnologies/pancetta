@@ -3,6 +3,7 @@
 //! This module provides structured error types, error recovery mechanisms,
 //! and detailed error reporting for all hamlib operations.
 
+use pancetta_core::time::UtcTimestamp;
 use std::fmt;
 use thiserror::Error;
 
@@ -645,7 +646,7 @@ pub struct ErrorContext {
     /// Additional context information
     pub context: std::collections::HashMap<String, String>,
     /// Timestamp of error
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: UtcTimestamp,
 }
 
 impl ErrorContext {
@@ -657,7 +658,7 @@ impl ErrorContext {
             frequency: None,
             vfo: None,
             context: std::collections::HashMap::new(),
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
         }
     }
 
@@ -713,7 +714,7 @@ impl ContextualError {
         report.push_str(&format!("Operation: {}\n", self.context.operation));
         report.push_str(&format!(
             "Time: {}\n",
-            self.context.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+            self.context.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
         ));
 
         if let Some(model) = &self.context.rig_model {

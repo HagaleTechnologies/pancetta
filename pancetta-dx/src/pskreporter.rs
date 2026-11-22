@@ -4,7 +4,9 @@
 //! digital mode activity monitoring and spot collection.
 
 use crate::{Band, DxError, DxErrorInner, DxSpot, Mode, Result};
-use chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -99,9 +101,9 @@ struct PskReporterResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryParams {
     /// Start time for query
-    pub start_time: DateTime<Utc>,
+    pub start_time: UtcTimestamp,
     /// End time for query
-    pub end_time: DateTime<Utc>,
+    pub end_time: UtcTimestamp,
     /// Specific callsign to search for
     pub callsign: Option<String>,
     /// Minimum frequency in Hz
@@ -124,9 +126,9 @@ pub struct QueryParams {
 
 impl Default for QueryParams {
     fn default() -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
-            start_time: now - Duration::hours(1),
+            start_time: now - SignedDuration::from_hours(1),
             end_time: now,
             callsign: None,
             min_frequency: None,
@@ -155,7 +157,7 @@ pub struct PskReporterStats {
     /// Band distribution
     pub band_distribution: HashMap<String, u32>,
     /// Time range covered
-    pub time_range: (DateTime<Utc>, DateTime<Utc>),
+    pub time_range: (UtcTimestamp, UtcTimestamp),
 }
 
 /// PSKReporter client
@@ -165,7 +167,7 @@ pub struct PskReporterClient {
     /// Configuration
     config: PskReporterConfig,
     /// Last request time for rate limiting
-    last_request: Option<DateTime<Utc>>,
+    last_request: Option<UtcTimestamp>,
 }
 
 impl PskReporterClient {
@@ -249,7 +251,7 @@ impl PskReporterClient {
             }
         }
 
-        self.last_request = Some(Utc::now());
+        self.last_request = Some(UtcTimestamp::now());
         Ok(spots)
     }
 
@@ -259,9 +261,9 @@ impl PskReporterClient {
         callsign: &str,
         hours_back: i64,
     ) -> Result<Vec<DxSpot>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let params = QueryParams {
-            start_time: now - Duration::hours(hours_back),
+            start_time: now - SignedDuration::from_hours(hours_back),
             end_time: now,
             callsign: Some(callsign.to_uppercase()),
             limit: Some(self.config.max_spots),
@@ -277,11 +279,11 @@ impl PskReporterClient {
         band: Band,
         hours_back: i64,
     ) -> Result<Vec<DxSpot>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let (min_freq, max_freq) = band.frequency_range();
 
         let params = QueryParams {
-            start_time: now - Duration::hours(hours_back),
+            start_time: now - SignedDuration::from_hours(hours_back),
             end_time: now,
             min_frequency: Some(min_freq),
             max_frequency: Some(max_freq),
@@ -299,9 +301,9 @@ impl PskReporterClient {
         mode: Mode,
         hours_back: i64,
     ) -> Result<Vec<DxSpot>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let params = QueryParams {
-            start_time: now - Duration::hours(hours_back),
+            start_time: now - SignedDuration::from_hours(hours_back),
             end_time: now,
             mode: Some(mode),
             limit: Some(self.config.max_spots),
@@ -317,9 +319,9 @@ impl PskReporterClient {
         grid_square: &str,
         hours_back: i64,
     ) -> Result<Vec<DxSpot>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let params = QueryParams {
-            start_time: now - Duration::hours(hours_back),
+            start_time: now - SignedDuration::from_hours(hours_back),
             end_time: now,
             transmitter_grid: Some(grid_square.to_uppercase()),
             limit: Some(self.config.max_spots),
@@ -385,7 +387,8 @@ impl PskReporterClient {
     where
         F: FnMut(Vec<DxSpot>) -> Result<()>,
     {
-        let mut last_check = Utc::now() - Duration::minutes(self.config.time_window_minutes);
+        let mut last_check =
+            UtcTimestamp::now() - SignedDuration::from_mins(self.config.time_window_minutes);
 
         info!(
             "Starting PSKReporter real-time monitoring (poll interval: {}s)",
@@ -393,7 +396,7 @@ impl PskReporterClient {
         );
 
         loop {
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let params = QueryParams {
                 start_time: last_check,
                 end_time: now,
@@ -440,8 +443,8 @@ impl PskReporterClient {
             )))
         })?;
 
-        let start_timestamp = params.start_time.timestamp();
-        let end_timestamp = params.end_time.timestamp();
+        let start_timestamp = params.start_time.as_second();
+        let end_timestamp = params.end_time.as_second();
 
         {
             let mut query_pairs = url.query_pairs_mut();
@@ -493,7 +496,7 @@ impl PskReporterClient {
     fn convert_spot(&self, psk_spot: PskReporterSpot) -> Result<DxSpot> {
         let mode = self.parse_mode(&psk_spot.mode);
 
-        let time = DateTime::from_timestamp(psk_spot.flow_start_seconds, 0)
+        let time = UtcTimestamp::from_parts(psk_spot.flow_start_seconds, 0)
             .ok_or_else(|| DxError::from(DxErrorInner::Parse("Invalid timestamp".to_string())))?;
 
         Ok(DxSpot {
@@ -537,8 +540,8 @@ impl PskReporterClient {
     /// Rate limiting
     async fn rate_limit(&mut self) -> Result<()> {
         if let Some(last_request) = self.last_request {
-            let elapsed = Utc::now().signed_duration_since(last_request);
-            let min_interval = Duration::milliseconds(self.config.rate_limit_ms as i64);
+            let elapsed = UtcTimestamp::now().duration_since(last_request);
+            let min_interval = SignedDuration::from_millis(self.config.rate_limit_ms as i64);
 
             if elapsed < min_interval {
                 let sleep_duration = (min_interval - elapsed)
@@ -1067,8 +1070,8 @@ mod tests {
     fn test_url_building() {
         let client = PskReporterClient::new();
         let params = QueryParams {
-            start_time: DateTime::from_timestamp(1600000000, 0).unwrap(),
-            end_time: DateTime::from_timestamp(1600003600, 0).unwrap(),
+            start_time: UtcTimestamp::from_parts(1600000000, 0).unwrap(),
+            end_time: UtcTimestamp::from_parts(1600003600, 0).unwrap(),
             callsign: Some("W1ABC".to_string()),
             min_frequency: Some(14_000_000),
             max_frequency: Some(14_350_000),
@@ -1094,7 +1097,7 @@ mod tests {
         client.rate_limit().await.unwrap(); // First call should not delay
         let first_elapsed = start.elapsed();
 
-        client.last_request = Some(Utc::now());
+        client.last_request = Some(UtcTimestamp::now());
         client.rate_limit().await.unwrap(); // Second call should delay
         let second_elapsed = start.elapsed();
 

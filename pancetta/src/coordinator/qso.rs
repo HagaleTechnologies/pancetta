@@ -16,6 +16,9 @@
 
 use super::ActiveQsoFreq;
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -41,13 +44,13 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 /// The resend re-keys the completed QSO by id
 /// (`QsoManager::resend_completed_close`, PAN-275); it never opens a QSO, so
 /// the contact is logged once however late in the window the repeat comes.
-const AUTO_73_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
+const AUTO_73_WINDOW: SignedDuration = SignedDuration::from_mins(3);
 /// Maximum number of auto re-sends of our 73 per completed manual QSO.
 const AUTO_73_MAX_RESENDS: u8 = 3;
 /// Minimum spacing between auto re-sends (one FT8 slot is 15 s; we use a
 /// slightly-under-slot guard so we fire at most once per slot even if the
 /// DX's RR73 is decoded a hair early/late).
-const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
+const AUTO_73_MIN_SPACING: SignedDuration = SignedDuration::from_secs(14);
 /// SM-F3/TX-F10: minimum time that must elapse since `completed_at` before
 /// the FIRST auto-resend (`resends` 0 → 1) is allowed to fire.
 ///
@@ -64,7 +67,7 @@ const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
 /// comfortably covers it while staying tiny next to [`AUTO_73_WINDOW`] (3
 /// min), so a truly later, genuine repeat of RR73 (the DX really didn't copy
 /// our first 73) is unaffected.
-const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::seconds(32);
+const AUTO_73_FIRST_RESEND_MIN_DELAY: SignedDuration = SignedDuration::from_secs(32);
 
 /// One recently-completed **manual** QSO, tracked so we can auto-re-send our
 /// 73 if the DX keeps sending RR73/RRR. Keyed (in the map) by uppercased
@@ -72,12 +75,12 @@ const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::secon
 #[derive(Debug, Clone)]
 struct RecentManualCompletion {
     /// When the QSO completed (window + pruning are measured from here).
-    completed_at: chrono::DateTime<chrono::Utc>,
+    completed_at: UtcTimestamp,
     /// How many auto re-sends we have already done (bounded by
     /// [`AUTO_73_MAX_RESENDS`]).
     resends: u8,
     /// When we last auto-re-sent (one-per-slot guard). `None` = never yet.
-    last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_resend_at: Option<UtcTimestamp>,
     /// SECURITY: `true` iff the completed QSO was remote-initiated. The auto-73
     /// resend is itself a TX, so it must inherit the origin — a remote QSO's
     /// auto-73 is `TxOrigin::Remote` and armed-TX gated (fail-closed: if the
@@ -115,10 +118,10 @@ struct PendingAuto73Resend {
     /// The emitted resend frame's attempt id, echoed on its TX report.
     attempt_id: pancetta_qso::TxAttemptId,
     /// The `last_resend_at` stamp this resend set.
-    committed_at: chrono::DateTime<chrono::Utc>,
+    committed_at: UtcTimestamp,
     /// `last_resend_at` before this resend, restored on a refund while the
     /// field still holds this resend's own stamp.
-    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_last_resend_at: Option<UtcTimestamp>,
 }
 
 /// item-2-auto-73 (PAN-275): record a manual completion for the auto-73.
@@ -130,9 +133,9 @@ fn stash_auto_73_completion(
     map: &mut HashMap<String, RecentManualCompletion>,
     callsign: &str,
     fresh: RecentManualCompletion,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) {
-    map.retain(|_, e| now.signed_duration_since(e.completed_at) < AUTO_73_WINDOW);
+    map.retain(|_, e| now.duration_since(e.completed_at) < AUTO_73_WINDOW);
     match map.entry(callsign.to_uppercase()) {
         std::collections::hash_map::Entry::Occupied(o) if o.get().qso_id == fresh.qso_id => {}
         std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -452,14 +455,14 @@ struct PendingManualCall {
 #[derive(Debug, Clone, Copy)]
 struct QueueStamp {
     mono: std::time::Instant,
-    wall: chrono::DateTime<chrono::Utc>,
+    wall: UtcTimestamp,
 }
 
 impl QueueStamp {
     fn now() -> Self {
         Self {
             mono: std::time::Instant::now(),
-            wall: chrono::Utc::now(),
+            wall: UtcTimestamp::now(),
         }
     }
 
@@ -505,7 +508,7 @@ struct DxActivity {
     /// Short human summary, e.g. "CQ", "→ W1XYZ R-12", "→ us -09".
     summary: String,
     /// When this frame was decoded (drives the staleness/"(silent)" display).
-    at: chrono::DateTime<chrono::Utc>,
+    at: UtcTimestamp,
 }
 
 /// Shared map (uppercased callsign → latest [`DxActivity`]) updated by the
@@ -518,7 +521,7 @@ const DX_ACTIVITY_MAX: usize = 256;
 
 /// Entries older than this are treated as stale (DX has gone quiet) and not
 /// surfaced; also the pruning horizon.
-const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
+const DX_ACTIVITY_TTL: SignedDuration = SignedDuration::from_secs(150);
 
 /// Compute the TX audio offset for a new **manual** QSO (StartQso /
 /// RespondToCaller) from the operator's held-offset state and the live active
@@ -689,7 +692,7 @@ fn record_dx_activity(
     map: &DxActivityMap,
     msg: &pancetta_qso::states::MessageType,
     our_call: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) {
     let Some((from, summary)) = dx_activity_summary(msg, our_call) else {
         return;
@@ -698,7 +701,7 @@ fn record_dx_activity(
         m.insert(from.to_uppercase(), DxActivity { summary, at: now });
         // Cheap bound: prune by age, and if still over the cap drop the oldest.
         if m.len() > DX_ACTIVITY_MAX {
-            m.retain(|_, a| now.signed_duration_since(a.at) < DX_ACTIVITY_TTL);
+            m.retain(|_, a| now.duration_since(a.at) < DX_ACTIVITY_TTL);
             while m.len() > DX_ACTIVITY_MAX {
                 if let Some(oldest_key) = m.iter().min_by_key(|(_, a)| a.at).map(|(k, _)| k.clone())
                 {
@@ -713,11 +716,7 @@ fn record_dx_activity(
 
 /// Look up the freshest non-stale activity summary for a callsign (#41),
 /// compound-call aware. Returns `None` if unknown or stale.
-fn lookup_dx_activity(
-    map: &DxActivityMap,
-    callsign: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
+fn lookup_dx_activity(map: &DxActivityMap, callsign: &str, now: UtcTimestamp) -> Option<String> {
     let m = map.read().ok()?;
     // Exact (uppercased) hit first; fall back to a compound-call match.
     let entry = m.get(&callsign.to_uppercase()).or_else(|| {
@@ -725,7 +724,7 @@ fn lookup_dx_activity(
             .find(|(k, _)| pancetta_qso::exchange::callsigns_match(k, callsign))
             .map(|(_, a)| a)
     })?;
-    if now.signed_duration_since(entry.at) < DX_ACTIVITY_TTL {
+    if now.duration_since(entry.at) < DX_ACTIVITY_TTL {
         Some(entry.summary.clone())
     } else {
         None
@@ -1164,7 +1163,7 @@ async fn maybe_auto_resend_73(
         return;
     }
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
 
     // Decide under the map lock: is this a stashed manual completion still in
     // window and under the cap, with the per-slot guard satisfied? We mutate
@@ -1179,7 +1178,7 @@ async fn maybe_auto_resend_73(
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
-        map.retain(|_, e| now.signed_duration_since(e.completed_at) < AUTO_73_WINDOW);
+        map.retain(|_, e| now.duration_since(e.completed_at) < AUTO_73_WINDOW);
 
         let Some(entry) = map.get_mut(&key) else {
             return;
@@ -1199,12 +1198,12 @@ async fn maybe_auto_resend_73(
         // attempt, so a genuine later RR73 (past this guard) still gets its
         // full allotment.
         if entry.resends == 0
-            && now.signed_duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
+            && now.duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
         {
             return;
         }
         if let Some(last) = entry.last_resend_at {
-            if now.signed_duration_since(last) < AUTO_73_MIN_SPACING {
+            if now.duration_since(last) < AUTO_73_MIN_SPACING {
                 // Already re-sent this slot — ignore the duplicate decode.
                 return;
             }
@@ -1406,9 +1405,9 @@ async fn roll_back_auto_73_commit(
     completions: &RecentManualCompletions,
     key: &str,
     qso_id: pancetta_qso::QsoId,
-    committed_at: chrono::DateTime<chrono::Utc>,
+    committed_at: UtcTimestamp,
     prev_resends: u8,
-    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_last_resend_at: Option<UtcTimestamp>,
 ) {
     let mut map = completions.lock().await;
     if let Some(entry) = map.get_mut(key) {
@@ -1537,7 +1536,7 @@ async fn handle_tx_frame_sent(
     qso_id: &str,
     message_text: &str,
     aired: &pancetta_qso::UnsentAttemptPayload,
-    aired_at: chrono::DateTime<chrono::Utc>,
+    aired_at: UtcTimestamp,
     attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
     match qso_id.parse::<pancetta_qso::QsoId>() {
@@ -2134,7 +2133,7 @@ async fn fox_grace_hound_count(
         Ok(set) => set.iter().cloned().collect(),
         Err(_) => return 0,
     };
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut count = 0usize;
     for key in keys {
         let Ok(id) = uuid::Uuid::parse_str(&key) else {
@@ -2503,7 +2502,7 @@ fn timeout_detail(
             return "watchdog timeout — no reply after we sent the report".to_string();
         }
         if metadata.first_call_at.is_some_and(|started| {
-            chrono::Utc::now() - started >= chrono::Duration::minutes(watchdog_minutes as i64)
+            UtcTimestamp::now() - started >= SignedDuration::from_mins(watchdog_minutes as i64)
         }) {
             return format!("watchdog timeout — no reply in {watchdog_minutes} min");
         }
@@ -2756,7 +2755,7 @@ fn recent_qso_outcome(
     let mut brief_timeline = vec![format!(
         "{} started at {}",
         their_call,
-        metadata.contact_started_at().format("%H:%M:%S")
+        metadata.contact_started_at().strftime("%H:%M:%S")
     )];
     if let Some(sent) = metadata.reports.sent {
         brief_timeline.push(format!("Report sent: {sent:+}"));
@@ -2779,7 +2778,7 @@ fn recent_qso_outcome(
         outcome,
         last_state,
         freq_hz: metadata.frequency as u32,
-        ts: chrono::Utc::now(),
+        ts: UtcTimestamp::now(),
         brief_timeline,
     }
 }
@@ -4251,7 +4250,7 @@ impl super::ApplicationCoordinator {
                                             band: history_band,
                                             success: true,
                                             reason: None,
-                                            completed_at: chrono::Utc::now(),
+                                            completed_at: UtcTimestamp::now(),
                                         },
                                         Instant::now(),
                                     );
@@ -4321,7 +4320,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-259: neither are Hound completions — a
                                     // Hound never sends 73 after the Fox's RR73.
                                     if stashes_auto_73(&metadata) {
-                                        let now = chrono::Utc::now();
+                                        let now = UtcTimestamp::now();
                                         let entry = RecentManualCompletion {
                                             completed_at: now,
                                             resends: 0,
@@ -4430,7 +4429,7 @@ impl super::ApplicationCoordinator {
                                             band: history_band,
                                             success: false,
                                             reason: Some(failure_reason_text(&reason)),
-                                            completed_at: chrono::Utc::now(),
+                                            completed_at: UtcTimestamp::now(),
                                         },
                                         Instant::now(),
                                     );
@@ -4831,7 +4830,7 @@ impl super::ApplicationCoordinator {
                                                 &dx_activity,
                                                 &msg_type,
                                                 &our_callsign,
-                                                chrono::Utc::now(),
+                                                UtcTimestamp::now(),
                                             );
                                         }
                                     }
@@ -6572,7 +6571,7 @@ fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
 fn secondary_decoder_hint_freq_for(
     progress: &pancetta_qso::QsoProgress,
     slot_ns: i64,
-) -> Option<(f64, chrono::DateTime<chrono::Utc>)> {
+) -> Option<(f64, UtcTimestamp)> {
     if !matches!(
         progress.state,
         pancetta_qso::states::QsoState::CallingCq { .. }
@@ -6582,7 +6581,7 @@ fn secondary_decoder_hint_freq_for(
     let pre = progress.metadata.pre_switch_offset?;
     let grace = pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(slot_ns);
     let expires_at = pre.left_at + grace;
-    (expires_at > chrono::Utc::now()).then_some((pre.offset_hz, expires_at))
+    (expires_at > UtcTimestamp::now()).then_some((pre.offset_hz, expires_at))
 }
 
 #[cfg(test)]
@@ -6657,7 +6656,7 @@ async fn build_active_qso_snapshot(
     Vec<crate::message_bus::PendingCallSnapshotItem>,
 ) {
     let active = qso_manager.get_active_qsos().await;
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     // Watchdog config for the manual keep-calling countdown (Batch 2 #1).
     let timeouts = &qso_manager.config().timeouts;
     let max_calls = timeouts.manual_call_max_calls;
@@ -6829,7 +6828,7 @@ fn snapshot_item_from_progress(
         let deadline = progress
             .metadata
             .first_call_at
-            .map(|t| t + chrono::Duration::minutes(watchdog_minutes as i64));
+            .map(|t| t + SignedDuration::from_mins(watchdog_minutes as i64));
         (progress.metadata.call_count, max_calls, deadline)
     } else {
         (0, 0, None)
@@ -6973,7 +6972,7 @@ fn cqdx_record_from_metadata(
         rst_sent: metadata.reports.sent.map(|r| r.to_string()),
         rst_received: metadata.reports.received.map(|r| r.to_string()),
         start_time: metadata.contact_started_at(),
-        end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
+        end_time: metadata.end_time.unwrap_or_else(UtcTimestamp::now),
     })
 }
 

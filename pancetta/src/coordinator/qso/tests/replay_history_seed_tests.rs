@@ -49,7 +49,7 @@ fn sample_progress(callsign: &str) -> QsoProgress {
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             first_answer_at: None,
-            start_time: chrono::Utc::now(),
+            start_time: pancetta_core::time::UtcTimestamp::now(),
             end_time: None,
             reports: SignalReports::default(),
             grids: GridSquares::default(),
@@ -704,7 +704,7 @@ async fn replay_with_no_adif_but_a_legacy_db_starts_cleanly_without_seeding() {
             our_report: -12,
             frequency: FREQ_20M_HZ,
             grid_square: None,
-            completed_at: chrono::Utc::now(),
+            completed_at: pancetta_core::time::UtcTimestamp::now(),
             duration_seconds: 90,
         };
         db.update_qso(&progress).await.unwrap();
@@ -760,7 +760,7 @@ async fn replay_with_unreadable_adif_starts_cleanly_without_seeding() {
             our_report: -7,
             frequency: FREQ_20M_HZ,
             grid_square: None,
-            completed_at: chrono::Utc::now(),
+            completed_at: pancetta_core::time::UtcTimestamp::now(),
             duration_seconds: 60,
         };
         db.update_qso(&progress).await.unwrap();

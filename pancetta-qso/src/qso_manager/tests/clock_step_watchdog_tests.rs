@@ -1,6 +1,8 @@
 // PAN-296. Formerly the inline module `pan296_watchdog_tests`.
 use super::*;
+use jiff::SignedDuration;
 use pancetta_core::slot_clock::ClockStepDetector;
+use pancetta_core::time::UtcTimestamp;
 use std::time::{Duration as StdDuration, Instant};
 
 fn manager() -> QsoManager {
@@ -17,7 +19,7 @@ fn manager() -> QsoManager {
     })
 }
 
-async fn open(manager: &QsoManager, call: &str, at: DateTime<Utc>) -> QsoId {
+async fn open(manager: &QsoManager, call: &str, at: UtcTimestamp) -> QsoId {
     let id = manager
         .respond_to_cq(call.into(), 14074000.0, None)
         .await
@@ -46,7 +48,7 @@ fn failures(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoFailureReason> {
 async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
     let manager = manager();
     let mut rx = manager.subscribe();
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let mono = Instant::now();
     let mut last = mono;
     let mut detector = ClockStepDetector::new(base);
@@ -57,7 +59,7 @@ async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
     for (wall, elapsed) in [(20, 20), (80, 20), (85, 25), (110, 50)] {
         manager
             .watchdog_pass_at(
-                base + Duration::seconds(wall),
+                base + SignedDuration::from_secs(wall),
                 mono + StdDuration::from_secs(elapsed),
                 &mut detector,
                 &mut last,
@@ -70,7 +72,7 @@ async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
     }
     manager
         .watchdog_pass_at(
-            base + Duration::seconds(111),
+            base + SignedDuration::from_secs(111),
             mono + StdDuration::from_secs(51),
             &mut detector,
             &mut last,
@@ -90,7 +92,7 @@ async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
 #[tokio::test]
 async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
     let manager = manager();
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let id = open(&manager, "K1DEF", base).await;
     let mono = Instant::now();
     let mut last = mono;
@@ -98,7 +100,7 @@ async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
     for (wall, elapsed) in [(20, 20), (-40, 20), (-10, 50), (90, 50), (120, 80)] {
         manager
             .watchdog_pass_at(
-                base + Duration::seconds(wall),
+                base + SignedDuration::from_secs(wall),
                 mono + StdDuration::from_secs(elapsed),
                 &mut detector,
                 &mut last,
@@ -108,7 +110,7 @@ async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
     }
     manager
         .watchdog_pass_at(
-            base + Duration::seconds(160),
+            base + SignedDuration::from_secs(160),
             mono + StdDuration::from_secs(120),
             &mut detector,
             &mut last,
@@ -116,13 +118,13 @@ async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
         .await;
     assert!(manager.get_qso(id).await.is_err());
 }
-async fn recover(manager: &QsoManager, base: DateTime<Utc>) {
+async fn recover(manager: &QsoManager, base: UtcTimestamp) {
     let mono = Instant::now();
     let mut last = mono;
     let mut detector = ClockStepDetector::new(base);
     manager
         .watchdog_pass_at(
-            base + Duration::seconds(80),
+            base + SignedDuration::from_secs(80),
             mono + StdDuration::from_secs(20),
             &mut detector,
             &mut last,
@@ -137,7 +139,7 @@ async fn repetitive_and_manual_watchdogs_keep_their_boundaries() {
         manager.config.timeouts.report_timeout = 1000;
         manager.config.timeouts.repetitive_tx_timeout_secs = if manual { 1000 } else { 30 };
         manager.config.timeouts.manual_call_watchdog_minutes = 1;
-        let base = Utc::now();
+        let base = UtcTimestamp::now();
         let id = open(&manager, "K1DEF", base).await;
         if manual {
             manager
@@ -151,15 +153,15 @@ async fn repetitive_and_manual_watchdogs_keep_their_boundaries() {
         }
         recover(&manager, base).await;
         assert!(manager.get_qso(id).await.is_ok());
-        let boundary = base + Duration::seconds(if manual { 140 } else { 110 });
+        let boundary = base + SignedDuration::from_secs(if manual { 140 } else { 110 });
         manager
-            .check_timeouts_at(boundary - Duration::milliseconds(1))
+            .check_timeouts_at(boundary - SignedDuration::from_millis(1))
             .await;
         assert!(manager.get_qso(id).await.is_ok());
         manager.check_timeouts_at(boundary).await;
         assert_eq!(manager.get_qso(id).await.is_ok(), !manual);
         manager
-            .check_timeouts_at(boundary + Duration::seconds(1))
+            .check_timeouts_at(boundary + SignedDuration::from_secs(1))
             .await;
         assert!(manager.get_qso(id).await.is_err());
     }
@@ -170,7 +172,7 @@ async fn recovery_preserves_count_cap_and_unencodable_failures() {
     for unencodable in [false, true] {
         let manager = manager();
         let mut rx = manager.subscribe();
-        let base = Utc::now();
+        let base = UtcTimestamp::now();
         let id = open(&manager, "K1DEF", base).await;
         {
             let mut qsos = manager.qsos.write().await;
@@ -197,7 +199,7 @@ async fn transitions_new_contacts_and_clones_use_the_right_anchors() {
     let mut manager = manager();
     manager.config.timeouts.repetitive_tx_timeout_secs = 1000;
     manager.config.timeouts.manual_call_watchdog_minutes = 1;
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let auto = open(&manager, "K1DEF", base).await;
     let manual = open(&manager, "K2DEF", base).await;
     manager
@@ -213,7 +215,10 @@ async fn transitions_new_contacts_and_clones_use_the_right_anchors() {
     recover(&clone, base).await;
     let original = manager.get_qso(manual).await.unwrap();
     assert_eq!(original.metadata.first_call_at, Some(base));
-    assert_eq!(original.state.state_duration(base), Some(Duration::zero()));
+    assert_eq!(
+        original.state.state_duration(base),
+        Some(SignedDuration::ZERO)
+    );
     assert_eq!(
         format!("{:?}", original.state_history),
         format!("{history:?}")
@@ -225,25 +230,29 @@ async fn transitions_new_contacts_and_clones_use_the_right_anchors() {
         for id in [auto, manual] {
             qsos.get_mut(&id).unwrap().state = QsoState::WaitingForReport {
                 their_callsign: if id == auto { "K1DEF" } else { "K2DEF" }.into(),
-                started_at: base + Duration::seconds(100),
+                started_at: base + SignedDuration::from_secs(100),
                 frequency: 14074000.0,
                 their_grid: None,
                 our_report: -10,
             };
         }
     }
-    let new = open(&manager, "K3DEF", base + Duration::seconds(100)).await;
+    let new = open(&manager, "K3DEF", base + SignedDuration::from_secs(100)).await;
     manager
-        .check_timeouts_at(base + Duration::seconds(130))
+        .check_timeouts_at(base + SignedDuration::from_secs(130))
         .await;
     for id in [auto, manual, new] {
         assert!(manager.get_qso(id).await.is_ok());
     }
-    clone.check_timeouts_at(base + Duration::seconds(131)).await;
+    clone
+        .check_timeouts_at(base + SignedDuration::from_secs(131))
+        .await;
     assert!(manager.get_qso(auto).await.is_err());
     assert!(manager.get_qso(new).await.is_err());
     assert!(manager.get_qso(manual).await.is_ok());
-    clone.check_timeouts_at(base + Duration::seconds(140)).await;
+    clone
+        .check_timeouts_at(base + SignedDuration::from_secs(140))
+        .await;
     assert!(
         manager.get_qso(manual).await.is_err(),
         "first-call recovery must persist across a state advance"
@@ -253,7 +262,7 @@ async fn transitions_new_contacts_and_clones_use_the_right_anchors() {
 #[tokio::test]
 async fn state_variant_and_first_call_identity_changes_discard_grace() {
     let manager = manager();
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let id = open(&manager, "K1DEF", base).await;
     recover(&manager, base).await;
     manager.qsos.write().await.get_mut(&id).unwrap().state = QsoState::WaitingForReport {
@@ -264,7 +273,7 @@ async fn state_variant_and_first_call_identity_changes_discard_grace() {
         our_report: -10,
     };
     manager
-        .check_timeouts_at(base + Duration::seconds(81))
+        .check_timeouts_at(base + SignedDuration::from_secs(81))
         .await;
     assert!(
         manager.get_qso(id).await.is_err(),
@@ -291,7 +300,7 @@ async fn state_variant_and_first_call_identity_changes_discard_grace() {
         .metadata
         .first_call_at = None;
     manager
-        .check_timeouts_at(base + Duration::seconds(81))
+        .check_timeouts_at(base + SignedDuration::from_secs(81))
         .await;
     assert!(
         manager.get_qso(id).await.is_ok(),
@@ -304,9 +313,9 @@ async fn state_variant_and_first_call_identity_changes_discard_grace() {
         .get_mut(&id)
         .unwrap()
         .metadata
-        .first_call_at = Some(base - Duration::minutes(10));
+        .first_call_at = Some(base - SignedDuration::from_mins(10));
     manager
-        .check_timeouts_at(base + Duration::seconds(82))
+        .check_timeouts_at(base + SignedDuration::from_secs(82))
         .await;
     assert!(
         manager.get_qso(id).await.is_err(),
@@ -317,22 +326,22 @@ async fn state_variant_and_first_call_identity_changes_discard_grace() {
 #[tokio::test]
 async fn contacts_created_between_observations_receive_grace_and_same_state_restart_expires() {
     let manager = manager();
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let mono = Instant::now();
     let mut last = mono;
     let mut detector = ClockStepDetector::new(base);
     manager
         .watchdog_pass_at(
-            base + Duration::seconds(20),
+            base + SignedDuration::from_secs(20),
             mono + StdDuration::from_secs(20),
             &mut detector,
             &mut last,
         )
         .await;
-    let id = open(&manager, "K1DEF", base + Duration::seconds(25)).await;
+    let id = open(&manager, "K1DEF", base + SignedDuration::from_secs(25)).await;
     manager
         .watchdog_pass_at(
-            base + Duration::seconds(85),
+            base + SignedDuration::from_secs(85),
             mono + StdDuration::from_secs(25),
             &mut detector,
             &mut last,
@@ -345,16 +354,16 @@ async fn contacts_created_between_observations_receive_grace_and_same_state_rest
             .await
             .unwrap()
             .state
-            .state_duration(base + Duration::seconds(25)),
-        Some(Duration::zero())
+            .state_duration(base + SignedDuration::from_secs(25)),
+        Some(SignedDuration::ZERO)
     );
     if let QsoState::RespondingToCq { started_at, .. } =
         &mut manager.qsos.write().await.get_mut(&id).unwrap().state
     {
-        *started_at = base + Duration::seconds(40);
+        *started_at = base + SignedDuration::from_secs(40);
     }
     manager
-        .check_timeouts_at(base + Duration::seconds(86))
+        .check_timeouts_at(base + SignedDuration::from_secs(86))
         .await;
     assert!(
         manager.get_qso(id).await.is_err(),

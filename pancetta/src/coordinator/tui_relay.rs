@@ -37,6 +37,8 @@
 
 use anyhow::Result;
 use geographiclib_rs::InverseGeodesic;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1430,7 +1432,7 @@ impl RelayDriverHost for TuiRelayLoop {
                 // event history (Shift+D overlay).
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                        ts: chrono::Utc::now(),
+                        ts: UtcTimestamp::now(),
                         target,
                         level,
                         text: text.clone(),
@@ -1479,7 +1481,7 @@ impl RelayDriverHost for TuiRelayLoop {
                             openness: snapshot.openness.clone(),
                             bin_hz: snapshot.bin_hz,
                             range: snapshot.range,
-                            received_at: chrono::Utc::now(),
+                            received_at: UtcTimestamp::now(),
                         },
                     },
                 );
@@ -1738,7 +1740,7 @@ impl RelayDriverHost for TuiRelayLoop {
             const PTT_CLEARED: &str = "PTT-off confirmed by the rig — stuck-PTT warning cleared";
             info!("{PTT_CLEARED}");
             let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                ts: chrono::Utc::now(),
+                ts: UtcTimestamp::now(),
                 target: "supervisor",
                 level: pancetta_core::DiagnosticLevel::Info,
                 text: PTT_CLEARED.into(),
@@ -2573,7 +2575,7 @@ impl super::ApplicationCoordinator {
                                                 level: pancetta_core::DiagnosticLevel::Warn,
                                             });
                                             let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                                                ts: chrono::Utc::now(),
+                                                ts: UtcTimestamp::now(),
                                                 target: "tx.drive",
                                                 level: pancetta_core::DiagnosticLevel::Warn,
                                                 text: "TX drive changed for this session only. Could not save TX drive.".into(),
@@ -5041,7 +5043,7 @@ fn queue_tx_drive_save(
                 level: pancetta_core::DiagnosticLevel::Warn,
             });
             let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                ts: chrono::Utc::now(),
+                ts: UtcTimestamp::now(),
                 target: "tx.drive",
                 level: pancetta_core::DiagnosticLevel::Warn,
                 text: format!("{notice} {error}"),
@@ -5234,7 +5236,7 @@ fn decoded_view_for_relay(
     }
 
     pancetta_tui::DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: dial_mhz,
         mode: super::mode_str(mode).to_string(),
         snr: decoded_msg.snr_db as i32,
@@ -6370,7 +6372,7 @@ mod tui_relay_tests {
                 let (priority_score, priority_factors) =
                     super::display_rank(&scorer, Some("K1ABC"), grid.as_deref(), -10.0, 14.074);
                 app.add_decoded_message(DecodedMessageView {
-                    timestamp: chrono::Utc::now(),
+                    timestamp: UtcTimestamp::now(),
                     frequency: 14.074,
                     mode: "FT8".into(),
                     snr: -10,
@@ -6408,7 +6410,7 @@ mod tui_relay_tests {
                     }
                 );
                 let reason =
-                    pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+                    pancetta_tui::dx_reason::reason_for(row, None, UtcTimestamp::now()).summary();
                 assert_eq!(reason.contains("grid FN42 may be new"), !worked_grid);
                 assert_eq!(reason.contains("QSO failed this session"), worked_grid);
             }
@@ -7249,7 +7251,7 @@ mod tui_relay_tests {
         let (priority_score, priority_factors) =
             super::display_rank(&scorer, Some("K1ABC/P"), Some("FN42"), -3.0, 14.074);
         app.add_decoded_message(DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".into(),
             snr: -3,
@@ -7313,7 +7315,7 @@ mod tui_relay_tests {
         let rank = row.local_rank.unwrap();
         assert!(rank.factors.unwrap().recent_failure);
         assert_eq!(rank.at, heard_at, "a rescore is not a new decode");
-        let reason = pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+        let reason = pancetta_tui::dx_reason::reason_for(row, None, UtcTimestamp::now()).summary();
         assert!(reason.contains("QSO failed this session"), "{reason}");
     }
 
@@ -9204,9 +9206,9 @@ mod tui_relay_tests {
     /// silently renders as "---" in the panel.
     #[test]
     fn map_qso_snapshot_item_carries_all_detail_fields() {
-        let started = chrono::Utc::now() - chrono::Duration::seconds(30);
-        let tx_at = started + chrono::Duration::seconds(15);
-        let rx_at = started + chrono::Duration::seconds(28);
+        let started = UtcTimestamp::now() - SignedDuration::from_secs(30);
+        let tx_at = started + SignedDuration::from_secs(15);
+        let rx_at = started + SignedDuration::from_secs(28);
         let item = crate::message_bus::ActiveQsoSnapshotItem {
             their_callsign: "JA1ABC".to_string(),
             state: "sending rpt".to_string(),
@@ -9230,7 +9232,7 @@ mod tui_relay_tests {
             next_line: "their signal report".to_string(),
             call_count: 4,
             max_calls: 10,
-            watchdog_deadline: Some(started + chrono::Duration::minutes(5)),
+            watchdog_deadline: Some(started + SignedDuration::from_mins(5)),
             dx_last_activity: None,
             hound: false,
             pending_freq_drift_hz: Some(937.5),
@@ -9261,7 +9263,7 @@ mod tui_relay_tests {
         assert_eq!(banner.max_calls, 10);
         assert_eq!(
             banner.watchdog_deadline,
-            Some(started + chrono::Duration::minutes(5))
+            Some(started + SignedDuration::from_mins(5))
         );
     }
 
@@ -9272,7 +9274,7 @@ mod tui_relay_tests {
         let item = crate::message_bus::ActiveQsoSnapshotItem {
             their_callsign: "W1AW".to_string(),
             state: "→ called".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 900.0,
             tx_parity: None,
             last_tx_text: None,
@@ -9312,7 +9314,7 @@ mod tui_relay_tests {
     /// `map_qso_snapshot_item_carries_all_detail_fields` above.
     #[test]
     fn map_recent_qso_outcome_carries_completed_fields() {
-        let ts = chrono::Utc::now();
+        let ts = UtcTimestamp::now();
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "JA1ABC".to_string(),
             qso_uuid: "u-ja1abc".to_string(),
@@ -9348,7 +9350,7 @@ mod tui_relay_tests {
             ),
             last_state: "Failed".to_string(),
             freq_hz: 900,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["QSO failed: timeout".to_string()],
         };
         let mapped = map_recent_qso_outcome(&outcome);
@@ -9369,7 +9371,7 @@ mod tui_relay_tests {
             outcome: crate::message_bus::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 14_075_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Completed".to_string()],
         };
         let a = map_recent_qso_outcome(&mk("u-1"));
@@ -9877,9 +9879,9 @@ mod tui_relay_tests {
             (
                 "20m".into(),
                 "ja1abc".into(),
-                chrono::Utc::now() - chrono::Duration::days(90),
+                UtcTimestamp::now() - SignedDuration::from_hours(24 * 90),
             ),
-            ("40m".into(), "JA1XYZ".into(), chrono::Utc::now()),
+            ("40m".into(), "JA1XYZ".into(), UtcTimestamp::now()),
         ]);
 
         let cases = [

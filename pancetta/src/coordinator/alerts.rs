@@ -3,6 +3,7 @@
 //! Webhook POSTs are capped at `alerts.webhook.max_per_minute` in any rolling
 //! 60 s; alerts over the cap are held and coalesced into one summary POST
 //! (PAN-361).
+use pancetta_core::time::UtcTimestamp;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -125,7 +126,7 @@ impl HeldAlerts {
             .collect();
         json!({
             "type": "decode_alert_summary", "source": "pancetta", "version": 1,
-            "utc_time": chrono::Utc::now().to_rfc3339(),
+            "utc_time": UtcTimestamp::now().to_rfc3339(),
             "count": count, "window_secs": WEBHOOK_RATE_WINDOW.as_secs(),
             "max_per_minute": max_per_minute, "alerts": alerts,
         })
@@ -371,7 +372,7 @@ impl AlertDispatcher {
         }
         let payload = json!({
             "type": "decode_alert", "source": "pancetta", "version": 1,
-            "utc_time": chrono::DateTime::<chrono::Utc>::from(decoded.timestamp).to_rfc3339(),
+            "utc_time": UtcTimestamp::try_from(decoded.timestamp).expect("system time is within jiff's range").to_rfc3339(),
             "callsign": call,
             "entity": pancetta_core::dxcc::entity_for_callsign(&call).unwrap_or("unknown entity"),
             "band": band, "audio_offset_hz": decoded.frequency_offset,

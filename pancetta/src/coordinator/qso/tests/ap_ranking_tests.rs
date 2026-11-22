@@ -141,14 +141,14 @@ fn waiting_for_report_state(their_callsign: &str) -> pancetta_qso::QsoState {
     pancetta_qso::QsoState::WaitingForReport {
         their_callsign: their_callsign.to_string(),
         frequency: 14_074_000.0,
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         their_grid: Some("FN31".to_string()),
         our_report: -12,
     }
 }
 
 fn empty_metadata(qso_id: pancetta_qso::QsoId, our_callsign: &str) -> pancetta_qso::QsoMetadata {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     pancetta_qso::QsoMetadata {
         qso_id,
         our_callsign: our_callsign.to_string(),
@@ -214,7 +214,7 @@ fn qso_ap_candidate_from_progress_extracts_grid_snr_freq_from_live_state() {
 fn qso_ap_candidate_from_progress_returns_none_for_calling_cq_and_idle() {
     let calling_cq = pancetta_qso::QsoState::CallingCq {
         frequency: 14_074_000.0,
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         call_count: 1,
     };
     let metadata = empty_metadata(pancetta_qso::QsoId::new_v4(), "K5ARH");

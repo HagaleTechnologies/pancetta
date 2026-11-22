@@ -98,7 +98,7 @@ async fn completed_and_aired_manual_qso(mgr: &QsoManager) -> QsoId {
             frequency_hz: 1500.0,
             remote_binding: Some((false, None)),
         },
-        chrono::Utc::now(),
+        pancetta_core::time::UtcTimestamp::now(),
     )
     .await;
     id
@@ -115,7 +115,8 @@ fn map_with_dx(qso_id: QsoId) -> RecentManualCompletions {
     map.insert(
         DX.to_string(),
         RecentManualCompletion {
-            completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+            completed_at: pancetta_core::time::UtcTimestamp::now()
+                - jiff::SignedDuration::from_secs(40),
             resends: 0,
             last_resend_at: None,
             remote_origin: false,
@@ -227,7 +228,9 @@ async fn outside_window_no_resend() {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now() - AUTO_73_WINDOW - chrono::Duration::seconds(1),
+                completed_at: pancetta_core::time::UtcTimestamp::now()
+                    - AUTO_73_WINDOW
+                    - jiff::SignedDuration::from_secs(1),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
@@ -457,7 +460,7 @@ async fn duplicate_decode_within_guard_window_no_resend() {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now(),
+                completed_at: pancetta_core::time::UtcTimestamp::now(),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
@@ -515,9 +518,9 @@ async fn genuine_later_resend_past_guard_window_fires() {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now()
+                completed_at: pancetta_core::time::UtcTimestamp::now()
                     - AUTO_73_FIRST_RESEND_MIN_DELAY
-                    - chrono::Duration::seconds(5),
+                    - jiff::SignedDuration::from_secs(5),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
@@ -565,7 +568,8 @@ async fn denied_identity_rolls_back_the_resend_commit() {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                completed_at: pancetta_core::time::UtcTimestamp::now()
+                    - jiff::SignedDuration::from_secs(40),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: true,
@@ -582,7 +586,7 @@ async fn denied_identity_rolls_back_the_resend_commit() {
 
     // client-b holds the arm — a mismatch against the entry's client-a.
     let mut st = pancetta_agent::arm::ArmState::new();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
         true,
@@ -638,7 +642,7 @@ async fn denied_identity_rolls_back_the_resend_commit() {
 
 fn armed_for(client: &str) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
     let mut st = pancetta_agent::arm::ArmState::new();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
         true,
@@ -703,7 +707,8 @@ async fn engine_denial_rolls_back(rekey_existing: bool) {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                completed_at: pancetta_core::time::UtcTimestamp::now()
+                    - jiff::SignedDuration::from_secs(40),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: true,
@@ -769,7 +774,7 @@ async fn engine_refusal_for_an_unknown_completion_rolls_back_the_commit() {
 async fn rollback_leaves_a_replaced_entry_alone() {
     let map = map_with_dx(uuid::Uuid::new_v4());
     let newer = map.lock().await.get(DX).cloned().unwrap();
-    let committed_at = chrono::Utc::now();
+    let committed_at = pancetta_core::time::UtcTimestamp::now();
     super::roll_back_auto_73_commit(&map, DX, uuid::Uuid::new_v4(), committed_at, 0, None).await;
     let after = map.lock().await.get(DX).cloned().unwrap();
     assert_eq!(after.qso_id, newer.qso_id);
@@ -786,9 +791,9 @@ async fn rollback_leaves_a_replaced_entry_alone() {
 
 fn stashed(
     qso_id: QsoId,
-    completed_at: chrono::DateTime<chrono::Utc>,
+    completed_at: pancetta_core::time::UtcTimestamp,
     resends: u8,
-    last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_resend_at: Option<pancetta_core::time::UtcTimestamp>,
 ) -> RecentManualCompletion {
     RecentManualCompletion {
         completed_at,
@@ -805,10 +810,10 @@ fn stashed(
 /// window and counters, so it can never reset the resend cap.
 #[test]
 fn stash_auto_73_completion_keeps_counters_for_the_same_qso() {
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let id = uuid::Uuid::new_v4();
-    let t = now - chrono::Duration::seconds(20);
-    let completed = now - chrono::Duration::seconds(60);
+    let t = now - jiff::SignedDuration::from_secs(20);
+    let completed = now - jiff::SignedDuration::from_secs(60);
     let mut map = HashMap::new();
     map.insert(DX.to_string(), stashed(id, completed, 2, Some(t)));
 
@@ -825,7 +830,7 @@ fn stash_auto_73_completion_keeps_counters_for_the_same_qso() {
 /// contact: it replaces the entry with a fresh budget.
 #[test]
 fn stash_auto_73_completion_replaces_a_different_qso() {
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let old = uuid::Uuid::new_v4();
     let new = uuid::Uuid::new_v4();
     let mut map = HashMap::new();
@@ -833,9 +838,9 @@ fn stash_auto_73_completion_replaces_a_different_qso() {
         DX.to_string(),
         stashed(
             old,
-            now - chrono::Duration::seconds(60),
+            now - jiff::SignedDuration::from_secs(60),
             2,
-            Some(now - chrono::Duration::seconds(20)),
+            Some(now - jiff::SignedDuration::from_secs(20)),
         ),
     );
 
@@ -850,13 +855,13 @@ fn stash_auto_73_completion_replaces_a_different_qso() {
 
 #[test]
 fn stash_auto_73_completion_inserts_when_vacant_and_prunes_expired() {
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let mut map = HashMap::new();
     map.insert(
         "W9OLD".to_string(),
         stashed(
             uuid::Uuid::new_v4(),
-            now - AUTO_73_WINDOW - chrono::Duration::seconds(1),
+            now - AUTO_73_WINDOW - jiff::SignedDuration::from_secs(1),
             0,
             None,
         ),
@@ -904,21 +909,20 @@ async fn pan275_late_rr73_rekeys_the_existing_qso_and_logs_once() {
     // The QSO completed 60 s ago: past the 45 s grace, inside the 3 min
     // window.
     assert!(
-        mgr.backdate_completion_for_test(id, chrono::Duration::seconds(60))
+        mgr.backdate_completion_for_test(id, jiff::SignedDuration::from_secs(60))
             .await
     );
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let map: RecentManualCompletions = Arc::new(Mutex::new(HashMap::new()));
     stash_auto_73_completion(
         &mut *map.lock().await,
         DX,
-        stashed(id, now - chrono::Duration::seconds(60), 0, None),
+        stashed(id, now - jiff::SignedDuration::from_secs(60), 0, None),
         now,
     );
     let grace = CompletedTxGrace::for_test(
         &mgr,
-        pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE
-            .to_std()
+        std::time::Duration::try_from(pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE)
             .unwrap(),
     );
     let policy = AtomicU8::new(TxPolicy::Full.as_u8());
@@ -951,7 +955,7 @@ async fn pan275_late_rr73_rekeys_the_existing_qso_and_logs_once() {
                 } => {
                     completed += 1;
                     // Feed it through the stash exactly as the arm would.
-                    let at = chrono::Utc::now();
+                    let at = pancetta_core::time::UtcTimestamp::now();
                     let call = metadata.their_callsign.clone().unwrap_or_default();
                     stash_auto_73_completion(
                         &mut *map.lock().await,
@@ -987,7 +991,7 @@ async fn pan275_late_rr73_rekeys_the_existing_qso_and_logs_once() {
         if let Some(e) = map.lock().await.get_mut(DX) {
             e.last_resend_at = e
                 .last_resend_at
-                .map(|t| t - AUTO_73_MIN_SPACING - chrono::Duration::seconds(1));
+                .map(|t| t - AUTO_73_MIN_SPACING - jiff::SignedDuration::from_secs(1));
         }
     }
 
@@ -1105,7 +1109,8 @@ async fn completed_remote_qso() -> (QsoManager, RecentManualCompletions, pancett
     m.insert(
         DX.to_string(),
         RecentManualCompletion {
-            completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+            completed_at: pancetta_core::time::UtcTimestamp::now()
+                - jiff::SignedDuration::from_secs(40),
             resends: 0,
             last_resend_at: None,
             remote_origin: true,
@@ -1192,7 +1197,7 @@ async fn tx_frame_sent_commits_a_pending_completion() {
             frequency_hz: 1500.0,
             remote_binding: Some((false, None)),
         },
-        chrono::Utc::now(),
+        pancetta_core::time::UtcTimestamp::now(),
         opened.attempt_id(),
     )
     .await;
@@ -1316,7 +1321,7 @@ async fn aired_auto_73_keeps_its_charge() {
             frequency_hz: 1500.0,
             remote_binding: Some((true, Some("client-a".into()))),
         },
-        chrono::Utc::now(),
+        pancetta_core::time::UtcTimestamp::now(),
         Some(id_b),
     )
     .await;
@@ -1379,8 +1384,8 @@ async fn operator_rekey_not_sent_does_not_touch_the_auto_73_budget() {
 #[tokio::test]
 async fn overlapping_auto_73_refund_takes_off_one_unit() {
     let map = map_with_dx(uuid::Uuid::new_v4());
-    let t1 = chrono::Utc::now() - chrono::Duration::seconds(20);
-    let t2 = t1 + chrono::Duration::seconds(15);
+    let t1 = pancetta_core::time::UtcTimestamp::now() - jiff::SignedDuration::from_secs(20);
+    let t2 = t1 + jiff::SignedDuration::from_secs(15);
     {
         let mut m = map.lock().await;
         let e = m.get_mut(DX).unwrap();

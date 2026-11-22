@@ -22,6 +22,7 @@ use crossbeam_channel::Receiver;
 use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
 use pancetta_config::Config;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,7 +263,7 @@ impl Recorder {
 const SLOT_MS: i64 = 15_000;
 
 fn ms_into_slot() -> i64 {
-    chrono::Utc::now().timestamp_millis().rem_euclid(SLOT_MS)
+    UtcTimestamp::now().as_millisecond().rem_euclid(SLOT_MS)
 }
 
 /// Waits until the wall clock is 4 to 10 s into a 15 s slot, so a frame sent
@@ -429,7 +430,7 @@ async fn run_cell(cell: Cell) -> Recorded {
             .store(true, Ordering::Release),
         Reason::Disarm => elapsed.store(600_000, Ordering::SeqCst),
         Reason::Supersede => {
-            let parity = SlotParity::of(chrono::Utc::now());
+            let parity = SlotParity::of(UtcTimestamp::now());
             h.coordinator
                 .message_bus
                 .send_message(ComponentMessage::new(

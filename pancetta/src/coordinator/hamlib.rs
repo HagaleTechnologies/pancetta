@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -113,11 +114,11 @@ async fn observe_hardware_ptt(
     rig: &dyn pancetta_hamlib::RigControl,
     safety: &super::receive_overload::GainSafety,
 ) -> Result<()> {
-    let asked_ms = chrono::Utc::now().timestamp_millis();
+    let asked_ms = UtcTimestamp::now().as_millisecond();
     if rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off {
         safety.observed_ptt_off(asked_ms);
     } else {
-        safety.observed_ptt_on(chrono::Utc::now().timestamp_millis());
+        safety.observed_ptt_on(UtcTimestamp::now().as_millisecond());
     }
     Ok(())
 }
@@ -166,7 +167,7 @@ impl ReceiveOverloadRuntime {
                 if let (Ok(a), Ok(b)) = (rig.get_attenuator().await, rig.get_attenuator().await) {
                     if a == b {
                         bus.receive_gain
-                            .recover_gain(chrono::Utc::now().timestamp_millis());
+                            .recover_gain(UtcTimestamp::now().as_millisecond());
                     }
                 }
             }
@@ -215,7 +216,7 @@ impl ReceiveOverloadRuntime {
                 }
                 bus.receive_gain.end_recovery(
                     matches!(confirmation, Ok(Ok(true)))
-                        .then(|| chrono::Utc::now().timestamp_millis()),
+                        .then(|| UtcTimestamp::now().as_millisecond()),
                 );
             }
         }
@@ -252,7 +253,7 @@ impl ReceiveOverloadRuntime {
                 _ => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
             }
         }
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = UtcTimestamp::now().as_millisecond();
         for measurement in measurements.try_iter() {
             if measurement.slot >= now.div_euclid(15000) - 1 {
                 self.policy.observe(measurement);
@@ -310,7 +311,7 @@ impl ReceiveOverloadRuntime {
         if !reserved {
             return;
         }
-        let remaining = slot * 15000 - 250 - chrono::Utc::now().timestamp_millis();
+        let remaining = slot * 15000 - 250 - UtcTimestamp::now().as_millisecond();
         if remaining <= 0 {
             bus.receive_gain.cancel_gain();
             return;
@@ -1424,7 +1425,7 @@ impl super::ApplicationCoordinator {
                         self.ptt_active.store(false, Ordering::Release);
                         self.message_bus
                             .receive_gain
-                            .confirmed_off(chrono::Utc::now().timestamp_millis());
+                            .confirmed_off(UtcTimestamp::now().as_millisecond());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -1545,7 +1546,7 @@ impl super::ApplicationCoordinator {
             if ptt_off {
                 self.message_bus
                     .receive_gain
-                    .confirmed_off(chrono::Utc::now().timestamp_millis());
+                    .confirmed_off(UtcTimestamp::now().as_millisecond());
             }
             for message in safe_messages {
                 self.replay_or_fallback(&sender, message).await;
@@ -1663,7 +1664,7 @@ impl super::ApplicationCoordinator {
                         self.ptt_active.store(false, Ordering::Release);
                         self.message_bus
                             .receive_gain
-                            .confirmed_off(chrono::Utc::now().timestamp_millis());
+                            .confirmed_off(UtcTimestamp::now().as_millisecond());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -2926,7 +2927,7 @@ impl super::ApplicationCoordinator {
                                 {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
-                                        overload_watchdog_safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+                                        overload_watchdog_safety.confirmed_off(UtcTimestamp::now().as_millisecond());
                                         // PAN-272: a failed unkey was already delivered,
                                         // so its TX worker guard cleared `ptt_active`.
                                         // A set flag now belongs to the next
@@ -3185,7 +3186,7 @@ impl super::ApplicationCoordinator {
                 if startup_ptt_off_succeeded {
                     message_bus_for_connect
                         .receive_gain
-                        .confirmed_off(chrono::Utc::now().timestamp_millis());
+                        .confirmed_off(UtcTimestamp::now().as_millisecond());
                 }
                 let mut overload = ReceiveOverloadRuntime::default();
                 overload.sweep_configured = overload_sweep_configured;
@@ -3485,7 +3486,7 @@ impl super::ApplicationCoordinator {
                                             && !message_bus_for_connect
                                                 .receive_gain
                                                 .hardware_ptt_on(
-                                                    chrono::Utc::now().timestamp_millis(),
+                                                    UtcTimestamp::now().as_millisecond(),
                                                 )
                                         {
                                             continue;
@@ -3560,7 +3561,7 @@ impl super::ApplicationCoordinator {
                                                     message_bus_for_connect
                                                         .receive_gain
                                                         .confirmed_off(
-                                                            chrono::Utc::now().timestamp_millis(),
+                                                            UtcTimestamp::now().as_millisecond(),
                                                         );
                                                     gain_tx_gate.fetch_and(!2, Ordering::AcqRel);
                                                     confirm_ptt_off(
@@ -9471,7 +9472,7 @@ mod receive_overload_notice_tests {
             runtime.generation = previous_generation;
             rig.connect().await.unwrap();
             bus.receive_gain
-                .confirmed_off(chrono::Utc::now().timestamp_millis());
+                .confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 runtime.tick(
@@ -9636,7 +9637,7 @@ mod receive_overload_notice_tests {
         rig.connect().await.unwrap();
         let bus = MessageBus::new(8).unwrap();
         bus.receive_gain
-            .confirmed_off(chrono::Utc::now().timestamp_millis());
+            .confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
         let (_sender, measurements) = crossbeam_channel::bounded(2);
         let mut runtime = ReceiveOverloadRuntime::default();
         runtime.sweep_configured = true;
@@ -9841,7 +9842,7 @@ mod receive_overload_notice_tests {
         });
         rig.connect().await.unwrap();
         let safety = GainSafety::default();
-        safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+        safety.confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
         super::observe_hardware_ptt(&rig, &safety).await.unwrap();
         assert!(safety.receiving());
         let epoch = safety.epoch();
@@ -9854,7 +9855,7 @@ mod receive_overload_notice_tests {
             epoch,
             "queued windows from before the key are stale"
         );
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = pancetta_core::time::UtcTimestamp::now().as_millisecond();
         assert_eq!(
             safety.window_validity(now + 1, now + 1),
             WindowValidity::KnownTx

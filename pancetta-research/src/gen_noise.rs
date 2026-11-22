@@ -16,6 +16,7 @@
 
 use anyhow::Context;
 use hound::{SampleFormat, WavSpec, WavWriter};
+use pancetta_core::time::UtcTimestamp;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
@@ -275,7 +276,7 @@ pub fn generate_noise_corpus_with_manifest(
     Ok(NoiseManifest {
         schema_version: NoiseManifest::CURRENT_SCHEMA_VERSION,
         label: label.to_string(),
-        generated_at: chrono::Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         config,
         entries,
     })

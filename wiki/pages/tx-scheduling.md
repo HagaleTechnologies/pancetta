@@ -195,7 +195,7 @@ targets the next slot and waits the full lead, and act on the first
 ## Replaying playback and stall tests
 
 PAN-325 gives `QsoManager` and the TX worker an injected UTC source, with
-`Utc::now` as the production default. The pan72 stall tests create every manager
+`UtcTimestamp::now` as the production default. The pan72 stall tests create every manager
 at the same even-slot origin. The pan71 playback tests derive UTC from paused
 Tokio time and use current-thread runtimes. Advance Tokio time to choose a slot;
 changing a test timestamp alone does not move the worker's clock. The arm clock

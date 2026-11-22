@@ -45,7 +45,7 @@ async fn send(h: &Harness, message_type: MessageType) {
 }
 
 fn parity_now() -> pancetta_core::slot::SlotParity {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     pancetta_core::slot::SlotParity::of_with_period(
         pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
         pancetta_core::slot::SLOT_NS,

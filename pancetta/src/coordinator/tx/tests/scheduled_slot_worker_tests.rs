@@ -8,7 +8,7 @@ use pancetta_qso::TxAttemptId;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-type Report = (String, TxAttemptId, chrono::DateTime<chrono::Utc>);
+type Report = (String, TxAttemptId, pancetta_core::time::UtcTimestamp);
 
 /// Dial on 20m and `qsos` live, as the QSO coordinator leaves them.
 fn setup(h: &Harness, qsos: &[&str]) {
@@ -74,9 +74,9 @@ async fn scheduled_reports(h: &Harness, count: usize) -> Vec<Report> {
 
 /// The start of the slot after the current one, and its parity: a
 /// request with that parity always defers to it.
-fn next_slot() -> (chrono::DateTime<chrono::Utc>, SlotParity) {
-    let next = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS)
-        + chrono::Duration::nanoseconds(SLOT_NS);
+fn next_slot() -> (pancetta_core::time::UtcTimestamp, SlotParity) {
+    let next = current_slot_start_with_period(pancetta_core::time::UtcTimestamp::now(), SLOT_NS)
+        + jiff::SignedDuration::from_nanos(SLOT_NS);
     (next, SlotParity::of_with_period(next, SLOT_NS))
 }
 
@@ -101,17 +101,17 @@ async fn request_dequeued_past_the_acceptance_cap_reports_the_next_own_slot() {
     let h = worker_harness().await;
     setup(&h, &["qa"]);
     // Wait until 2.0-12.0 s into a slot (at most ~5 s).
-    let now = chrono::Utc::now();
+    let now = pancetta_core::time::UtcTimestamp::now();
     let phase = now - current_slot_start_with_period(now, SLOT_NS);
-    let wait = if phase < chrono::Duration::milliseconds(2_000) {
-        chrono::Duration::milliseconds(2_000) - phase
-    } else if phase > chrono::Duration::milliseconds(12_000) {
-        chrono::Duration::milliseconds(17_000) - phase
+    let wait = if phase < jiff::SignedDuration::from_millis(2_000) {
+        jiff::SignedDuration::from_millis(2_000) - phase
+    } else if phase > jiff::SignedDuration::from_millis(12_000) {
+        jiff::SignedDuration::from_millis(17_000) - phase
     } else {
-        chrono::Duration::zero()
+        jiff::SignedDuration::ZERO
     };
-    tokio::time::sleep(wait.to_std().unwrap()).await;
-    let s = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS);
+    tokio::time::sleep(std::time::Duration::try_from(wait).unwrap()).await;
+    let s = current_slot_start_with_period(pancetta_core::time::UtcTimestamp::now(), SLOT_NS);
     let own = SlotParity::of_with_period(s, SLOT_NS);
 
     send(&h, request("qa", 42, own)).await;
@@ -122,7 +122,7 @@ async fn request_dequeued_past_the_acceptance_cap_reports_the_next_own_slot() {
         vec![(
             "qa".to_string(),
             TxAttemptId(42),
-            s + chrono::Duration::seconds(30)
+            s + jiff::SignedDuration::from_secs(30)
         )],
         "dequeued past the cap of own slot {s}, the frame is scheduled into the next own slot"
     );

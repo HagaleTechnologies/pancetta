@@ -16,7 +16,7 @@ fn hound_completion_is_not_stashed_for_auto_73() {
 }
 
 fn metadata(initiated_by: CallInitiation, call_count: u32, age_minutes: i64) -> QsoMetadata {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: pancetta_qso::QsoId::new_v4(),
         our_callsign: "K5ARH".into(),
@@ -39,7 +39,7 @@ fn metadata(initiated_by: CallInitiation, call_count: u32, age_minutes: i64) -> 
         initiated_by,
         role: Default::default(),
         call_count,
-        first_call_at: Some(now - chrono::Duration::minutes(age_minutes)),
+        first_call_at: Some(now - SignedDuration::from_mins(age_minutes)),
         last_call_at: Some(now),
         progressed_this_cycle: false,
         stall_cycles: 0,
@@ -59,7 +59,7 @@ fn metadata(initiated_by: CallInitiation, call_count: u32, age_minutes: i64) -> 
 fn calling() -> QsoState {
     QsoState::CallingCq {
         frequency: 14_074_000.0,
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         call_count: 1,
     }
 }
@@ -93,7 +93,7 @@ fn engaged_qso_names_report_stage_before_elapsed_bound() {
     let state = QsoState::WaitingForReport {
         their_callsign: "W1AW".into(),
         frequency: 14_074_000.0,
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         their_grid: None,
         our_report: -10,
     };

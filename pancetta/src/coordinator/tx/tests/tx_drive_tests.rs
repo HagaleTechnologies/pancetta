@@ -1,4 +1,5 @@
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 fn assert_db(baseline: &[f32], adjusted: &[f32], expected_db: f32) {
     assert_eq!(baseline.len(), adjusted.len());
@@ -331,7 +332,7 @@ async fn transmit_readings(
     .await
     .expect("worker sent one keyed waveform");
     attempt.confirm();
-    playback.expect("audio ack").started(chrono::Utc::now());
+    playback.expect("audio ack").started(UtcTimestamp::now());
     for level in alc {
         attempt.sample(pancetta_core::tx_meter::TxMeterReading {
             alc: *level,
@@ -646,7 +647,7 @@ async fn bundle_burst_steps_drive_once_with_one_key_down() {
                 .1
                 .take()
                 .expect("audio ack")
-                .started(chrono::Utc::now());
+                .started(UtcTimestamp::now());
             attempt.sample(alc_sample(0.02));
             attempt.sample(alc_sample(0.03));
         }

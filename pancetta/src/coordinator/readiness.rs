@@ -8,6 +8,7 @@
 //! falling edge of `ptt_off_unconfirmed`. The relay itself only wires these
 //! together (`tui_relay.rs`).
 
+use pancetta_core::time::UtcTimestamp;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
@@ -466,7 +467,7 @@ mod tests {
             NeedListAvailability::Loading,
             NeedListAvailability::NotOffered,
             NeedListAvailability::Loaded {
-                fetched_at: chrono::Utc::now(),
+                fetched_at: UtcTimestamp::now(),
                 band: Some("20m".into()),
             },
         ] {
@@ -482,7 +483,7 @@ mod tests {
         ] {
             assert_eq!(
                 tui_need_list_health(&NeedListAvailability::Unavailable {
-                    since: chrono::Utc::now(),
+                    since: UtcTimestamp::now(),
                     error: error.clone(),
                     retrying,
                 }),
@@ -510,7 +511,7 @@ mod tests {
     #[test]
     fn need_list_health_uses_local_logbook_when_seeded() {
         let down = NeedListAvailability::Unavailable {
-            since: chrono::Utc::now(),
+            since: UtcTimestamp::now(),
             error: "connection refused".into(),
             retrying: true,
         };
@@ -533,7 +534,7 @@ mod tests {
             NeedListAvailability::Loading,
             NeedListAvailability::NotOffered,
             NeedListAvailability::Loaded {
-                fetched_at: chrono::Utc::now(),
+                fetched_at: UtcTimestamp::now(),
                 band: None,
             },
         ] {

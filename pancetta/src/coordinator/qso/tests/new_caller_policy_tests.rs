@@ -135,7 +135,7 @@ async fn complete_by_answer(st: &Station, text: &str) -> pancetta_qso::QsoId {
                 frequency_hz: 1500.0,
                 remote_binding: Some((false, None)),
             },
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         )
         .await;
     drain(&mut rx)
@@ -156,7 +156,7 @@ async fn pan275_rr73_repeat_inside_the_auto_73_window_opens_no_caller_qso() {
     let id = complete_by_answer(&st, "K5ARH W1ABC RR73").await;
     assert!(
         st.manager
-            .backdate_completion_for_test(id, chrono::Duration::seconds(130))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(130))
             .await
     );
     let mut rx = st.manager.subscribe();
@@ -179,7 +179,7 @@ async fn pan275_new_exchange_from_a_station_worked_130_s_ago_is_still_answered()
     let id = complete_by_answer(&st, "K5ARH W1ABC RR73").await;
     assert!(
         st.manager
-            .backdate_completion_for_test(id, chrono::Duration::seconds(130))
+            .backdate_completion_for_test(id, SignedDuration::from_secs(130))
             .await
     );
     let mut rx = st.manager.subscribe();

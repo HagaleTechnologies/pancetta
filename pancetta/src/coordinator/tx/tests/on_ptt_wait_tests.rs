@@ -19,7 +19,7 @@ fn flag(set: bool) -> Arc<AtomicBool> {
 }
 
 fn forward_jump() -> pancetta_core::slot_clock::WallClockJump {
-    pancetta_core::slot_clock::WallClockJump::Forward(chrono::Duration::seconds(5))
+    pancetta_core::slot_clock::WallClockJump::Forward(SignedDuration::from_secs(5))
 }
 
 /// A bus with the three channels Step 4 sends on.

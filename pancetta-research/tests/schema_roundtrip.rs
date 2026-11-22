@@ -1,4 +1,4 @@
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::scorecard::{
     BuildInfo, CompositeInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags, Scorecard,
     TierResult,
@@ -24,7 +24,7 @@ fn sample_scorecard() -> Scorecard {
     weights.insert("fixtures_pass_rate".to_string(), 1.0);
     Scorecard {
         schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
-        generated_at: Utc::now(),
+        generated_at: UtcTimestamp::now(),
         mode: Mode::Ft8,
         git: GitInfo {
             branch: "main".to_string(),

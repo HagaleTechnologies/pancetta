@@ -16,6 +16,7 @@ const REMOVED_SECTIONS: &[&str] = &[
 
 use crate::{Config, ConfigError, ConfigResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -322,7 +323,7 @@ impl ConfigLoader {
 
         // Update metadata
         if let Some(ref mut metadata) = config.metadata {
-            metadata.last_modified = Some(chrono::Utc::now());
+            metadata.last_modified = Some(UtcTimestamp::now());
             metadata.sources = sources.iter().map(|s| s.path.clone()).collect();
         }
 
