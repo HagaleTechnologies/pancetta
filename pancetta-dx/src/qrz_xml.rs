@@ -242,11 +242,24 @@ impl QrzXmlClient {
         }
     }
 
+    /// Every spelling of a credential QRZ may echo back: the username, the
+    /// password, each `extra` value (the session key), then the percent-encoded
+    /// form of each, as sent in the request URL. The one source for both
+    /// redaction and error classification.
+    fn credential_spellings(&self, extra: &[&str]) -> Vec<String> {
+        let mut plain = vec![self.username.as_str(), self.password.as_str()];
+        plain.extend_from_slice(extra);
+        let encoded: Vec<String> = plain.iter().map(|s| urlencode(s)).collect();
+        plain
+            .into_iter()
+            .map(str::to_string)
+            .chain(encoded)
+            .collect()
+    }
+
     fn sanitize(&self, message: &str, extra: &[&str]) -> String {
-        let mut secrets = vec![self.username.as_str(), self.password.as_str()];
-        secrets.extend_from_slice(extra);
-        let encoded: Vec<String> = secrets.iter().map(|s| urlencode(s)).collect();
-        secrets.extend(encoded.iter().map(String::as_str));
+        let spellings = self.credential_spellings(extra);
+        let secrets: Vec<&str> = spellings.iter().map(String::as_str).collect();
         // Redact before trimming so a credential with edge whitespace still
         // matches its own spelling.
         pancetta_core::error_redaction::sanitize_error_body(message, &secrets)
@@ -269,14 +282,26 @@ impl QrzXmlClient {
                 "Malformed QRZ XML response".into(),
             ))
         })? {
-            // Classify on the parsed text: redaction clips for display, and
-            // the clipped message must not lose the phrases callers match on.
-            let safe = if is_session_expired(&msg) {
+            // Classify on the whole parsed text, because redaction clips it for
+            // display, but never on a phrase that only an echoed credential
+            // spells (PAN-474): a password reading "not found" must not cache
+            // a callsign miss, nor one reading "session timeout" force a re-login.
+            let text = ErrorText::new(&msg, &self.credential_spellings(&[key]));
+            let safe = if session_expiry_phrase(|phrase| text.mentions(phrase)) {
                 "Session Timeout".to_string()
-            } else if is_not_found(&msg) {
+            } else if text.says("not found") {
                 "Not found".to_string()
             } else {
-                self.sanitize(&msg, &[key])
+                // Display the masked text, not the redactor's output: the
+                // redactor skips a credential that starts inside one it already
+                // replaced, and its leftover tail could still spell a phrase
+                // `lookup` or the coordinator matches on. `masked` already
+                // replaced every spelling, so only the `pat_` rule and the clip
+                // remain; redacting again would match a short credential inside
+                // the markers and garble them.
+                pancetta_core::error_redaction::sanitize_error_body(&text.masked(), &[])
+                    .trim()
+                    .to_string()
             };
             return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "QRZ lookup error: {safe}"
@@ -311,17 +336,106 @@ enum SessionResult {
 /// re-auth should be attempted.
 fn is_session_expired(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("session timeout")
-        || lower.contains("invalid session")
-        || lower.contains("session expired")
-        || (lower.contains("session") && lower.contains("expire"))
+    session_expiry_phrase(|phrase| lower.contains(phrase))
 }
 
-/// True if a QRZ lookup error reports the callsign was not found. Checked on
-/// the parsed text, before redaction clips the message for display, so the
-/// interactive coordinator can still cache the miss.
-fn is_not_found(msg: &str) -> bool {
-    msg.to_ascii_lowercase().contains("not found")
+/// True when `has` reports one of QRZ's session-expiry phrases. Every phrase
+/// passed to `has` is lowercase ASCII.
+fn session_expiry_phrase(has: impl Fn(&str) -> bool) -> bool {
+    has("session timeout")
+        || has("invalid session")
+        || has("session expired")
+        || (has("session") && has("expire"))
+}
+
+/// Marker that replaces each run of credential text; the same one
+/// `pancetta_core::error_redaction` uses.
+const REDACTED_MARKER: &str = "<redacted>";
+
+/// A QRZ `<Error>` text with every byte an echoed credential spells marked, so
+/// classification can tell the service's own words from echoed credentials.
+struct ErrorText<'a> {
+    /// The text as QRZ sent it.
+    message: &'a str,
+    /// The text, ASCII-lowercased so byte offsets match the original.
+    lower: String,
+    /// One flag per byte of the text: `true` inside any credential spelling.
+    credential: Vec<bool>,
+}
+
+impl<'a> ErrorText<'a> {
+    /// Mark every occurrence of every non-empty spelling, overlapping ones
+    /// included. The search is case-sensitive on the original text, as
+    /// redaction's is. Like the redactor's scan, the cost grows with the text
+    /// length times the spelling length; the body is capped at
+    /// `QRZ_XML_MAX_BODY_BYTES`.
+    fn new(message: &'a str, spellings: &[String]) -> Self {
+        let mut credential = vec![false; message.len()];
+        for spelling in spellings {
+            for start in match_starts(message, spelling) {
+                credential[start..start + spelling.len()].fill(true);
+            }
+        }
+        Self {
+            message,
+            lower: message.to_ascii_lowercase(),
+            credential,
+        }
+    }
+
+    /// The text with each run of credential bytes replaced by one marker. A
+    /// phrase cannot span a marker, so any phrase left in the result holds no
+    /// credential byte and `says`/`mentions` already counted it.
+    fn masked(&self) -> String {
+        let mut out = String::with_capacity(self.message.len());
+        let mut in_run = false;
+        // Occurrences start and end on char boundaries, so a char's first
+        // byte tells whether the whole char is credential text.
+        for (at, ch) in self.message.char_indices() {
+            if self.credential[at] {
+                if !in_run {
+                    out.push_str(REDACTED_MARKER);
+                }
+                in_run = true;
+            } else {
+                in_run = false;
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// True when some occurrence of the lowercase `phrase` holds no credential
+    /// byte. A miss is cached for the session, so a phrase a credential even
+    /// partly spells does not count.
+    fn says(&self, phrase: &str) -> bool {
+        match_starts(&self.lower, phrase)
+            .any(|start| !self.credential[start..start + phrase.len()].contains(&true))
+    }
+
+    /// True when some occurrence of the lowercase `phrase` holds at least one
+    /// byte that is not credential text. A missed session expiry strands a
+    /// stale key until restart, so only a phrase a credential wholly spells is
+    /// ignored.
+    fn mentions(&self, phrase: &str) -> bool {
+        match_starts(&self.lower, phrase)
+            .any(|start| self.credential[start..start + phrase.len()].contains(&false))
+    }
+}
+
+/// Byte offset of every occurrence of `needle` in `haystack`, overlapping
+/// occurrences included. An empty `needle` has none.
+fn match_starts<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
+        }
+        let start = from + haystack.get(from..)?.find(needle)?;
+        // Step one character past the hit so the next search can overlap it.
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+        Some(start)
+    })
 }
 
 /// Parse the `<Session>` block: returns a `<Key>` or an `<Error>` if present.
@@ -449,7 +563,7 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const AUTH_OK: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+    pub(super) const AUTH_OK: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <QRZDatabase version="1.34" xmlns="http://xmldata.qrz.com">
   <Session>
     <Key>2331uf894c4bd29f3923f3bacf02c532d7bd9</Key>
@@ -459,7 +573,7 @@ mod tests {
   </Session>
 </QRZDatabase>"#;
 
-    const LOOKUP_OK: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+    pub(super) const LOOKUP_OK: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <QRZDatabase version="1.34" xmlns="http://xmldata.qrz.com">
   <Callsign>
     <call>AA7BQ</call>
@@ -476,7 +590,7 @@ mod tests {
   </Session>
 </QRZDatabase>"#;
 
-    const SESSION_TIMEOUT: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+    pub(super) const SESSION_TIMEOUT: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <QRZDatabase version="1.34" xmlns="http://xmldata.qrz.com">
   <Session>
     <Error>Session Timeout</Error>
@@ -612,7 +726,7 @@ mod tests {
 
     /// A minimal HTTP server that returns successive canned bodies, one per
     /// request, recording each request's raw query string.
-    fn spawn_mock(responses: Vec<&'static str>) -> (String, Arc<StdMutex<Vec<String>>>) {
+    pub(super) fn spawn_mock(responses: Vec<&'static str>) -> (String, Arc<StdMutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}/xml/current/");
@@ -870,3 +984,7 @@ mod endpoint_scheme_tests;
 #[cfg(test)]
 #[path = "qrz_xml/tests/error_redaction_tests.rs"]
 mod error_redaction_tests;
+
+#[cfg(test)]
+#[path = "qrz_xml/tests/credential_echo_tests.rs"]
+mod credential_echo_tests;
