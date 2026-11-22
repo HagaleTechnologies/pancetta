@@ -41,6 +41,7 @@ pub mod gridsquare;
 pub mod response_step;
 pub mod slot;
 pub mod slot_clock;
+pub mod slot_timer;
 pub mod solar;
 pub mod tx_drive_mode;
 pub mod tx_freq_mode;
@@ -52,6 +53,7 @@ pub mod utc_window;
 // Re-export core types at the crate root for convenience
 pub use diagnostic_level::DiagnosticLevel;
 pub use response_step::ResponseStep;
+pub use slot_clock::SlotClock;
 pub use tx_drive_mode::TxDriveMode;
 pub use tx_freq_mode::TxFreqMode;
 pub use tx_policy::TxPolicy;

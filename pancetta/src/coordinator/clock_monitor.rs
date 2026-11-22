@@ -2,7 +2,9 @@
 //!
 //! A lightweight tokio task that runs [`ClockSkewMonitorCore`]'s schedule:
 //! one SNTP probe to pool.ntp.org 30 s after start and then every 30 min
-//! (plus a re-check after a detected clock step). The blocking query (DNS
+//! (plus a re-check after a clock step). PAN-358: it has no step detector of
+//! its own; each tick reads the coordinator's shared `SlotClock` and reports
+//! the clock's latest event when its epoch moved. The blocking query (DNS
 //! resolution included, which no socket timeout bounds) runs on a detached
 //! OS thread awaited under [`ClockMonitorSchedule::probe_deadline`], never on
 //! tokio's blocking pool: a started `spawn_blocking` task cannot be aborted
@@ -20,7 +22,7 @@ use crate::clock_skew::{
     ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, ClockStatus, SkewDiag, SNTP_TIMEOUT,
 };
 use crate::message_bus::{ComponentId, DiagnosticLevel, MessageBus};
-use chrono::{DateTime, Utc};
+use pancetta_core::SlotClock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +35,7 @@ const CLOCK_PROBE_DEADLINE: Duration = Duration::from_secs(4 * SNTP_TIMEOUT.as_s
 /// Timing of the monitor task. `Default` is the production schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClockMonitorSchedule {
-    /// Scheduler tick; also the step-detection sampling period.
+    /// Scheduler tick; also how often the shared slot clock is read.
     pub tick: Duration,
     pub first_probe: Duration,
     pub interval: Duration,
@@ -73,9 +75,6 @@ impl ClockMonitorSchedule {
 /// SNTP probe: the clock offset in seconds (positive = local clock behind).
 pub(crate) type ClockProbe = Arc<dyn Fn() -> Result<f64, String> + Send + Sync>;
 
-/// Wall-clock source (injected so tests can step it).
-pub(crate) type WallClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
-
 /// Spawn the monitor task. It exits on the first tick after `shutdown` is
 /// set.
 ///
@@ -87,13 +86,13 @@ pub(crate) fn spawn_clock_skew_monitor(
     shutdown: Arc<AtomicBool>,
     schedule: ClockMonitorSchedule,
     probe: ClockProbe,
-    wall_now: WallClock,
+    clock: SlotClock,
 ) -> tokio::task::JoinHandle<()> {
     shared.set_status(ClockStatus::Pending);
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let mut last_tick = start;
-        let mut core = ClockSkewMonitorCore::with_timing(wall_now(), schedule.timing());
+        let mut seen_epoch = clock.read().epoch;
+        let mut core = ClockSkewMonitorCore::with_timing(schedule.timing());
         let in_flight = Arc::new(AtomicBool::new(false));
         let mut ticker = tokio::time::interval(schedule.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -102,12 +101,16 @@ pub(crate) fn spawn_clock_skew_monitor(
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let now = std::time::Instant::now();
-            let mono_since_start = now.duration_since(start);
-            let mono_since_last = now.duration_since(last_tick);
-            last_tick = now;
+            let mono_since_start = start.elapsed();
+            let reading = clock.read();
+            let step = if reading.epoch != seen_epoch {
+                seen_epoch = reading.epoch;
+                reading.last_event
+            } else {
+                None
+            };
 
-            let outcome = core.on_tick(mono_since_start, wall_now(), mono_since_last);
+            let outcome = core.on_tick(mono_since_start, step);
             shared.publish(&core);
             if let Some(diag) = outcome.step_diag {
                 emit(&bus, &diag).await;
@@ -198,6 +201,7 @@ mod tests {
     use crate::message_bus::{ComponentMessage, MessageType};
     use crossbeam_channel::Receiver;
     use std::collections::VecDeque;
+    use pancetta_core::slot_clock::ManualClock;
     use std::sync::atomic::{AtomicI64, AtomicUsize};
     use std::sync::Mutex;
     use std::time::Instant;
@@ -259,14 +263,11 @@ mod tests {
         }
     }
 
-    /// `Utc::now()` plus a test-controlled offset in milliseconds.
-    fn offset_wall_clock() -> (WallClock, Arc<AtomicI64>) {
-        let offset_ms = Arc::new(AtomicI64::new(0));
-        let off = offset_ms.clone();
-        let wall: WallClock = Arc::new(move || {
-            Utc::now() + chrono::Duration::milliseconds(off.load(Ordering::SeqCst))
-        });
-        (wall, offset_ms)
+    /// A shared slot clock over a `ManualClock`; `step_wall` steps it.
+    fn manual_slot_clock() -> (SlotClock, ManualClock) {
+        let manual = ManualClock::new(chrono::Utc::now());
+        let clock = manual.slot_clock(Arc::new(AtomicI64::new(pancetta_core::slot::SLOT_NS)));
+        (clock, manual)
     }
 
     struct Diag {
@@ -322,7 +323,7 @@ mod tests {
         let shared = ClockSkewShared::new();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (probe, _calls) = scripted_probe(vec![Ok(0.012), Ok(0.42), Ok(0.004)]);
-        let (wall, _offset) = offset_wall_clock();
+        let (wall, _manual) = manual_slot_clock();
         let handle = spawn_clock_skew_monitor(
             bus.clone(),
             shared.clone(),
@@ -379,7 +380,7 @@ mod tests {
         let shared = ClockSkewShared::new();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (probe, calls) = scripted_probe(vec![Ok(0.42), Ok(0.0)]);
-        let (wall, offset_ms) = offset_wall_clock();
+        let (wall, manual) = manual_slot_clock();
         let schedule = test_schedule();
         let handle = spawn_clock_skew_monitor(
             bus.clone(),
@@ -396,7 +397,7 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1);
 
         let stepped_at = Instant::now();
-        offset_ms.fetch_add(3_600_000, Ordering::SeqCst);
+        manual.step_wall(chrono::Duration::milliseconds(3_600_000));
 
         let d = next_diag(&rx).await;
         assert_eq!(d.source, ComponentId::Coordinator);
@@ -450,7 +451,7 @@ mod tests {
         assert_eq!(shared.status(), ClockStatus::NotMonitored);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (probe, _calls) = scripted_probe(vec![Err("timeout".into()), Ok(0.01)]);
-        let (wall, _offset) = offset_wall_clock();
+        let (wall, _manual) = manual_slot_clock();
         let handle = spawn_clock_skew_monitor(
             bus.clone(),
             shared.clone(),
@@ -488,7 +489,7 @@ mod tests {
             ..test_schedule()
         };
         let (probe, calls) = scripted_probe(vec![Ok(0.0)]);
-        let (wall, _offset) = offset_wall_clock();
+        let (wall, _manual) = manual_slot_clock();
         let handle = spawn_clock_skew_monitor(
             bus,
             ClockSkewShared::new(),
@@ -524,7 +525,7 @@ mod tests {
             probe_deadline: Duration::from_millis(50),
             ..test_schedule()
         };
-        let (wall, _offset) = offset_wall_clock();
+        let (wall, _manual) = manual_slot_clock();
         let shared = ClockSkewShared::new();
         let (bus, _tx, rx, handle) = rt.block_on(async {
             let bus = MessageBus::new(16).unwrap();
@@ -576,7 +577,7 @@ mod tests {
             probe_deadline: Duration::from_millis(50),
             ..test_schedule()
         };
-        let (wall, _offset) = offset_wall_clock();
+        let (wall, _manual) = manual_slot_clock();
         let handle = spawn_clock_skew_monitor(
             bus.clone(),
             ClockSkewShared::new(),
