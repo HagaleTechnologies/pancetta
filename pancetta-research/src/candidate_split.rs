@@ -181,6 +181,14 @@ pub fn jt9_recovered_from_cache(dir: &Path, sha: &str, message: &str) -> Result<
         cache.decoder_identity,
     ))
 }
+/// Lowercase two-digit-per-byte hex, the text form sha2 0.10 digests had through `LowerHex`.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+/// SHA-256 of `data` as 64 lowercase hex characters.
+fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    hex_lower(&Sha256::digest(data))
+}
 pub fn synth_corpus_provenance(
     tier: &str,
     workspace: &Path,
@@ -189,9 +197,8 @@ pub fn synth_corpus_provenance(
     let manifest = workspace.join(manifest);
     let m = SynthManifest::load(&manifest)?;
     let hash = |p: &Path| -> Result<String> {
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(std::fs::read(p).with_context(|| format!("hashing {}", p.display()))?)
+        Ok(sha256_hex(
+            std::fs::read(p).with_context(|| format!("hashing {}", p.display()))?,
         ))
     };
     let mut set = Sha256::new();
@@ -212,7 +219,7 @@ pub fn synth_corpus_provenance(
             .to_string(),
         manifest_sha256: hash(&manifest)?,
         config_sha256: config.as_deref().map(hash).transpose()?,
-        wav_set_sha256: format!("{:x}", set.finalize()),
+        wav_set_sha256: hex_lower(&set.finalize()),
         wav_count: m.entries.len(),
     })
 }
@@ -1044,6 +1051,33 @@ mod tests {
         );
     }
     #[test]
+    fn sha256_hex_known_vectors() {
+        // Literal digests from Python hashlib, not a second copy of the helper.
+        for (input, digest) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "286",
+                "00328ce57bbc14b33bd6695bc8eb32cdf2fb5f3a7d89ec14a42825e15d39df60",
+            ),
+            (
+                "88484",
+                "0000a456e7b5a5eb059e721fb431436883143101275c4077f83fe70298f5623d",
+            ),
+        ] {
+            let hex = sha256_hex(input.as_bytes());
+            assert_eq!(hex, digest, "sha256({input:?})");
+            assert_eq!(hex.len(), 64);
+            assert!(hex.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
+        }
+    }
+    #[test]
     fn corpus_wav_set_hash_matches_eval_definition() {
         let d = tempfile::tempdir().unwrap();
         let mut m: crate::synth::SynthManifest = serde_json::from_str(include_str!(
@@ -1058,13 +1092,11 @@ mod tests {
         let p = d.path().join("tiny.manifest.json");
         m.save(&p).unwrap();
         let a = synth_corpus_provenance("synth-ft4", d.path(), &p).unwrap();
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                format!("{:x}{:x}", Sha256::digest([0]), Sha256::digest([1])).as_bytes()
-            )
+        // sha256(sha256_hex([0]) + sha256_hex([1])), computed with Python hashlib.
+        assert_eq!(
+            a.wav_set_sha256,
+            "f1760081a911722f089886e61aedc65a8e19065908c2ca8562458f2670de86fe"
         );
-        assert_eq!(a.wav_set_sha256, expected);
         assert_eq!(a.manifest, "tiny.manifest.json");
         m.entries.reverse();
         m.save(&p).unwrap();

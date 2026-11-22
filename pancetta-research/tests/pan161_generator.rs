@@ -32,7 +32,13 @@ fn crowded_edge_generator_manifest_is_reproducible_and_nonoverlapping() {
         serde_json::to_vec(&manifest).unwrap()
     );
     for (entry, bytes) in &first {
-        assert_eq!(entry.sha256, format!("{:x}", Sha256::digest(bytes)));
+        assert_eq!(
+            entry.sha256,
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
         assert!(entry.peak_before_quantization <= 0.9);
         if entry.kind == "noise" {
             assert!(entry.signals.is_empty());
