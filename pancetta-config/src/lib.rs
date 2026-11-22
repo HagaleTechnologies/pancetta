@@ -50,6 +50,7 @@
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![allow(dead_code, unused_imports)]
 
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -241,7 +242,7 @@ pub struct ConfigMetadata {
 
     /// When this configuration was last modified
     #[serde(default)]
-    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_modified: Option<UtcTimestamp>,
 
     /// Source files that contributed to this configuration
     #[serde(default)]
@@ -273,7 +274,7 @@ impl Default for Config {
             contest: None,
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
-                last_modified: Some(chrono::Utc::now()),
+                last_modified: Some(UtcTimestamp::now()),
                 sources: vec![],
                 instance_id: uuid::Uuid::new_v4(),
             }),
@@ -544,7 +545,7 @@ impl Config {
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
-            metadata.last_modified = Some(chrono::Utc::now());
+            metadata.last_modified = Some(UtcTimestamp::now());
             if let Some(other_metadata) = other.metadata {
                 metadata.sources.extend(other_metadata.sources);
             }
@@ -2455,7 +2456,7 @@ mod merge_guard {
                 ),
                 (
                     "webhook",
-                    json!({"enabled":true,"min_tier":"per_band_dxcc_new","url":"https://localhost/hook"}),
+                    json!({"enabled":true,"min_tier":"per_band_dxcc_new","url":"https://localhost/hook","allow_private_targets":true,"max_per_minute":30}),
                 ),
             ],
             |a, b| a.merge_with(b),

@@ -7,7 +7,8 @@ use crate::adif::{AdifFile, AdifProcessor};
 use crate::async_database::{AsyncDatabaseError, QsoDatabase, QsoFilter, QueryOptions, SortOrder};
 use crate::qso_manager::{QsoEvent, QsoManager};
 use crate::states::*;
-use chrono::{DateTime, Utc};
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -263,7 +264,7 @@ pub struct ExportResult {
     pub qso_count: usize,
 
     /// Export timestamp
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
 
     /// File size in bytes
     pub file_size: u64,
@@ -349,8 +350,8 @@ pub struct DatabaseStatistics {
     pub bands_worked: usize,
     pub modes_worked: usize,
     pub countries_worked: usize,
-    pub oldest_qso: Option<DateTime<Utc>>,
-    pub newest_qso: Option<DateTime<Utc>>,
+    pub oldest_qso: Option<UtcTimestamp>,
+    pub newest_qso: Option<UtcTimestamp>,
     pub database_size_bytes: u64,
 }
 
@@ -510,7 +511,7 @@ impl QsoLogger {
         output_path: P,
         filter: Option<&QsoFilter>,
     ) -> Result<ExportResult, AsyncLoggerError> {
-        let start_time = Utc::now();
+        let start_time = UtcTimestamp::now();
 
         // Get QSOs to export
         let default_filter = QsoFilter::default();
@@ -537,7 +538,7 @@ impl QsoLogger {
         tokio::fs::write(&output_path, &adif_content).await?;
 
         let file_size = adif_content.len() as u64;
-        let duration_ms = (Utc::now() - start_time).num_milliseconds() as u64;
+        let duration_ms = (UtcTimestamp::now() - start_time).as_millis_i64() as u64;
 
         let export_result = ExportResult {
             format: ExportFormat::Adif,
@@ -609,7 +610,7 @@ impl QsoLogger {
 
     /// Create a backup of the database
     pub async fn create_backup(&self) -> Result<PathBuf, AsyncLoggerError> {
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let timestamp = UtcTimestamp::now().strftime("%Y%m%d_%H%M%S");
         let backup_filename = format!("qso_backup_{}.db", timestamp);
         let backup_directory = self.backup_directory();
         let backup_path = backup_directory.join(backup_filename);
@@ -732,8 +733,8 @@ impl QsoLogger {
         let their_report = metadata.reports.received.unwrap_or(0);
         let our_report = metadata.reports.sent.unwrap_or(0);
         let grid_square = metadata.grids.theirs.clone();
-        let completed_at = metadata.end_time.unwrap_or_else(Utc::now);
-        let duration_seconds = (completed_at - metadata.start_time).num_seconds().max(0) as u32;
+        let completed_at = metadata.end_time.unwrap_or_else(UtcTimestamp::now);
+        let duration_seconds = (completed_at - metadata.start_time).as_secs().max(0) as u32;
 
         // Layer 2 timeline persistence (docs/observability-diagnostics-plan.md
         // §"Persist the timeline"): only populate the real state_history /
@@ -1025,7 +1026,7 @@ mod tests {
     // must reproduce the old discard-everything behavior exactly).
 
     fn test_metadata(qso_id: QsoId, their_callsign: &str) -> QsoMetadata {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         QsoMetadata {
             qso_id,
             our_callsign: "W1ABC".to_string(),
@@ -1068,7 +1069,7 @@ mod tests {
         }
     }
 
-    fn non_trivial_timeline(now: DateTime<Utc>) -> (Vec<StateTransition>, Vec<QsoMessage>) {
+    fn non_trivial_timeline(now: UtcTimestamp) -> (Vec<StateTransition>, Vec<QsoMessage>) {
         let state_history = vec![StateTransition {
             from_state: QsoState::Idle,
             to_state: QsoState::CallingCq {
@@ -1095,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_qso_timeline_persisted_only_when_flag_enabled() {
-        let (state_history, messages) = non_trivial_timeline(Utc::now());
+        let (state_history, messages) = non_trivial_timeline(UtcTimestamp::now());
 
         // Flag off (default): the qsos row must carry an EMPTY timeline,
         // exactly like the pre-fix hard-coded `vec![]`, and no qso_events
@@ -1163,7 +1164,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_qso_timeline_persisted_only_when_flag_enabled() {
-        let (state_history, messages) = non_trivial_timeline(Utc::now());
+        let (state_history, messages) = non_trivial_timeline(UtcTimestamp::now());
 
         // Flag off (default): failed QSOs get NO persistent record at all —
         // matches today's behavior (QsoFailed was never logged anywhere).

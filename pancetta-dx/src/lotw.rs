@@ -4,7 +4,9 @@
 //! for QSL confirmation and award tracking.
 
 use crate::{body, ConfirmationStatus, DxError, DxErrorInner, DxQso, Result};
-use chrono::{NaiveDate, Utc};
+use jiff::civil;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use reqwest::{multipart::Form, Client};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -75,7 +77,7 @@ pub struct LotwQsl {
     /// Contacted callsign
     pub call: String,
     /// QSO date
-    pub qso_date: NaiveDate,
+    pub qso_date: civil::Date,
     /// QSO time (HHMM UTC)
     pub time_on: String,
     /// QSO band
@@ -93,7 +95,7 @@ pub struct LotwQsl {
     /// Contest ID
     pub contest_id: Option<String>,
     /// Confirmation date
-    pub qsl_rcvd_date: Option<NaiveDate>,
+    pub qsl_rcvd_date: Option<civil::Date>,
     /// Confirmation status
     pub credit_granted: Option<String>,
 }
@@ -117,9 +119,9 @@ pub struct LotwUploadResponse {
 #[derive(Debug, Clone)]
 pub struct LotwDownloadParams {
     /// Start date for QSL query
-    pub start_date: NaiveDate,
+    pub start_date: civil::Date,
     /// End date for QSL query
-    pub end_date: NaiveDate,
+    pub end_date: civil::Date,
     /// Own callsign
     pub own_callsign: String,
     /// QSL query mode (all, confirmed, etc.)
@@ -136,8 +138,8 @@ pub struct LotwDownloadParams {
 
 impl Default for LotwDownloadParams {
     fn default() -> Self {
-        let end_date = Utc::now().date_naive();
-        let start_date = end_date - chrono::Duration::days(365);
+        let end_date = UtcTimestamp::now().to_civil().date();
+        let start_date = end_date - SignedDuration::from_hours(24 * 365);
 
         Self {
             start_date,
@@ -326,7 +328,7 @@ impl LotwClient {
     async fn fetch_qsl_report(&self, params: &LotwDownloadParams) -> Result<String> {
         let download_url = format!("{}/lotw/lotwreport.adi", self.config.base_url);
 
-        let start_date_str = params.start_date.format("%Y-%m-%d").to_string();
+        let start_date_str = params.start_date.strftime("%Y-%m-%d").to_string();
         let mut query_params = vec![
             ("login", self.config.username.as_str()),
             ("password", self.config.password.as_str()),
@@ -393,8 +395,8 @@ impl LotwClient {
         own_callsign: &str,
         days_back: i64,
     ) -> Result<Vec<LotwQsl>> {
-        let end_date = Utc::now().date_naive();
-        let start_date = end_date - chrono::Duration::days(days_back);
+        let end_date = UtcTimestamp::now().to_civil().date();
+        let start_date = end_date - SignedDuration::from_hours(24 * days_back);
 
         let params = LotwDownloadParams {
             start_date,
@@ -414,7 +416,7 @@ impl LotwClient {
         adif.push_str("ADIF Export from Pancetta DX\n");
         adif.push_str(&format!(
             "Created: {}\n",
-            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            UtcTimestamp::now().strftime("%Y-%m-%d %H:%M:%S UTC")
         ));
         adif.push_str("<ADIF_VER:5>3.1.4\n");
         adif.push_str("<PROGRAMID:11>Pancetta-DX\n");
@@ -437,8 +439,8 @@ impl LotwClient {
         record.push_str(&format!("<CALL:{}>{}", qso.callsign.len(), qso.callsign));
 
         // Date and time
-        let date_str = qso.datetime.format("%Y%m%d").to_string();
-        let time_str = qso.datetime.format("%H%M").to_string();
+        let date_str = qso.datetime.strftime("%Y%m%d").to_string();
+        let time_str = qso.datetime.strftime("%H%M").to_string();
         record.push_str(&format!("<QSO_DATE:{}>{}", date_str.len(), date_str));
         record.push_str(&format!("<TIME_ON:{}>{}", time_str.len(), time_str));
 
@@ -487,7 +489,7 @@ impl LotwClient {
         if !matches!(qso.confirmation_status, ConfirmationStatus::None) {
             record.push_str("<QSL_RCVD:1>Y");
             if let Some(conf_date) = qso.confirmation_date {
-                let conf_date_str = conf_date.format("%Y%m%d").to_string();
+                let conf_date_str = conf_date.strftime("%Y%m%d").to_string();
                 record.push_str(&format!(
                     "<QSLRDATE:{}>{}",
                     conf_date_str.len(),
@@ -526,7 +528,7 @@ impl LotwClient {
         let mut qsl = LotwQsl {
             own_call: self.config.station_callsign.clone(),
             call: String::new(),
-            qso_date: Utc::now().date_naive(),
+            qso_date: UtcTimestamp::now().to_civil().date(),
             time_on: "0000".to_string(),
             band: String::new(),
             mode: String::new(),
@@ -544,7 +546,7 @@ impl LotwClient {
             match field.tag.to_uppercase().as_str() {
                 "CALL" => qsl.call = field.value,
                 "QSO_DATE" => {
-                    if let Ok(date) = NaiveDate::parse_from_str(&field.value, "%Y%m%d") {
+                    if let Ok(date) = civil::Date::strptime("%Y%m%d", &field.value) {
                         qsl.qso_date = date;
                     }
                 }
@@ -557,7 +559,7 @@ impl LotwClient {
                 "GRIDSQUARE" => qsl.gridsquare = Some(field.value),
                 "CONTEST_ID" => qsl.contest_id = Some(field.value),
                 "QSLRDATE" => {
-                    if let Ok(date) = NaiveDate::parse_from_str(&field.value, "%Y%m%d") {
+                    if let Ok(date) = civil::Date::strptime("%Y%m%d", &field.value) {
                         qsl.qsl_rcvd_date = Some(date);
                     }
                 }
@@ -748,7 +750,7 @@ struct AdifField {
 mod tests {
     use super::*;
     use crate::{Band, Mode};
-    use chrono::{DateTime, Utc};
+    use pancetta_core::time::UtcTimestamp;
 
     #[test]
     fn test_client_creation() {
@@ -776,9 +778,7 @@ mod tests {
         let qso = DxQso {
             id: None,
             callsign: "JA1ABC".to_string(),
-            datetime: DateTime::parse_from_rfc3339("2023-01-01T12:34:56Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            datetime: str::parse::<UtcTimestamp>("2023-01-01T12:34:56Z").unwrap(),
             frequency: 14_074_000,
             band: Band::Band20m,
             mode: Mode::FT8,
@@ -789,11 +789,7 @@ mod tests {
             name: Some("Taro".to_string()),
             qsl_route: None,
             confirmation_status: ConfirmationStatus::Lotw,
-            confirmation_date: Some(
-                DateTime::parse_from_rfc3339("2023-01-02T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            ),
+            confirmation_date: Some(str::parse::<UtcTimestamp>("2023-01-02T00:00:00Z").unwrap()),
             dxcc_entity: 61,
             contest_id: None,
             notes: None,
@@ -820,7 +816,7 @@ mod tests {
         let qsos = vec![DxQso {
             id: None,
             callsign: "JA1ABC".to_string(),
-            datetime: Utc::now(),
+            datetime: UtcTimestamp::now(),
             frequency: 14_074_000,
             band: Band::Band20m,
             mode: Mode::FT8,
@@ -1085,7 +1081,7 @@ mod tests {
         let qsl = client.parse_adif_record(record).unwrap();
 
         assert_eq!(qsl.call, "JA1ABC");
-        assert_eq!(qsl.qso_date, NaiveDate::from_ymd_opt(2023, 1, 1).unwrap());
+        assert_eq!(qsl.qso_date, civil::date(2023, 1, 1));
         assert_eq!(qsl.time_on, "1234");
         assert_eq!(qsl.band, "20m");
         assert_eq!(qsl.mode, "FT8");

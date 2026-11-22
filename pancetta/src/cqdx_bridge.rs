@@ -5,6 +5,7 @@
 
 use crate::coordinator::upload_outbox::clip;
 use crate::priority_evaluator::{CachedStationLookup, NeedListAvailability};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::Band;
 use pancetta_cqdx::{
     frequency_to_band, rank_to_rarity, Activation, CqdxCache, CqdxClient, CqdxError, NeededEntity,
@@ -43,7 +44,7 @@ fn apply_needed(
     needed: &[NeededEntity],
     band: Option<&str>,
 ) -> (usize, usize) {
-    cached_lookup.update_needed_entities(needed, band.map(str::to_owned), chrono::Utc::now())
+    cached_lookup.update_needed_entities(needed, band.map(str::to_owned), UtcTimestamp::now())
 }
 
 /// PAN-93: how long a needed list that has not loaded waits between retries.
@@ -1030,9 +1031,9 @@ impl CqdxBridge {
 
                 match client.fetch_live_spots(None, None).await {
                     Ok(groups) => {
-                        let as_of = chrono::Utc::now();
+                        let as_of = UtcTimestamp::now();
                         let bands =
-                            count_needed_by_band(&groups, &needed, &candidates, as_of.timestamp());
+                            count_needed_by_band(&groups, &needed, &candidates, as_of.as_second());
                         debug!(
                             "cqdx.io opportunity poll: {} spot groups, {:?}",
                             groups.len(),
@@ -1381,7 +1382,7 @@ mod tests {
             frequency: 14_074_000,
             mode: "FT8".into(),
             snr: -10,
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             reporter: "K5ARH".into(),
             reporter_grid: None,
         }]);

@@ -119,7 +119,7 @@ pub(crate) fn contactinfo_xml(
     let freq_10hz = format!("{}", (metadata.frequency / 10.0).round() as u64);
     let timestamp = metadata
         .contact_started_at()
-        .format("%Y-%m-%d %H:%M:%S")
+        .strftime("%Y-%m-%d %H:%M:%S")
         .to_string();
     let continent = pancetta_core::dxcc::continent_for_callsign(call)
         .map(|c| c.code())

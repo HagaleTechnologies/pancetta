@@ -4,6 +4,7 @@
 //! directory (`pancetta_core::data_dir`); a second test in the same binary
 //! would see its value.
 
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{ContestExchangeConfig, ExchangeFormat, MessageExchange, MessageType, QsoState};
 
 #[test]
@@ -27,7 +28,7 @@ fn contest_serial_follows_the_process_data_dir() {
     let state = QsoState::RespondingToCq {
         target_callsign: "K5TD".to_string(),
         frequency: 14_074_000.0,
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     let incoming = MessageType::ContestExchange {
         to_station: "K5ARH".to_string(),

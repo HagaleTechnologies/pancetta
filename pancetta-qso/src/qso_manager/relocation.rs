@@ -13,6 +13,8 @@
 //! method of `qso_manager.rs`.
 
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 impl QsoManager {
     /// PAN-15 item 3: returns `Some(separation)` when a candidate relatched
@@ -74,7 +76,7 @@ impl QsoManager {
         &self,
         message_type: &MessageType,
         frequency: f64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) {
         // Reuses the module-level `ESTABLISHED_FREQ_TOLERANCE_HZ`/
         // `FREQ_TOLERANCE_HZ` shared with `is_message_relevant`/
@@ -89,7 +91,7 @@ impl QsoManager {
         // timestamp — comfortably below FT4's 7.5s slot period, so two genuinely
         // separate transmissions always clear it while two decode-pipeline copies of
         // the SAME transmission (milliseconds apart) never do.
-        const DRIFT_CONFIRM_MIN_GAP: chrono::Duration = chrono::Duration::seconds(5);
+        const DRIFT_CONFIRM_MIN_GAP: SignedDuration = SignedDuration::from_secs(5);
         // Wide RX-plausibility sanity bound for candidate ELIGIBILITY -- deliberately
         // NOT the same as TX_OFFSET_MIN_HZ/MAX_HZ (which govern where we autonomously
         // PICK a fresh TX offset, not where we're willing to consider a real decoded

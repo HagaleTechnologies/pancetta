@@ -8,9 +8,10 @@
 //!   cargo run --example tx_test -- --ptt
 //!   cargo run --example tx_test -- --message "CQ N0CALL EM10" --freq-offset 1200
 
-use chrono::Utc;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator, SAMPLE_RATE as FT8_SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -302,20 +303,20 @@ fn main() {
     // symbols begin. Require at least 1s of total lead time so we have
     // headroom for both the PTT engage AND the relay settle.
     const PTT_LEAD: Duration = Duration::from_millis(200);
-    const MIN_LEAD: chrono::Duration = chrono::Duration::seconds(1);
+    const MIN_LEAD: SignedDuration = SignedDuration::from_secs(1);
 
     let (target_audio_start, target_ptt_engage) = if args.immediate {
         let now = std::time::Instant::now();
         (now, now)
     } else {
-        let now_utc = Utc::now();
+        let now_utc = UtcTimestamp::now();
         let target_audio_utc = pancetta_core::slot::next_audio_start(now_utc, MIN_LEAD);
         let now_inst = std::time::Instant::now();
         let audio_in = pancetta_core::slot::duration_until(target_audio_utc, now_utc);
 
         println!(
             "\nWaiting for FT8 audio start at {} ({:.3}s)",
-            target_audio_utc.format("%H:%M:%S%.3f UTC"),
+            target_audio_utc.strftime("%H:%M:%S%.3f UTC"),
             audio_in.as_secs_f64()
         );
         let target_audio = now_inst + audio_in;
@@ -336,7 +337,7 @@ fn main() {
         ptt_start = std::time::Instant::now();
         println!(
             "PTT ON  at {}  (watchdog: {:.1}s)",
-            Utc::now().format("%H:%M:%S%.3f UTC"),
+            UtcTimestamp::now().strftime("%H:%M:%S%.3f UTC"),
             args.max_tx_secs
         );
         match PttGuard::engage(args.max_tx_secs) {
@@ -359,7 +360,7 @@ fn main() {
     started.store(true, Ordering::Release);
     println!(
         "Audio  at {}  ({} samples, {:.2}s)",
-        Utc::now().format("%H:%M:%S%.3f UTC"),
+        UtcTimestamp::now().strftime("%H:%M:%S%.3f UTC"),
         samples.len(),
         duration_secs
     );

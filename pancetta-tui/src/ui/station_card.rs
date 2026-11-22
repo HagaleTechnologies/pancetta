@@ -14,8 +14,10 @@
 //! proves too thin.
 
 use anyhow::Result;
+use jiff::SignedDuration;
 use pancetta_core::callsign::callsigns_match;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -110,7 +112,7 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let line2 = render_line2(app, last_decode);
     let line3 = render_line3(app, &call, last_decode);
 
-    let why = render_why_line(app, inner.width, chrono::Utc::now());
+    let why = render_why_line(app, inner.width, UtcTimestamp::now());
     let mut lines = vec![line1];
     if let Some(info) = focused_qrz_info(app) {
         let parts: Vec<&str> = [&info.name, &info.qth, &info.grid, &info.country]
@@ -128,7 +130,7 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
 }
 
 /// Fit complete clauses so clipping cannot hide a caution or a hedge.
-fn render_why_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
+fn render_why_line(app: &App, width: u16, now: UtcTimestamp) -> Line<'static> {
     use crate::dx_reason::{self, FocusedReason};
     let (clauses, caution_count) = match dx_reason::focused(app, now) {
         FocusedReason::NoFocus => return Line::default(),
@@ -284,7 +286,7 @@ pub(in crate::ui) mod tests {
 
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".to_string(),
             snr,
@@ -312,7 +314,7 @@ pub(in crate::ui) mod tests {
         ActiveQsoBanner {
             their_callsign: call.to_string(),
             state: state.to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1500.0,
             tx_parity: None,
             last_tx_text: None,
@@ -423,7 +425,7 @@ pub(in crate::ui) mod tests {
             outcome,
             last_state: "Completed".to_string(),
             freq_hz: 14_075_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Completed".to_string()],
         };
         let row = |lines: &[Line<'static>]| -> String {
@@ -623,13 +625,13 @@ pub(in crate::ui) mod tests {
             "Why: not ranked now (not heard or spotted in the last 3 min)"
         ));
         let mut app = ranked_app("JA1ABC", true, false).await;
-        app.dx_stations.get_mut("JA1ABC").unwrap().last_seen -= chrono::Duration::minutes(4);
+        app.dx_stations.get_mut("JA1ABC").unwrap().last_seen -= SignedDuration::from_mins(4);
         assert!(buffer_contains(
             &render_at(&app, 130, 6),
             "Why: not ranked now (not heard or spotted in the last 3 min)"
         ));
         let station = app.dx_stations.get_mut("JA1ABC").unwrap();
-        station.last_seen = chrono::Utc::now();
+        station.last_seen = UtcTimestamp::now();
         station.local_rank = None;
         station.network_rank = None;
         assert!(buffer_contains(
@@ -900,7 +902,7 @@ pub(in crate::ui) mod tests {
                 frequency: 14.074,
                 band: None,
                 mode: "FT8".to_string(),
-                last_seen: chrono::Utc::now(),
+                last_seen: UtcTimestamp::now(),
                 snr: 3,
                 distance: None,
                 bearing: None,

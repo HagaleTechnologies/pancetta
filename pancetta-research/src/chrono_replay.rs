@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -335,7 +336,7 @@ pub fn preflight_timing_history(
         if entry.slot_index as usize != index || !digests.insert(&entry.wav_sha256) {
             reject(wav.clone(), "duplicate or unordered slot".into());
         }
-        match chrono::DateTime::parse_from_rfc3339(&entry.wav_timestamp) {
+        match str::parse::<UtcTimestamp>(&entry.wav_timestamp) {
             Ok(at) if previous_time.is_none_or(|previous| at > previous) => {
                 previous_time = Some(at)
             }

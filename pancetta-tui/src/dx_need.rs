@@ -3,6 +3,7 @@
 //! Providers also receive the row's DXCC entity, resolved once when the row
 //! was created, and must not resolve the callsign's entity again (PAN-284).
 
+use pancetta_core::time::UtcTimestamp;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DxNeedStatus {
     /// None means missing/invalid data or unavailable history.
@@ -51,7 +52,7 @@ impl EntityStanding {
 pub struct NeedListSource {
     /// Per-band scope (e.g. "20M"); None for an all-bands list.
     pub band: Option<String>,
-    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub fetched_at: UtcTimestamp,
 }
 
 pub trait DxNeedLookup: Send + Sync {

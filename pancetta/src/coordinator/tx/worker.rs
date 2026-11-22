@@ -1,4 +1,7 @@
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 pub(super) const DELAY_MS: u64 = 500;
@@ -182,7 +185,7 @@ pub(super) fn multi_tx_acceptance_cap_ms(
 /// first).
 pub(super) fn adaptive_coalesce_cap_ms(
     head: &MessageType,
-    request_received_at: chrono::DateTime<chrono::Utc>,
+    request_received_at: UtcTimestamp,
     tx_self_parity: pancetta_config::station::TxSelfParity,
     tx_late_max_ms: u64,
     sample_rate: u32,
@@ -212,7 +215,7 @@ pub(super) fn adaptive_coalesce_cap_ms(
     // Signed: negative when the target slot (a deferred one) has not begun
     // yet, which ADDS the time until it starts to the headroom. A current
     // slot target is never ahead of `request_received_at`.
-    let elapsed_in_slot_ms = (request_received_at - probe.target_slot).num_milliseconds();
+    let elapsed_in_slot_ms = (request_received_at - probe.target_slot).as_millis_i64();
     let headroom = (tx_late_max_ms_eff as i64)
         .saturating_sub(elapsed_in_slot_ms)
         .saturating_sub(coalesce_collect_window_ms(protocol) as i64)
@@ -226,7 +229,7 @@ pub(super) fn adaptive_coalesce_cap_ms(
 #[derive(Debug, Clone, Copy)]
 pub struct TxSchedule {
     /// UTC time of the slot boundary we're targeting.
-    pub target_slot: chrono::DateTime<chrono::Utc>,
+    pub target_slot: UtcTimestamp,
     /// Number of zero samples to emit before the modulated waveform.
     pub silent_pad_samples: usize,
     /// Sample offset into the waveform — caller emits `waveform[cursor..]`.
@@ -264,7 +267,7 @@ pub struct TxSchedule {
 /// directly dequeued bundle that did not. The key-time final gate keeps
 /// enforcing the raw effective cap.
 pub fn schedule_tx(
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
     required_parity: pancetta_core::slot::SlotParity,
     tx_late_max_ms: u64,
     sample_rate: u32,
@@ -276,7 +279,7 @@ pub fn schedule_tx(
 
     let cur_start = current_slot_start_with_period(now, slot_ns);
     let cur_parity = SlotParity::of_with_period(cur_start, slot_ns);
-    let mstr_in_cur_slot = (now - cur_start).num_milliseconds().max(0) as u64;
+    let mstr_in_cur_slot = (now - cur_start).as_millis_i64().max(0) as u64;
 
     // Decide which slot to target. The current slot is viable iff its
     // parity matches AND we haven't burned past tx_late_max_ms.
@@ -311,13 +314,13 @@ pub fn schedule_tx(
 /// the original decision; this function can't do that — it only computes
 /// how far into (or before) an already-chosen `target_slot` `now` falls.
 pub(super) fn pad_and_cursor_for_target(
-    now: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
+    target_slot: UtcTimestamp,
     sample_rate: u32,
 ) -> (usize, usize) {
     // mstr relative to the target. When target is in the future,
     // (now - target) is negative; clamp so we hit the early branch.
-    let mstr_signed = (now - target_slot).num_milliseconds();
+    let mstr_signed = (now - target_slot).as_millis_i64();
     let mstr_unsigned = mstr_signed.max(0) as u64;
 
     let (silent_pad_ms, cursor_ms) = if mstr_unsigned < DELAY_MS {
@@ -1329,7 +1332,7 @@ pub(super) struct SlotTimingContext {
     pub(super) sample_rate: u32,
     pub(super) slot_ns: i64,
     /// Frozen at dequeue, before the coalesce wait.
-    pub(super) request_received_at: chrono::DateTime<chrono::Utc>,
+    pub(super) request_received_at: UtcTimestamp,
 }
 
 impl super::super::ApplicationCoordinator {
@@ -2097,7 +2100,7 @@ impl super::super::ApplicationCoordinator {
                                             "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
                                         );
                                         audit_log.record(&pancetta_agent::audit::AuditEvent {
-                                            ts_unix_ms: utc_clock().timestamp_millis(),
+                                            ts_unix_ms: utc_clock().as_millisecond(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
                                                 &remote_tx_arm,
@@ -2319,7 +2322,7 @@ impl super::super::ApplicationCoordinator {
                                         info!(
                                         "TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples deferred={}",
                                         required_parity,
-                                        schedule.target_slot.format("%H:%M:%S%.3f UTC"),
+                                        schedule.target_slot.strftime("%H:%M:%S%.3f UTC"),
                                         schedule.silent_pad_samples,
                                         schedule.cursor_offset_samples,
                                         schedule.deferred,
@@ -3489,8 +3492,8 @@ impl super::super::ApplicationCoordinator {
                                                     attempt_id,
                                                 )],
                                                 pancetta_core::slot_clock::WallClockJump::Backward(
-                                                    chrono::Duration::from_std(to_slot)
-                                                        .unwrap_or(chrono::Duration::MAX),
+                                                    SignedDuration::try_from(to_slot)
+                                                        .unwrap_or(SignedDuration::MAX),
                                                 ),
                                                 &mut qso_id
                                                     .as_deref()
@@ -4547,7 +4550,7 @@ impl super::super::ApplicationCoordinator {
                                             items.len()
                                         );
                                         audit_log.record(&pancetta_agent::audit::AuditEvent {
-                                            ts_unix_ms: utc_clock().timestamp_millis(),
+                                            ts_unix_ms: utc_clock().as_millisecond(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
                                                 &remote_tx_arm,
@@ -4821,7 +4824,7 @@ impl super::super::ApplicationCoordinator {
                                     info!(
                                         "Multi-TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples ({} items)",
                                         required_parity,
-                                        schedule.target_slot.format("%H:%M:%S%.3f UTC"),
+                                        schedule.target_slot.strftime("%H:%M:%S%.3f UTC"),
                                         schedule.silent_pad_samples,
                                         schedule.cursor_offset_samples,
                                         item_texts.len(),
@@ -6302,7 +6305,7 @@ impl super::super::ApplicationCoordinator {
                                             &mut pivoted_from,
                                         );
                                         let elapsed_ms = (key_time_now - schedule.target_slot)
-                                            .num_milliseconds()
+                                            .as_millis_i64()
                                             .max(0)
                                             as u64;
                                         let n = items.len();
@@ -6520,8 +6523,8 @@ impl super::super::ApplicationCoordinator {
                                             &message_bus,
                                             &frames,
                                             pancetta_core::slot_clock::WallClockJump::Backward(
-                                                chrono::Duration::from_std(to_slot)
-                                                    .unwrap_or(chrono::Duration::MAX),
+                                                SignedDuration::try_from(to_slot)
+                                                    .unwrap_or(SignedDuration::MAX),
                                             ),
                                             &mut bundle_replaced,
                                         )
@@ -7709,7 +7712,7 @@ impl super::super::ApplicationCoordinator {
 pub fn resolve_required_parity(
     tx_parity: Option<pancetta_core::slot::SlotParity>,
     tx_self_parity: pancetta_config::station::TxSelfParity,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
     slot_ns: i64,
 ) -> pancetta_core::slot::SlotParity {
     use pancetta_config::station::TxSelfParity;

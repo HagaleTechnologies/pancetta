@@ -1,4 +1,5 @@
 //! PAN-86: real cache -> prepared App status -> Ratatui, with real ADIF persistence.
+use pancetta_core::time::UtcTimestamp;
 use pancetta_lib::priority_evaluator::CachedStationLookup;
 use pancetta_qso::{adif_log_writer::AdifLogWriter, async_database::QsoDatabase, AdifProcessor};
 use pancetta_tui::{app::App, tui_runner::CqdxSpotInfo, Config, DecodedMessageView};
@@ -13,7 +14,7 @@ fn contact(state: &str, date: &str) -> pancetta_qso::QsoMetadata {
 
 async fn add_rows(app: &mut App) {
     app.add_decoded_message(DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: app.station_info.operating_frequency,
         mode: "FT8".into(),
         snr: -10,
@@ -47,8 +48,8 @@ async fn add_rows(app: &mut App) {
         reporter_count: 3,
         best_snr: Some(-10),
         confidence: 0.9,
-        first_seen: chrono::Utc::now().timestamp(),
-        last_seen: chrono::Utc::now().timestamp(),
+        first_seen: UtcTimestamp::now().as_second(),
+        last_seen: UtcTimestamp::now().as_second(),
         is_notable: false,
         notable_type: None,
         entity_name: "United States".into(),

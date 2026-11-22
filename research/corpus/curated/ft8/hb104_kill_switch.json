@@ -6,7 +6,7 @@
  "time_gate_sec": 2.0,
  "entries": [
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_154228.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_154228.wav",
    "wav_sha256": "70ad8e7032847b6ad8086f145b92e346ee5c0428cdcaa16e9d72aa3fdc8b606b",
    "n_pairs": 5,
    "pairs": [
@@ -53,7 +53,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_170958.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_170958.wav",
    "wav_sha256": "99191c6681f9b3649e089afa88c070f4dd13b5398bd5e0ded1a8d781005dce44",
    "n_pairs": 5,
    "pairs": [
@@ -100,7 +100,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_171858.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_171858.wav",
    "wav_sha256": "330f6e092bbc45dfe391b50c56cae5fa89473bb6960c82c5351514d7c96cba18",
    "n_pairs": 5,
    "pairs": [
@@ -147,7 +147,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_154358.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_154358.wav",
    "wav_sha256": "b07e6bc38361d1475ebd2be403506dd2025f6e913408f85b46ac4164653c1e1b",
    "n_pairs": 4,
    "pairs": [
@@ -186,7 +186,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_163143.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_163143.wav",
    "wav_sha256": "cd01e84195b8e513534415b439faafdfb182c7db665ab6309427abbea1185a60",
    "n_pairs": 4,
    "pairs": [
@@ -225,7 +225,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_171828.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_171828.wav",
    "wav_sha256": "cb4f6809a1396eedc791b21c2a466c3dae9d81e85c57172800ddb1c7ba5520aa",
    "n_pairs": 4,
    "pairs": [
@@ -264,7 +264,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_191028.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_191028.wav",
    "wav_sha256": "19199656e20a82ef0d398832d1d3357aa553fe49691a5e5c3a4c954c91030671",
    "n_pairs": 4,
    "pairs": [
@@ -303,7 +303,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_152443.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_152443.wav",
    "wav_sha256": "74e64b38e91fa4872dcd77d1e562dcdd7d358b82ad4e9eae841483621938d15c",
    "n_pairs": 3,
    "pairs": [
@@ -334,7 +334,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_152828.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_152828.wav",
    "wav_sha256": "6b9ee33977a67a96fda3f6ce4af95e8a22d48f873449ea4cee947b3bdb7bc56d",
    "n_pairs": 3,
    "pairs": [
@@ -365,7 +365,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_152928.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_152928.wav",
    "wav_sha256": "3d9cb28ee49842fd9933efd0406196ec6d6ccb783285dc2cd4f8f5a1656bc4bf",
    "n_pairs": 3,
    "pairs": [
@@ -396,7 +396,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_153258.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_153258.wav",
    "wav_sha256": "bd36a60fe537053d9a7ad9121d38f944d7511746eb22b7d9a8b05f21146124cf",
    "n_pairs": 3,
    "pairs": [
@@ -427,7 +427,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_154258.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_154258.wav",
    "wav_sha256": "83554e9fdb4dd37733f66edaddb3541f6ce37ca68e5ee446c95af666a9bbcc33",
    "n_pairs": 3,
    "pairs": [
@@ -458,7 +458,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_154328.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_154328.wav",
    "wav_sha256": "dadbefcbc675470fce56268cacdfd90d07df30e0e05edc60ad90188b0a28c3b9",
    "n_pairs": 3,
    "pairs": [
@@ -489,7 +489,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_160958.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_160958.wav",
    "wav_sha256": "e3dc3630a325639beba99c102c61f75a545c7d0e867b433ee99991567be80ac5",
    "n_pairs": 3,
    "pairs": [
@@ -520,7 +520,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_161058.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_161058.wav",
    "wav_sha256": "b0d47225acbcfc7d5ecdbb7f989e51c941ca85edf657f7401cc30081858a0078",
    "n_pairs": 3,
    "pairs": [
@@ -551,7 +551,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_161928.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_161928.wav",
    "wav_sha256": "78f4a05c385327b86c8120854c55d20e978510ad98cdb76e32ad8f0ebcfa0c02",
    "n_pairs": 3,
    "pairs": [
@@ -582,7 +582,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_163513.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_163513.wav",
    "wav_sha256": "3cd6c0b69fa759e45fa02b772943335464f1365d5f49cfa397d8a83f7fa1cbd4",
    "n_pairs": 3,
    "pairs": [
@@ -613,7 +613,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_171958.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_171958.wav",
    "wav_sha256": "409f04d1af5a6fe2560642ecd61631285d320ecdb3aa18db151addcca8f769f3",
    "n_pairs": 3,
    "pairs": [
@@ -644,7 +644,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_174028.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_174028.wav",
    "wav_sha256": "ced51d9299981cd0ae6d820c4e8d2fa333ad225b31b71e210e2e3b5bc4ee587a",
    "n_pairs": 3,
    "pairs": [
@@ -675,7 +675,7 @@
    ]
   },
   {
-   "wav_path": "~/.pancetta/recordings/ft8_20260530_185458.wav",
+   "wav_path": "/Users/thagale/.pancetta/corpus/ft8_20260530_185458.wav",
    "wav_sha256": "f647ef6e8d3f042bc639551246bb53878bb89d87adaa670c0cd6ff22e2b48a22",
    "n_pairs": 3,
    "pairs": [

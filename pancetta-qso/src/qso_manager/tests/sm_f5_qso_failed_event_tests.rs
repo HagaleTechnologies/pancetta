@@ -6,6 +6,7 @@
 //! failure path. This module proves all three producer sites now emit
 //! `QsoFailed` with the correct reason and non-empty metadata.
 use super::*;
+use jiff::SignedDuration;
 
 const OUR: &str = "W1ABC"; // test_config()'s our_callsign
 const DX: &str = "K1DEF";
@@ -153,7 +154,7 @@ async fn check_timeouts_at_retirement_emits_qso_failed_with_timeout() {
     // Past the 30s report_timeout, past the one bounded Auto resend cap
     // too, so this retires cleanly via the timeout path.
     manager
-        .check_timeouts_at(opened_at + Duration::seconds(45))
+        .check_timeouts_at(opened_at + SignedDuration::from_secs(45))
         .await;
 
     let events = drain(&mut rx);
@@ -192,7 +193,7 @@ async fn check_timeouts_at_retirement_qso_failed_event_carries_timeline() {
         .unwrap();
 
     manager
-        .check_timeouts_at(opened_at + Duration::seconds(45))
+        .check_timeouts_at(opened_at + SignedDuration::from_secs(45))
         .await;
 
     let mut events = Vec::new();

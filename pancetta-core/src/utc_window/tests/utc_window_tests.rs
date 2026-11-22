@@ -1,7 +1,8 @@
 use super::*;
+use jiff::civil;
 
-fn t(h: u32, m: u32) -> NaiveTime {
-    NaiveTime::from_hms_opt(h, m, 0).expect("valid test time")
+fn t(h: u32, m: u32) -> civil::Time {
+    civil::Time::new(h as i8, m as i8, 0, 0).expect("valid test time")
 }
 
 fn window(text: &str) -> UtcWindow {
@@ -42,7 +43,7 @@ fn utc_window_parse_and_contains_table() {
     assert!(w.contains(t(18, 0)));
 
     // Seconds inside the last minute stay inside a 24:00 window.
-    let late = NaiveTime::from_hms_opt(23, 59, 59).expect("valid time");
+    let late = civil::Time::new(23, 59, 59, 0).expect("valid time");
     assert!(window("00:00-24:00").contains(late));
 
     // Outer whitespace is trimmed.

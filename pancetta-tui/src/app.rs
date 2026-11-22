@@ -1,6 +1,7 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -91,6 +92,7 @@ impl ColorCapability {
 struct DxStationLookupAdapter {
     needed: bool,
     atno: bool,
+    need_source: pancetta_qso::priority::NeedSource,
     band_needed: bool,
     worked_before: bool,
     /// Session failure history the relay's local rescore found (PAN-94).
@@ -115,6 +117,9 @@ impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
     }
     fn is_atno(&self, _callsign: &str) -> bool {
         self.atno
+    }
+    fn need_source(&self, _callsign: &str) -> pancetta_qso::priority::NeedSource {
+        self.need_source
     }
     fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
         self.band_needed
@@ -156,7 +161,7 @@ fn rarity_tier_to_f64(tier: Option<&str>) -> f64 {
 /// instead of duplicating fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecodedMessageView {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     pub frequency: f64,
     pub mode: String,
     pub snr: i32,
@@ -235,7 +240,7 @@ pub struct DecodedMessageView {
 pub struct QsoHistoryItem {
     pub call_sign: String,
     pub success: bool,
-    pub completed_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: UtcTimestamp,
 }
 
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
@@ -251,7 +256,7 @@ pub struct ActiveQsoBanner {
     /// Human-readable state ("CqResponse", "Waiting Report", "Sending RR73", etc.).
     pub state: String,
     /// When this QSO started (used to render an elapsed timer).
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: UtcTimestamp,
     /// Audio frequency in Hz (`AUDIO_PASSBAND_MIN_HZ`-`AUDIO_PASSBAND_MAX_HZ`
     /// range, where the contra station was heard / where we're transmitting
     /// back).
@@ -262,11 +267,11 @@ pub struct ActiveQsoBanner {
     /// QSO-detail panel TX line).
     pub last_tx_text: Option<String>,
     /// When the last TX message was recorded.
-    pub last_tx_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_tx_at: Option<UtcTimestamp>,
     /// Raw text of the last message we received from the contra station.
     pub last_rx_text: Option<String>,
     /// When the last RX message was recorded.
-    pub last_rx_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_rx_at: Option<UtcTimestamp>,
     /// Measured SNR (dB) of the last message received from them.
     pub snr_rx: Option<i32>,
     /// Signal report we sent them (their signal at our end).
@@ -296,7 +301,7 @@ pub struct ActiveQsoBanner {
     pub max_calls: u32,
     /// Manual keep-calling watchdog: when keep-calling stops (elapsed-time
     /// bound). `None` when not keep-calling. Rendered as a live countdown.
-    pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub watchdog_deadline: Option<UtcTimestamp>,
     /// #41: short summary of what the DX is doing on the band (their latest
     /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
     pub dx_last_activity: Option<String>,
@@ -311,7 +316,7 @@ pub struct ActiveQsoBanner {
     /// `ActiveQsoSnapshotItem::pending_freq_drift_hz`).
     pub pending_freq_drift_hz: Option<f64>,
     /// When the pending drift candidate above was first noted.
-    pub pending_freq_drift_since: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_freq_drift_since: Option<UtcTimestamp>,
 }
 
 /// One entry in the cross-parity manual-call queue, pushed to the TUI as
@@ -388,9 +393,9 @@ pub struct QsoStatus {
     pub snr_tx: Option<i32>,
     /// Measured SNR of their last received message — drives the RX SNR gauge.
     pub snr_rx: Option<i32>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub last_tx: Option<DateTime<Utc>>,
-    pub last_rx: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
+    pub last_tx: Option<UtcTimestamp>,
+    pub last_rx: Option<UtcTimestamp>,
     /// Raw text of the last message we sent in this QSO.
     pub last_tx_text: Option<String>,
     /// Raw text of the last message we received in this QSO.
@@ -421,7 +426,7 @@ pub struct QsoStatus {
     pub max_calls: u32,
     /// Manual keep-calling watchdog deadline (elapsed-time bound). `None`
     /// when not keep-calling.
-    pub watchdog_deadline: Option<DateTime<Utc>>,
+    pub watchdog_deadline: Option<UtcTimestamp>,
     /// #41: short summary of what the DX is doing on the band (their latest
     /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
     pub dx_last_activity: Option<String>,
@@ -432,7 +437,7 @@ pub struct QsoStatus {
     /// DX-frequency-drift relatch. `None` when no drift candidate pending.
     pub pending_freq_drift_hz: Option<f64>,
     /// When the pending drift candidate above was first noted.
-    pub pending_freq_drift_since: Option<DateTime<Utc>>,
+    pub pending_freq_drift_since: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,7 +516,7 @@ impl std::fmt::Display for SpotSource {
 pub struct RankedBy {
     pub score: u32,
     pub factors: Option<PriorityFactors>,
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,7 +540,7 @@ pub struct DxStation {
     /// `frequency` changes (PAN-345).
     pub band: Option<pancetta_core::Band>,
     pub mode: String,
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: UtcTimestamp,
     pub snr: i32,
     pub distance: Option<f64>,
     pub bearing: Option<f64>,
@@ -642,11 +647,27 @@ impl DxStation {
     /// Score this row's latest cqdx spot. Worked and failure history from the
     /// relay's local rank applies too, so a QSO outcome lowers both sources
     /// (PAN-94).
-    fn score_network_spot(&self, at: DateTime<Utc>) -> RankedBy {
+    fn score_network_spot(&self, at: UtcTimestamp) -> RankedBy {
+        self.score_network_spot_with_need(
+            self.needed,
+            self.atno,
+            pancetta_qso::priority::NeedSource::Cqdx,
+            at,
+        )
+    }
+
+    fn score_network_spot_with_need(
+        &self,
+        needed: bool,
+        atno: bool,
+        need_source: pancetta_qso::priority::NeedSource,
+        at: UtcTimestamp,
+    ) -> RankedBy {
         let local = self.local_rank.and_then(|rank| rank.factors);
         let adapter = DxStationLookupAdapter {
-            needed: self.needed,
-            atno: self.atno,
+            needed,
+            atno,
+            need_source,
             band_needed: self.band_needed,
             worked_before: self.worked_before || local.is_some_and(|f| f.worked_on_band),
             recent_failure: local.is_some_and(|f| f.recent_failure),
@@ -666,15 +687,36 @@ impl DxStation {
     }
 }
 
-/// Band of a local decode's dial frequency, which the decoded view carries
-/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
-/// out-of-band value has no band.
-fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+/// A dial frequency in MHz, as the decoded view and the station state carry
+/// it, rounded to whole Hz (PAN-443). A nonfinite or non-positive value is an
+/// unknown dial.
+fn hz_from_mhz(mhz: f64) -> Option<u64> {
     let hz = (mhz * 1_000_000.0).round();
     if !hz.is_finite() || hz <= 0.0 {
         return None;
     }
-    pancetta_core::Band::from_frequency(hz as u64)
+    Some(hz as u64)
+}
+
+/// Band of a local decode's dial frequency, which the decoded view carries
+/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
+/// out-of-band value has no band.
+fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+    hz_from_mhz(mhz).and_then(pancetta_core::Band::from_frequency)
+}
+
+/// A dial in Hz as exact MHz text for a status line (PAN-443): every Hz is
+/// kept, trailing zeros are trimmed down to three decimals, so two different
+/// dials never print alike (`14.074 MHz`, `14.0745 MHz`, `0.4742 MHz`).
+/// Integer arithmetic only.
+pub(crate) fn dial_label(hz: u64) -> String {
+    let mut text = format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000);
+    let three_decimals = text.len() - 3;
+    while text.len() > three_decimals && text.ends_with('0') {
+        text.pop();
+    }
+    text.push_str(" MHz");
+    text
 }
 
 /// Exact station identity for worked status: a resolved hash render matches
@@ -698,7 +740,7 @@ fn tui_rank(
     grid: Option<&str>,
     snr: i32,
     freq_mhz: f64,
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
 ) -> RankedBy {
     let scorer = pancetta_qso::PriorityScorer::new(
         pancetta_qso::priority::PriorityWeights::default(),
@@ -743,7 +785,7 @@ pub enum DevicePanel {
 /// like a curated slice of the log, not a new ad-hoc taxonomy.
 #[derive(Debug, Clone)]
 pub struct DiagnosticEventRecord {
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: UtcTimestamp,
     pub target: &'static str,
     pub level: pancetta_core::DiagnosticLevel,
     pub text: String,
@@ -784,7 +826,7 @@ pub struct RecentQsoOutcome {
     /// Operating frequency in Hz at the time of the outcome.
     pub freq_hz: u32,
     /// When the outcome was recorded.
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: UtcTimestamp,
     /// Short human-readable summary lines built from the QSO's metadata.
     pub brief_timeline: Vec<String>,
 }
@@ -817,7 +859,7 @@ pub struct PlacementView {
     /// Allocation range (min, max) in Hz.
     pub range: (f64, f64),
     /// When this snapshot was received by the TUI.
-    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub received_at: UtcTimestamp,
 }
 
 /// Which field of the frequency-entry modal is focused.
@@ -991,19 +1033,18 @@ pub const RIG_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
 /// `live_baud_rate`/`live_ptt_method` instead of indexing into the array.
 const NOT_ENUMERATED: usize = usize::MAX;
 
-/// The 4 PTT methods the wizard offers (`setup_ptt`, `pancetta/src/main.rs:1409-1414`).
+/// The PTT methods the picker offers: the ones that have a keying path
+/// (PAN-357), the same three the setup wizard offers (`setup_ptt` in
+/// `pancetta/src/main.rs`). `None` and `Cat` key through rigctld and
+/// `SerialRts` keys the RTS line of a separate serial port; every other
+/// method is refused by validation while rig control is on. A live method
+/// outside this list still shows and is kept on apply ([`NOT_ENUMERATED`]);
+/// a bookmark that stores one is refused on load.
 /// Deliberately a function, not a `const` array: `PttMethod` doesn't derive
-/// `Copy` (nor `PartialEq` — comparisons below use `Debug` formatting,
-/// mirroring `setup_ptt`'s own `format!("{:?}", ...)` comparison at
-/// `pancetta/src/main.rs:1420`).
-pub fn rig_ptt_methods() -> [pancetta_config::rig::PttMethod; 4] {
+/// `Copy`.
+pub fn rig_ptt_methods() -> [pancetta_config::rig::PttMethod; 3] {
     use pancetta_config::rig::PttMethod;
-    [
-        PttMethod::None,
-        PttMethod::Cat,
-        PttMethod::Serial,
-        PttMethod::Vox,
-    ]
+    [PttMethod::None, PttMethod::Cat, PttMethod::SerialRts]
 }
 
 /// State for the live rig-config picker modal (`i` key, PAN-59). Mirrors
@@ -1226,7 +1267,7 @@ impl RigSelectionState {
         let baud_idx = RIG_BAUD_RATES.iter().position(|b| *b == bookmark.baud_rate);
         let ptt_idx = rig_ptt_methods()
             .iter()
-            .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method));
+            .position(|m| *m == bookmark.ptt_method);
         let (Some(baud_idx), Some(ptt_idx)) = (baud_idx, ptt_idx) else {
             return Err(format!(
                 "Bookmark '{}' has a baud rate or PTT method the picker doesn't support \
@@ -1490,7 +1531,7 @@ pub enum SpaceAction {
 struct BandSnapshot {
     decoded_messages: VecDeque<DecodedMessageView>,
     dx_stations: HashMap<String, DxStation>,
-    captured_at: DateTime<Utc>,
+    captured_at: UtcTimestamp,
 }
 
 /// A compact, display-oriented TX item for the NOW-SENDING / QUEUED view.
@@ -1705,11 +1746,11 @@ pub struct App {
     /// Last SWR reading (e.g. 1.3) from the rig while keyed, and when it
     /// arrived. Shown in the status bar only during TX; goes stale after 5s.
     pub swr: Option<f32>,
-    pub swr_at: Option<DateTime<Utc>>,
+    pub swr_at: Option<UtcTimestamp>,
     /// PAN-291: last keyed forward-power/ALC reading and when it arrived.
     /// Live for [`TX_METER_LIVE_SECS`] after it arrives.
     pub tx_meter: Option<pancetta_core::tx_meter::TxMeterReading>,
-    pub tx_meter_at: Option<DateTime<Utc>>,
+    pub tx_meter_at: Option<UtcTimestamp>,
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on. `None` until announced.
     pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
@@ -1721,7 +1762,7 @@ pub struct App {
     pub tx_drive_available: bool,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
-    pub signal_strength_at: Option<DateTime<Utc>>,
+    pub signal_strength_at: Option<UtcTimestamp>,
     pub pipeline_health: Option<PipelineHealth>,
     /// `true` when autonomous mode is enabled but the operator has gone idle
     /// past the presence window, so the coordinator is suppressing autonomous
@@ -1900,7 +1941,7 @@ pub struct App {
     pub placement_cursor: usize,
     /// When the operator "parked" a TX-placement pick, if any. `None` = not
     /// parked. Set/cleared by later tasks (12).
-    pub parked_since: Option<DateTime<Utc>>,
+    pub parked_since: Option<UtcTimestamp>,
     /// `(parked frequency Hz, openness code 0-3 at that frequency's bin)`
     /// as of the LAST `apply_placement` call — the edge-detect baseline for
     /// the one-shot parked-slice degradation warning (Task 14). The
@@ -2522,7 +2563,7 @@ impl App {
 
         self.tx_offset_hold_hz = Some(hz);
         self.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-        self.parked_since = Some(chrono::Utc::now());
+        self.parked_since = Some(UtcTimestamp::now());
         self.statuses.push(
             match code {
                 1 => format!("Parked at {hz} Hz (O) \u{2014} Even window busy"),
@@ -2695,6 +2736,19 @@ impl App {
                     if message.external
                         && matches!(entry.source, SpotSource::Local | SpotSource::Both) => {}
                 Some(entry) => {
+                    // A network-only rank may have used the frame's local need
+                    // verdict. Once heard locally, keep the spot's cqdx rank
+                    // as the independent network half of the mixed row.
+                    if entry.local_rank.is_none()
+                        && entry.network_rank.is_some_and(|rank| {
+                            rank.factors.is_some_and(|f| {
+                                f.need_source == pancetta_qso::priority::NeedSource::LocalLogbook
+                            })
+                        })
+                    {
+                        let at = entry.network_rank.unwrap().at;
+                        entry.network_rank = Some(entry.score_network_spot(at));
+                    }
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
                     entry.band = band_from_mhz(message.frequency);
@@ -2799,6 +2853,7 @@ impl App {
         let adapter = DxStationLookupAdapter {
             needed: message.needed,
             atno: message.atno,
+            need_source: pancetta_qso::priority::NeedSource::Cqdx,
             band_needed: message.band_needed,
             worked_before: message.worked_before,
             recent_failure: false,
@@ -3049,11 +3104,11 @@ impl App {
     }
 
     fn cleanup_old_data(&mut self) {
-        self.cleanup_old_data_at(Utc::now());
+        self.cleanup_old_data_at(UtcTimestamp::now());
     }
 
-    fn cleanup_old_data_at(&mut self, now: chrono::DateTime<Utc>) {
-        let cutoff = now - chrono::Duration::hours(24);
+    fn cleanup_old_data_at(&mut self, now: UtcTimestamp) {
+        let cutoff = now - SignedDuration::from_hours(24);
 
         // Remove old messages
         while let Some(front) = self.decoded_messages.front() {
@@ -3104,7 +3159,7 @@ impl App {
         let current_hz = self.station_info.operating_frequency * 1_000_000.0;
         // Match displayed_dx_stations eligibility before allocating or taking
         // lookup locks. The backing station map can retain older, hidden rows.
-        let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(Self::DX_HUNTER_STALE_SECS);
         let our_call = self.station_info.call_sign.trim();
         self.dx_need = lookup
             .map(|lookup| {
@@ -3130,6 +3185,45 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Reconcile network-only scores with the verdict used by this frame's
+        // marker. The spot fields remain cqdx's wire values.
+        for (key, row) in &mut self.dx_stations {
+            if row.local_rank.is_some() {
+                continue;
+            }
+            let Some(rank) = row.network_rank else {
+                continue;
+            };
+            let local = self.dx_need.get(dx_row_call(key)).filter(|need| {
+                need.dxcc_source == Some(pancetta_qso::priority::NeedSource::LocalLogbook)
+                    && need.unconfirmed_policy == Some(true)
+            });
+            let (needed, atno, source) =
+                if let Some(need) = local.and_then(|n| n.dxcc_needed.map(|needed| (n, needed))) {
+                    (
+                        need.1,
+                        need.1
+                            && need.0.entity_standing
+                                == Some(crate::dx_need::EntityStanding::NotWorked),
+                        pancetta_qso::priority::NeedSource::LocalLogbook,
+                    )
+                } else {
+                    (
+                        row.needed,
+                        row.atno,
+                        pancetta_qso::priority::NeedSource::Cqdx,
+                    )
+                };
+            if rank.factors.is_some_and(|f| {
+                f.needed_dxcc == needed && f.atno == atno && f.need_source == source
+            }) {
+                continue;
+            }
+            row.network_rank =
+                Some(row.score_network_spot_with_need(needed, atno, source, rank.at));
+            row.refresh_priority_score();
+        }
     }
 
     /// The DX-row key in its original case; a resolved hash-render (`"<K1ABC>"`)
@@ -3143,8 +3237,8 @@ impl App {
     /// is one, wins over the flags stored at decode or spot time, so both
     /// follow a list that loads or changes between decodes, as the Why view
     /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
-    /// too; a newly needed ATNO's `!` changes with the row's score, at its next
-    /// decode or spot. `atno` is the caller's ATNO input; DX Hunter passes
+    /// too; a network-only ATNO's `!` changes with its score on a frame refresh.
+    /// `atno` is the caller's ATNO input; DX Hunter passes
     /// `DxStation::ranked_atno` (PAN-399). With no verdict, the inputs stand.
     pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
         match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
@@ -3220,7 +3314,7 @@ impl App {
                     BandSnapshot {
                         decoded_messages: self.decoded_messages.clone(),
                         dx_stations: self.dx_stations.clone(),
-                        captured_at: Utc::now(),
+                        captured_at: UtcTimestamp::now(),
                     },
                 );
             }
@@ -3257,7 +3351,7 @@ impl App {
 
         // 4. Restore a fresh snapshot for the band we're switching TO, if any.
         if let Some(snap) = self.band_cache.remove(&band_name) {
-            let age_secs = (Utc::now() - snap.captured_at).num_seconds();
+            let age_secs = (UtcTimestamp::now() - snap.captured_at).as_secs();
             if age_secs <= Self::BAND_CACHE_TTL_SECS {
                 let caller_count = directed_caller_count(&snap.decoded_messages);
                 self.decoded_messages = snap.decoded_messages;
@@ -3300,9 +3394,9 @@ impl App {
     /// Drop band-cache entries older than the TTL, then evict the oldest until
     /// the cache is within [`Self::BAND_CACHE_MAX`].
     fn prune_band_cache(&mut self) {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         self.band_cache
-            .retain(|_, snap| (now - snap.captured_at).num_seconds() <= Self::BAND_CACHE_TTL_SECS);
+            .retain(|_, snap| (now - snap.captured_at).as_secs() <= Self::BAND_CACHE_TTL_SECS);
         while self.band_cache.len() > Self::BAND_CACHE_MAX {
             if let Some(oldest) = self
                 .band_cache
@@ -3332,13 +3426,13 @@ impl App {
     /// latent. S-meter and audio level are now separate fields.
     pub fn update_signal_strength(&mut self, db_over_s9: i32) {
         self.signal_strength_db = Some(db_over_s9);
-        self.signal_strength_at = Some(Utc::now());
+        self.signal_strength_at = Some(UtcTimestamp::now());
     }
 
     /// PAN-291: record a keyed forward-power/ALC reading from the rig.
     pub fn update_tx_meter(&mut self, reading: pancetta_core::tx_meter::TxMeterReading) {
         self.tx_meter = Some(reading);
-        self.tx_meter_at = Some(Utc::now());
+        self.tx_meter_at = Some(UtcTimestamp::now());
     }
 
     /// PAN-291: record which TX meters this Hamlib session reads.
@@ -3353,12 +3447,12 @@ impl App {
     /// [`TX_METER_LIVE_SECS`] before `now`, else `None` (not keyed, or stale).
     pub fn tx_meter_live_at(
         &self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<pancetta_core::tx_meter::TxMeterReading> {
         let at = self.tx_meter_at?;
-        let age = now.signed_duration_since(at);
+        let age = now.duration_since(at);
         // A negative age (wall clock stepped back) is not live either.
-        if age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(TX_METER_LIVE_SECS) {
+        if age >= SignedDuration::ZERO && age <= SignedDuration::from_secs(TX_METER_LIVE_SECS) {
             self.tx_meter
         } else {
             None
@@ -3368,7 +3462,7 @@ impl App {
     /// Record a live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed.
     pub fn update_swr(&mut self, swr: f32) {
         self.swr = Some(swr);
-        self.swr_at = Some(Utc::now());
+        self.swr_at = Some(UtcTimestamp::now());
     }
 
     /// SWR display ("SWR 1.3:1"), or `None` when there's no recent reading
@@ -3378,7 +3472,7 @@ impl App {
         const STALE_AFTER_SECS: i64 = 5;
         let swr = self.swr?;
         let at = self.swr_at?;
-        if (Utc::now() - at).num_seconds() > STALE_AFTER_SECS {
+        if (UtcTimestamp::now() - at).as_secs() > STALE_AFTER_SECS {
             return None;
         }
         Some(format!("SWR {swr:.1}:1"))
@@ -3391,7 +3485,7 @@ impl App {
     pub fn s_meter_display(&self) -> Option<String> {
         let db = self.signal_strength_db?;
         let at = self.signal_strength_at?;
-        if (Utc::now() - at).num_seconds() > SIGNAL_STRENGTH_STALE_AFTER_SECS {
+        if (UtcTimestamp::now() - at).as_secs() > SIGNAL_STRENGTH_STALE_AFTER_SECS {
             return None;
         }
         Some(format_s_meter(db))
@@ -3407,7 +3501,7 @@ impl App {
     pub fn signal_strength_status_bar(&self) -> String {
         match (self.signal_strength_db, self.signal_strength_at) {
             (Some(db), Some(at))
-                if (Utc::now() - at).num_seconds() <= SIGNAL_STRENGTH_STALE_AFTER_SECS =>
+                if (UtcTimestamp::now() - at).as_secs() <= SIGNAL_STRENGTH_STALE_AFTER_SECS =>
             {
                 format!("S:{db:+}")
             }
@@ -3518,7 +3612,7 @@ impl App {
         &mut self,
         call_sign: String,
         success: bool,
-        completed_at: chrono::DateTime<chrono::Utc>,
+        completed_at: UtcTimestamp,
     ) {
         self.qso_history.push_front(QsoHistoryItem {
             call_sign,
@@ -3535,12 +3629,7 @@ impl App {
     /// `is_directed_at_us: true` unconditionally pins TX rows into the same
     /// top tier `App::displayed_messages()` already reserves for RX frames
     /// addressed to us — a QSO's full back-and-forth reads as one block.
-    pub fn add_tx_frame(
-        &mut self,
-        text: String,
-        freq_hz: f64,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) {
+    pub fn add_tx_frame(&mut self, text: String, freq_hz: f64, timestamp: UtcTimestamp) {
         self.decoded_messages.push_back(DecodedMessageView {
             timestamp,
             frequency: self.station_info.operating_frequency,
@@ -3691,7 +3780,7 @@ impl App {
             frequency: freq,
             band,
             mode,
-            last_seen: Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr,
             distance: None,
             bearing: None,
@@ -3884,7 +3973,7 @@ impl App {
             text: error,
             code,
             count: 1,
-            first_at: Utc::now(),
+            first_at: UtcTimestamp::now(),
             acknowledged: false,
         });
         while self.alerts.len() > crate::readiness::ALERT_CAP {
@@ -3977,7 +4066,7 @@ impl App {
                 &outcome.qso_uuid,
                 &outcome.callsign,
                 status.as_ref(),
-                chrono::Utc::now(),
+                UtcTimestamp::now(),
             ));
         }
         let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
@@ -3999,7 +4088,7 @@ impl App {
     pub fn apply_qso_upload_statuses(
         &mut self,
         statuses: Vec<crate::upload_status::QsoUploadStatus>,
-        now: chrono::DateTime<chrono::Utc>,
+        now: UtcTimestamp,
     ) {
         const MAX_UPLOAD_STATUSES: usize = 100;
         for status in statuses {
@@ -4038,7 +4127,7 @@ impl App {
 
     /// The visible completion-toast text, or `None` when no toast is active
     /// or it has expired (PAN-344).
-    pub fn active_toast_text(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    pub fn active_toast_text(&self, now: UtcTimestamp) -> Option<String> {
         self.completion_toast
             .as_ref()
             .and_then(|t| t.text_at(now))
@@ -4374,7 +4463,7 @@ impl App {
     pub fn displayed_dx_stations(&self) -> Vec<&DxStation> {
         // Drop spots not heard within the staleness window — a station last
         // heard minutes ago is no longer "current" DX to chase.
-        let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(Self::DX_HUNTER_STALE_SECS);
         // Belt-and-suspenders: even if our own callsign somehow slipped into
         // dx_stations (e.g. a stale entry from before #42 was extended), never
         // surface it to the operator at render time. (#42 extension)
@@ -4713,25 +4802,22 @@ impl App {
         })
     }
 
-    /// PAN-435: the status line refusing Space or a directed reply on a
-    /// decode a same-host WSJT-X sent (PAN-381) whose band or mode differs
-    /// from pancetta's live dial and mode; `None` for a native decode or a
-    /// WSJT-X decode on pancetta's own band and mode. Pancetta's band is the
-    /// operating frequency's, and a rig readback that names another band
-    /// also refuses, because the readback lags a band key and the rig
-    /// transmits on its own dial. A band `pancetta_core::Band` cannot name
-    /// refuses, because a match cannot be shown.
+    /// PAN-435, PAN-443: the status line refusing Space or a directed reply
+    /// on a decode a same-host WSJT-X sent (PAN-381) unless WSJT-X heard it
+    /// on pancetta's dial and mode; `None` for a native decode or a WSJT-X
+    /// decode that passes. The dial rule is [`Self::external_origin_refusal`]'s.
     pub fn external_decode_refusal(&self, msg: &DecodedMessageView) -> Option<String> {
         if !msg.external {
             return None;
         }
         let call = msg.call_sign.as_deref().unwrap_or("this station");
-        self.external_origin_refusal(call, band_from_mhz(msg.frequency), &msg.mode)
+        self.external_origin_refusal(call, msg.frequency, &msg.mode)
     }
 
-    /// PAN-435: [`Self::external_decode_refusal`] for the row under the
-    /// focused panel's cursor, when that row is `callsign` and was heard only
-    /// through WSJT-X. An `EX+N` row with a network frequency keeps its
+    /// PAN-435, PAN-443: [`Self::external_decode_refusal`] for the row under
+    /// the focused panel's cursor, when that row is `callsign` and was heard
+    /// only through WSJT-X. A DX Hunter `EXT` row carries WSJT-X's dial in
+    /// MHz in `frequency`. An `EX+N` row with a network frequency keeps its
     /// existing spot-call path and uses the spot's dial.
     fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
         let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
@@ -4753,7 +4839,7 @@ impl App {
                     SpotSource::ExternalNetwork if row.spot_rf_hz.is_none() => {}
                     _ => return None,
                 }
-                self.external_origin_refusal(&row.call_sign, row.band, &row.mode)
+                self.external_origin_refusal(&row.call_sign, row.frequency, &row.mode)
             }
             ActivePanel::Callers => self
                 .selected_caller()
@@ -4763,37 +4849,55 @@ impl App {
         }
     }
 
-    /// PAN-435: refuse unless WSJT-X's `band` and `mode` are pancetta's live
-    /// band and mode.
+    /// PAN-435, PAN-443: refuse unless WSJT-X's dial (`wsjtx_dial_mhz`) is
+    /// within [`pancetta_core::types::band::SAME_DIAL_SLACK_HZ`] of
+    /// pancetta's dial and `mode` is pancetta's mode. Pancetta's dial is the
+    /// rig readback when known, else the operating frequency; no band name is
+    /// needed, so a shared dial on a band `pancetta_core::Band` cannot name
+    /// passes. A readback that is a band change from the operating frequency
+    /// also refuses, because the readback lags a band key and the rig
+    /// transmits on its own dial. Pancetta never retunes to WSJT-X's dial.
     fn external_origin_refusal(
         &self,
         callsign: &str,
-        band: Option<pancetta_core::Band>,
+        wsjtx_dial_mhz: f64,
         mode: &str,
     ) -> Option<String> {
-        let ours = band_from_mhz(self.station_info.operating_frequency);
-        let rig = self.radio_frequency.and_then(band_from_mhz);
-        let rig_agrees = rig.is_none() || rig == ours;
+        use pancetta_core::types::band::{is_band_change, same_dial};
+        let theirs = hz_from_mhz(wsjtx_dial_mhz);
+        let target = hz_from_mhz(self.station_info.operating_frequency);
+        let readback = self.radio_frequency.and_then(hz_from_mhz);
+        let ours = readback.or(target);
+        let rig_agrees = match (target, readback) {
+            (Some(t), Some(r)) => !is_band_change(t, r),
+            _ => true,
+        };
         let ours_mode = self.station_info.mode.as_str();
-        if band.is_some()
-            && band == ours
-            && rig_agrees
-            && mode.trim().eq_ignore_ascii_case(ours_mode.trim())
-        {
+        let mode_ok = mode.trim().eq_ignore_ascii_case(ours_mode.trim());
+        let dial_ok = matches!((ours, theirs), (Some(o), Some(t)) if same_dial(o, t));
+        if dial_ok && rig_agrees && mode_ok {
             return None;
         }
-        let rig_note = match rig {
-            Some(r) if !rig_agrees => format!(" (rig reads {r})"),
-            _ => String::new(),
+        let band_of = |hz: Option<u64>| hz.and_then(pancetta_core::Band::from_frequency);
+        let named_bands_differ = matches!(
+            (band_of(theirs), band_of(ours)),
+            (Some(a), Some(b)) if a != b
+        );
+        let by_band = !rig_agrees || named_bands_differ;
+        let label = |hz: Option<u64>| match (hz, band_of(hz)) {
+            (Some(_), Some(band)) if by_band => band.to_string(),
+            (Some(hz), _) => dial_label(hz),
+            (None, _) => "an unknown dial".to_string(),
         };
-        let name = |b: Option<pancetta_core::Band>| {
-            b.map_or_else(|| "an unknown band".to_string(), |b| b.to_string())
+        let (ours_label, rig_note) = if rig_agrees {
+            (label(ours), String::new())
+        } else {
+            (label(target), format!(" (rig reads {})", label(readback)))
         };
         Some(format!(
-            "Can't work {callsign}. WSJT-X heard it on {} {mode}. Pancetta is on {} \
+            "Can't work {callsign}. WSJT-X heard it on {} {mode}. Pancetta is on {ours_label} \
              {ours_mode}{rig_note}.",
-            name(band),
-            name(ours),
+            label(theirs),
         ))
     }
 
@@ -5075,11 +5179,11 @@ impl App {
     /// on pancetta-qso and pancetta-core; the old private copy is gone).
     pub fn is_caller_busy(&self, callsign: &str) -> bool {
         const BUSY_WINDOW_SECS: i64 = 90;
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let our = self.station_info.call_sign.to_uppercase();
         let target = callsign.to_uppercase();
         self.decoded_messages.iter().any(|m| {
-            if now.signed_duration_since(m.timestamp).num_seconds() > BUSY_WINDOW_SECS {
+            if now.duration_since(m.timestamp).as_secs() > BUSY_WINDOW_SECS {
                 return false;
             }
             third_party_exchange_participants(&m.message, &our).contains(&target)
@@ -5275,7 +5379,7 @@ impl App {
             .unwrap_or(NOT_ENUMERATED);
         let selected_ptt_idx = rig_ptt_methods()
             .iter()
-            .position(|m| format!("{:?}", m) == format!("{:?}", current_ptt_method))
+            .position(|m| *m == current_ptt_method)
             .unwrap_or(NOT_ENUMERATED);
 
         self.rig_selection.available_ports = available_ports;
@@ -5380,7 +5484,7 @@ impl App {
                     frequency: spot.frequency_hz as f64 / 1_000_000.0,
                     band: pancetta_core::Band::from_frequency(spot.frequency_hz),
                     mode: spot.mode.clone(),
-                    last_seen: chrono::Utc::now(),
+                    last_seen: UtcTimestamp::now(),
                     snr: spot.best_snr.unwrap_or(0),
                     distance: None,
                     bearing: None,
@@ -5391,7 +5495,8 @@ impl App {
                     // TUI's cqdx network feed) has no access to the
                     // coordinator's CachedStationLookup that the local
                     // per-band QSO-DB cross-reference needs. Network spots
-                    // rely on cqdx's own `needed`/`atno` flags instead.
+                    // retain cqdx's own `needed`/`atno` flags. The frame
+                    // refresh can select a local display verdict.
                     band_needed: false,
                     priority_score: 0,
                     local_rank: None,
@@ -5438,7 +5543,7 @@ impl App {
             // current with the network's last-heard timestamp so an actively
             // spotted station does not age off the list while it's still being
             // reported. Take the max so a fresh local decode is never aged back.
-            if let Some(net_dt) = chrono::DateTime::from_timestamp(spot.last_seen, 0) {
+            if let Some(net_dt) = UtcTimestamp::from_parts(spot.last_seen, 0) {
                 if net_dt > entry.last_seen {
                     entry.last_seen = net_dt;
                 }
@@ -5447,7 +5552,7 @@ impl App {
             // Replace this source's score using the latest spot signal.
             // Local band/worked history remains available when previously decoded.
             // The display chooses the higher of the two latest source scores.
-            entry.network_rank = Some(entry.score_network_spot(Utc::now()));
+            entry.network_rank = Some(entry.score_network_spot(UtcTimestamp::now()));
             entry.refresh_priority_score();
         }
 
@@ -5514,8 +5619,8 @@ impl App {
         const SPECTRAL_RANGE_HZ: (f64, f64) = (0.0, 3000.0);
 
         let tx_parity: Option<SlotParity> = self.resolve_tx_parity();
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(60);
+        let now = UtcTimestamp::now();
+        let cutoff = now - SignedDuration::from_secs(60);
 
         let latest_row: Option<&Vec<f32>> = self.waterfall_data.last();
 
@@ -5944,28 +6049,28 @@ mod tests {
     async fn tx_meter_reading_is_live_for_two_seconds() {
         use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
         let mut app = App::new(Config::default(), None).await.unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         assert_eq!(app.tx_meter_live_at(now), None);
         let reading = TxMeterReading {
             forward_power: Some(ForwardPower::Watts(48.0)),
             alc: Some(0.12),
         };
         app.update_tx_meter(reading);
-        assert_eq!(app.tx_meter_live_at(Utc::now()), Some(reading));
+        assert_eq!(app.tx_meter_live_at(UtcTimestamp::now()), Some(reading));
         let at = app.tx_meter_at.unwrap();
         assert_eq!(
-            app.tx_meter_live_at(at + chrono::Duration::seconds(TX_METER_LIVE_SECS)),
+            app.tx_meter_live_at(at + SignedDuration::from_secs(TX_METER_LIVE_SECS)),
             Some(reading)
         );
         assert_eq!(
-            app.tx_meter_live_at(at + chrono::Duration::milliseconds(2_001)),
+            app.tx_meter_live_at(at + SignedDuration::from_millis(2_001)),
             None
         );
-        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(3));
-        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        app.tx_meter_at = Some(UtcTimestamp::now() - SignedDuration::from_secs(3));
+        assert_eq!(app.tx_meter_live_at(UtcTimestamp::now()), None);
         // A reading stamped after `now` (clock stepped back) is not live.
         assert_eq!(
-            app.tx_meter_live_at(at - chrono::Duration::seconds(3600)),
+            app.tx_meter_live_at(at - SignedDuration::from_secs(3600)),
             None
         );
     }
@@ -5982,8 +6087,8 @@ mod tests {
                 alc: Some(0.2),
             });
         }
-        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(10));
-        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        app.tx_meter_at = Some(UtcTimestamp::now() - SignedDuration::from_secs(10));
+        assert_eq!(app.tx_meter_live_at(UtcTimestamp::now()), None);
         let unacked: Vec<_> = app.alerts.iter().filter(|a| !a.acknowledged).collect();
         assert_eq!(unacked.len(), 1);
         assert_eq!(unacked[0].text, text);
@@ -6064,8 +6169,8 @@ mod tests {
             reporter_count: 1,
             best_snr: Some(-7),
             confidence: 0.9,
-            first_seen: Utc::now().timestamp(),
-            last_seen: Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "Japan".into(),
@@ -6139,7 +6244,8 @@ mod tests {
             "under 5 reporters earns no bonus"
         );
         let lines =
-            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, Utc::now()).lines;
+            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, UtcTimestamp::now())
+                .lines;
         assert!(
             lines.contains(&network_reports_row("3, best -12 dB")),
             "{lines:#?}"
@@ -6161,7 +6267,8 @@ mod tests {
         );
         assert_eq!(app.dx_stations["JA1ABC"].priority_score, rank.score);
         let lines =
-            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, Utc::now()).lines;
+            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, UtcTimestamp::now())
+                .lines;
         assert!(
             lines.contains(&network_reports_row("6, best -10 dB")),
             "{lines:#?}"
@@ -6197,7 +6304,7 @@ mod tests {
         let mut app = fixture_app().await;
         let mut spot = reason_spot("JA1ABC", false);
         let fresh = merged_network_rank(&mut app, &spot).score;
-        spot.last_seen = Utc::now().timestamp() - 600;
+        spot.last_seen = UtcTimestamp::now().as_second() - 600;
         let rank = merged_network_rank(&mut app, &spot);
         let factors = rank.factors.unwrap();
         assert!(factors.terms.freshness < 1.0, "{}", factors.terms.freshness);
@@ -6209,7 +6316,7 @@ mod tests {
         assert!(rank.score < fresh, "{} >= {fresh}", rank.score);
         let row = &app.dx_stations["JA1ABC"];
         assert_eq!(row.priority_score, rank.score);
-        let lines = crate::dx_reason::detail_for(row, None, Utc::now()).lines;
+        let lines = crate::dx_reason::detail_for(row, None, UtcTimestamp::now()).lines;
         let used = format!("× {:.2} freshness", factors.terms.freshness);
         assert!(lines.iter().any(|l| l.contains(&used)), "{lines:#?}");
         assert!(
@@ -6234,14 +6341,14 @@ mod tests {
         row.reporter_count = None;
         row.best_snr_network = None;
         row.last_seen_network = None;
-        row.network_rank = Some(row.score_network_spot(Utc::now()));
+        row.network_rank = Some(row.score_network_spot(UtcTimestamp::now()));
         row.refresh_priority_score();
         let factors = row.network_rank.unwrap().factors.unwrap();
         assert_eq!(factors.network_reports, None);
         assert_eq!(factors.network_age_secs, None);
         assert_eq!(factors.terms.freshness, 1.0);
         assert_eq!(factors.terms.network_bonus, 0.0);
-        let lines = crate::dx_reason::detail_for(row, None, Utc::now()).lines;
+        let lines = crate::dx_reason::detail_for(row, None, UtcTimestamp::now()).lines;
         assert!(lines.contains(&network_reports_row("none")), "{lines:#?}");
         assert!(
             lines.iter().any(|l| l.contains("× 1.00 freshness")),
@@ -6249,7 +6356,7 @@ mod tests {
         );
 
         row.reporter_count = Some(3);
-        let factors = row.score_network_spot(Utc::now()).factors.unwrap();
+        let factors = row.score_network_spot(UtcTimestamp::now()).factors.unwrap();
         assert_eq!(
             factors.network_reports, None,
             "a count without an SNR is no report"
@@ -6529,6 +6636,7 @@ mod tests {
         let adapter = DxStationLookupAdapter {
             needed: true,
             atno: true,
+            need_source: pancetta_qso::priority::NeedSource::Cqdx,
             band_needed: false,
             worked_before: true,
             recent_failure: true,
@@ -6553,7 +6661,7 @@ mod tests {
     async fn calculate_dx_priority_fallback_uses_tiered_scorer_when_no_precomputed_score() {
         let app = App::new(Config::default(), None).await.unwrap();
         let message = DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".to_string(),
             snr: -10,
@@ -6708,7 +6816,7 @@ mod tests {
 
     pub(super) fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".to_string(),
             snr,
@@ -6832,7 +6940,7 @@ mod tests {
 
         let mut app = fixture_app().await;
         let provider = CountingNeed::default();
-        let old = Utc::now() - chrono::Duration::seconds(App::DX_HUNTER_STALE_SECS + 5);
+        let old = UtcTimestamp::now() - SignedDuration::from_secs(App::DX_HUNTER_STALE_SECS + 5);
         for i in 0..1000 {
             let call = format!("W{i}OLD");
             let mut row = dx_fixture(&call, 50, 10, 14.074, false);
@@ -6853,7 +6961,7 @@ mod tests {
         // An expired row loses its derived status; a newly heard row gains it.
         provider.0.lock().unwrap().clear();
         app.dx_stations.get_mut("W5ABC").unwrap().last_seen = old;
-        app.dx_stations.get_mut("W0OLD").unwrap().last_seen = Utc::now();
+        app.dx_stations.get_mut("W0OLD").unwrap().last_seen = UtcTimestamp::now();
         app.refresh_dx_need(Some(&provider));
         assert_eq!(*provider.0.lock().unwrap(), vec!["W0OLD"]);
         assert!(app.dx_need_for("W5ABC").is_none());
@@ -7064,8 +7172,8 @@ mod tests {
             reporter_count: 2,
             best_snr: Some(-10),
             confidence: 0.9,
-            first_seen: Utc::now().timestamp(),
-            last_seen: Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "United States".into(),
@@ -7112,14 +7220,14 @@ mod tests {
     #[tokio::test]
     async fn pan319_cleanup_boundary_and_selection() {
         let mut app = fixture_app().await;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for (call, age) in [
-            ("W5ABC", chrono::Duration::hours(24)),
+            ("W5ABC", SignedDuration::from_hours(24)),
             (
                 "W6ABC",
-                chrono::Duration::hours(24) - chrono::Duration::nanoseconds(1),
+                SignedDuration::from_hours(24) - SignedDuration::from_nanos(1),
             ),
-            ("W7ABC", chrono::Duration::zero()),
+            ("W7ABC", SignedDuration::ZERO),
         ] {
             app.add_decoded_message(fixture_view(call, -10))
                 .await
@@ -7141,9 +7249,9 @@ mod tests {
     async fn pan319_cleanup_preserves_band_activity_call_target() {
         let mut app = fixture_app().await;
         app.active_panel = ActivePanel::BandActivity;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut expired = fixture_view_directed("K1OLD", -10);
-        expired.timestamp = now - chrono::Duration::hours(25);
+        expired.timestamp = now - SignedDuration::from_hours(25);
         app.add_decoded_message(expired).await.unwrap();
         app.add_decoded_message(fixture_view("K2AAA", -8))
             .await
@@ -7166,12 +7274,12 @@ mod tests {
         // When the selected call also expires, adopt the surviving row.
         app.band_activity_scroll = 1;
         app.pin_band_activity_selection();
-        app.decoded_messages.front_mut().unwrap().timestamp = now - chrono::Duration::hours(25);
+        app.decoded_messages.front_mut().unwrap().timestamp = now - SignedDuration::from_hours(25);
         app.cleanup_old_data_at(now);
         assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
         assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
 
-        app.cleanup_old_data_at(now + chrono::Duration::hours(25));
+        app.cleanup_old_data_at(now + SignedDuration::from_hours(25));
         assert_eq!(app.band_activity_scroll, 0);
         assert!(app.band_activity_pinned_call.is_none());
         assert!(app.get_selected_station().is_none());
@@ -7633,13 +7741,13 @@ mod tests {
         ActiveQsoBanner {
             their_callsign: call.into(),
             state: state.into(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1234.0,
             tx_parity,
             last_tx_text: Some(format!("{} K5ARH EM10", call)),
-            last_tx_at: Some(chrono::Utc::now()),
+            last_tx_at: Some(UtcTimestamp::now()),
             last_rx_text: Some(format!("K5ARH {} -12", call)),
-            last_rx_at: Some(chrono::Utc::now()),
+            last_rx_at: Some(UtcTimestamp::now()),
             snr_rx: Some(-12),
             report_sent: Some(-8),
             report_received: Some(-15),
@@ -7768,7 +7876,7 @@ mod tests {
 
     fn fixture_diag_event(text: &str) -> DiagnosticEventRecord {
         DiagnosticEventRecord {
-            ts: Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: text.to_string(),
@@ -7784,7 +7892,7 @@ mod tests {
             outcome: QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
-            ts: Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["QSO with X logged".to_string()],
         }
     }
@@ -7802,7 +7910,7 @@ mod tests {
         app.push_recent_qso_outcome(a);
         app.push_recent_qso_outcome(b);
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let accepted = crate::upload_status::QsoUploadStatus {
             uuid: "u-a".into(),
             callsign: "K1ABC".into(),
@@ -7879,7 +7987,7 @@ mod tests {
     #[tokio::test]
     async fn pan344_upload_history_bounds() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for i in 0..120 {
             let s = crate::upload_status::QsoUploadStatus {
                 uuid: format!("u-{i}"),
@@ -8056,7 +8164,7 @@ mod tests {
         let mut banner = fixture_banner("JA1ABC", "→ called", None);
         banner.call_count = 4;
         banner.max_calls = 10;
-        let deadline = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let deadline = UtcTimestamp::now() + SignedDuration::from_mins(5);
         banner.watchdog_deadline = Some(deadline);
         app.apply_active_qsos(vec![banner], Vec::new());
         let q = &app.qso_statuses[0];
@@ -8175,21 +8283,22 @@ mod tests {
 
     #[tokio::test]
     async fn find_clear_offset_avoids_busy_parity() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
 
         let mut app = App::new(Config::default(), None).await.unwrap();
         // Set TX parity so the finder knows what to avoid.
         app.config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
 
         // Saturate the band 1400-1600 Hz with Even-parity decodes (busy for us).
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for f in (1400..1600).step_by(50) {
             app.decoded_messages.push_back(fixture_view_at(
                 "AB1CD",
                 f as f32,
                 SlotParity::Even,
-                now - Duration::seconds(5),
+                now - SignedDuration::from_secs(5),
             ));
         }
 
@@ -8217,20 +8326,21 @@ mod tests {
 
     #[tokio::test]
     async fn find_clear_offset_best_effort_when_band_saturated() {
-        use chrono::{Duration, Utc};
+        use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
 
         let mut app = App::new(Config::default(), None).await.unwrap();
         app.config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
 
         // Decode every 25 Hz across the whole 200-2800 range in our parity.
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for f in (200..=2800).step_by(25) {
             app.decoded_messages.push_back(fixture_view_at(
                 "ZZZZZ",
                 f as f32,
                 SlotParity::Even,
-                now - Duration::seconds(5),
+                now - SignedDuration::from_secs(5),
             ));
         }
 
@@ -8275,7 +8385,7 @@ mod tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: Utc::now(),
+            received_at: UtcTimestamp::now(),
         });
 
         let (pick, is_clear) = app
@@ -8316,7 +8426,7 @@ mod tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: Utc::now(),
+            received_at: UtcTimestamp::now(),
         });
 
         let (pick, is_clear) = app
@@ -8340,12 +8450,12 @@ mod tests {
 
     #[tokio::test]
     async fn band_activity_jump_and_page_navigation() {
-        use chrono::Utc;
         use pancetta_core::slot::SlotParity;
+        use pancetta_core::time::UtcTimestamp;
 
         let mut app = App::new(Config::default(), None).await.unwrap();
         app.active_panel = ActivePanel::BandActivity;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for i in 0..50 {
             app.decoded_messages.push_back(fixture_view_at(
                 "Z",
@@ -8384,7 +8494,7 @@ mod tests {
         call: &str,
         delta_freq: f32,
         parity: pancetta_core::slot::SlotParity,
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp: UtcTimestamp,
     ) -> DecodedMessageView {
         let mut v = fixture_view(call, -10);
         v.delta_freq = delta_freq;
@@ -8660,7 +8770,7 @@ mod tests {
             best_snr: Some(-10),
             confidence: 1.0,
             first_seen: 0,
-            last_seen: chrono::Utc::now().timestamp(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "United States".to_string(),
@@ -8703,8 +8813,8 @@ mod tests {
             reporter_count: 3,
             best_snr: Some(-10),
             confidence: 0.9,
-            first_seen: chrono::Utc::now().timestamp(),
-            last_seen: chrono::Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "Japan".to_string(),
@@ -8767,8 +8877,8 @@ mod tests {
             reporter_count: 3,
             best_snr: Some(-10),
             confidence: 0.9,
-            first_seen: chrono::Utc::now().timestamp(),
-            last_seen: chrono::Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "Japan".to_string(),
@@ -8801,7 +8911,7 @@ mod tests {
                 frequency: 14.074,
                 band: None,
                 mode: "FT8".to_string(),
-                last_seen: chrono::Utc::now(),
+                last_seen: UtcTimestamp::now(),
                 snr: -10,
                 distance: None,
                 bearing: None,
@@ -8911,7 +9021,7 @@ mod tests {
         app.update_signal_strength(0);
         assert_eq!(app.s_meter_display().as_deref(), Some("S9"));
         // Backdate the reading past the staleness window.
-        app.signal_strength_at = Some(Utc::now() - chrono::Duration::seconds(11));
+        app.signal_strength_at = Some(UtcTimestamp::now() - SignedDuration::from_secs(11));
         assert_eq!(app.s_meter_display(), None, "stale reading must hide");
     }
 
@@ -8932,7 +9042,7 @@ mod tests {
             "Rust's {{:+}} formats zero with an explicit sign"
         );
         // Backdate the reading past the shared staleness window.
-        app.signal_strength_at = Some(Utc::now() - chrono::Duration::seconds(11));
+        app.signal_strength_at = Some(UtcTimestamp::now() - SignedDuration::from_secs(11));
         assert_eq!(
             app.signal_strength_status_bar(),
             "S:---",
@@ -8969,7 +9079,7 @@ mod tests {
             frequency: freq,
             band: None,
             mode: "FT8".to_string(),
-            last_seen: Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr,
             distance: None,
             bearing: None,
@@ -9089,7 +9199,8 @@ mod tests {
         app.dx_stations
             .insert("FRESH".into(), dx_fixture("FRESH", 50, 10, 14.074, false));
         let mut stale = dx_fixture("STALE", 999, 30, 14.074, false);
-        stale.last_seen = Utc::now() - chrono::Duration::seconds(App::DX_HUNTER_STALE_SECS + 5);
+        stale.last_seen =
+            UtcTimestamp::now() - SignedDuration::from_secs(App::DX_HUNTER_STALE_SECS + 5);
         app.dx_stations.insert("STALE".into(), stale);
 
         let shown: Vec<&str> = app
@@ -9415,8 +9526,8 @@ mod tests {
             reporter_count: 1,
             best_snr: Some(-7),
             confidence: 0.9,
-            first_seen: Utc::now().timestamp(),
-            last_seen: Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "New Zealand".into(),
@@ -9913,7 +10024,7 @@ mod tests {
                 model: "FTdx10".to_string(),
                 port: String::new(),
                 baud_rate: 9600,
-                // Not one of the 4 choices `rig_ptt_methods()` offers.
+                // Not one of the choices `rig_ptt_methods()` offers.
                 ptt_method: pancetta_config::rig::PttMethod::Parallel,
             }],
             ..Default::default()
@@ -9929,6 +10040,63 @@ mod tests {
             matches!(state.selected_ptt(), pancetta_config::rig::PttMethod::Cat),
             "a rejected load must leave the PTT field untouched"
         );
+    }
+
+    /// PAN-357 (AC11): the picker offers only the PTT methods that have a
+    /// keying path, in the order Up/Down cycles them, with these labels.
+    #[test]
+    fn rig_ptt_methods_are_the_implemented_methods() {
+        use pancetta_config::rig::PttMethod;
+        let methods = rig_ptt_methods();
+        assert_eq!(
+            methods,
+            [PttMethod::None, PttMethod::Cat, PttMethod::SerialRts]
+        );
+        let labels: Vec<&str> = methods.iter().map(crate::presentation::ptt_label).collect();
+        assert_eq!(labels, ["none", "CAT", "serial RTS"]);
+    }
+
+    /// PAN-357: `serial` and `vox` left the picker's choices, so a
+    /// bookmark that stores either is refused whole, like any other
+    /// unsupported PTT method; one that stores `serial_rts` loads.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_serial_or_vox_is_rejected() {
+        use pancetta_config::rig::PttMethod;
+        for method in [PttMethod::Serial, PttMethod::Vox] {
+            let mut state = RigSelectionState {
+                model: "Unchanged".to_string(),
+                selected_ptt_idx: 1, // Cat
+                bookmarks: vec![pancetta_config::rig::RigBookmark {
+                    name: "OldPtt".to_string(),
+                    model: "FTdx10".to_string(),
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 9600,
+                    ptt_method: method.clone(),
+                }],
+                ..Default::default()
+            };
+            let err = state.load_bookmark(0).unwrap_err();
+            assert!(
+                err.contains("PTT method the picker doesn't support"),
+                "{method:?}: {err}"
+            );
+            assert_eq!(state.model, "Unchanged");
+            assert_eq!(state.selected_ptt(), PttMethod::Cat);
+        }
+
+        let mut state = RigSelectionState {
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Rts".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 9600,
+                ptt_method: PttMethod::SerialRts,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(0), Ok(()));
+        assert_eq!(state.selected_ptt_idx, 2);
+        assert_eq!(state.selected_ptt(), PttMethod::SerialRts);
     }
 
     #[test]
@@ -9971,7 +10139,7 @@ mod tests {
             "FTdx10".to_string(),
             "/dev/ttyUSB1".to_string(),
             38400,
-            pancetta_config::rig::PttMethod::Serial,
+            pancetta_config::rig::PttMethod::SerialRts,
             vec![],
             0,
         );
@@ -9979,10 +10147,11 @@ mod tests {
         assert_eq!(app.rig_selection.selected_port_idx, 1);
         assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB1");
         assert_eq!(app.rig_selection.selected_baud(), 38400);
-        assert!(matches!(
+        assert_eq!(app.rig_selection.selected_ptt_idx, 2);
+        assert_eq!(
             app.rig_selection.selected_ptt(),
-            pancetta_config::rig::PttMethod::Serial
-        ));
+            pancetta_config::rig::PttMethod::SerialRts
+        );
     }
 
     /// I-2a fix (PAN-59 final review): when the configured port isn't
@@ -10047,7 +10216,7 @@ mod tests {
     }
 
     /// PAN-64: same bug, PTT side -- e.g. a hand-edited
-    /// `PttMethod::Parallel` (schema-valid, not one of the picker's 4
+    /// `PttMethod::Parallel` (schema-valid, not one of the picker's
     /// choices). Previously substituted with `PttMethod::None`.
     #[tokio::test]
     async fn apply_rig_config_update_preserves_unenumerated_ptt_method() {
@@ -10310,7 +10479,7 @@ mod tests {
             "IC-7300".to_string(),
             "/dev/ttyUSB0".to_string(),
             19200,
-            pancetta_config::rig::PttMethod::Serial,
+            pancetta_config::rig::PttMethod::SerialRts,
             vec![rig_bookmark("A")],
             0,
         );
@@ -10319,10 +10488,10 @@ mod tests {
         assert_eq!(rs.model, "IC-7300");
         assert_eq!(rs.selected_port(), "/dev/ttyUSB0");
         assert_eq!(rs.selected_baud(), 19200);
-        assert!(matches!(
+        assert_eq!(
             rs.selected_ptt(),
-            pancetta_config::rig::PttMethod::Serial
-        ));
+            pancetta_config::rig::PttMethod::SerialRts
+        );
         assert_eq!(rs.committed_model, "IC-7300");
         assert_eq!(rs.bookmarks.len(), 1);
     }
@@ -10416,7 +10585,7 @@ mod tests {
         let mut app = fixture_app().await;
         // Two directed-at-us decodes from K9ZZ (older then newer) + one from W1XYZ.
         let mut older = fixture_view_directed("K9ZZ", -10);
-        older.timestamp = chrono::Utc::now() - chrono::Duration::seconds(30);
+        older.timestamp = UtcTimestamp::now() - SignedDuration::from_secs(30);
         older.message = "K5ARH K9ZZ -15".to_string();
         let newer = {
             let mut v = fixture_view_directed("K9ZZ", -5);
@@ -11022,7 +11191,7 @@ mod tests {
         assert_eq!(twenty_m, "20M");
         if let Some(snap) = app.band_cache.get_mut(&twenty_m) {
             snap.captured_at =
-                Utc::now() - chrono::Duration::seconds(App::BAND_CACHE_TTL_SECS + 60);
+                UtcTimestamp::now() - SignedDuration::from_secs(App::BAND_CACHE_TTL_SECS + 60);
         } else {
             panic!("20M snapshot should have been cached");
         }
@@ -11431,7 +11600,7 @@ mod tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: Utc::now(),
+            received_at: UtcTimestamp::now(),
         });
         assert_eq!(app.placement_cursor, 0);
     }
@@ -11452,7 +11621,7 @@ mod tests {
             openness,
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: Utc::now(),
+            received_at: UtcTimestamp::now(),
         }
     }
 
@@ -11867,8 +12036,8 @@ mod tests {
     #[tokio::test]
     async fn push_qso_history_prepends_most_recent_first() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        let t1 = chrono::Utc::now();
-        let t2 = t1 + chrono::Duration::seconds(15);
+        let t1 = UtcTimestamp::now();
+        let t2 = t1 + SignedDuration::from_secs(15);
         app.push_qso_history("K5ARH".to_string(), true, t1);
         app.push_qso_history("JA1ABC".to_string(), false, t2);
         assert_eq!(app.qso_history.len(), 2);
@@ -11881,12 +12050,12 @@ mod tests {
     #[tokio::test]
     async fn push_qso_history_caps_at_ten_evicting_oldest() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        let base = chrono::Utc::now();
+        let base = UtcTimestamp::now();
         for i in 0i64..11i64 {
             app.push_qso_history(
                 format!("CALL{i}"),
                 true,
-                base + chrono::Duration::seconds(i),
+                base + SignedDuration::from_secs(i),
             );
         }
         assert_eq!(app.qso_history.len(), 10);
@@ -11921,7 +12090,7 @@ mod tests {
         config.station.call_sign = "K5ARH".to_string();
         config.station.default_frequency = 14.074;
         let mut app = App::new(config, None).await.unwrap();
-        let ts = chrono::Utc::now();
+        let ts = UtcTimestamp::now();
 
         app.add_tx_frame("K5ARH JA1ABC RR73".to_string(), 1500.0, ts);
 
@@ -11942,7 +12111,7 @@ mod tests {
             .await
             .unwrap();
         for i in 0..1005 {
-            app.add_tx_frame(format!("frame {i}"), 1500.0, chrono::Utc::now());
+            app.add_tx_frame(format!("frame {i}"), 1500.0, UtcTimestamp::now());
         }
         assert_eq!(app.decoded_messages.len(), 1000);
         // Oldest evicted first (pop_front), newest retained.
@@ -11957,3 +12126,7 @@ mod waterfall_panel_focus_tests;
 #[cfg(test)]
 #[path = "app/tests/external_decode_tests.rs"]
 mod external_decode_tests;
+
+#[cfg(test)]
+#[path = "app/tests/dial_label_tests.rs"]
+mod dial_label_tests;

@@ -40,7 +40,7 @@ fn coordinator_dir() -> PathBuf {
 /// One concise, accurate role per immediate coordinator module. Keys are
 /// names without the directory suffix. Keep in sync with the module docs.
 fn roles() -> BTreeMap<&'static str, &'static str> {
-    let entries: [(&str, &str); 51] = [
+    let entries: [(&str, &str); 52] = [
         ("adif_backup", "Changed startup ADIF snapshots and independent retention."),
         (
             "alerts",
@@ -108,6 +108,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
             "Decode-pipeline crossbeam channel wiring and startup.",
         ),
         ("psk_reporter", "PSKReporter component."),
+        (
+            "ptt_line",
+            "Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357).",
+        ),
         (
             "qrz_lookup",
             "Interactive, session-cached QRZ station lookups.",

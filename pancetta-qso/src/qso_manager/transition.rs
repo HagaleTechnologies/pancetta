@@ -309,7 +309,7 @@ impl QsoManager {
             } = &new_state
             {
                 let completed_at = self.now_utc();
-                let duration_seconds = (completed_at - *started_at).num_seconds().max(0) as u32;
+                let duration_seconds = (completed_at - *started_at).as_secs().max(0) as u32;
                 new_state = QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: *their_report,
@@ -1221,7 +1221,7 @@ impl QsoManager {
                 let our_report = signal_strength
                     .map(|snr| (snr.round() as i8).clamp(-30, 50))
                     .unwrap_or(-15);
-                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).as_secs().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: -15,
@@ -1690,7 +1690,7 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).as_secs().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: their_report.unwrap_or(-15),
@@ -1734,7 +1734,7 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).as_secs().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: *their_report,

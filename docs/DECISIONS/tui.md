@@ -744,3 +744,44 @@ SSH terminal in step with the audio worker. The Station Health TX meter shows
 that setting before any CAT power or ALC text, including when the rig has no
 meter. Text-entry dialogs keep their keys; the drive chords belong only to
 the main view, Station Health, and Diagnostics.
+
+## WSJT-X decodes are matched by dial (PAN-443, 2026-11)
+
+PAN-435 refused Space and directed replies on a WSJT-X (`EXT`) decode whose
+band or mode differed from pancetta's. That missed two cases: two dials on one
+band matched (WSJT-X on 14.090, pancetta on 14.074, so Space keyed the audio
+offset on the wrong dial), and two identical dials on a band
+`pancetta_core::Band` cannot name never matched (4m, 630m, 2200m, custom).
+`App::external_origin_refusal` now compares dials.
+
+- **Refuse, never retune.** PAN-435 Option B stays. Retuning to an arbitrary
+  WSJT-X dial would need new coordinator work under `ptt_sync_gate`, and
+  re-offsetting the call would change the offset the QSO engine tracks. Both
+  change what a key press transmits, so neither is built.
+- **Dials in whole Hz with 10 Hz slack.** `pancetta_core::types::band::same_dial`
+  is the spot-call "already there" rule. The slack absorbs readback rounding
+  and stays under the QSO engine's 15 Hz first-contact gate, so an allowed
+  call can complete. No band name is needed, which covers custom dials.
+  Adding bands to `Band::all()` was rejected: it would still miss custom
+  dials and would change the band-plan gate and ADIF band names.
+- **Pancetta's dial is the readback when known**, else the operating
+  frequency. The readback is where the rig keys. Split is not compared,
+  matching native rows.
+- **The rig-lag guard stays and sees unnamed bands.** A readback that is a
+  band change from the operating frequency
+  (`pancetta_core::types::band::is_band_change`, the coordinator's C9 rule)
+  refuses, so a band key from 4m to 20m that the rig has not yet followed
+  cannot call on the old dial.
+- **Wording.** Band names when the refusal is the lag guard or the two bands
+  are named and differ, so every PAN-435 cross-band line and key-effects
+  golden row is unchanged. Exact dials otherwise (`14.0745 MHz`), so two
+  different dials never print alike.
+- **The predicates live in `pancetta-core`.** `pancetta-tui` cannot import
+  the `pancetta` crate, so `same_dial` and `is_band_change` moved there; the
+  coordinator re-uses them, one definition each. New public items only, so
+  no `pancetta-core` version bump.
+- **Out of scope.** The operating frequency stays stale after a frequency
+  modal or front-panel QSY to another band, which already misfires at band
+  level. Follow-up ticket: "Operators should be able to answer a same-dial
+  WSJT-X decode after a manual QSY to another band, so that the frequency
+  modal does not leave Space refusing".

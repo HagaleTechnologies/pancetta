@@ -1,5 +1,6 @@
 //! Integration tests for the cqdx.io client + cache interaction.
 
+use pancetta_core::time::UtcTimestamp;
 use pancetta_cqdx::types::*;
 use pancetta_cqdx::{CqdxCache, CqdxClient};
 use wiremock::matchers::{header, method, path, query_param};
@@ -155,7 +156,7 @@ async fn test_spot_and_qso_reporting() {
         frequency: 14074000,
         mode: "FT8".to_string(),
         snr: -12,
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         reporter: "K2DEF".to_string(),
         reporter_grid: Some("FN31".to_string()),
     }];
@@ -169,8 +170,8 @@ async fn test_spot_and_qso_reporting() {
         mode: "FT8".to_string(),
         rst_sent: Some("-10".to_string()),
         rst_received: Some("-14".to_string()),
-        start_time: chrono::Utc::now(),
-        end_time: chrono::Utc::now(),
+        start_time: UtcTimestamp::now(),
+        end_time: UtcTimestamp::now(),
     };
     client.report_qso(qso).await.unwrap();
 }

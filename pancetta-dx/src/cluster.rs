@@ -4,8 +4,9 @@
 //! DX spot monitoring and posting.
 
 use crate::{Band, DxError, DxErrorInner, DxSpot, Mode, Result};
-use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+use jiff::{civil, SignedDuration};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -249,7 +250,7 @@ pub struct ClusterSpot {
     /// Spotter callsign
     pub spotter: String,
     /// Spot time
-    pub time: DateTime<Utc>,
+    pub time: UtcTimestamp,
     /// Spot comment
     pub comment: String,
     /// Raw spot line from cluster
@@ -262,9 +263,9 @@ pub enum ClusterMessage {
     /// DX spot
     Spot(ClusterSpot),
     /// Announcement
-    Announcement { text: String, time: DateTime<Utc> },
+    Announcement { text: String, time: UtcTimestamp },
     /// WWV/WCY propagation data
-    Propagation { text: String, time: DateTime<Utc> },
+    Propagation { text: String, time: UtcTimestamp },
     /// System message
     System { text: String },
     /// Login prompt/response
@@ -284,7 +285,7 @@ pub struct DxClusterClient {
     /// Spot receiver
     spot_receiver: Option<mpsc::Receiver<DxSpot>>,
     /// Recently seen spots (for duplicate filtering)
-    recent_spots: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    recent_spots: Arc<Mutex<HashMap<String, UtcTimestamp>>>,
     /// Spots dropped because the spot queue was full
     dropped_spots: Arc<AtomicU64>,
 }
@@ -834,7 +835,7 @@ impl DxClusterClient {
         if line.starts_with("To ALL de ") || line.starts_with("WWV de ") {
             return Some(ClusterMessage::Announcement {
                 text: line.to_string(),
-                time: Utc::now(),
+                time: UtcTimestamp::now(),
             });
         }
 
@@ -897,9 +898,9 @@ impl DxClusterClient {
         }
         let time = if time_str.ends_with('Z') {
             // Parse time format like 1234Z
-            Self::parse_cluster_time(time_str).unwrap_or_else(Utc::now)
+            Self::parse_cluster_time(time_str).unwrap_or_else(UtcTimestamp::now)
         } else {
-            Utc::now()
+            UtcTimestamp::now()
         };
 
         // [sec I-15] Sanitize every field sourced from the untrusted telnet line
@@ -917,7 +918,7 @@ impl DxClusterClient {
     /// Parse cluster time format (HHMMZ). Only four ASCII digits before the
     /// `Z` are accepted, checked before any slicing, so a multibyte character
     /// cannot land a slice mid-character (PAN-288).
-    fn parse_cluster_time(time_str: &str) -> Option<DateTime<Utc>> {
+    fn parse_cluster_time(time_str: &str) -> Option<UtcTimestamp> {
         let digits = time_str.strip_suffix('Z')?.as_bytes();
         if digits.len() != 4 || !digits.iter().all(u8::is_ascii_digit) {
             return None;
@@ -931,14 +932,16 @@ impl DxClusterClient {
             return None;
         }
 
-        let now = Utc::now();
-        let today = now.date_naive();
+        let now = UtcTimestamp::now();
+        let today = now.to_civil().date();
 
-        let time = today.and_hms_opt(hour, minute, 0)?.and_utc();
+        let time = UtcTimestamp::from_civil(
+            today.to_datetime(civil::Time::new(hour as i8, minute as i8, 0, 0).ok()?),
+        )?;
 
         // If the time is in the future (next hour), assume it's from yesterday
-        if time > now + chrono::Duration::hours(1) {
-            Some(time - chrono::Duration::days(1))
+        if time > now + SignedDuration::from_hours(1) {
+            Some(time - SignedDuration::from_hours(24))
         } else {
             Some(time)
         }
@@ -949,13 +952,11 @@ impl DxClusterClient {
     /// reused; keeps `recent_spots` bounded by the dedup window rather than by
     /// the (unbounded) number of distinct spots ever seen.
     fn prune_recent_spots(
-        recent: &mut HashMap<String, DateTime<Utc>>,
-        now: DateTime<Utc>,
+        recent: &mut HashMap<String, UtcTimestamp>,
+        now: UtcTimestamp,
         duplicate_timeout: u64,
     ) {
-        recent.retain(|_, &mut t| {
-            now.signed_duration_since(t).num_seconds() < duplicate_timeout as i64
-        });
+        recent.retain(|_, &mut t| now.duration_since(t).as_secs() < duplicate_timeout as i64);
     }
 
     /// Convert cluster spot to DxSpot (PAN-345).
@@ -970,7 +971,7 @@ impl DxClusterClient {
     async fn convert_cluster_spot(
         cluster_spot: ClusterSpot,
         filter: &ClusterFilter,
-        recent_spots: &Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+        recent_spots: &Arc<Mutex<HashMap<String, UtcTimestamp>>>,
     ) -> Result<DxSpot> {
         // A malformed frequency must not masquerade as valid metadata.
         if !cluster_spot.frequency_khz.is_finite() || cluster_spot.frequency_khz <= 0.0 {
@@ -999,11 +1000,11 @@ impl DxClusterClient {
                 "{}:{}",
                 cluster_spot.callsign, cluster_spot.frequency_khz as u64
             );
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let mut recent = recent_spots.lock().await;
             if let Some(last_time) = recent.get(&spot_key) {
-                let elapsed = now.signed_duration_since(*last_time);
-                if elapsed.num_seconds() < filter.duplicate_timeout as i64 {
+                let elapsed = now.duration_since(*last_time);
+                if elapsed.as_secs() < filter.duplicate_timeout as i64 {
                     return Err(DxError::from(DxErrorInner::Configuration(
                         "Duplicate spot filtered".to_string(),
                     )));
@@ -1083,18 +1084,18 @@ mod tests {
 
     #[test]
     fn test_prune_recent_spots_evicts_old_keeps_fresh() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let timeout: u64 = 300; // 5 minutes
-        let mut recent: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut recent: HashMap<String, UtcTimestamp> = HashMap::new();
         // Older than the window -> should be evicted.
         recent.insert(
             "OLD:14074".to_string(),
-            now - chrono::Duration::seconds(timeout as i64 + 1),
+            now - SignedDuration::from_secs(timeout as i64 + 1),
         );
         // Inside the window -> should be kept.
         recent.insert(
             "FRESH:14074".to_string(),
-            now - chrono::Duration::seconds(10),
+            now - SignedDuration::from_secs(10),
         );
 
         DxClusterClient::prune_recent_spots(&mut recent, now, timeout);
@@ -1160,8 +1161,8 @@ mod tests {
     #[test]
     fn test_time_parsing() {
         let time = DxClusterClient::parse_cluster_time("1234Z").unwrap();
-        assert_eq!(chrono::Timelike::hour(&time.time()), 12);
-        assert_eq!(chrono::Timelike::minute(&time.time()), 34);
+        assert_eq!(time.hour(), 12);
+        assert_eq!(time.minute(), 34);
 
         assert!(DxClusterClient::parse_cluster_time("2560Z").is_none()); // Invalid hour
         assert!(DxClusterClient::parse_cluster_time("1234").is_none()); // Missing Z
@@ -1190,7 +1191,7 @@ mod tests {
     /// A real telnet spot line timed "now", so an accepted spot's dedup key
     /// stays inside the window instead of being pruned as an old spot.
     fn pan345_line(freq_khz: &str, call: &str, comment: &str) -> String {
-        let time = Utc::now().format("%H%MZ");
+        let time = UtcTimestamp::now().strftime("%H%MZ");
         format!("DX de W1ABC:     {freq_khz}  {call}       {comment}     {time}")
     }
 
@@ -1198,13 +1199,13 @@ mod tests {
     async fn pan345_convert(
         line: &str,
         filter: &ClusterFilter,
-        recent: &Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+        recent: &Arc<Mutex<HashMap<String, UtcTimestamp>>>,
     ) -> Result<DxSpot> {
         let spot = DxClusterClient::parse_dx_spot(line).expect("a parseable spot line");
         DxClusterClient::convert_cluster_spot(spot, filter, recent).await
     }
 
-    fn pan345_recent() -> Arc<Mutex<HashMap<String, DateTime<Utc>>>> {
+    fn pan345_recent() -> Arc<Mutex<HashMap<String, UtcTimestamp>>> {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
@@ -1348,7 +1349,7 @@ mod tests {
                 callsign: "JA1XYZ".to_string(),
                 frequency_khz: freq,
                 spotter: "W1ABC".to_string(),
-                time: Utc::now(),
+                time: UtcTimestamp::now(),
                 comment: "FT8".to_string(),
                 raw_line: String::new(),
             };
@@ -1740,7 +1741,6 @@ mod tests {
 
     #[test]
     fn time_token_with_multibyte_chars_returns_none() {
-        use chrono::Timelike;
         // Each of the first three is 5 bytes ending in Z; before the fix they
         // panicked slicing mid-character.
         for token in ["€1Z", "1é1Z", "😀Z", "ééZ", "+123Z"] {
@@ -1776,9 +1776,9 @@ mod tests {
         let spot = DxClusterClient::parse_dx_spot(lenient).expect("lenient line still a spot");
         assert_eq!(spot.callsign, "K1ABC");
         assert!(
-            Utc::now()
-                .signed_duration_since(spot.time)
-                .num_seconds()
+            UtcTimestamp::now()
+                .duration_since(spot.time)
+                .as_secs()
                 .abs()
                 < 5,
             "fallback time should be now, got {}",

@@ -16,6 +16,8 @@
 
 use super::ActiveQsoFreq;
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::merge::{drop_unresolved_hash_twins, merge_ft8lib_first, MergedDecodes};
 use pancetta_ft8::window_execution::run_overlapped_passes;
 use pancetta_ft8::Ft8Decoder;
@@ -569,8 +571,8 @@ fn waterfall_from_reference_capture(
 /// never "stick" to a stale mode's period the way caching them once at
 /// thread startup did.
 fn slot_parity_for_receipt(
-    received_utc: chrono::DateTime<chrono::Utc>,
-    decode_phase: chrono::Duration,
+    received_utc: UtcTimestamp,
+    decode_phase: SignedDuration,
     slot_ns: i64,
 ) -> pancetta_core::slot::SlotParity {
     let slot_start = received_utc - decode_phase;
@@ -1008,7 +1010,7 @@ impl super::ApplicationCoordinator {
         // recover the slot start before parity-stamping. Also re-read once per
         // iteration alongside `active_slot_ns` for the same reason. mode=FT8
         // is 13e9 ns, byte-identical to the prior hardcoded
-        // `Duration::seconds(13)`.
+        // `SignedDuration::from_secs(13)`.
         let active_decode_phase_ns = self.active_decode_phase_ns.clone();
 
         // decoder-speed-overhaul Task 12: decode-budget metrics.
@@ -1108,7 +1110,7 @@ impl super::ApplicationCoordinator {
                         // slot on a loaded MiniPC could push us into slot N+1
                         // and produce the wrong parity, causing the autonomous
                         // operator to TX in the same slot as the DX.)
-                        let window_received_utc = chrono::Utc::now();
+                        let window_received_utc = UtcTimestamp::now();
                         let receipt_ptt_on = last_ptt_on_ms.load(Ordering::Acquire);
                         let receipt_ptt_off = last_ptt_off_ms.load(Ordering::Acquire);
                         let receipt_ptt_active = desense_ptt_active.load(Ordering::Acquire);
@@ -1144,7 +1146,7 @@ impl super::ApplicationCoordinator {
                         // prevent. mode=FT8 is byte-identical to before (same
                         // constant value read every iteration instead of once).
                         let slot_ns = active_slot_ns.load(Ordering::Relaxed);
-                        let decode_phase = chrono::Duration::nanoseconds(
+                        let decode_phase = SignedDuration::from_nanos(
                             active_decode_phase_ns.load(Ordering::Relaxed),
                         );
 
@@ -1332,7 +1334,7 @@ impl super::ApplicationCoordinator {
                                 // PAN-72 round-9 fix (Codex round 9, finding
                                 // 1): the secondary now carries its own
                                 // `expires_at`, re-checked HERE against
-                                // `Utc::now()` on every read -- the old code
+                                // `UtcTimestamp::now()` on every read -- the old code
                                 // trusted whatever was last written, so a
                                 // secondary whose grace had genuinely lapsed
                                 // (with no further StateChanged/
@@ -1345,7 +1347,7 @@ impl super::ApplicationCoordinator {
                                     let mut lo = center.saturating_sub(SCOPED_HALF_WIDTH);
                                     let mut hi = center.saturating_add(SCOPED_HALF_WIDTH);
                                     let live_secondary_hz =
-                                        hint.live_secondary_hz(chrono::Utc::now());
+                                        hint.live_secondary_hz(UtcTimestamp::now());
                                     if let Some(secondary_hz) = live_secondary_hz {
                                         let secondary_center =
                                             (secondary_hz / 6.25).round() as usize;
@@ -1482,7 +1484,7 @@ impl super::ApplicationCoordinator {
                         // secondary now carries its own `expires_at`
                         // alongside the frequency, so
                         // `compute_narrow_filter_bins_default_dual_with_expiry`
-                        // re-evaluates freshness against `Utc::now()` on
+                        // re-evaluates freshness against `UtcTimestamp::now()` on
                         // EVERY read (this decode loop runs every slot
                         // regardless of events) instead of trusting a value
                         // latched once at the last `StateChanged`/
@@ -1498,7 +1500,7 @@ impl super::ApplicationCoordinator {
                             super::qso_filter::compute_narrow_filter_bins_default_dual_with_expiry(
                                 partner_freq_for_main,
                                 secondary_for_main,
-                                chrono::Utc::now(),
+                                UtcTimestamp::now(),
                                 qso_filter_override_off,
                             );
                         let narrow_filter_bins = super::qso_filter::include_hound_response_region(
@@ -1774,7 +1776,7 @@ impl super::ApplicationCoordinator {
                                         let mags_db: Vec<f32> =
                                             row.iter().map(|&v| v as f32).collect();
                                         let timestamp = window_received_utc
-                                            + chrono::Duration::milliseconds(
+                                            + SignedDuration::from_millis(
                                                 (t_offset * 1000.0) as i64,
                                             );
                                         let gw_msg = ComponentMessage::new(
@@ -1930,7 +1932,7 @@ impl super::ApplicationCoordinator {
 
                         let observation = super::desense::WindowObservation {
                             slot_start_ms: (window_received_utc - decode_phase)
-                                .timestamp_millis()
+                                .as_millisecond()
                                 .max(0) as u64,
                             slot_len_ms: (slot_ns / 1_000_000).max(1) as u64,
                             decoded_count: decoded_messages.len(),
@@ -2752,8 +2754,9 @@ mod sanitize_decoded_field_tests {
 #[cfg(test)]
 mod slot_parity_for_receipt_tests {
     use super::slot_parity_for_receipt;
-    use chrono::{DateTime, Duration, Utc};
+    use jiff::SignedDuration;
     use pancetta_core::slot::SlotParity;
+    use pancetta_core::time::UtcTimestamp;
 
     /// mode=FT8 regression: feeding the historical hardcoded values (13s
     /// decode phase, 15s slot) reproduces the same parity `SlotParity::of`
@@ -2761,8 +2764,8 @@ mod slot_parity_for_receipt_tests {
     /// live-mode-switch fix must not change FT8 behavior.
     #[test]
     fn ft8_params_match_legacy_hardcoded_formula() {
-        let received: DateTime<Utc> = DateTime::from_timestamp_nanos(20_000_000_000); // t=20s
-        let ft8_decode_phase = Duration::nanoseconds(13_000_000_000); // 13s
+        let received: UtcTimestamp = UtcTimestamp::from_nanosecond_i64(20_000_000_000); // t=20s
+        let ft8_decode_phase = SignedDuration::from_nanos(13_000_000_000); // 13s
         let ft8_slot_ns = 15_000_000_000i64; // 15s
 
         let via_helper = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
@@ -2787,13 +2790,13 @@ mod slot_parity_for_receipt_tests {
     /// window would keep landing on the FT8 answer.
     #[test]
     fn same_receipt_instant_differs_by_active_mode_period() {
-        let received: DateTime<Utc> = DateTime::from_timestamp_nanos(20_000_000_000); // t=20s
+        let received: UtcTimestamp = UtcTimestamp::from_nanosecond_i64(20_000_000_000); // t=20s
 
-        let ft8_decode_phase = Duration::nanoseconds(13_000_000_000); // 13s
+        let ft8_decode_phase = SignedDuration::from_nanos(13_000_000_000); // 13s
         let ft8_slot_ns = 15_000_000_000i64; // 15s
         let ft8_parity = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
 
-        let ft4_decode_phase = Duration::nanoseconds(6_500_000_000); // 6.5s
+        let ft4_decode_phase = SignedDuration::from_nanos(6_500_000_000); // 6.5s
         let ft4_slot_ns = 7_500_000_000i64; // 7.5s
         let ft4_parity = slot_parity_for_receipt(received, ft4_decode_phase, ft4_slot_ns);
 

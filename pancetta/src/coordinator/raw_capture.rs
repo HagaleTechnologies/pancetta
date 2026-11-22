@@ -15,12 +15,13 @@
 //! count. `raw48/` has its own 2 GiB cap ([`RAW_CAPTURE_MAX_BYTES`]); reaching
 //! it stops raw capture and never deletes anything.
 
+use jiff::SignedDuration;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use tracing::{debug, info, warn};
 
 /// Subdirectory of the recording directory that holds raw captures.
@@ -55,7 +56,7 @@ pub(super) const MSG_RAW_CAPTURE_RESUMED: &str = "Raw 48 kHz capture resumed: FT
 fn enabled_message(
     dir: &Path,
     minutes: u32,
-    until: DateTime<Utc>,
+    until: UtcTimestamp,
     existing_bytes: u64,
     max_bytes: u64,
 ) -> String {
@@ -63,17 +64,17 @@ fn enabled_message(
         "Raw 48 kHz capture enabled: dir={}, length={} min (until {} UTC), existing={:.1} MB, cap={:.1} GB",
         dir.display(),
         minutes,
-        until.format("%H:%M:%S"),
+        until.strftime("%H:%M:%S"),
         existing_bytes as f64 / BYTES_PER_MB,
         max_bytes as f64 / BYTES_PER_GB,
     )
 }
 
-fn finished_message(minutes: u32, until: DateTime<Utc>) -> String {
+fn finished_message(minutes: u32, until: UtcTimestamp) -> String {
     format!(
         "Raw 48 kHz capture finished: raw_capture_minutes = {} ended at {} UTC",
         minutes,
-        until.format("%H:%M:%S"),
+        until.strftime("%H:%M:%S"),
     )
 }
 
@@ -114,11 +115,11 @@ fn paused_message(mode_label: &str) -> String {
     )
 }
 
-fn queue_full_message(slot_start: DateTime<Utc>) -> String {
+fn queue_full_message(slot_start: UtcTimestamp) -> String {
     format!(
         "Raw 48 kHz capture dropped the {} UTC slot: the writer is still busy with earlier \
          slots (slow disk?). Decoding is unaffected.",
-        slot_start.format("%H:%M:%S"),
+        slot_start.strftime("%H:%M:%S"),
     )
 }
 
@@ -204,22 +205,25 @@ impl RawCaptureDecision {
 /// or after `from` and whose boundary is before `until`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CaptureWindow {
-    pub from: DateTime<Utc>,
-    pub until: DateTime<Utc>,
+    pub from: UtcTimestamp,
+    pub until: UtcTimestamp,
 }
 
 /// The capture window, fixed by the first DSP start that ran a capture.
 /// `start` lives on `DecodePipelineHandles`, which every DSP supervisor
 /// restart reuses, so a restart neither extends nor restarts the capture.
 pub(super) fn capture_window(
-    start: &OnceLock<DateTime<Utc>>,
+    start: &OnceLock<UtcTimestamp>,
     minutes: u32,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> CaptureWindow {
     let from = *start.get_or_init(|| now);
     CaptureWindow {
         from,
-        until: from + chrono::Duration::minutes(i64::from(minutes)),
+        // Past jiff's year 9999 the window never closes.
+        until: from
+            .checked_add(SignedDuration::from_mins(i64::from(minutes)))
+            .unwrap_or(UtcTimestamp::MAX),
     }
 }
 
@@ -266,8 +270,8 @@ pub(super) fn tx_overlaps(ptt: PttSnapshot, span_start_ms: u64, span_end_ms: u64
 
 /// `raw48_<UTC date>_<UTC slot boundary>[_<band>][_tx].wav`. An unknown or
 /// out-of-band dial drops the band, as the 12 kHz files do.
-pub(super) fn raw_slot_file_name(slot_start: DateTime<Utc>, dial_hz: u64, tx: bool) -> String {
-    let mut name = format!("raw48_{}", slot_start.format("%Y%m%d_%H%M%S"));
+pub(super) fn raw_slot_file_name(slot_start: UtcTimestamp, dial_hz: u64, tx: bool) -> String {
+    let mut name = format!("raw48_{}", slot_start.strftime("%Y%m%d_%H%M%S"));
     if let Some(band) = super::dsp::band_for_freq_hz(dial_hz) {
         name.push('_');
         name.push_str(band);
@@ -286,8 +290,8 @@ pub(super) fn raw_slot_file_name(slot_start: DateTime<Utc>, dial_hz: u64, tx: bo
 /// What the DSP knows about one batch when it hands it over.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BatchContext {
-    /// `Utc::now()` when the DSP handles the batch.
-    pub end: DateTime<Utc>,
+    /// `UtcTimestamp::now()` when the DSP handles the batch.
+    pub end: UtcTimestamp,
     /// The DSP's `last_known_dial_hz` after its dial guard (0 = unknown).
     pub dial_hz: u64,
     /// The DSP's cached mode is FT8.
@@ -316,7 +320,7 @@ pub(super) enum AbandonReason {
 /// One full slot, ready to write.
 #[derive(Debug)]
 pub(super) struct CompletedSlot {
-    pub slot_start: DateTime<Utc>,
+    pub slot_start: UtcTimestamp,
     /// Interleaved, `FRAMES_PER_SLOT * channels`.
     pub samples: Vec<f32>,
     pub channels: u16,
@@ -327,7 +331,7 @@ pub(super) struct CompletedSlot {
 #[derive(Debug, Default)]
 pub(super) struct PushOutcome {
     pub completed: Vec<CompletedSlot>,
-    pub abandoned: Vec<(DateTime<Utc>, AbandonReason)>,
+    pub abandoned: Vec<(UtcTimestamp, AbandonReason)>,
 }
 
 struct SlotInProgress {
@@ -353,12 +357,12 @@ pub(super) struct RawSlotCutter {
     in_progress: Vec<SlotInProgress>,
 }
 
-fn ns(t: DateTime<Utc>) -> i64 {
-    t.timestamp_nanos_opt().unwrap_or(i64::MAX)
+fn ns(t: UtcTimestamp) -> i64 {
+    t.as_nanosecond_i64().unwrap_or(i64::MAX)
 }
 
-fn from_ns(t: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_nanos(t)
+fn from_ns(t: i64) -> UtcTimestamp {
+    UtcTimestamp::from_nanosecond_i64(t)
 }
 
 fn frames_to_ns(frames: usize) -> i64 {
@@ -389,7 +393,7 @@ impl RawSlotCutter {
     pub(super) fn abandon_all(
         &mut self,
         reason: AbandonReason,
-    ) -> Vec<(DateTime<Utc>, AbandonReason)> {
+    ) -> Vec<(UtcTimestamp, AbandonReason)> {
         self.in_progress
             .drain(..)
             .map(|s| (from_ns(s.slot_ns), reason))
@@ -498,7 +502,7 @@ impl RawSlotCutter {
 
     /// No slot is in progress and every slot the window allows has been
     /// started or skipped.
-    pub(super) fn finished(&self, now: DateTime<Utc>) -> bool {
+    pub(super) fn finished(&self, now: UtcTimestamp) -> bool {
         self.in_progress.is_empty() && ns(now) + self.lead_ns >= self.until_ns
     }
 }
@@ -738,7 +742,7 @@ pub(super) struct RawCapture {
     cutter: RawSlotCutter,
     writer: RawCaptureWriterHandle,
     minutes: u32,
-    until: DateTime<Utc>,
+    until: UtcTimestamp,
     paused: bool,
     last_queue_full_warn: Option<std::time::Instant>,
     /// Slots handed to the writer queue.
@@ -755,7 +759,7 @@ impl RawCapture {
         channels: u16,
         lead_secs: f64,
         max_bytes: u64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<Self> {
         let cutter = RawSlotCutter::new(channels, lead_secs, window);
         if cutter.finished(now) {
@@ -816,7 +820,7 @@ impl RawCapture {
         for (slot_start, reason) in out.abandoned {
             debug!(
                 "Raw 48 kHz capture abandoned the {} UTC slot: {:?}",
-                slot_start.format("%H:%M:%S"),
+                slot_start.strftime("%H:%M:%S"),
                 reason
             );
         }
@@ -863,7 +867,7 @@ impl RawCapture {
         for (slot_start, reason) in self.cutter.abandon_all(reason) {
             debug!(
                 "Raw 48 kHz capture abandoned the {} UTC slot: {:?}",
-                slot_start.format("%H:%M:%S"),
+                slot_start.strftime("%H:%M:%S"),
                 reason
             );
         }
@@ -883,14 +887,14 @@ mod test_stream {
     pub(super) const SEC: i64 = 1_000_000_000;
     pub(super) const MS: i64 = 1_000_000;
 
-    pub(super) fn t(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    pub(super) fn t(s: &str) -> UtcTimestamp {
+        str::parse::<UtcTimestamp>(s).unwrap()
     }
 
-    pub(super) fn window(from: DateTime<Utc>, minutes: i64) -> CaptureWindow {
+    pub(super) fn window(from: UtcTimestamp, minutes: i64) -> CaptureWindow {
         CaptureWindow {
             from,
-            until: from + chrono::Duration::minutes(minutes),
+            until: from + SignedDuration::from_mins(minutes),
         }
     }
 
@@ -914,7 +918,7 @@ mod test_stream {
         pub frames: usize,
         /// Frames per second of wall time the device produces.
         pub device_rate: f64,
-        pub start: DateTime<Utc>,
+        pub start: UtcTimestamp,
     }
 
     #[derive(Default)]
@@ -923,7 +927,7 @@ mod test_stream {
         /// Wall-clock error of each completed slot's first frame (stereo
         /// feeds only; the frame index is encoded in the samples).
         pub start_errors_ns: Vec<i64>,
-        pub abandoned: Vec<(DateTime<Utc>, AbandonReason)>,
+        pub abandoned: Vec<(UtcTimestamp, AbandonReason)>,
         pub max_in_progress: usize,
     }
 
@@ -1006,7 +1010,7 @@ mod test_stream {
         run
     }
 
-    pub(super) fn ctx_at(end: DateTime<Utc>) -> BatchContext {
+    pub(super) fn ctx_at(end: UtcTimestamp) -> BatchContext {
         BatchContext {
             end,
             dial_hz: 14_074_000,
@@ -1044,9 +1048,8 @@ mod test_stream {
 mod cutter_tests {
     use super::test_stream::*;
     use super::*;
-    use chrono::Timelike;
 
-    fn realtime_stereo(start: DateTime<Utc>) -> Feed {
+    fn realtime_stereo(start: UtcTimestamp) -> Feed {
         Feed {
             channels: 2,
             frames: 512,
@@ -1055,7 +1058,7 @@ mod cutter_tests {
         }
     }
 
-    fn slot_times(run: &Run) -> Vec<DateTime<Utc>> {
+    fn slot_times(run: &Run) -> Vec<UtcTimestamp> {
         run.completed.iter().map(|s| s.slot_start).collect()
     }
 
@@ -1071,7 +1074,7 @@ mod cutter_tests {
             assert_eq!(slot.samples.len(), 1_440_000);
             assert_eq!(slot.channels, 2);
             assert!([0, 15, 30, 45].contains(&slot.slot_start.second()));
-            assert_eq!(slot.slot_start.nanosecond(), 0);
+            assert_eq!(slot.slot_start.subsec_nanosecond(), 0);
         }
     }
 
@@ -1300,7 +1303,7 @@ mod cutter_tests {
             vec![(t("2026-11-10T12:00:15Z"), AbandonReason::GainChange)]
         );
         let feed = Feed {
-            start: start + chrono::Duration::milliseconds(12_000),
+            start: start + SignedDuration::from_millis(12_000),
             ..feed
         };
         let rest = run(&mut cutter, &feed, 26.0, |_| {});
@@ -1485,7 +1488,7 @@ mod tx_marker_tests {
     }
 
     fn slot_index(s: &CompletedSlot) -> i64 {
-        s.slot_start.timestamp().div_euclid(15)
+        s.slot_start.as_second().div_euclid(15)
     }
 
     #[test]
@@ -1545,10 +1548,10 @@ mod window_tests {
         let lock = OnceLock::new();
         let first = t("2026-11-10T12:00:07Z");
         let a = capture_window(&lock, 30, first);
-        let b = capture_window(&lock, 30, first + chrono::Duration::minutes(10));
+        let b = capture_window(&lock, 30, first + SignedDuration::from_mins(10));
         assert_eq!(a, b);
         assert_eq!(a.from, first);
-        assert_eq!(a.until, first + chrono::Duration::minutes(30));
+        assert_eq!(a.until, first + SignedDuration::from_mins(30));
     }
 }
 
@@ -1916,9 +1919,9 @@ mod raw_capture_glue_tests {
     fn feed_capture(
         cap: &mut RawCapture,
         dir: &Path,
-        start: DateTime<Utc>,
+        start: UtcTimestamp,
         duration_s: f64,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<UtcTimestamp> {
         let frames = 512usize;
         let batch_ns = frames as f64 / 48_000.0 * 1e9;
         let total = (duration_s * 1e9 / batch_ns).ceil() as u64;
@@ -2004,7 +2007,7 @@ mod raw_capture_glue_tests {
         let dir = tmp.path().join("raw48");
         let start = t("2026-11-10T12:00:07.123Z");
         let w = window(start, 1);
-        let later = start + chrono::Duration::minutes(5);
+        let later = start + SignedDuration::from_mins(5);
         assert!(
             RawCapture::open(dir.clone(), 1, w, 1, 0.5, RAW_CAPTURE_MAX_BYTES, later).is_none()
         );
@@ -2026,13 +2029,13 @@ mod raw_capture_glue_tests {
             start,
         )
         .unwrap();
-        let mut ctx = ctx_at(start + chrono::Duration::seconds(1));
+        let mut ctx = ctx_at(start + SignedDuration::from_secs(1));
         ctx.ft8_active = false;
         ctx.mode_label = "FT4";
         cap.on_batch(&samples_for(1, 0, 512), &ctx);
         assert!(cap.paused);
         ctx.ft8_active = true;
-        ctx.end += chrono::Duration::milliseconds(11);
+        ctx.end += SignedDuration::from_millis(11);
         cap.on_batch(&samples_for(1, 512, 512), &ctx);
         assert!(!cap.paused);
     }

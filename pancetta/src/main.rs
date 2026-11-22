@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use pancetta_config::Config;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::logbook_lock::{LogbookGuard, LogbookLock};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -305,7 +306,7 @@ struct ExportArgs {
 
     /// Only QSOs on or after this UTC date (QSO_DATE)
     #[arg(long, value_name = "YYYY-MM-DD", value_parser = parse_export_date)]
-    since: Option<chrono::NaiveDate>,
+    since: Option<jiff::civil::Date>,
 
     /// Only QSOs on this band, e.g. 20m (BAND, else the band FREQ falls in)
     #[arg(long, value_parser = parse_export_band)]
@@ -320,9 +321,9 @@ struct ExportArgs {
     callsign: Option<String>,
 }
 
-fn parse_export_date(value: &str) -> std::result::Result<chrono::NaiveDate, String> {
-    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|e| e.to_string())?;
-    if date.format("%Y-%m-%d").to_string() != value {
+fn parse_export_date(value: &str) -> std::result::Result<jiff::civil::Date, String> {
+    let date = jiff::civil::Date::strptime("%Y-%m-%d", value).map_err(|e| e.to_string())?;
+    if date.strftime("%Y-%m-%d").to_string() != value {
         return Err("use YYYY-MM-DD".into());
     }
     Ok(date)
@@ -1460,7 +1461,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         version: RECEIPT_VERSION,
         logbook: adif.clone(),
         import_file: std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()),
-        imported_at: chrono::Utc::now(),
+        imported_at: UtcTimestamp::now(),
         contacts: plan.to_add.len(),
         backup,
         offset: block.offset,
@@ -1604,7 +1605,7 @@ fn write_import_receipt(
 ) -> Result<PathBuf> {
     use std::io::Write;
     std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    let stem = format!("import-{}", receipt.imported_at.format("%Y%m%d-%H%M%S"));
+    let stem = format!("import-{}", receipt.imported_at.strftime("%Y%m%d-%H%M%S"));
     let json = receipt.to_json();
     for n in 1..=100 {
         let path = if n == 1 {
@@ -1684,7 +1685,7 @@ fn rewrite_import_receipt(
 /// Why `pancetta import --undo` left the logbook alone (PAN-214).
 enum UndoRefusal<'a> {
     /// The receipt is marked undone, at this time.
-    AlreadyUndone(chrono::DateTime<chrono::Utc>),
+    AlreadyUndone(UtcTimestamp),
     /// The receipt names `receipt`, not this Pancetta's logbook `logbook`.
     OtherLogbook {
         receipt: &'a Path,
@@ -1701,7 +1702,7 @@ impl std::fmt::Display for UndoRefusal<'_> {
             UndoRefusal::AlreadyUndone(at) => write!(
                 f,
                 "This import was already undone at {}; your logbook was not changed.",
-                at.format("%Y-%m-%d %H:%M UTC")
+                at.strftime("%Y-%m-%d %H:%M UTC")
             ),
             UndoRefusal::OtherLogbook { receipt, logbook } => write!(
                 f,
@@ -1816,7 +1817,7 @@ async fn undo_import_command(receipt_path: PathBuf) -> Result<()> {
         .parse_bytes(&current[at + len..])
         .records
         .len();
-    receipt.undone_at = Some(chrono::Utc::now());
+    receipt.undone_at = Some(UtcTimestamp::now());
     let marked = rewrite_import_receipt(&receipt_path, &receipt);
     print!("{}", format_undo_report(&receipt, &adif, &bak, kept));
     if let Err(e) = marked {
@@ -1847,7 +1848,7 @@ fn format_undo_report(
                 "{} ({}, added {})",
                 receipt.import_file.display(),
                 count_of(receipt.contacts, "contact", "contacts"),
-                receipt.imported_at.format("%Y-%m-%d %H:%M UTC")
+                receipt.imported_at.strftime("%Y-%m-%d %H:%M UTC")
             )
         )
     );
@@ -2430,13 +2431,8 @@ fn format_load_report(
             "No config file found. Searched these directories (lowest to highest \
              precedence) for pancetta.toml, config.toml, pancetta.json, config.json:"
         );
-        let cwd = std::env::current_dir().ok();
         for dir in &report.searched {
-            if cwd.as_deref() == Some(dir.as_path()) {
-                let _ = writeln!(out, "  {}   (current directory)", dir.display());
-            } else {
-                let _ = writeln!(out, "  {}", dir.display());
-            }
+            let _ = writeln!(out, "  {}", dir.display());
         }
         let _ = writeln!(
             out,
@@ -2792,11 +2788,11 @@ fn run_first_time_setup(
     );
     if new_config.rig.interface.enabled {
         println!(
-            "Rig:     {} on {} @ {} (PTT: {:?})",
+            "Rig:     {} on {} @ {} (PTT: {})",
             new_config.rig.model,
             new_config.rig.interface.port,
             new_config.rig.interface.baud_rate,
-            new_config.rig.ptt.method
+            wizard_ptt_summary(&new_config.rig.ptt)
         );
         println!("         Verify the link any time with: pancetta test-rig");
     } else {
@@ -3112,29 +3108,91 @@ fn setup_rig(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// PAN-357: the PTT methods the wizard offers, each one with a keying path.
+fn wizard_ptt_methods() -> [(pancetta_config::rig::PttMethod, &'static str); 3] {
+    use pancetta_config::rig::PttMethod;
+    [
+        (
+            PttMethod::None,
+            "None (default: key through rigctld, same as CAT)",
+        ),
+        (PttMethod::Cat, "CAT (key through rigctld)"),
+        (
+            PttMethod::SerialRts,
+            "Serial RTS (the RTS line of a separate serial port keys the rig)",
+        ),
+    ]
+}
+
+/// PAN-357: `config` with the wizard's PTT method and device applied, or the
+/// validation sentence when those settings cannot key the rig.
+fn apply_wizard_ptt_choice(
+    config: &Config,
+    method: pancetta_config::rig::PttMethod,
+    device: Option<String>,
+) -> Result<Config, String> {
+    let mut candidate = config.clone();
+    candidate.rig.ptt.method = method;
+    candidate.rig.ptt.device = device;
+    match candidate.rig.ptt.refusal(&candidate.rig.interface) {
+        Some(reason) => Err(reason),
+        None => Ok(candidate),
+    }
+}
+
+/// The PTT method as the wizard summaries show it; serial RTS names its port.
+fn wizard_ptt_summary(ptt: &pancetta_config::rig::PttConfig) -> String {
+    use pancetta_config::rig::PttMethod;
+    if ptt.method == PttMethod::SerialRts {
+        let device = ptt.device.as_deref().map(str::trim).unwrap_or("");
+        let device = if device.is_empty() { "not set" } else { device };
+        format!("{:?} ({device})", ptt.method)
+    } else {
+        format!("{:?}", ptt.method)
+    }
+}
+
 fn setup_ptt(config: &mut Config) -> Result<()> {
     use pancetta_config::rig::PttMethod;
 
     println!("--- PTT Control ---");
     println!();
 
-    let methods = [
-        (PttMethod::None, "None (no PTT control)"),
-        (PttMethod::Cat, "CAT (via rig control)"),
-        (PttMethod::Serial, "Serial (RTS/DTR)"),
-        (PttMethod::Vox, "VOX (voice-operated)"),
-    ];
+    let methods = wizard_ptt_methods();
 
     for (i, (_, desc)) in methods.iter().enumerate() {
         println!("    [{}] {}", i + 1, desc);
     }
 
-    let current = format!("{:?}", config.rig.ptt.method);
+    let previous = config.rig.ptt.method.clone();
     if let Some(choice) = prompt_choice(
-        &format!("  Select PTT method [current: {}]: ", current),
+        &format!("  Select PTT method [current: {:?}]: ", previous),
         methods.len(),
     )? {
-        config.rig.ptt.method = methods[choice - 1].0.clone();
+        let method = methods[choice - 1].0.clone();
+        let mut device = config.rig.ptt.device.clone();
+        if method == PttMethod::SerialRts {
+            let current = device.as_deref().map(str::trim).unwrap_or("");
+            let current = if current.is_empty() {
+                "not set"
+            } else {
+                current
+            };
+            let input = prompt_line(&format!(
+                "  Serial PTT port, whose RTS line keys the rig [current: {current}]: "
+            ))?;
+            // An empty answer keeps the current device.
+            if !input.is_empty() {
+                device = Some(input);
+            }
+        }
+        match apply_wizard_ptt_choice(config, method, device) {
+            Ok(updated) => config.rig.ptt = updated.rig.ptt,
+            Err(reason) => {
+                println!("  {reason}");
+                println!("  PTT method left as {previous:?}.");
+            }
+        }
     }
 
     println!();
@@ -3321,7 +3379,7 @@ async fn setup_command() -> Result<()> {
             "  Rig:       {} on {} @ {}",
             config.rig.model, config.rig.interface.port, config.rig.interface.baud_rate
         );
-        println!("  PTT:       {:?}", config.rig.ptt.method);
+        println!("  PTT:       {}", wizard_ptt_summary(&config.rig.ptt));
         println!(
             "  Freq ctrl: {}",
             if config.rig.frequency.control_enabled {
@@ -3397,6 +3455,22 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     println!("Rig model:  {}", config.rig.model);
     println!("rigctld:    {address}");
     println!("PTT method: {:?}", config.rig.ptt.method);
+    // PAN-357: serial_rts keys a separate port, never `rig.interface.port`.
+    let ptt_device = config
+        .rig
+        .ptt
+        .device
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
+    if config.rig.ptt.method == PttMethod::SerialRts {
+        let shown = if ptt_device.is_empty() {
+            "not set"
+        } else {
+            ptt_device
+        };
+        println!("PTT port:   {shown}");
+    }
     let rig = RigctldClient::new(endpoint);
     print!("[1/3] Connecting to rigctld... ");
     std::io::stdout().flush()?;
@@ -3417,10 +3491,13 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     println!("OK ({frequency} Hz)");
     if args.ptt {
         anyhow::ensure!(
-            matches!(config.rig.ptt.method, PttMethod::Cat | PttMethod::Serial),
+            matches!(config.rig.ptt.method, PttMethod::Cat | PttMethod::SerialRts),
             "PTT method {:?} cannot be tested by this command",
             config.rig.ptt.method
         );
+        if let Some(reason) = config.rig.ptt.refusal(&config.rig.interface) {
+            anyhow::bail!("{reason}");
+        }
         println!("[3/3] Testing PTT...");
         std::io::stdout().flush()?;
         // Unlike the coordinator, this command has no polling cache.
@@ -3476,12 +3553,20 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
                 test_rig_pulse_result("PTT", on, off, pulse)?;
                 println!("       PTT OFF");
             }
-            PttMethod::Serial => {
-                let mut port =
-                    serialport::new(&config.rig.interface.port, config.rig.interface.baud_rate)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .open()
-                        .context("cannot open Serial PTT port")?;
+            PttMethod::SerialRts => {
+                // The refusal above rules out a blank device and the CAT
+                // port by name; also refuse a link that resolves to it.
+                anyhow::ensure!(
+                    !pancetta_lib::coordinator::resolves_to_cat_port(
+                        ptt_device,
+                        config.rig.interface.port.trim()
+                    ),
+                    "rig.ptt.device = \"{ptt_device}\" resolves to the CAT port \
+                     (rig.interface.port). rigctld owns that port; serial_rts needs a \
+                     separate PTT port."
+                );
+                // Opens with RTS low.
+                let mut port = pancetta_lib::coordinator::open_serial_rts_port(ptt_device)?;
                 test_rig_rts_pulse(
                     |on| port.write_request_to_send(on).map_err(Into::into),
                     &mut interrupted,
@@ -3497,7 +3582,7 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Gate shared by CAT and Serial; a diagnostic must never skip an unknown dial.
+/// Gate shared by CAT and serial RTS; a diagnostic must never skip an unknown dial.
 fn test_rig_admit_ptt(
     dial: u64,
     split: u64,
@@ -3568,7 +3653,7 @@ mod test_rig_tests {
     fn test_rig_unknown_and_cat_serial_admission() {
         let plan = pancetta_config::BandPlanConfig::default();
         // Both methods use this exact gate before opening/asserting PTT.
-        for _method in ["Cat", "Serial"] {
+        for _method in ["Cat", "SerialRts"] {
             assert!(test_rig_admit_ptt(0, 0, &plan).is_err());
             assert!(test_rig_admit_ptt(14_074_000, 30_000_000, &plan).is_err());
             assert_eq!(
@@ -3804,9 +3889,9 @@ mod tests {
         assert_eq!(reloaded.station.callsign, "K1ABC");
     }
 
-    /// PAN-90 review (Codex P1): the backup name is predictable, and the
-    /// search path includes the cwd, so another user of a shared directory
-    /// can plant `<config>.bak` as a symlink. The backup must never follow
+    /// PAN-90 review (Codex P1): the backup name is predictable, and a
+    /// config directory can be shared, so another user can plant
+    /// `<config>.bak` as a symlink. The backup must never follow
     /// it (writing the plaintext config into the symlink's target), and must
     /// not be readable by anyone but the owner.
     #[cfg(unix)]
@@ -4006,20 +4091,28 @@ mod tests {
 
     #[test]
     fn format_load_report_with_no_files_lists_search_dirs_and_defaults_note() {
+        // PAN-360: even a searched directory that happens to be the cwd is
+        // listed plainly; the report never tags the current directory.
+        let cwd = std::env::current_dir().expect("test process has a cwd");
         let report = pancetta_config::LoadReport {
             files: vec![],
             searched: vec![
                 PathBuf::from("/etc/pancetta"),
                 PathBuf::from("/home/op/.pancetta"),
+                cwd.clone(),
             ],
             warnings: vec![],
         };
         let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"), None);
         assert!(text.starts_with("No config file found. Searched these directories"));
         assert!(
-            text.contains("\n  /etc/pancetta\n  /home/op/.pancetta\n"),
+            text.contains(&format!(
+                "\n  /etc/pancetta\n  /home/op/.pancetta\n  {}\n",
+                cwd.display()
+            )),
             "{text}"
         );
+        assert!(!text.contains("(current directory)"), "{text}");
         assert!(
             text.contains(
                 "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create \
@@ -4429,14 +4522,11 @@ mod tests {
     /// The receipt the `undo_*` tests read back: two contacts from LoTW,
     /// imported at the time the Design for review shows.
     fn design_receipt() -> pancetta_qso::adif_import::ImportReceipt {
-        use chrono::TimeZone;
         pancetta_qso::adif_import::ImportReceipt {
             version: pancetta_qso::adif_import::RECEIPT_VERSION,
             logbook: PathBuf::from(LOGBOOK),
             import_file: PathBuf::from("/home/op/lotw.adi"),
-            imported_at: chrono::Utc
-                .with_ymd_and_hms(2026, 10, 26, 10, 15, 0)
-                .unwrap(),
+            imported_at: UtcTimestamp::from_ymd_hms(2026, 10, 26, 10, 15, 0).unwrap(),
             contacts: 2,
             backup: Some(PathBuf::from(BACKUP)),
             offset: 153,
@@ -4472,10 +4562,7 @@ mod tests {
 
     #[test]
     fn undo_errors_match_the_design() {
-        use chrono::TimeZone;
-        let undone = chrono::Utc
-            .with_ymd_and_hms(2026, 10, 26, 10, 20, 0)
-            .unwrap();
+        let undone = UtcTimestamp::from_ymd_hms(2026, 10, 26, 10, 20, 0).unwrap();
         assert_eq!(
             UndoRefusal::AlreadyUndone(undone).to_string(),
             "This import was already undone at 2026-10-26 10:20 UTC; your logbook was not changed."
@@ -4821,6 +4908,61 @@ mod wizard_validation_tests {
         let mut cfg = Config::default();
         cfg.station.power_watts = 5000;
         assert!(cfg.validate().is_err());
+    }
+
+    /// PAN-357 AC11: the wizard lists only methods that key the rig.
+    #[test]
+    fn wizard_offers_only_implemented_ptt_methods() {
+        use pancetta_config::rig::PttMethod;
+        assert_eq!(
+            wizard_ptt_methods(),
+            [
+                (
+                    PttMethod::None,
+                    "None (default: key through rigctld, same as CAT)"
+                ),
+                (PttMethod::Cat, "CAT (key through rigctld)"),
+                (
+                    PttMethod::SerialRts,
+                    "Serial RTS (the RTS line of a separate serial port keys the rig)"
+                ),
+            ]
+        );
+    }
+
+    /// PAN-357 AC11: a Serial RTS choice without a separate PTT port is not
+    /// kept; one with a separate port is.
+    #[test]
+    fn wizard_serial_rts_choice_needs_a_separate_port() {
+        use pancetta_config::rig::PttMethod;
+        let mut cfg = Config::default();
+        cfg.rig.interface.enabled = true;
+        cfg.rig.interface.port = "/dev/ttyUSB0".to_string();
+        let needs_device = "rig.ptt.method = \"serial_rts\" needs rig.ptt.device, the serial \
+                            port whose RTS line keys the rig.";
+        for device in [None, Some(String::new()), Some("   ".to_string())] {
+            assert_eq!(
+                apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, device.clone()).unwrap_err(),
+                needs_device,
+                "device {device:?}"
+            );
+        }
+        assert_eq!(
+            apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, Some("/dev/ttyUSB0".to_string()))
+                .unwrap_err(),
+            "rig.ptt.device = \"/dev/ttyUSB0\" is the CAT port (rig.interface.port). rigctld \
+             owns that port; serial_rts needs a separate PTT port."
+        );
+        let chosen =
+            apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, Some("/dev/ttyUSB1".to_string()))
+                .unwrap();
+        assert_eq!(chosen.rig.ptt.method, PttMethod::SerialRts);
+        assert_eq!(chosen.rig.ptt.device.as_deref(), Some("/dev/ttyUSB1"));
+        assert_eq!(
+            wizard_ptt_summary(&chosen.rig.ptt),
+            "SerialRts (/dev/ttyUSB1)"
+        );
+        assert_eq!(wizard_ptt_summary(&cfg.rig.ptt), "None");
     }
 }
 

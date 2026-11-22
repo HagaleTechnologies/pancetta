@@ -4,7 +4,6 @@
 // real-time updates, and efficient rendering.
 
 use anyhow::Result;
-use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::{
     event::{
@@ -13,6 +12,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
@@ -271,7 +272,7 @@ pub enum TuiMessage {
     /// `MessageType::DiagnosticEvent`. Appended to `App`'s bounded event
     /// history rather than overwriting the single status line.
     DiagnosticEvent {
-        ts: chrono::DateTime<chrono::Utc>,
+        ts: UtcTimestamp,
         target: &'static str,
         level: pancetta_core::DiagnosticLevel,
         text: String,
@@ -323,7 +324,7 @@ pub enum TuiMessage {
         band: String,
         success: bool,
         reason: Option<String>,
-        completed_at: chrono::DateTime<chrono::Utc>,
+        completed_at: UtcTimestamp,
     },
     /// Pushed once per keyed TX frame (#172) — Band Activity's own-TX
     /// history. Forwarded by the coordinator relay from the TX worker's
@@ -332,7 +333,7 @@ pub enum TuiMessage {
         text: String,
         freq_hz: f64,
         qso_id: Option<String>,
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp: UtcTimestamp,
     },
     /// Structured autonomous-operator status, forwarded by the
     /// coordinator's relay from the autonomous loop (one per 15s
@@ -1290,7 +1291,7 @@ impl TuiRunner {
                 app.parked_since = if offset_hz == 0 {
                     None
                 } else {
-                    Some(chrono::Utc::now())
+                    Some(UtcTimestamp::now())
                 };
                 app.park_coverage_last = None;
             }
@@ -1396,7 +1397,7 @@ impl TuiRunner {
                 app.push_recent_qso_outcome(outcome);
             }
             TuiMessage::QsoUploadStatuses(statuses) => {
-                app.apply_qso_upload_statuses(statuses, chrono::Utc::now());
+                app.apply_qso_upload_statuses(statuses, UtcTimestamp::now());
             }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
@@ -2603,7 +2604,7 @@ impl TuiRunner {
                         app.tx_frequency_offset = hz;
                         app.tx_offset_hold_hz = Some(hz_u64);
                         app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                        app.parked_since = Some(chrono::Utc::now());
+                        app.parked_since = Some(UtcTimestamp::now());
                         {
                             let text = if is_clear {
                                 format!("TX cursor → {:.0} Hz (clear, held)", hz)
@@ -3037,7 +3038,7 @@ impl TuiRunner {
                     );
                     app.tx_offset_hold_hz = Some(hz);
                     app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                    app.parked_since = Some(chrono::Utc::now());
+                    app.parked_since = Some(UtcTimestamp::now());
                     {
                         let text = format!("Parked at {hz} Hz ({coverage})");
                         app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
@@ -3933,7 +3934,7 @@ mod key_tests {
         assert_eq!(app.tx_meter_capability, Some(capability));
         assert_eq!(app.tx_meter, Some(reading));
         assert!(app.tx_meter_at.is_some());
-        assert_eq!(app.tx_meter_live_at(chrono::Utc::now()), Some(reading));
+        assert_eq!(app.tx_meter_live_at(UtcTimestamp::now()), Some(reading));
     }
 
     #[tokio::test]
@@ -4530,7 +4531,7 @@ mod key_tests {
                     );
                     a.set_station_state(call, "AR");
                 }
-                a.dx_stations.get_mut("W5ABC").unwrap().last_seen -= chrono::Duration::hours(25);
+                a.dx_stations.get_mut("W5ABC").unwrap().last_seen -= SignedDuration::from_hours(25);
                 a.set_station_state("W8ABC", "AR");
                 a.dx_hunter_scroll = 40;
             }
@@ -5023,7 +5024,7 @@ mod key_tests {
 
     fn pan89_decode(i: usize) -> crate::app::DecodedMessageView {
         crate::app::DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".to_string(),
             snr: -10,
@@ -5411,7 +5412,7 @@ mod key_tests {
             frequency: 14.074,
             band: None,
             mode: "FT8".to_string(),
-            last_seen: chrono::Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr: -10,
             distance: None,
             bearing: None,
@@ -5554,7 +5555,7 @@ mod key_tests {
             a.active_panel = crate::app::ActivePanel::Callers;
             a.decoded_messages
                 .push_back(crate::app::DecodedMessageView {
-                    timestamp: chrono::Utc::now(),
+                    timestamp: UtcTimestamp::now(),
                     frequency: 14_074_000.0,
                     mode: "FT8".to_string(),
                     snr: -8,
@@ -5644,7 +5645,7 @@ mod key_tests {
             a.active_panel = ActivePanel::Callers;
             a.decoded_messages
                 .push_back(crate::app::DecodedMessageView {
-                    timestamp: chrono::Utc::now(),
+                    timestamp: UtcTimestamp::now(),
                     frequency: 14_074_000.0,
                     mode: "FT8".into(),
                     snr: -7,
@@ -5726,6 +5727,7 @@ mod key_tests {
             (SoundCard, "sound card"),
             (Vox, "VOX"),
             (Network, "network"),
+            (SerialRts, "serial RTS"),
         ] {
             state.selected_ptt_idx = usize::MAX;
             state.live_ptt_method = method.clone();
@@ -6544,13 +6546,13 @@ mod key_tests {
         let banner = crate::app::ActiveQsoBanner {
             their_callsign: "JA1ABC".to_string(),
             state: "wait rpt".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1500.0,
             tx_parity: None,
             last_tx_text: Some("JA1ABC K5ARH EM10".to_string()),
-            last_tx_at: Some(chrono::Utc::now()),
+            last_tx_at: Some(UtcTimestamp::now()),
             last_rx_text: Some("K5ARH JA1ABC -12".to_string()),
-            last_rx_at: Some(chrono::Utc::now()),
+            last_rx_at: Some(UtcTimestamp::now()),
             snr_rx: Some(-12),
             report_sent: Some(-8),
             report_received: Some(-15),
@@ -6803,7 +6805,7 @@ mod key_tests {
         assert_eq!(app.read().await.session_completed, 0);
 
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
@@ -6813,7 +6815,7 @@ mod key_tests {
         .await
         .unwrap();
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "QSO with W2XYZ logged (RST -05/-10)".to_string(),
@@ -6827,7 +6829,7 @@ mod key_tests {
         // varying only `level` here, unlike the combined negative case
         // below, so a regression in the level check alone is caught.
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Warn,
             text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
@@ -6840,7 +6842,7 @@ mod key_tests {
         // count — isolates the text-prefix guard, varying only `text` from
         // the positive cases above.
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "QSO failed: timeout".to_string(),
@@ -6853,7 +6855,7 @@ mod key_tests {
         // original real-world shape (a QSO-failed event), kept alongside
         // the two isolated cases above rather than in place of them.
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Warn,
             text: "QSO failed: timeout".to_string(),
@@ -6880,7 +6882,7 @@ mod key_tests {
         assert_eq!(app.read().await.session_tx_drops, 0);
 
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Warn,
             text: "QSO failed: timeout".to_string(),
@@ -6891,7 +6893,7 @@ mod key_tests {
         .unwrap();
 
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "tx.policy",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "dropping stale TX for ended QSO: 'CQ K5ARH EM12'".to_string(),
@@ -6921,7 +6923,7 @@ mod key_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["QSO with K1ABC logged".to_string()],
         }))
         .await
@@ -6936,7 +6938,7 @@ mod key_tests {
                 outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
                 last_state: "Failed".to_string(),
                 freq_hz: 1500,
-                ts: chrono::Utc::now(),
+                ts: UtcTimestamp::now(),
                 brief_timeline: vec!["QSO failed: timeout".to_string()],
             }))
             .await
@@ -6959,7 +6961,7 @@ mod key_tests {
     async fn pan344_upload_updates_preserve_counters_and_readiness() {
         let (mut r, _cmd_rx, app) = make_runner().await;
         r.handle_message(TuiMessage::DiagnosticEvent {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
@@ -6976,7 +6978,7 @@ mod key_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["QSO with K1ABC logged".to_string()],
         }))
         .await
@@ -6984,7 +6986,7 @@ mod key_tests {
         {
             let a = app.read().await;
             assert_eq!(
-                a.active_toast_text(chrono::Utc::now()).as_deref(),
+                a.active_toast_text(UtcTimestamp::now()).as_deref(),
                 Some("K1ABC logged \u{b7} uploads queued")
             );
         }
@@ -7000,7 +7002,7 @@ mod key_tests {
         assert_eq!(
             app.read()
                 .await
-                .active_toast_text(chrono::Utc::now())
+                .active_toast_text(UtcTimestamp::now())
                 .as_deref(),
             Some("K1ABC logged \u{b7} uploads queued")
         );
@@ -7026,7 +7028,7 @@ mod key_tests {
 
         let a = app.read().await;
         assert_eq!(
-            a.active_toast_text(chrono::Utc::now()).as_deref(),
+            a.active_toast_text(UtcTimestamp::now()).as_deref(),
             Some("K1ABC uploaded"),
             "all-accepted transitions the toast in place"
         );
@@ -7051,7 +7053,7 @@ mod key_tests {
         {
             let mut a = app.write().await;
             a.decoded_messages.push_back(DecodedMessageView {
-                timestamp: chrono::Utc::now(),
+                timestamp: UtcTimestamp::now(),
                 frequency: 14.074,
                 mode: "FT8".to_string(),
                 snr: -3,
@@ -7080,7 +7082,7 @@ mod key_tests {
                     outcome: crate::app::QsoOutcome::Completed,
                     last_state: "Completed".to_string(),
                     freq_hz: 14075000,
-                    ts: chrono::Utc::now(),
+                    ts: UtcTimestamp::now(),
                     brief_timeline: vec!["Completed".to_string()],
                 });
             }
@@ -7127,7 +7129,7 @@ mod key_tests {
     #[tokio::test]
     async fn tx_offset_update_resyncs_stale_park_state_after_auto_repark() {
         let (mut r, _cmd_rx, app) = make_runner().await;
-        let stale_park_time = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let stale_park_time = UtcTimestamp::now() - SignedDuration::from_mins(10);
         {
             let mut a = app.write().await;
             a.tx_offset_hold_hz = Some(500);
@@ -7164,7 +7166,7 @@ mod key_tests {
         {
             let mut a = app.write().await;
             a.tx_offset_hold_hz = Some(500);
-            a.parked_since = Some(chrono::Utc::now());
+            a.parked_since = Some(UtcTimestamp::now());
             a.park_coverage_last = Some((500, 2));
         }
 
@@ -7250,7 +7252,7 @@ mod key_tests {
     #[tokio::test]
     async fn tx_frame_logged_appends_to_band_activity() {
         let (mut r, _cmd_rx, app) = make_runner().await;
-        let ts = chrono::Utc::now();
+        let ts = UtcTimestamp::now();
         r.handle_message(TuiMessage::TxFrameLogged {
             text: "K5ARH JA1ABC RR73".to_string(),
             freq_hz: 1500.0,
@@ -7332,7 +7334,7 @@ mod key_tests {
         crate::app::ActiveQsoBanner {
             their_callsign: call.to_string(),
             state: "wait rpt".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1500.0,
             tx_parity: None,
             last_tx_text: None,
@@ -8223,7 +8225,7 @@ mod key_tests {
     /// and grid.
     #[tokio::test]
     async fn shift_h_on_dx_hunter_emits_engage_hound() {
-        use chrono::Utc;
+        use pancetta_core::time::UtcTimestamp;
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
@@ -8238,7 +8240,7 @@ mod key_tests {
                     frequency: 14.074,
                     band: None,
                     mode: "FT8".to_string(),
-                    last_seen: Utc::now(),
+                    last_seen: UtcTimestamp::now(),
                     snr: -10,
                     distance: None,
                     bearing: None,
@@ -8587,7 +8589,7 @@ mod key_tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: chrono::Utc::now(),
+            received_at: UtcTimestamp::now(),
         }
     }
 
@@ -8768,7 +8770,7 @@ mod key_tests {
                 openness: vec![3; 96],
                 bin_hz: 25.0,
                 range: (200.0, 2600.0),
-                received_at: chrono::Utc::now(),
+                received_at: UtcTimestamp::now(),
             });
         }
         (r, cmd_rx, app)
@@ -8880,7 +8882,7 @@ mod key_tests {
     async fn mode_update_clears_live_decode_lists() {
         let (mut r, _cmd_rx, app) = make_runner().await;
         let stale = DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".to_string(),
             snr: -5,
@@ -8973,7 +8975,7 @@ mod key_tests {
     /// confirm the resulting `CallStation` targets that pinned callsign.
     #[tokio::test]
     async fn space_targets_the_dx_hunter_pinned_focus() {
-        use chrono::Utc;
+        use pancetta_core::time::UtcTimestamp;
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
@@ -8989,7 +8991,7 @@ mod key_tests {
                     frequency: 14.074,
                     band: None,
                     mode: "FT8".to_string(),
-                    last_seen: Utc::now(),
+                    last_seen: UtcTimestamp::now(),
                     snr: -10,
                     distance: None,
                     bearing: None,
@@ -9177,7 +9179,7 @@ mod key_tests {
                 vec![crate::app::ActiveQsoBanner {
                     their_callsign: "JA1ABC".to_string(),
                     state: "wait rpt".to_string(),
-                    started_at: chrono::Utc::now(),
+                    started_at: UtcTimestamp::now(),
                     frequency_hz: 1234.0,
                     tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
                     last_tx_text: None,
@@ -9241,7 +9243,7 @@ mod key_tests {
                 vec![crate::app::ActiveQsoBanner {
                     their_callsign: "G8KHF".to_string(),
                     state: "wait rpt".to_string(),
-                    started_at: chrono::Utc::now(),
+                    started_at: UtcTimestamp::now(),
                     frequency_hz: 2222.0,
                     tx_parity: None,
                     last_tx_text: None,
@@ -9274,7 +9276,7 @@ mod key_tests {
             // branch must fire (Space → our 73), never the blocked Call branch.
             a.decoded_messages
                 .push_back(crate::app::DecodedMessageView {
-                    timestamp: chrono::Utc::now(),
+                    timestamp: UtcTimestamp::now(),
                     frequency: 14_074_000.0,
                     mode: "FT8".to_string(),
                     snr: -8,
@@ -9982,7 +9984,7 @@ mod pan_59_command_tests {
             model: "IC-7300".to_string(),
             port: "/dev/ttyUSB1".to_string(),
             baud_rate: 38400,
-            ptt_method: pancetta_config::rig::PttMethod::Cat,
+            ptt_method: pancetta_config::rig::PttMethod::SerialRts,
         };
         match cmd {
             TuiCommand::SelectRig {
@@ -9994,7 +9996,7 @@ mod pan_59_command_tests {
                 assert_eq!(model, "IC-7300");
                 assert_eq!(port, "/dev/ttyUSB1");
                 assert_eq!(baud_rate, 38400);
-                assert!(matches!(ptt_method, pancetta_config::rig::PttMethod::Cat));
+                assert_eq!(ptt_method, pancetta_config::rig::PttMethod::SerialRts);
             }
             _ => panic!("expected SelectRig"),
         }
@@ -10007,7 +10009,7 @@ mod pan_59_command_tests {
             current_model: "FTdx10".to_string(),
             current_port: "/dev/ttyUSB0".to_string(),
             current_baud_rate: 38400,
-            current_ptt_method: pancetta_config::rig::PttMethod::Serial,
+            current_ptt_method: pancetta_config::rig::PttMethod::SerialRts,
             bookmarks: vec![],
             select_seq: 0,
         };
@@ -10015,10 +10017,15 @@ mod pan_59_command_tests {
             TuiMessage::RigConfigUpdate {
                 available_ports,
                 current_model,
+                current_ptt_method,
                 ..
             } => {
                 assert_eq!(available_ports.len(), 2);
                 assert_eq!(current_model, "FTdx10");
+                assert_eq!(
+                    current_ptt_method,
+                    pancetta_config::rig::PttMethod::SerialRts
+                );
             }
             _ => panic!("expected RigConfigUpdate"),
         }
@@ -10185,7 +10192,7 @@ mod decode_log_level_tests {
 
     fn decoded_view(i: usize) -> crate::app::DecodedMessageView {
         crate::app::DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".to_string(),
             snr: -10,

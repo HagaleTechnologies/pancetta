@@ -14,6 +14,7 @@
 //! Spec: `docs/superpowers/specs/2026-07-03-tui-redesign-design.md` §2.
 
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
@@ -554,7 +555,7 @@ fn render_park_line(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
         // the clause.
         let mins = app
             .parked_since
-            .map(|t| (chrono::Utc::now() - t).num_minutes().max(0))
+            .map(|t| (UtcTimestamp::now() - t).as_mins().max(0))
             .unwrap_or(0);
         let warn = if code.is_some_and(|c| c < 3) {
             "\u{26a0} "

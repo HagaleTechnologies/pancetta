@@ -21,6 +21,8 @@
 pub mod codec;
 pub(crate) mod ingest;
 
+use jiff::civil;
+use jiff::SignedDuration;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use pancetta_core::time::UtcTimestamp;
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
@@ -961,9 +963,9 @@ pub(crate) fn decode_to_msg(
 /// `QTime` wire value for a decode: milliseconds since midnight UTC of
 /// `t` (protocol notes §3 QTime / §4 Decode `Time`).
 fn time_ms_since_midnight_utc(t: SystemTime) -> u32 {
-    let datetime: DateTime<Utc> = t.into();
-    let time = datetime.time();
-    time.num_seconds_from_midnight() * 1_000 + time.nanosecond() / 1_000_000
+    let datetime = UtcTimestamp::try_from(t).expect("system time is within jiff's range");
+    (datetime.hour() * 3_600 + datetime.minute() * 60 + datetime.second()) * 1_000
+        + datetime.subsec_nanosecond() / 1_000_000
 }
 
 /// Extract the `StoredKey` for a just-built `Decode` message. `None` for
@@ -1199,24 +1201,25 @@ fn normalize_qrz(message: &str) -> String {
 /// time of day maps to the same JDN `2459153` (protocol notes §3 golden
 /// example).
 ///
-/// Implementation: `chrono::NaiveDate::num_days_from_ce()` counts days since
-/// `0001-01-01` (day 1, proleptic Gregorian) — the same epoch/convention as
+/// Implementation: whole days since the Unix epoch (floored) plus `719163`
+/// counts days since `0001-01-01` (day 1, proleptic Gregorian), the same
+/// epoch/convention as
 /// the civil "days since the epoch" ordinal used by every standard
 /// Gregorian→JDN conversion. `1721425` is the fixed JDN-vs-days-from-CE
 /// offset (equivalently: JDN of the Unix epoch `1970-01-01` is the
-/// well-known `2440588`, and `NaiveDate(1970-01-01).num_days_from_ce()` is
-/// `719163`; `2440588 - 719163 = 1721425`).
-fn unix_to_jdn(t: DateTime<Utc>) -> u64 {
+/// well-known `2440588`, and 1970-01-01 is day `719163` counted from 0001-01-01 as day 1; `2440588 - 719163 = 1721425`).
+fn unix_to_jdn(t: UtcTimestamp) -> u64 {
     const JDN_MINUS_DAYS_FROM_CE: i64 = 1_721_425;
-    (i64::from(t.date_naive().num_days_from_ce()) + JDN_MINUS_DAYS_FROM_CE) as u64
+    const DAYS_FROM_CE_AT_UNIX_EPOCH: i64 = 719_163;
+    (t.as_second().div_euclid(86_400) + DAYS_FROM_CE_AT_UNIX_EPOCH + JDN_MINUS_DAYS_FROM_CE) as u64
 }
 
 /// Map a UTC instant onto the wire `QDateTime` pair (JDN, ms-since-midnight
 /// UTC). Reuses [`unix_to_jdn`] for the date half and
-/// [`time_ms_since_midnight_utc`] (via the standard `DateTime<Utc> ->
+/// [`time_ms_since_midnight_utc`] (via the standard `UtcTimestamp ->
 /// SystemTime` conversion) for the time-of-day half, so there is exactly one
 /// implementation of each half shared with the `Decode` mapping.
-fn qdatetime_of(t: DateTime<Utc>) -> codec::QDateTimeUtc {
+fn qdatetime_of(t: UtcTimestamp) -> codec::QDateTimeUtc {
     (unix_to_jdn(t), time_ms_since_midnight_utc(t.into()))
 }
 
@@ -1867,7 +1870,6 @@ mod status_tests {
 #[cfg(test)]
 mod decode_tests {
     use super::*;
-    use chrono::TimeZone;
     use pancetta_config::OperatingMode;
     use pancetta_ft8::{DecodedMessage, Ft8Message};
 
@@ -1898,9 +1900,9 @@ mod decode_tests {
         // 2026-07-15 12:34:56.789 UTC — mid-day, non-trivial ms remainder,
         // so both the seconds and sub-second parts of `time_ms_since_
         // midnight_utc` are exercised.
-        Utc.with_ymd_and_hms(2026, 7, 15, 12, 34, 56)
+        UtcTimestamp::from_ymd_hms(2026, 7, 15, 12, 34, 56)
             .unwrap()
-            .checked_add_signed(chrono::Duration::milliseconds(789))
+            .checked_add(SignedDuration::from_millis(789))
             .unwrap()
             .into()
     }
@@ -2249,7 +2251,6 @@ mod decode_tests {
 #[cfg(test)]
 mod qso_logged_tests {
     use super::*;
-    use chrono::TimeZone;
     use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
 
     /// Fixture matching the pattern used elsewhere in the coordinator
@@ -2257,11 +2258,10 @@ mod qso_logged_tests {
     /// explicitly so new fields fail to compile here instead of silently
     /// defaulting.
     pub(super) fn metadata() -> QsoMetadata {
-        let start = Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 40).unwrap();
-        let end = Utc
-            .with_ymd_and_hms(2020, 10, 30, 12, 34, 56)
+        let start = UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 34, 40).unwrap();
+        let end = UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 34, 56)
             .unwrap()
-            .checked_add_signed(chrono::Duration::milliseconds(789))
+            .checked_add(SignedDuration::from_millis(789))
             .unwrap();
         QsoMetadata {
             qso_id: pancetta_qso::QsoId::new_v4(),
@@ -2311,16 +2311,16 @@ mod qso_logged_tests {
     #[test]
     fn unix_to_jdn_matches_the_protocol_notes_golden_date() {
         // Protocol notes §3: "Example: JDN 2459153 = 2020-10-30".
-        let d = Utc.with_ymd_and_hms(2020, 10, 30, 0, 0, 0).unwrap();
+        let d = UtcTimestamp::from_ymd_hms(2020, 10, 30, 0, 0, 0).unwrap();
         assert_eq!(unix_to_jdn(d), 2_459_153);
     }
 
     #[test]
     fn unix_to_jdn_is_stable_across_times_of_day() {
         // The JDN is a pure calendar-date value; time-of-day must not shift it.
-        let midnight = Utc.with_ymd_and_hms(2020, 10, 30, 0, 0, 0).unwrap();
-        let noon = Utc.with_ymd_and_hms(2020, 10, 30, 12, 0, 0).unwrap();
-        let just_before_midnight = Utc.with_ymd_and_hms(2020, 10, 30, 23, 59, 59).unwrap();
+        let midnight = UtcTimestamp::from_ymd_hms(2020, 10, 30, 0, 0, 0).unwrap();
+        let noon = UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 0, 0).unwrap();
+        let just_before_midnight = UtcTimestamp::from_ymd_hms(2020, 10, 30, 23, 59, 59).unwrap();
         assert_eq!(unix_to_jdn(midnight), 2_459_153);
         assert_eq!(unix_to_jdn(noon), 2_459_153);
         assert_eq!(unix_to_jdn(just_before_midnight), 2_459_153);
@@ -2329,7 +2329,7 @@ mod qso_logged_tests {
     #[test]
     fn qso_to_msgs_uses_first_answer_time() {
         let mut m = metadata();
-        m.first_answer_at = Some(m.start_time + chrono::Duration::seconds(5));
+        m.first_answer_at = Some(m.start_time + SignedDuration::from_secs(5));
         let (logged, _) = qso_to_msgs(&m, 100, String::new());
         let OutMsg::QsoLogged {
             date_time_on,
@@ -2796,13 +2796,11 @@ mod replay_gate_tests {
     /// A retained CQ decode fixture: stored under the wire triple
     /// (message "CQ W1AW FN31", time 45_296_000 ms, delta_freq 1302).
     fn cq_decode_fixture() -> pancetta_ft8::DecodedMessage {
-        use chrono::TimeZone as _;
         let mut d =
             pancetta_ft8::DecodedMessage::new(Ft8Message::default(), -5.0, 1.0, 1302.0, 0.2);
         d.text = "CQ W1AW FN31".to_string();
         // 2026-07-15 12:34:56 UTC → ((12*3600 + 34*60 + 56) * 1000) ms.
-        d.timestamp = chrono::Utc
-            .with_ymd_and_hms(2026, 7, 15, 12, 34, 56)
+        d.timestamp = UtcTimestamp::from_ymd_hms(2026, 7, 15, 12, 34, 56)
             .unwrap()
             .into();
         d
@@ -3164,7 +3162,7 @@ mod active_status_tests {
             select_status_qso(&qsos, "FT8").unwrap().0.to_string(),
             expected
         );
-        qsos[0].1.metadata.start_time -= chrono::Duration::seconds(1);
+        qsos[0].1.metadata.start_time -= SignedDuration::from_secs(1);
         assert_eq!(select_status_qso(&qsos, "FT8").unwrap().0, qsos[0].0);
         qsos[0].1.metadata.their_callsign = None;
         assert_eq!(select_status_qso(&qsos, "FT8").unwrap().0, qsos[1].0);
@@ -3181,7 +3179,7 @@ mod active_status_tests {
         qsos[0].1.state = QsoState::Completed {
             their_callsign: "DL1ABC".into(),
             frequency: 1500.0,
-            completed_at: Utc::now(),
+            completed_at: UtcTimestamp::now(),
             our_report: -10,
             their_report: -17,
             grid_square: None,
@@ -3192,7 +3190,7 @@ mod active_status_tests {
         assert!(manager.get_qso(qsos[1].0).await.is_err());
         qsos[1].1.state = pancetta_qso::QsoState::Failed {
             reason: pancetta_qso::QsoFailureReason::UserCancelled,
-            failed_at: Utc::now(),
+            failed_at: UtcTimestamp::now(),
             last_state: Box::new(qsos[1].1.state.clone()),
         };
         assert!(select_status_qso(&qsos, "FT8").is_none());

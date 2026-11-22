@@ -18,7 +18,8 @@
 //! context selection and fact collection (never the current dial — identity
 //! uses the logged band, as in PAN-260).
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -202,9 +203,9 @@ impl std::error::Error for ContestRuleError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContestPeriod {
     /// Interval start (UTC, inclusive).
-    pub start: DateTime<Utc>,
+    pub start: UtcTimestamp,
     /// Interval end (UTC, exclusive).
-    pub end: DateTime<Utc>,
+    pub end: UtcTimestamp,
 }
 
 /// A resolved, immutable contest instance: one entrant in one contest
@@ -275,13 +276,13 @@ impl ContestScoringContext {
 
     /// Whether `t` falls inside any operating interval (half-open, matched on
     /// contact start time only).
-    pub fn in_period(&self, t: DateTime<Utc>) -> bool {
+    pub fn in_period(&self, t: UtcTimestamp) -> bool {
         self.periods.iter().any(|w| t >= w.start && t < w.end)
     }
 
     /// The instant the rate window ends at: `now` during the contest, the
     /// final interval end after it (final rate freezes at contest end).
-    pub fn rate_time(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn rate_time(&self, now: UtcTimestamp) -> UtcTimestamp {
         match self.periods.last() {
             Some(last) if now > last.end => last.end,
             _ => now,
@@ -321,7 +322,7 @@ pub struct ContestContactFact {
     pub mode: String,
     /// Actual QSO start time (UTC) — the only time scope for eligibility,
     /// dupes, multipliers, and rate. Never database insertion time.
-    pub start: DateTime<Utc>,
+    pub start: UtcTimestamp,
     /// Whether the attempt failed (failed attempts never earn credit and
     /// never become worked entries, as in PAN-260).
     pub failed: bool,
@@ -559,7 +560,7 @@ fn dupe_key(family: RulesKind, call: &str, band: &str, mode: &str, county: &Dupe
 pub fn reduce_contest_score(
     context: &ContestScoringContext,
     facts: &[ContestContactFact],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Result<ContestScoreSnapshot, ScoringError> {
     let rules = context
         .rules()
@@ -583,7 +584,7 @@ pub fn contest_dupe_status(
     };
     let mut all: Vec<ContestContactFact> = facts.to_vec();
     all.push(candidate.clone());
-    let snapshot = match reduce_with_rules(rules, context, &all, Utc::now()) {
+    let snapshot = match reduce_with_rules(rules, context, &all, UtcTimestamp::now()) {
         Ok(snapshot) => snapshot,
         Err(_) => return ContactClassification::Pending,
     };
@@ -599,7 +600,7 @@ fn reduce_with_rules(
     rules: &ContestRules,
     context: &ContestScoringContext,
     facts: &[ContestContactFact],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Result<ContestScoreSnapshot, ScoringError> {
     // Deterministic order, then delivery dedup by stable contact id.
     let mut ordered: Vec<&ContestContactFact> = facts.iter().collect();
@@ -706,7 +707,7 @@ fn reduce_with_rules(
     let mut points_total: u64 = 0;
     let mut rate_window_count: u64 = 0;
     let rate_time = context.rate_time(now);
-    let rate_start = rate_time - chrono::Duration::minutes(60);
+    let rate_start = rate_time - SignedDuration::from_mins(60);
 
     for entry in staged {
         let fact = match entry {
@@ -963,12 +964,8 @@ mod tests {
 
     #[test]
     fn context_rejects_bad_periods_and_region() {
-        let start = DateTime::parse_from_rfc3339("2026-08-29T14:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let end = DateTime::parse_from_rfc3339("2026-08-30T02:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let start = str::parse::<UtcTimestamp>("2026-08-29T14:00:00Z").unwrap();
+        let end = str::parse::<UtcTimestamp>("2026-08-30T02:00:00Z").unwrap();
         assert!(ContestScoringContext::new(
             "KSQP-2026-K5ARH",
             "us-state-qso-party",
@@ -1009,12 +1006,8 @@ mod tests {
     /// Production sponsor weights are covered by integration fixtures.
     #[test]
     fn context_rejects_a_profile_that_does_not_match_the_selected_rules() {
-        let start = DateTime::parse_from_rfc3339("2026-08-29T14:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let end = DateTime::parse_from_rfc3339("2026-08-30T02:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let start = str::parse::<UtcTimestamp>("2026-08-29T14:00:00Z").unwrap();
+        let end = str::parse::<UtcTimestamp>("2026-08-30T02:00:00Z").unwrap();
         // A misspelled profile_id used to pass startup, get stamped onto
         // contacts by `attach`, and then fail every `decode` (hence the
         // whole ledger) with "contest: unsupported profile" — permanently,
@@ -1073,12 +1066,8 @@ mod tests {
             ],
             source_notes: "test-only weights",
         };
-        let start = DateTime::parse_from_rfc3339("2026-03-01T15:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let end = DateTime::parse_from_rfc3339("2026-03-01T21:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let start = str::parse::<UtcTimestamp>("2026-03-01T15:00:00Z").unwrap();
+        let end = str::parse::<UtcTimestamp>("2026-03-01T21:00:00Z").unwrap();
         let context = ContestScoringContext {
             instance_id: "SCQP-2026-K5ARH".to_string(),
             profile_id: "us-state-qso-party".to_string(),
@@ -1092,7 +1081,7 @@ mod tests {
             callsign: call.to_string(),
             band: Some(band.to_string()),
             mode: "FT8".to_string(),
-            start: start + chrono::Duration::minutes(mins),
+            start: start + SignedDuration::from_mins(mins),
             failed: false,
             their_region: Some("SC".to_string()),
             their_county: Some(county.to_string()),

@@ -2,7 +2,8 @@
 //! gate used by `maybe_answer_caller` to suppress post-completion duplicate
 //! QSOs (fix for the ZL1UHD-style four-73 bug).
 use super::*;
-use chrono::Duration;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
@@ -23,7 +24,7 @@ fn manager() -> QsoManager {
 
 /// Minimal `QsoMetadata` for a QSO with `their_callsign`.
 fn meta(their_callsign: &str) -> QsoMetadata {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: Uuid::new_v4(),
         our_callsign: "W1ABC".into(),
@@ -92,7 +93,7 @@ async fn has_active_or_recent_qso_with_is_band_scoped() {
             our_report: -7,
             frequency: 1500.0,
             grid_square: None,
-            completed_at: Utc::now() - Duration::seconds(5),
+            completed_at: UtcTimestamp::now() - SignedDuration::from_secs(5),
             duration_seconds: 60,
         },
         state_history: vec![],
@@ -137,7 +138,7 @@ async fn recently_completed_within_window_returns_true() {
         our_report: -7,
         frequency: 1500.0,
         grid_square: None,
-        completed_at: Utc::now() - Duration::seconds(5),
+        completed_at: UtcTimestamp::now() - SignedDuration::from_secs(5),
         duration_seconds: 60,
     };
     insert(&m, completed_state, "ZL1UHD").await;
@@ -161,7 +162,7 @@ async fn completed_outside_window_returns_false() {
         our_report: -7,
         frequency: 1500.0,
         grid_square: None,
-        completed_at: Utc::now() - Duration::seconds(200),
+        completed_at: UtcTimestamp::now() - SignedDuration::from_secs(200),
         duration_seconds: 60,
     };
     insert(&m, completed_state, "ZL1UHD").await;
@@ -181,7 +182,7 @@ async fn active_qso_returns_true() {
     let active_state = QsoState::RespondingToCq {
         target_callsign: "ZL1UHD".into(),
         frequency: 1500.0,
-        started_at: Utc::now(),
+        started_at: UtcTimestamp::now(),
     };
     insert(&m, active_state, "ZL1UHD").await;
 
@@ -203,7 +204,7 @@ async fn different_callsign_returns_false() {
         our_report: -7,
         frequency: 1500.0,
         grid_square: None,
-        completed_at: Utc::now() - Duration::seconds(5),
+        completed_at: UtcTimestamp::now() - SignedDuration::from_secs(5),
         duration_seconds: 60,
     };
     insert(&m, completed_state, "ZL1UHD").await;
@@ -239,7 +240,7 @@ async fn compound_call_matches_base() {
         our_report: -7,
         frequency: 1500.0,
         grid_square: None,
-        completed_at: Utc::now() - Duration::seconds(5),
+        completed_at: UtcTimestamp::now() - SignedDuration::from_secs(5),
         duration_seconds: 60,
     };
     insert(&m, completed_state, "EA8/G8BCG").await;

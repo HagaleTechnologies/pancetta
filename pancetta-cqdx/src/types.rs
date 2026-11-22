@@ -1,6 +1,6 @@
 //! Request and response types for the cqdx.io REST API.
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 
 // --- Entities ---
@@ -276,7 +276,7 @@ pub struct SpotReport {
     pub frequency: u64,
     pub mode: String,
     pub snr: i32,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     pub reporter: String,
     #[serde(rename = "reporterGrid")]
     pub reporter_grid: Option<String>,
@@ -306,9 +306,9 @@ pub struct QsoRecord {
     #[serde(rename = "rstReceived")]
     pub rst_received: Option<String>,
     #[serde(rename = "startTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: UtcTimestamp,
     #[serde(rename = "endTime")]
-    pub end_time: DateTime<Utc>,
+    pub end_time: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -376,9 +376,7 @@ mod tests {
 
     #[test]
     fn qso_record_json_round_trips() {
-        let start = DateTime::parse_from_rfc3339("2026-10-17T14:02:11Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let start = str::parse::<UtcTimestamp>("2026-10-17T14:02:11Z").unwrap();
         for rec in [
             QsoRecord {
                 callsign: "K1ABC".to_string(),
@@ -389,7 +387,7 @@ mod tests {
                 rst_sent: Some("-10".to_string()),
                 rst_received: Some("+02".to_string()),
                 start_time: start,
-                end_time: start + chrono::Duration::seconds(60),
+                end_time: start + jiff::SignedDuration::from_secs(60),
             },
             QsoRecord {
                 callsign: "JA1XYZ".to_string(),

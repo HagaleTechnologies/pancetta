@@ -1,6 +1,8 @@
 //! Slot progress and station TX parity for the shared title row.
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot::{current_slot_start_with_period, SlotParity, SLOT_NS};
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 fn slot_period_ns(mode: &str) -> i64 {
     match mode.trim().to_ascii_uppercase().as_str() {
@@ -11,10 +13,10 @@ fn slot_period_ns(mode: &str) -> i64 {
 }
 
 /// Format the current slot and the separately resolved station TX parity.
-pub fn slot_clock_text(now: DateTime<Utc>, mode: &str, tx: Option<SlotParity>) -> String {
+pub fn slot_clock_text(now: UtcTimestamp, mode: &str, tx: Option<SlotParity>) -> String {
     let period = slot_period_ns(mode);
     let elapsed = (now - current_slot_start_with_period(now, period))
-        .num_nanoseconds()
+        .as_nanos_i64()
         .unwrap_or(0)
         .clamp(0, period);
     let letter = |parity| match parity {
@@ -33,9 +35,8 @@ pub fn slot_clock_text(now: DateTime<Utc>, mode: &str, tx: Option<SlotParity>) -
 mod tests {
     use super::*;
 
-    fn at(ms: i64) -> DateTime<Utc> {
-        "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
-            + chrono::Duration::milliseconds(ms)
+    fn at(ms: i64) -> UtcTimestamp {
+        "2026-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap() + SignedDuration::from_millis(ms)
     }
 
     #[test]

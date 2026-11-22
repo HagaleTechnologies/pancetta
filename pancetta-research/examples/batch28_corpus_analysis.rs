@@ -24,6 +24,7 @@
 //!   cargo run --release -p pancetta-research --example batch28_corpus_analysis
 
 use anyhow::{Context, Result};
+use pancetta_core::time::UtcTimestamp;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -302,7 +303,7 @@ fn main() -> Result<()> {
         let manifest = LidOfBandManifest {
             schema_version: 1,
             label: "lid_of_band",
-            generated_at: chrono::Utc::now().to_rfc3339(),
+            generated_at: UtcTimestamp::now().to_rfc3339(),
             snr_threshold_db: snr_threshold,
             entries: lid_entries,
         };

@@ -1,4 +1,6 @@
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 #[test]
 fn pan302_qso_late_cap_refreshes_before_slot_acceptance() {
@@ -6,7 +8,7 @@ fn pan302_qso_late_cap_refreshes_before_slot_acceptance() {
     let live = Arc::new(std::sync::atomic::AtomicU64::new(8000));
     manager.set_tx_late_max_ms_source(live.clone());
     let timeout_clone = manager.clone();
-    let now = chrono::DateTime::from_timestamp(2, 0).unwrap();
+    let now = UtcTimestamp::from_parts(2, 0).unwrap();
     let before = keep_call_tx_slot(
         now,
         15_000,
@@ -46,7 +48,7 @@ fn bound_to_other_remote_client_preserves_local_and_unbound_qsos() {
     assert!(!bound_to_other_remote_client(false, Some("a"), "b"));
 }
 
-async fn rollback_fixture() -> (QsoManager, QsoId, DateTime<Utc>, String) {
+async fn rollback_fixture() -> (QsoManager, QsoId, UtcTimestamp, String) {
     let manager = QsoManager::new(test_config());
     let id = manager
         .respond_to_cq_manual("K1DEF".into(), 1500.0, None)
@@ -60,7 +62,7 @@ async fn rollback_fixture() -> (QsoManager, QsoId, DateTime<Utc>, String) {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(15))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(15))
         .await;
     let text = manager
         .get_qso(id)
@@ -83,7 +85,7 @@ async fn rollback_reverses_a_rearm_attempt() {
     assert_eq!(before.messages.len(), 2);
     assert_eq!(
         manager
-            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 1 }
     );
@@ -99,14 +101,14 @@ async fn rollback_keeps_rearm_cadence() {
     let (manager, id, opened, text) = rollback_fixture().await;
     let mut events = manager.subscribe();
     manager
-        .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+        .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
         .await;
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(20))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(20))
         .await;
     assert!(drain(&mut events).is_empty());
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     assert_eq!(
         drain(&mut events)
@@ -123,7 +125,7 @@ async fn rollback_with_unmatched_text_is_noop() {
     let before = format!("{:?}", manager.get_qso(id).await.unwrap());
     assert_eq!(
         manager
-            .roll_back_unsent_attempt_at(id, "wrong", opened + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(id, "wrong", opened + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::NoMatchingAttempt
     );
@@ -136,7 +138,7 @@ async fn rollback_on_terminal_qso_is_noop() {
     manager.cancel_qso(id).await.unwrap();
     assert_eq!(
         manager
-            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::QsoNotActive
     );
@@ -150,7 +152,7 @@ async fn rollback_of_expired_attempt_is_noop() {
             .roll_back_unsent_attempt_at(
                 id,
                 &text,
-                opened + Duration::seconds(75) + Duration::milliseconds(1)
+                opened + SignedDuration::from_secs(75) + SignedDuration::from_millis(1)
             )
             .await,
         UnsentAttemptRollback::NoMatchingAttempt
@@ -162,26 +164,26 @@ async fn rollback_of_expired_attempt_is_noop() {
 async fn rollback_matches_newest_same_text_attempt_and_relinks() {
     let (manager, id, opened, text) = rollback_fixture().await;
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     assert_eq!(
         manager
-            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(35))
+            .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(35))
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
     );
     let after = manager.get_qso(id).await.unwrap();
     assert_eq!(
         after.metadata.last_call_at,
-        Some(opened + Duration::seconds(15))
+        Some(opened + SignedDuration::from_secs(15))
     );
     assert_eq!(after.messages.len(), 2);
     assert_eq!(
         after.messages.last().unwrap().timestamp,
-        opened + Duration::seconds(15)
+        opened + SignedDuration::from_secs(15)
     );
     manager
-        .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(35))
+        .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(35))
         .await;
     let after = manager.get_qso(id).await.unwrap();
     assert_eq!(after.metadata.call_count, 1);
@@ -216,7 +218,7 @@ async fn pan183_repro_rollback_of_older_rearm_removes_newer_same_text_resend() {
                 &text,
                 None,
                 Some(rearm_id),
-                opened + Duration::seconds(20)
+                opened + SignedDuration::from_secs(20)
             )
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
@@ -238,7 +240,7 @@ async fn pan183_repro_rollback_of_older_rearm_removes_newer_same_text_resend() {
                 &text,
                 None,
                 Some(resend_id),
-                opened + Duration::seconds(20)
+                opened + SignedDuration::from_secs(20)
             )
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 1 }
@@ -263,7 +265,7 @@ async fn pan183_rollback_by_id_ignores_newer_same_text_same_offset_attempt() {
     let (manager, id, opened, text) = rollback_fixture().await;
     pan183_rebind_remote(&manager, id).await;
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     let ids = manager.keep_call_attempt_ids(id);
     assert_eq!(ids.len(), 2);
@@ -273,7 +275,13 @@ async fn pan183_rollback_by_id_ignores_newer_same_text_same_offset_attempt() {
     // 4244657620): content alone would pick the newer remote rearm.
     assert_eq!(
         manager
-            .roll_back_replaced_attempt_at(id, &text, None, Some(a), opened + Duration::seconds(35))
+            .roll_back_replaced_attempt_at(
+                id,
+                &text,
+                None,
+                Some(a),
+                opened + SignedDuration::from_secs(35)
+            )
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
     );
@@ -283,7 +291,7 @@ async fn pan183_rollback_by_id_ignores_newer_same_text_same_offset_attempt() {
     assert_eq!(after.messages.len(), 2);
     assert_eq!(
         after.messages.last().unwrap().timestamp,
-        opened + Duration::seconds(30)
+        opened + SignedDuration::from_secs(30)
     );
     assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
 }
@@ -294,7 +302,7 @@ async fn pan183_rollback_by_id_ignores_binding_mismatch() {
     let local = manager.keep_call_attempt_ids(id)[0].0;
     pan183_rebind_remote(&manager, id).await;
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     let remote = manager.keep_call_attempt_ids(id)[1].0;
     // A mixed bundle's report carries the folded Remote binding for every
@@ -310,7 +318,7 @@ async fn pan183_rollback_by_id_ignores_binding_mismatch() {
                 &text,
                 Some(&folded),
                 Some(local),
-                opened + Duration::seconds(35)
+                opened + SignedDuration::from_secs(35)
             )
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
@@ -319,7 +327,7 @@ async fn pan183_rollback_by_id_ignores_binding_mismatch() {
     let after = manager.get_qso(id).await.unwrap();
     assert_eq!(
         after.messages.last().unwrap().timestamp,
-        opened + Duration::seconds(30)
+        opened + SignedDuration::from_secs(30)
     );
 }
 
@@ -335,7 +343,7 @@ async fn pan183_rollback_with_unknown_id_is_noop() {
                 &text,
                 None,
                 Some(TxAttemptId(u64::MAX)),
-                opened + Duration::seconds(20)
+                opened + SignedDuration::from_secs(20)
             )
             .await,
         UnsentAttemptRollback::NoMatchingAttempt
@@ -352,7 +360,7 @@ async fn pan183_rollback_without_id_keeps_content_match() {
     // An id-less report keeps the newest-same-text match: the resend.
     assert_eq!(
         manager
-            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 2 }
     );
@@ -362,7 +370,7 @@ async fn pan183_rollback_without_id_keeps_content_match() {
     assert_eq!(after.messages.len(), 2);
     assert_eq!(
         after.metadata.last_call_at,
-        Some(opened + Duration::seconds(15))
+        Some(opened + SignedDuration::from_secs(15))
     );
 }
 
@@ -438,7 +446,7 @@ async fn pan183_rearm_message_to_send_carries_attempt_id_matching_ledger() {
         .unwrap();
     let mut events = manager.subscribe();
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(15))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(15))
         .await;
     let ledger = manager.keep_call_attempt_ids(id);
     assert_eq!(ledger.len(), 1);
@@ -517,7 +525,7 @@ async fn pan183_gherkin_rollback_of_older_rearm_with_newer_same_text_resend_end_
     let mut events = manager.subscribe();
     // Given a manual QSO whose keep-call rearm frame is waiting before PTT
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(15))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(15))
         .await;
     // And the operator explicitly resends the same message text
     manager.resend_last_tx(id).await.unwrap();
@@ -558,7 +566,7 @@ async fn pan183_gherkin_rollback_of_older_rearm_with_newer_same_text_resend_end_
     assert!(after
         .messages
         .iter()
-        .all(|m| m.timestamp != opened + Duration::seconds(15)));
+        .all(|m| m.timestamp != opened + SignedDuration::from_secs(15)));
     // And the operator resend's accounting is left untouched
     assert_eq!(
         manager.keep_call_attempt_ids(id),
@@ -585,7 +593,7 @@ async fn rollback_after_advance_preserves_new_stall_and_stamp() {
         .unwrap();
     let advance_stamp = manager.get_qso(id).await.unwrap().metadata.last_call_at;
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     let new_attempt = manager.get_qso(id).await.unwrap();
     let new_text = &new_attempt.messages.last().unwrap().raw_text;
@@ -593,7 +601,7 @@ async fn rollback_after_advance_preserves_new_stall_and_stamp() {
     assert_eq!(new_attempt.metadata.stall_cycles, 1);
 
     manager
-        .roll_back_unsent_attempt_at(id, &old_text, opened + Duration::seconds(35))
+        .roll_back_unsent_attempt_at(id, &old_text, opened + SignedDuration::from_secs(35))
         .await;
     let after_old = manager.get_qso(id).await.unwrap();
     assert_eq!(
@@ -610,7 +618,7 @@ async fn rollback_after_advance_preserves_new_stall_and_stamp() {
     );
 
     manager
-        .roll_back_unsent_attempt_at(id, new_text, opened + Duration::seconds(36))
+        .roll_back_unsent_attempt_at(id, new_text, opened + SignedDuration::from_secs(36))
         .await;
     let after_new = manager.get_qso(id).await.unwrap();
     assert_eq!(after_new.metadata.stall_cycles, 0);
@@ -639,7 +647,7 @@ async fn rollback_after_forward_advance_keeps_the_advance_stamp() {
     let before = manager.get_qso(id).await.unwrap();
     assert!(matches!(before.state, QsoState::SendingReport { .. }));
     manager
-        .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+        .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
         .await;
     let after = manager.get_qso(id).await.unwrap();
     assert_eq!(after.metadata.call_count, before.metadata.call_count - 1);
@@ -649,7 +657,7 @@ async fn rollback_after_forward_advance_keeps_the_advance_stamp() {
         .messages
         .iter()
         .any(|m| m.direction == MessageDirection::Sent
-            && m.timestamp == opened + Duration::seconds(15)));
+            && m.timestamp == opened + SignedDuration::from_secs(15)));
 }
 
 #[tokio::test]
@@ -714,17 +722,17 @@ async fn ledger_is_shared_across_clones_and_pruned_when_qso_leaves() {
     assert_eq!(
         manager
             .clone()
-            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .roll_back_unsent_attempt_at(id, &text, opened + SignedDuration::from_secs(20))
             .await,
         UnsentAttemptRollback::RolledBack { call_count: 1 }
     );
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     assert_eq!(manager.keep_call_ledger_len(id), 1);
     manager.cancel_qso(id).await.unwrap();
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(45))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(45))
         .await;
     assert_eq!(manager.keep_call_ledger_len(id), 0);
 }
@@ -747,7 +755,7 @@ async fn auto_qso_rollback_restores_its_resend() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(15))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(15))
         .await;
     let emitted = manager.get_qso(id).await.unwrap();
     assert_eq!(emitted.metadata.call_count, 2);
@@ -755,13 +763,13 @@ async fn auto_qso_rollback_restores_its_resend() {
         .roll_back_unsent_attempt_at(
             id,
             &emitted.messages.last().unwrap().raw_text,
-            opened + Duration::seconds(20),
+            opened + SignedDuration::from_secs(20),
         )
         .await;
     assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 1);
     let mut events = manager.subscribe();
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
     assert_eq!(
         drain(&mut events)
@@ -1929,13 +1937,15 @@ async fn manual_recall_after_watchdog_timeout_starts_fresh_cleanly() {
         .unwrap();
 
     // Keep-call until the watchdog cap is reached, then let it retire.
-    let mut t = Utc::now();
+    let mut t = UtcTimestamp::now();
     for _ in 0..4 {
-        t += Duration::seconds(15);
+        t += SignedDuration::from_secs(15);
         manager.rearm_manual_calls_at(t).await;
     }
     // Past the cap-reaching frame's rollback window (PAN-75).
-    manager.check_timeouts_at(t + Duration::seconds(60)).await;
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(60))
+        .await;
 
     // The timed-out QSO is gone from the live map AND its callsign mapping
     // is cleared (no stale entry left behind).
@@ -2068,9 +2078,9 @@ async fn manual_watchdog_fires_on_max_calls() {
 
     // Simulate keep-calling: re-arm enough times (one slot apart) to
     // hit the cap. call_count starts at 1; re-arm to 3.
-    let mut t = Utc::now();
+    let mut t = UtcTimestamp::now();
     for _ in 0..5 {
-        t += Duration::seconds(15);
+        t += SignedDuration::from_secs(15);
         manager.rearm_manual_calls_at(t).await;
     }
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -2082,7 +2092,9 @@ async fn manual_watchdog_fires_on_max_calls() {
 
     // Watchdog must now retire it, once the cap-reaching frame is past
     // the rollback window (PAN-75).
-    manager.check_timeouts_at(t + Duration::seconds(60)).await;
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(60))
+        .await;
     let after = manager.get_qso(qso_id).await;
     assert!(
         matches!(after, Err(QsoManagerError::QsoNotFound { .. })),
@@ -2105,9 +2117,9 @@ async fn manual_cap_waits_for_cap_reaching_frame_outcome() {
         .await
         .unwrap();
 
-    let t0 = Utc::now();
-    let t1 = t0 + Duration::seconds(15);
-    let t2 = t0 + Duration::seconds(30);
+    let t0 = UtcTimestamp::now();
+    let t1 = t0 + SignedDuration::from_secs(15);
+    let t2 = t0 + SignedDuration::from_secs(30);
     manager.rearm_manual_calls_at(t1).await;
     manager.rearm_manual_calls_at(t2).await;
     let progress = manager.get_qso(qso_id).await.unwrap();
@@ -2126,7 +2138,7 @@ async fn manual_cap_waits_for_cap_reaching_frame_outcome() {
 
     // The TX worker reports the cap-reaching frame as unsent.
     let rollback = manager
-        .roll_back_unsent_attempt_at(qso_id, &text, t2 + Duration::seconds(5))
+        .roll_back_unsent_attempt_at(qso_id, &text, t2 + SignedDuration::from_secs(5))
         .await;
     assert_eq!(
         rollback,
@@ -2139,7 +2151,7 @@ async fn manual_cap_waits_for_cap_reaching_frame_outcome() {
     );
 
     // Keep-calling resumes and the QSO gets its real last call.
-    let t3 = t2 + Duration::seconds(15);
+    let t3 = t2 + SignedDuration::from_secs(15);
     manager.rearm_manual_calls_at(t3).await;
     let progress = manager.get_qso(qso_id).await.unwrap();
     assert_eq!(progress.metadata.call_count, 3);
@@ -2147,7 +2159,9 @@ async fn manual_cap_waits_for_cap_reaching_frame_outcome() {
     assert!(manager.get_qso(qso_id).await.is_ok(), "still pending");
 
     // Once that frame is past the rollback window, the cap retires it.
-    manager.check_timeouts_at(t3 + Duration::seconds(75)).await;
+    manager
+        .check_timeouts_at(t3 + SignedDuration::from_secs(75))
+        .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
         Err(QsoManagerError::QsoNotFound { .. })
@@ -2172,13 +2186,13 @@ async fn manual_watchdog_fires_on_elapsed_time() {
     // Just under 5 minutes: still alive.
     let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
     manager
-        .check_timeouts_at(start + Duration::seconds(4 * 60 + 59))
+        .check_timeouts_at(start + SignedDuration::from_secs(4 * 60 + 59))
         .await;
     assert!(manager.get_qso(qso_id).await.is_ok());
 
     // Past 5 minutes: retired.
     manager
-        .check_timeouts_at(start + Duration::seconds(5 * 60 + 1))
+        .check_timeouts_at(start + SignedDuration::from_secs(5 * 60 + 1))
         .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
@@ -2239,7 +2253,7 @@ async fn encodable_compound_callsign_is_not_retired_by_unencodable_watchdog() {
     let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(
@@ -2288,7 +2302,7 @@ async fn unencodable_our_callsign_retires_immediately() {
     let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(matches!(
@@ -2336,7 +2350,7 @@ fn callsign_is_plausibly_pack28_standard_boundary() {
 
 #[test]
 fn report_stage_partner_callsign_extracts_from_report_bearing_states_only() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     assert_eq!(
         report_stage_partner_callsign(&QsoState::SendingReport {
             their_callsign: "YS/WE9G".to_string(),
@@ -2452,7 +2466,7 @@ async fn resolved_hash_render_reply_latches_plain_callsign_not_bracketed() {
     // its invalid characters instead.
     let mut events = manager.subscribe();
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
@@ -2575,7 +2589,7 @@ async fn genuinely_unresolvable_caller_hash_retires_fast_not_a_hang() {
     // The very next watchdog pass retires it -- bounded, fast, not a
     // hang and not a full 5-minute silent loop.
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
@@ -2638,7 +2652,7 @@ async fn report_stage_watchdog_retires_compound_partner() {
     }
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(
@@ -2679,7 +2693,7 @@ async fn report_stage_watchdog_does_not_retire_standard_partner() {
     }
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(
@@ -2719,7 +2733,7 @@ async fn report_stage_watchdog_does_not_retire_portable_suffix_partner() {
     }
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(
@@ -2764,7 +2778,7 @@ async fn report_stage_watchdog_does_not_retire_compound_partner_waiting_for_conf
     }
 
     manager
-        .check_timeouts_at(start + Duration::seconds(1))
+        .check_timeouts_at(start + SignedDuration::from_secs(1))
         .await;
 
     assert!(
@@ -3126,14 +3140,14 @@ async fn repetitive_tx_watchdog_retires_stuck_state() {
 
     // Just under 2 min in the same state: still alive.
     manager
-        .check_timeouts_at(start + Duration::seconds(119))
+        .check_timeouts_at(start + SignedDuration::from_secs(119))
         .await;
     assert!(manager.get_qso(qso_id).await.is_ok());
 
     // Past 2 min stuck re-sending the same message: retired by the cap
     // (manual watchdog bounds are deliberately non-binding here).
     manager
-        .check_timeouts_at(start + Duration::seconds(121))
+        .check_timeouts_at(start + SignedDuration::from_secs(121))
         .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
@@ -3184,7 +3198,7 @@ async fn rearm_emits_call_once_per_slot_for_manual_only() {
 
     // Re-arm a slot later: exactly one new call, for the manual QSO.
     manager
-        .rearm_manual_calls_at(start + Duration::seconds(15))
+        .rearm_manual_calls_at(start + SignedDuration::from_secs(15))
         .await;
     let mut recalls = Vec::new();
     while let Ok(ev) = events.try_recv() {
@@ -4323,7 +4337,7 @@ async fn rearm_resends_r_report_in_sending_report() {
     // R-report (ReportAck), not a fresh call.
     let last = progress.metadata.last_call_at.unwrap();
     manager
-        .rearm_manual_calls_at(last + Duration::seconds(15))
+        .rearm_manual_calls_at(last + SignedDuration::from_secs(15))
         .await;
     let mut resends = Vec::new();
     while let Ok(ev) = events.try_recv() {
@@ -4394,7 +4408,7 @@ async fn rearm_resends_plain_report_when_their_report_is_none() {
     // must re-send our plain -NN report, NOT escalate to R-NN.
     let last = progress.metadata.last_call_at.unwrap();
     manager
-        .rearm_manual_calls_at(last + Duration::seconds(15))
+        .rearm_manual_calls_at(last + SignedDuration::from_secs(15))
         .await;
     let mut resends = Vec::new();
     while let Ok(ev) = events.try_recv() {
@@ -4446,7 +4460,7 @@ async fn forward_advance_stamps_last_call_at_suppressing_same_slot_rearm() {
     // The DX's report arrives 12s into the slot (a realistically late
     // decode — well under the 15s SLOT_SECONDS rearm threshold measured
     // from `opened_at`, but this IS a genuine forward advance).
-    let response_at = opened_at + Duration::seconds(12);
+    let response_at = opened_at + SignedDuration::from_secs(12);
     manager
         .process_message(
             MessageType::SignalReport {
@@ -4471,7 +4485,7 @@ async fn forward_advance_stamps_last_call_at_suppressing_same_slot_rearm() {
     // would still see elapsed_since_last >= 15s from opened_at and
     // re-emit a stale rung in the very slot the DX just answered.
     manager
-        .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+        .rearm_manual_calls_at(opened_at + SignedDuration::from_secs(15))
         .await;
     let mut resends = Vec::new();
     while let Ok(ev) = events.try_recv() {
@@ -4488,7 +4502,7 @@ async fn forward_advance_stamps_last_call_at_suppressing_same_slot_rearm() {
     // Sanity: the rearm is NOT permanently disabled — one full slot after
     // the ADVANCE (not the original open), it does fire again.
     manager
-        .rearm_manual_calls_at(response_at + Duration::seconds(15))
+        .rearm_manual_calls_at(response_at + SignedDuration::from_secs(15))
         .await;
     let mut resends2 = Vec::new();
     while let Ok(ev) = events.try_recv() {
@@ -4669,12 +4683,12 @@ async fn watchdog_retires_stalled_sending_report() {
     let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
     // Just under the watchdog: still alive.
     manager
-        .check_timeouts_at(start + Duration::seconds(4 * 60 + 59))
+        .check_timeouts_at(start + SignedDuration::from_secs(4 * 60 + 59))
         .await;
     assert!(manager.get_qso(qso_id).await.is_ok());
     // Past the watchdog: retired.
     manager
-        .check_timeouts_at(start + Duration::seconds(5 * 60 + 1))
+        .check_timeouts_at(start + SignedDuration::from_secs(5 * 60 + 1))
         .await;
     assert!(matches!(
         manager.get_qso(qso_id).await,
@@ -4892,7 +4906,7 @@ async fn one_reply_can_only_advance_the_earliest_calling_cq_not_multiple() {
     // incoming decode.
     let qso_x = manager.start_cq(1500.0, None, false, None).await.unwrap();
     // Sleep so `metadata.start_time` orders deterministically (real
-    // `Utc::now()` calls back-to-back could otherwise tie).
+    // `UtcTimestamp::now()` calls back-to-back could otherwise tie).
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let qso_y = manager.start_cq(1505.0, None, false, None).await.unwrap();
     assert!(matches!(
@@ -5518,7 +5532,7 @@ async fn manual_cqer_emits_report_then_rr73() {
     // Build a manual CallingCq QSO directly (start_cq is Auto-only; the
     // operator-CQ-as-QSO wiring is a separate deferred item — see report).
     let qso_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let progress = QsoProgress {
         state: QsoState::CallingCq {
             frequency: freq,
@@ -5791,15 +5805,15 @@ async fn manual_cq_rearm_re_emits_one_cq_per_slot() {
         .unwrap();
     let mut events = manager.subscribe();
 
-    let start = Utc::now();
+    let start = UtcTimestamp::now();
     // Same slot as creation (< 15s elapsed): rearm must NOT re-emit (the
     // opening CQ already went out — re-emitting now would double-TX).
     manager
-        .rearm_manual_calls_at(start + Duration::seconds(5))
+        .rearm_manual_calls_at(start + SignedDuration::from_secs(5))
         .await;
     // One slot later: rearm re-emits exactly one Cq.
     manager
-        .rearm_manual_calls_at(start + Duration::seconds(16))
+        .rearm_manual_calls_at(start + SignedDuration::from_secs(16))
         .await;
 
     let mut cq_count = 0;
@@ -5852,12 +5866,12 @@ async fn manual_cq_with_no_parity_preference_latches_one_parity_for_life_of_qso(
         .expect("start_cq_manual(tx_parity: None) must latch a concrete parity, not leave it None");
 
     let mut events = manager.subscribe();
-    let start = Utc::now();
+    let start = UtcTimestamp::now();
 
     // Drive 6 consecutive keep-call rearms (6 slots = 90s of CQing).
     for slot in 1..=6i64 {
         manager
-            .rearm_manual_calls_at(start + Duration::seconds(15 * slot + 1))
+            .rearm_manual_calls_at(start + SignedDuration::from_secs(15 * slot + 1))
             .await;
     }
 
@@ -5920,9 +5934,9 @@ async fn manual_cq_watchdog_retires_after_max_calls() {
         .unwrap();
 
     // Drive enough slots to exceed manual_call_max_calls (10).
-    let mut t = Utc::now();
+    let mut t = UtcTimestamp::now();
     for _ in 0..15 {
-        t += Duration::seconds(16);
+        t += SignedDuration::from_secs(16);
         manager.rearm_manual_calls_at(t).await;
     }
     manager.check_timeouts_at(t).await;
