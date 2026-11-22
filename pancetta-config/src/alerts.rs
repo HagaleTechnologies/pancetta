@@ -149,7 +149,10 @@ fn ipv4_class(ip: std::net::Ipv4Addr) -> Option<&'static str> {
 }
 
 fn ipv6_class(ip: std::net::Ipv6Addr) -> Option<&'static str> {
-    let first = ip.segments()[0];
+    let segments = ip.segments();
+    let first = segments[0];
+    let embedded =
+        |high: u16, low: u16| std::net::Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
     if ip.is_loopback() {
         Some(TARGET_LOOPBACK)
     } else if ip.is_unspecified() {
@@ -158,6 +161,16 @@ fn ipv6_class(ip: std::net::Ipv6Addr) -> Option<&'static str> {
         // `::ffff:a.b.c.d` (mapped) and `::a.b.c.d` (compatible) carry an
         // IPv4 target; `to_canonical()` would miss the compatible form.
         ipv4_class(v4)
+    } else if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): a translator
+        // forwards to the IPv4 address in the low 32 bits.
+        ipv4_class(embedded(segments[6], segments[7]))
+    } else if segments[..3] == [0x64, 0xff9b, 0x1] {
+        // Local-use NAT64 prefix 64:ff9b:1::/48 (RFC 8215).
+        Some(TARGET_PRIVATE)
+    } else if first == 0x2002 {
+        // 6to4 2002::/16 (RFC 3056) carries its IPv4 relay target in bits 16-47.
+        ipv4_class(embedded(segments[1], segments[2]))
     } else if (first & 0xffc0) == 0xfe80 {
         Some(TARGET_LINK_LOCAL)
     } else if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfec0 {

@@ -100,6 +100,27 @@ fn restricted_targets_are_refused_with_their_reason() {
 }
 
 #[test]
+fn nat64_and_6to4_targets_are_judged_by_their_ipv4_address() {
+    for (url, reason) in [
+        ("https://[64:ff9b::a9fe:a9fe]/latest/", Some(LINK_LOCAL)),
+        ("https://[64:ff9b::7f00:1]/hook", Some(LOOPBACK)),
+        ("https://[64:ff9b::c0a8:105]/hook", Some(PRIVATE)),
+        ("https://[64:ff9b:1::a00:5]/hook", Some(PRIVATE)),
+        ("https://[2002:c0a8:105::]/hook", Some(PRIVATE)),
+        ("https://[2002:a9fe:a9fe::1]/hook", Some(LINK_LOCAL)),
+        ("https://[64:ff9b::808:808]/hook", None),
+        ("https://[2002:808:808::1]/hook", None),
+    ] {
+        let config = webhook_config(url, None);
+        assert_eq!(config.alerts.webhook.restricted_target(), reason, "{url}");
+        assert_eq!(config.validate().is_ok(), reason.is_none(), "{url}");
+        webhook_config(url, Some(true))
+            .validate()
+            .unwrap_or_else(|error| panic!("{url} with the opt-in: {error}"));
+    }
+}
+
+#[test]
 fn public_https_targets_need_no_opt_in() {
     for url in [
         "https://example.com/hook",
