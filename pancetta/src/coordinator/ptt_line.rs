@@ -74,18 +74,29 @@ fn open_port_raw(device: &str) -> serialport::Result<Box<dyn serialport::SerialP
 /// leaves HUPCL as the tty had it, and some drivers or udev rules clear it.
 #[cfg(unix)]
 pub(crate) fn set_hang_up_on_close(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-    // SAFETY: `fd` is an open tty the caller owns for the duration of the
-    // call; `termios` is plain data that `tcgetattr` fills in completely.
-    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let mut termios = tty_attributes(fd)?;
     termios.c_cflag |= libc::HUPCL;
-    // SAFETY: as above; `termios` came from `tcgetattr` on the same fd.
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+    // SAFETY: `fd` is an open tty the caller owns for the duration of the
+    // call, and `termios` is a fully initialized value from `tcgetattr`.
+    let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+    if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `tcgetattr` on an open tty.
+#[cfg(unix)]
+pub(crate) fn tty_attributes(fd: std::os::unix::io::RawFd) -> std::io::Result<libc::termios> {
+    // SAFETY: `termios` is plain C data for which all-zero bytes are valid.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor the caller owns, and `termios` is a
+    // valid, writable `termios` that `tcgetattr` fills in.
+    let rc = unsafe { libc::tcgetattr(fd, &mut termios) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(termios)
 }
 
 /// Open a serial PTT port with RTS low. The baud rate does not matter for

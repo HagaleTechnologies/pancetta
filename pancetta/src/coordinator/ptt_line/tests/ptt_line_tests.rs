@@ -849,7 +849,9 @@ fn real_open_of_a_missing_device_fails_and_names_it() {
 fn real_open_of_an_unreadable_device_reports_permission_denied() {
     use std::os::unix::fs::PermissionsExt;
     // Root ignores file modes, so there is nothing to observe.
-    if unsafe { libc::geteuid() } == 0 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -877,6 +879,8 @@ fn real_open_of_an_unreadable_device_reports_permission_denied() {
 fn hang_up_on_close_is_set_on_the_ptt_fd() {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
+    // SAFETY: both out-pointers are valid `c_int`s; the optional name,
+    // termios and winsize arguments may be null.
     let rc = unsafe {
         libc::openpty(
             &mut master,
@@ -887,22 +891,23 @@ fn hang_up_on_close_is_set_on_the_ptt_fd() {
         )
     };
     assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    let read_cflag = |fd| {
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
-        t.c_cflag
-    };
     // Start from a tty with HUPCL clear, as some drivers and udev rules leave it.
-    let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+    let mut t = tty_attributes(slave).unwrap();
     t.c_cflag &= !libc::HUPCL;
-    assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
-    assert_eq!(read_cflag(slave) & libc::HUPCL, 0);
+    // SAFETY: `slave` is the open pty from `openpty`, and `t` came from
+    // `tcgetattr` on it.
+    let rc = unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) };
+    assert_eq!(rc, 0);
+    assert_eq!(tty_attributes(slave).unwrap().c_cflag & libc::HUPCL, 0);
 
     set_hang_up_on_close(slave).unwrap();
-    assert_ne!(read_cflag(slave) & libc::HUPCL, 0, "HUPCL must be set");
-    unsafe {
-        libc::close(slave);
-        libc::close(master);
+    assert_ne!(
+        tty_attributes(slave).unwrap().c_cflag & libc::HUPCL,
+        0,
+        "HUPCL must be set"
+    );
+    for fd in [slave, master] {
+        // SAFETY: each fd came from `openpty` above and is closed once.
+        unsafe { libc::close(fd) };
     }
 }
