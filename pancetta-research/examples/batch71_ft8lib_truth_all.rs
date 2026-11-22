@@ -41,7 +41,10 @@ fn sha256_of(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
     let mut h = Sha256::new();
     h.update(&bytes);
-    Ok(format!("{:x}", h.finalize()))
+    Ok(h.finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 fn main() -> Result<()> {

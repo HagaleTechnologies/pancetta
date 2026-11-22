@@ -1327,7 +1327,10 @@ fn unlimited_fft_fallback_matches_frozen_baseline() {
         let path = rec["path"].as_str().expect("path");
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(fixture(path)).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let hash = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert_eq!(
             rec["sha256"].as_str().unwrap(),
             hash,
