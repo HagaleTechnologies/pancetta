@@ -17,6 +17,7 @@ fn config() -> QsoManagerConfig {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: default_active_mode(),
+        activation: crate::sig_reference::ActivationReference::default(),
     }
 }
 
