@@ -1,6 +1,9 @@
 //! Decode alerts run inside the supervised Autonomous task, including manual mode.
 //! HTTP deliveries never hold up decode admission or TX decisions.
-use std::collections::HashMap;
+//! Webhook POSTs are capped at `alerts.webhook.max_per_minute` in any rolling
+//! 60 s; alerts over the cap are held and coalesced into one summary POST
+//! (PAN-361).
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +60,77 @@ impl DeliveryState {
     }
 }
 
+/// PAN-361: the rolling window `alerts.webhook.max_per_minute` counts
+/// webhook POST admissions in, summaries included.
+const WEBHOOK_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// PAN-361: held alerts listed in one summary; `count` covers the rest, so
+/// held state stays bounded under a flood of distinct calls.
+const SUMMARY_LIST_MAX: usize = 20;
+
+/// PAN-361: webhook alerts held over the per-minute cap, waiting for one
+/// summary POST. Each listed entry is (tier rank, arrival sequence,
+/// `decode_alert` payload).
+#[derive(Default)]
+struct HeldAlerts {
+    count: u64,
+    seq: u64,
+    listed: Vec<(u8, u64, Value)>,
+}
+impl HeldAlerts {
+    /// Counts every held alert and lists at most `SUMMARY_LIST_MAX`. Once the
+    /// list is full, a new alert replaces the least rare, latest entry only if
+    /// it is strictly rarer, so routine pins never push out an ATNO.
+    fn hold(&mut self, tier_rank: u8, payload: Value) {
+        self.count += 1;
+        self.seq += 1;
+        let entry = (tier_rank, self.seq, payload);
+        if self.listed.len() < SUMMARY_LIST_MAX {
+            self.listed.push(entry);
+            return;
+        }
+        if let Some(worst) = self
+            .listed
+            .iter_mut()
+            .max_by_key(|(rank, seq, _)| (*rank, *seq))
+        {
+            if tier_rank < worst.0 {
+                *worst = entry;
+            }
+        }
+    }
+
+    /// One held alert posts as its own `decode_alert`; two or more post as a
+    /// `decode_alert_summary` listing the rarest first, then in arrival order.
+    fn body(self, max_per_minute: u32) -> Value {
+        let HeldAlerts {
+            count, mut listed, ..
+        } = self;
+        if count == 1 {
+            if let Some((_, _, payload)) = listed.pop() {
+                return payload;
+            }
+        }
+        listed.sort_by_key(|(rank, seq, _)| (*rank, *seq));
+        let alerts: Vec<Value> = listed
+            .into_iter()
+            .map(|(_, _, mut payload)| {
+                if let Some(fields) = payload.as_object_mut() {
+                    for key in ["type", "source", "version"] {
+                        fields.remove(key);
+                    }
+                }
+                payload
+            })
+            .collect();
+        json!({
+            "type": "decode_alert_summary", "source": "pancetta", "version": 1,
+            "utc_time": chrono::Utc::now().to_rfc3339(),
+            "count": count, "window_secs": WEBHOOK_RATE_WINDOW.as_secs(),
+            "max_per_minute": max_per_minute, "alerts": alerts,
+        })
+    }
+}
+
 pub(super) struct AlertDispatcher {
     config: AlertsConfig,
     client: reqwest::Client,
@@ -67,6 +141,10 @@ pub(super) struct AlertDispatcher {
     available: Option<(bool, bool)>,
     dedupe: HashMap<(usize, String, String), Instant>,
     delivery: [Arc<Mutex<DeliveryState>>; 2],
+    /// PAN-361: admission times of webhook POSTs within `WEBHOOK_RATE_WINDOW`.
+    webhook_sent: VecDeque<Instant>,
+    /// PAN-361: webhook alerts held over the cap for one summary.
+    webhook_held: HeldAlerts,
 }
 impl AlertDispatcher {
     fn http_builder() -> reqwest::ClientBuilder {
@@ -76,11 +154,22 @@ impl AlertDispatcher {
     }
 
     pub(super) fn new(
-        config: AlertsConfig,
+        mut config: AlertsConfig,
         lookup: CachedStationLookup,
         weights: pancetta_qso::priority::PriorityWeights,
         tui: bool,
     ) -> anyhow::Result<Self> {
+        // PAN-361: re-check the webhook target, so a config that reached the
+        // station without validation still never posts to a private or
+        // plaintext target. Only the webhook channel turns off: an `Err` here
+        // would fail the whole Autonomous task (its caller uses `?`) over a
+        // notification target. The URL is never logged; it can carry secrets.
+        if config.webhook.enabled && !config.webhook.allow_private_targets {
+            if let Some(reason) = config.webhook.restricted_target() {
+                warn!(target: "pancetta::alerts", "webhook alerts disabled: alerts.webhook.url {reason}; set alerts.webhook.allow_private_targets = true to accept it");
+                config.webhook.enabled = false;
+            }
+        }
         Ok(Self {
             config,
             client: Self::http_builder().build()?,
@@ -90,7 +179,48 @@ impl AlertDispatcher {
             available: None,
             dedupe: HashMap::new(),
             delivery: std::array::from_fn(|_| Arc::new(Mutex::new(DeliveryState::default()))),
+            webhook_sent: VecDeque::new(),
+            webhook_held: HeldAlerts::default(),
         })
+    }
+
+    /// PAN-361: drops admissions older than `WEBHOOK_RATE_WINDOW` and says
+    /// whether another webhook POST fits under `max_per_minute`.
+    fn webhook_has_room(&mut self, now: Instant) -> bool {
+        self.webhook_sent
+            .retain(|sent| now.saturating_duration_since(*sent) < WEBHOOK_RATE_WINDOW);
+        // `.max(1)` guards an unvalidated zero.
+        self.webhook_sent.len() < self.config.webhook.max_per_minute.max(1) as usize
+    }
+
+    /// PAN-361: posts the webhook alerts held over the per-minute cap, once
+    /// the rolling window has room, as one `decode_alert_summary` (or as a
+    /// plain `decode_alert` when only one was held). Called from the
+    /// Autonomous task's 250 ms slot-poll timer, so a quiet band still
+    /// flushes. Never posts while the webhook target is paused: a pause
+    /// delays the summary, it never drops it.
+    pub(super) fn flush_due(&mut self, now: Instant) -> Option<tokio::task::JoinHandle<()>> {
+        if self.webhook_held.count == 0 || !self.webhook_has_room(now) {
+            return None;
+        }
+        let available = self.delivery[1]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .available(now);
+        if !available {
+            return None;
+        }
+        let held = std::mem::take(&mut self.webhook_held);
+        let count = held.count;
+        self.webhook_sent.push_back(now);
+        info!(target: "pancetta::alerts", held = count, "webhook alert summary");
+        Some(deliver(
+            self.client.clone(),
+            self.config.webhook.url.clone(),
+            held.body(self.config.webhook.max_per_minute),
+            self.delivery[1].clone(),
+            "webhook",
+        ))
     }
 
     /// Returns bell admission and detached single-attempt HTTP tasks.
@@ -206,6 +336,21 @@ impl AlertDispatcher {
                 }
             }
             self.dedupe.insert(key, now);
+            // PAN-361: at most `max_per_minute` webhook POSTs in any rolling
+            // 60 s. Over the cap, or while older alerts are already held, the
+            // alert is held for one summary that `flush_due` sends, so no new
+            // alert overtakes an older summary.
+            if channel == 2 {
+                if self.webhook_held.count > 0 || !self.webhook_has_room(now) {
+                    if self.webhook_held.count == 0 {
+                        info!(target: "pancetta::alerts", "webhook alerts over {} per minute; holding further alerts for one summary", self.config.webhook.max_per_minute);
+                    }
+                    self.webhook_held.hold(6 - tier as u8, payload.clone());
+                    raised.push("webhook_held");
+                    continue;
+                }
+                self.webhook_sent.push_back(now);
+            }
             raised.push(["bell", "ntfy", "webhook"][channel]);
             if channel == 0 {
                 bell = true;
@@ -357,6 +502,7 @@ mod tests {
             .await;
         let mut config = AlertsConfig::default();
         config.webhook.enabled = true;
+        config.webhook.allow_private_targets = true;
         config.webhook.url = format!("{}/hook", server.uri());
         let mut d = dispatcher(config, false);
         let msg = decode("VP8ABC", false);
@@ -390,6 +536,7 @@ mod tests {
         config.ntfy.topic = "ham".into();
         config.ntfy.min_tier = DxTier::SpecialStation;
         config.webhook.enabled = true;
+        config.webhook.allow_private_targets = true;
         config.webhook.url = format!("{}/hook", server.uri());
         config.webhook.min_tier = DxTier::PerBandDxccNew;
         let mut d = dispatcher(config, false);
@@ -434,6 +581,7 @@ mod tests {
             .await;
         let mut config = AlertsConfig::default();
         config.webhook.enabled = true;
+        config.webhook.allow_private_targets = true;
         config.webhook.url = server.uri();
         let mut d = dispatcher(config, false);
         for call in ["VP8PJ", "T88AA", "JA1ABC"] {
@@ -472,6 +620,7 @@ mod tests {
             .await;
         let mut config = AlertsConfig::default();
         config.webhook.enabled = true;
+        config.webhook.allow_private_targets = true;
         config.webhook.url = server.uri();
         let mut d = dispatcher(config, false);
         complete(
@@ -651,3 +800,11 @@ mod evidence_tests {
 #[cfg(test)]
 #[path = "alerts/tests/tls_security_tests.rs"]
 mod tls_security_tests;
+
+#[cfg(test)]
+#[path = "alerts/tests/webhook_target_guard_tests.rs"]
+mod webhook_target_guard_tests;
+
+#[cfg(test)]
+#[path = "alerts/tests/webhook_rate_limit_tests.rs"]
+mod webhook_rate_limit_tests;

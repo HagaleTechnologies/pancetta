@@ -24,6 +24,27 @@ names its topic in the body. The generic webhook receives a versioned
 `decode_alert` payload with call, entity, band, audio offset, SNR, tier and
 trigger. No live notification service has been qualified.
 
+PAN-361 hardens the webhook only; ntfy keeps its URL rule and has no rate
+limit, because self-hosted ntfy on a LAN address is common. An enabled webhook
+must be an https URL on a public host. One opt-in,
+`alerts.webhook.allow_private_targets`, accepts plain http, loopback, private,
+link-local, CGNAT, unspecified and broadcast literals (IPv4 inside IPv6 is
+judged as IPv4) and the special-use names `localhost`, `.local`, `.home.arpa`,
+`.internal` and single-label names. The check reads the parsed URL only and
+never resolves a name, so a public name that resolves to a private address, or
+DNS rebinding, is not caught. The alert dispatcher repeats the check when it
+starts and turns only the webhook channel off, with a URL-free warning, rather
+than fail the Autonomous task. Webhook POSTs are capped at
+`alerts.webhook.max_per_minute` (default 10) admissions in any rolling 60 s,
+summaries included, counted after dedupe and the failure pause. An alert over
+the cap, or arriving while others are already held, is held. Held state is a
+running count plus the rarest 20 alerts, so an ATNO is never pushed out by
+routine pins. The Autonomous 250 ms timer sends the held alerts once the
+window has room and the target is not paused: one `decode_alert_summary`, or
+a plain `decode_alert` when only one was held. A pause delays the summary and
+never drops it; the summary is a single attempt that counts toward the
+failure pause.
+
 `Shift+W` opens a callsign input prefilled from the focused DX Hunter row.
 Enter toggles that pin; Esc cancels. Pins render as `◆`, while automatic
 near-miss entries retain `◇`. Pins bypass automatic expiry and persist in

@@ -536,12 +536,12 @@ fn populated_base_merge_follows_each_fields_rule() {
             &[
                 ("bell", json!({"enabled": true, "min_tier": "standard"})),
                 ("ntfy", json!({"enabled": true, "min_tier": "special_station", "server": "https://localhost", "topic": "dx"})),
-                ("webhook", json!({"enabled": true, "min_tier": "per_band_dxcc_new", "url": "https://localhost/hook"})),
+                ("webhook", json!({"enabled": true, "min_tier": "per_band_dxcc_new", "url": "https://localhost/hook", "allow_private_targets": true, "max_per_minute": 30})),
             ],
             &[
                 ("bell", json!({"enabled": false, "min_tier": "atno"})),
                 ("ntfy", json!({"enabled": false, "min_tier": "standard", "server": "https://example.org", "topic": "cq"})),
-                ("webhook", json!({"enabled": false, "min_tier": "atno", "url": "https://example.org/hook"})),
+                ("webhook", json!({"enabled": false, "min_tier": "atno", "url": "https://example.org/hook", "allow_private_targets": false, "max_per_minute": 20})),
             ],
             REPLACE,
             |a, b| a.merge_with(b),
