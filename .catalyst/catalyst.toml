@@ -3,6 +3,13 @@
 [project]
 linear_team = "PAN"
 
+# Rust implement phases peak at 33-38 GiB (target/ for the workspace + research
+# crates). rigel's default 20 GiB per-slot budget stopped every implement phase
+# since 2026-11-21 (slot_disk_exceeded -> resource_exhausted parks, PAN-213,
+# 357-361, 411, 417, 424, 460, 474). Self-hosted runners only.
+[runner]
+disk_budget_gib = 48
+
 # Mirrors .github/workflows/ci.yml and rust-toolchain.toml. No secrets or
 # configuration variables are declared. The workspace lane links the whole tree
 # several times and ran out of disk with full debuginfo, so, like CI, verify
