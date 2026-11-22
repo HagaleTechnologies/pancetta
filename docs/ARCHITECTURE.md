@@ -138,6 +138,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
+| `qrz_lookup/` | Interactive, session-cached QRZ station lookups. |
 | `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso/` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso_filter.rs` | QSO partner band-collapse filtering (hb-229). |
