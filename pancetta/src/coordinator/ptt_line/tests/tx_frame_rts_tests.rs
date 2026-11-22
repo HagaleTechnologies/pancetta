@@ -302,3 +302,40 @@ async fn watchdog_retries_a_failed_rts_unkey_until_the_line_is_low() {
     assert!(!c.ptt_line.is_asserted());
     c.shutdown().await.unwrap();
 }
+
+/// PR #745 review (Codex P1): a Hamlib start whose new settings key by CAT,
+/// while the old RTS line could not be lowered, must keep RTS-aware unkeying
+/// (the startup PTT-off lowers the old line) instead of installing the bare
+/// CAT rig and leaving RTS asserted; and must never key by CAT meanwhile.
+#[tokio::test]
+async fn switch_to_cat_with_a_stuck_line_still_lowers_rts() {
+    let fake = FakeLines::default();
+    let (mut c, scratch) = new_coordinator().await;
+    let rig = mock_rig();
+    c.test_mock_rig = Some(rig.clone());
+    let line = fake.line();
+    c.ptt_line = line.clone();
+    line.configure(Some(DEV.into()), "/dev/fake-cat")
+        .await
+        .unwrap();
+    line.set(true).await.unwrap();
+    // The reconcile's low write and its lowering reopen both fail.
+    fake.fail_writes.store(1, Ordering::Release);
+    fake.fail_opens.store(1, Ordering::Release);
+    c.test_ptt_line_device = None;
+    c.start_hamlib_component().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !c.hamlib_command_loop_ready.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "Hamlib command loop ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    wait_rts(&fake, &rig, false, Duration::from_secs(5)).await;
+    assert!(!line.is_asserted());
+    assert!(!line.has_device(), "the switch to CAT applied once low");
+
+    manual_ptt(&c, true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fake.rts_levels().last(), Some(&false), "RTS never re-keyed");
+    c.shutdown().await.unwrap();
+    drop(scratch);
+}

@@ -127,6 +127,12 @@ struct LineState {
     device: Option<String>,
     handle: Option<Box<dyn RtsLine>>,
     shut: bool,
+    /// A `configure` that could not lower the old line to switch away from
+    /// it: the target it wanted (`None` = CAT keying) and the CAT port. While
+    /// set, every key-down is refused (it would key the old device, a method
+    /// the operator no longer configured); the first confirmed low write
+    /// applies the switch.
+    pending_switch: Option<(Option<String>, String)>,
 }
 
 /// The coordinator's serial PTT line.
@@ -215,6 +221,16 @@ impl PttLine {
 
     fn configure_blocking(&self, target: Option<String>, cat_port: &str) -> Result<()> {
         let mut state = self.lock_for(false)?;
+        self.reconcile_locked(&mut state, target, cat_port)
+    }
+
+    fn reconcile_locked(
+        &self,
+        state: &mut LineState,
+        target: Option<String>,
+        cat_port: &str,
+    ) -> Result<()> {
+        state.pending_switch = None;
         if state.device == target && state.handle.is_some() {
             return Ok(());
         }
@@ -223,13 +239,15 @@ impl PttLine {
                 if self.is_asserted() {
                     // Never switch away from a line that may still key the
                     // rig: keep it (get_ptt reports On, so the watchdog keeps
-                    // unkeying) until a low write is confirmed.
-                    self.lower_locked(&mut state, &old).with_context(|| {
-                        format!(
+                    // unkeying) and refuse key-downs until a low write is
+                    // confirmed, which then applies the switch.
+                    if let Err(e) = self.lower_locked(state, &old) {
+                        state.pending_switch = Some((target, cat_port.to_string()));
+                        return Err(e.context(format!(
                             "cannot switch the serial PTT port away from {old}: RTS may still \
-                             be asserted there"
-                        )
-                    })?;
+                             be asserted there; TX is refused until it is confirmed low"
+                        )));
+                    }
                 } else if let Some(handle) = state.handle.as_mut() {
                     if let Err(e) = handle.write_rts(false) {
                         tracing::warn!(
@@ -256,7 +274,7 @@ impl PttLine {
             ));
         }
         state.device = Some(device.clone());
-        self.open_locked(&mut state, &device)
+        self.open_locked(state, &device)
     }
 
     /// Drive RTS low on `device`: through the open handle, or by reopening
@@ -287,6 +305,27 @@ impl PttLine {
                 "serial PTT line is released for shutdown; refusing to key"
             ));
         }
+        if asserted && state.pending_switch.is_some() {
+            return Err(anyhow!(
+                "serial PTT port {} may still be asserted from the previous PTT settings; \
+                 refusing to key until it is confirmed low",
+                state.device.as_deref().unwrap_or("?")
+            ));
+        }
+        let result = self.drive_locked(&mut state, asserted);
+        if result.is_ok() && !asserted && !self.is_asserted() {
+            if let Some((target, cat_port)) = state.pending_switch.take() {
+                // The old line is confirmed low: apply the deferred switch.
+                // The unkey itself succeeded, so a failed open is only logged.
+                if let Err(e) = self.reconcile_locked(&mut state, target, &cat_port) {
+                    tracing::warn!("Serial PTT: {e:#}");
+                }
+            }
+        }
+        result
+    }
+
+    fn drive_locked(&self, state: &mut LineState, asserted: bool) -> Result<()> {
         let Some(device) = state.device.clone() else {
             if asserted {
                 return Err(anyhow!("no serial PTT port is open; refusing to key"));
@@ -299,7 +338,7 @@ impl PttLine {
                 return Ok(());
             }
             // Reopening writes RTS low, which is the unkey itself.
-            self.open_locked(&mut state, &device)?;
+            self.open_locked(state, &device)?;
             if !asserted {
                 return Ok(());
             }

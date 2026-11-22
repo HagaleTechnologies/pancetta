@@ -728,9 +728,22 @@ async fn configure_keeps_an_asserted_line_it_cannot_lower() {
     assert!(line.is_asserted(), "still reported keyed");
     assert!(line.has_device());
 
-    // The next unkey reopens the old port to lower it.
+    // The next unkey reopens the old port to lower it, then applies the
+    // deferred switch to the new port.
     line.set(false).await.unwrap();
-    assert_eq!(fake.events().last(), Some(&rts(DEV, false)));
+    let events = fake.events();
+    assert_eq!(
+        events[events.len() - 6..],
+        [
+            open(DEV),
+            rts(DEV, false),
+            rts(DEV, false),
+            close(DEV),
+            open("/dev/fake-ptt2"),
+            rts("/dev/fake-ptt2", false)
+        ],
+        "{events:?}"
+    );
     assert!(!line.is_asserted());
 }
 
@@ -910,4 +923,60 @@ fn hang_up_on_close_is_set_on_the_ptt_fd() {
         // SAFETY: each fd came from `openpty` above and is closed once.
         unsafe { libc::close(fd) };
     }
+}
+
+/// PR #745 review (Codex P1): a switch away from a line that cannot be
+/// lowered must not let a key-down assert the old device; the first
+/// confirmed low applies the switch.
+#[tokio::test]
+async fn stuck_switch_refuses_key_down_and_applies_on_confirmed_low() {
+    const DEV2: &str = "/dev/fake-ptt2";
+    let fake = FakeLines::default();
+    let line = fake.line();
+    line.configure(Some(DEV.into()), CAT).await.unwrap();
+    line.set(true).await.unwrap();
+    fake.fail_writes.store(1, Ordering::Release);
+    fake.fail_opens.store(1, Ordering::Release);
+    assert!(line.configure(Some(DEV2.into()), CAT).await.is_err());
+
+    let err = line.set(true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("refusing to key"), "{err:#}");
+    assert_eq!(fake.opens(), 1, "a refused key-down opens nothing");
+
+    line.set(false).await.unwrap();
+    assert!(!line.is_asserted());
+    let events = fake.events();
+    // Reopen lowers DEV; the switch writes low once more before closing it.
+    assert_eq!(
+        events[events.len() - 6..],
+        [
+            open(DEV),
+            rts(DEV, false),
+            rts(DEV, false),
+            close(DEV),
+            open(DEV2),
+            rts(DEV2, false)
+        ],
+        "old port lowered, then the deferred switch: {events:?}"
+    );
+    line.set(true).await.unwrap();
+    assert_eq!(fake.events().last(), Some(&rts(DEV2, true)));
+}
+
+/// PR #745 review (Codex P1): the same when the new settings key by CAT.
+#[tokio::test]
+async fn stuck_switch_to_cat_keeps_the_line_until_confirmed_low() {
+    let fake = FakeLines::default();
+    let line = fake.line();
+    line.configure(Some(DEV.into()), CAT).await.unwrap();
+    line.set(true).await.unwrap();
+    fake.fail_writes.store(1, Ordering::Release);
+    fake.fail_opens.store(1, Ordering::Release);
+    assert!(line.configure(None, CAT).await.is_err());
+    assert!(line.has_device(), "the possibly asserted line is retained");
+    assert!(line.set(true).await.is_err());
+
+    line.set(false).await.unwrap();
+    assert_eq!(fake.rts_levels().last(), Some(&false));
+    assert!(!line.has_device(), "the switch to CAT applied once low");
 }

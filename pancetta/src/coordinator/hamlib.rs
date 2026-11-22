@@ -2132,9 +2132,24 @@ impl super::ApplicationCoordinator {
             )
             .await;
         }
+        // A line the reconcile could not switch away from (it may still be
+        // asserted) keeps the wrapper even when the new settings key by CAT:
+        // the wrapper's unkeys drive that line and its `get_ptt` reports it,
+        // so the watchdog and the PAN-272 latch stay RTS-aware, and its
+        // key-downs are refused until the line is confirmed low (PR #745
+        // review).
+        let line_retained = ptt_line_target.is_none() && self.ptt_line.has_device();
         let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> =
-            if let Some(device) = ptt_line_target.as_deref() {
-                info!("PTT keys the RTS line of {device} (rig.ptt.method = serial_rts)");
+            if ptt_line_target.is_some() || line_retained {
+                match ptt_line_target.as_deref() {
+                    Some(device) => {
+                        info!("PTT keys the RTS line of {device} (rig.ptt.method = serial_rts)")
+                    }
+                    None => warn!(
+                        "Serial PTT: the previous PTT line may still be asserted; TX is \
+                         refused until it is confirmed low"
+                    ),
+                }
                 let keyed = super::ptt_line::LineKeyedRig::new(rig, self.ptt_line.clone());
                 // Only a managed data mode guards key-downs and CAT
                 // mutations, as it does inside `RigctldClient`.
