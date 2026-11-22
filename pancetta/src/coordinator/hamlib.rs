@@ -2151,6 +2151,11 @@ impl super::ApplicationCoordinator {
                     ),
                 }
                 let keyed = super::ptt_line::LineKeyedRig::new(rig, self.ptt_line.clone());
+                let keyed = if line_retained {
+                    keyed.keying_cat_after_release()
+                } else {
+                    keyed
+                };
                 // Only a managed data mode guards key-downs and CAT
                 // mutations, as it does inside `RigctldClient`.
                 Arc::new(if rig_config.data_mode.is_some() {

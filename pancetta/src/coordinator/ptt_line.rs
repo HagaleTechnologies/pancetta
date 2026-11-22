@@ -432,6 +432,10 @@ pub(crate) struct LineKeyedRig {
     /// Serializes a key-down with the data-mode CAT mutations below, as the
     /// inner `RigctldClient` serializes `T 1` with them under its own lock.
     key_gate: tokio::sync::Mutex<()>,
+    /// The configured method keys by CAT, and this wrapper is only here to
+    /// unkey a retained RTS line it could not switch away from. Once that
+    /// line is released (no device left), PTT goes to the inner rig.
+    cat_after_release: bool,
 }
 
 impl LineKeyedRig {
@@ -441,7 +445,19 @@ impl LineKeyedRig {
             line,
             data_mode: None,
             key_gate: tokio::sync::Mutex::new(()),
+            cat_after_release: false,
         }
+    }
+
+    /// The configured method keys by CAT: once the retained line is
+    /// confirmed low and released, `set_ptt` keys the inner rig (PR #745).
+    pub(crate) fn keying_cat_after_release(mut self) -> Self {
+        self.cat_after_release = true;
+        self
+    }
+
+    fn keys_by_cat(&self) -> bool {
+        self.cat_after_release && !self.line.has_device()
     }
 
     /// The rig's data mode is managed (`rig.data_mode` is set). The inner
@@ -536,10 +552,17 @@ impl RigControl for LineKeyedRig {
         self.inner.get_vfo().await
     }
 
-    async fn set_ptt(&self, _vfo: Vfo, ptt: PttState) -> Result<()> {
+    async fn set_ptt(&self, vfo: Vfo, ptt: PttState) -> Result<()> {
         if ptt == PttState::Off {
             // An unkey never waits for the gate.
-            return self.line.set(false).await;
+            self.line.set(false).await?;
+            if self.keys_by_cat() {
+                return self.inner.set_ptt(vfo, PttState::Off).await;
+            }
+            return Ok(());
+        }
+        if self.keys_by_cat() {
+            return self.inner.set_ptt(vfo, PttState::On).await;
         }
         let _gate = self.key_gate.lock().await;
         if self.data_mode.as_ref().is_some_and(|mode| !mode.is_ready()) {

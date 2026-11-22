@@ -333,9 +333,21 @@ async fn switch_to_cat_with_a_stuck_line_still_lowers_rts() {
     assert!(!line.is_asserted());
     assert!(!line.has_device(), "the switch to CAT applied once low");
 
+    // Once released, the configured CAT method keys the rig again (PR #745
+    // review, P2), and RTS is never re-keyed.
     manual_ptt(&c, true);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.get_ptt(Vfo::Current).await.ok() != Some(PttState::On) {
+        assert!(Instant::now() < deadline, "CAT keys after the release");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(fake.rts_levels().last(), Some(&false), "RTS never re-keyed");
+    manual_ptt(&c, false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.get_ptt(Vfo::Current).await.ok() != Some(PttState::Off) {
+        assert!(Instant::now() < deadline, "CAT unkeys");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     c.shutdown().await.unwrap();
     drop(scratch);
 }
