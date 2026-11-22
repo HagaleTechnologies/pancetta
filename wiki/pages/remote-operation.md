@@ -117,6 +117,15 @@ Cloud mode caches full owner edges separately from eligibility and refreshes
 local trust on its own timer, including during failed or stalled requests.
 The refresh reads live admission so it cannot restore a config removal.
 
+## Two trust roots (PAN-362)
+
+TX is rooted on the station (`clients/<keyId>.pub` plus the arm chain).
+Under cqdx auto-populate, admission and non-TX control (`qsy`, `setSplit`,
+`stopCq`, `takeControl`) are rooted in cqdx, which lists who may connect
+and signs hello scope. A `tx_allow_list` removal is undone by the next
+poll. The accepted residual and its evidence are in
+`docs/DECISIONS/remote-operation.md`.
+
 ## Station-agent endpoint validation (PAN-310)
 
 Supplied relay and pairing URLs are validated even when the agent is disabled.
