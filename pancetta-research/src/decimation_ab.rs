@@ -151,7 +151,11 @@ pub fn load_capture(manifest_dir: &Path, entry: &CaptureEntry) -> Result<LoadedC
     let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", entry.path))?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     if hash != entry.sha256.to_ascii_lowercase() {
         bail!(
             "{}: sha256 mismatch (manifest {}, file {})",
@@ -705,5 +709,9 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }

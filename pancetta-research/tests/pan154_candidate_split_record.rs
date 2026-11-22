@@ -81,10 +81,10 @@ fn corpus_is_the_committed_ft4_tier() {
     assert_eq!(s.corpus.manifest, manifest);
     assert_eq!(
         s.corpus.manifest_sha256,
-        format!(
-            "{:x}",
-            Sha256::digest(std::fs::read(root().join(manifest)).unwrap())
-        )
+        Sha256::digest(std::fs::read(root().join(manifest)).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     let prior = json("research/scorecards/pan110-synth-ft4-max-merged.json");
     assert_eq!(

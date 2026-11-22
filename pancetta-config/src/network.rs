@@ -177,7 +177,7 @@ impl std::fmt::Debug for LotwUploadConfig {
             .field("enabled", &self.enabled)
             .field("tqsl_path", &self.tqsl_path)
             .field("station_location", &self.station_location)
-            .field("password", &"[REDACTED]")
+            .field("password", &REDACTED)
             .finish()
     }
 }
@@ -919,7 +919,10 @@ pub struct HealthCheckConfig {
 }
 
 /// Custom service configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): every value in
+/// `headers` and `parameters` prints as `<redacted>`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CustomServiceConfig {
     /// Service name
     pub name: String,
@@ -944,7 +947,10 @@ pub struct CustomServiceConfig {
 }
 
 /// Custom authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): every value in
+/// `parameters` and `credentials` prints as `<redacted>`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CustomAuthConfig {
     /// Authentication type
     pub auth_type: String,
@@ -1017,7 +1023,10 @@ impl Default for DistanceFilters {
 /// `#[serde(default)]` at the container level (see `PskReporterConfig`'s
 /// doc comment for why): a missing field falls back to this struct's own
 /// `Default::default()` (e.g. `poll_interval_secs: 30`), not to `0`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): a set `token`
+/// prints as `Some("<redacted>")`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CqdxConfig {
     /// Enable cqdx.io integration
@@ -1391,8 +1400,28 @@ impl ConfigSection for NetworkConfig {
 // These structs hold plaintext secrets; `#[derive(Debug)]` was removed so a
 // stray `debug!("{:?}", cfg)` or a panic that formats one can never dump a
 // password / api_key / cert secret. Non-secret fields are still shown.
+//
+// PAN-363 adds the cqdx Personal Access Token and the custom-service maps
+// (`headers`, `parameters`, auth `parameters`, `credentials`). Free-form maps
+// cannot be classified by key name, so they print every key with every value
+// `<redacted>`. These newer impls destructure `Self` exhaustively, so a field
+// added later fails to compile until its Debug line is written.
 // ---------------------------------------------------------------------------
 const REDACTED: &str = "<redacted>";
+
+/// Debug view of a map that shows its keys, in sorted order for
+/// deterministic output, and prints every value as [`REDACTED`].
+struct RedactedValues<'a, V>(&'a HashMap<String, V>);
+
+impl<V> std::fmt::Debug for RedactedValues<'_, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.0.keys().collect();
+        keys.sort_unstable();
+        f.debug_map()
+            .entries(keys.into_iter().map(|key| (key, REDACTED)))
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for RemoteGatewayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1402,6 +1431,66 @@ impl std::fmt::Debug for RemoteGatewayConfig {
             .field("auth_token", &self.auth_token.as_ref().map(|_| REDACTED))
             .field("allowed_origins", &self.allowed_origins)
             .field("allow_network_exposure", &self.allow_network_exposure)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CqdxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            base_url,
+            token,
+            poll_interval_secs,
+            authorizations_poll_interval_secs,
+        } = self;
+        f.debug_struct("CqdxConfig")
+            .field("enabled", enabled)
+            .field("base_url", base_url)
+            .field("token", &token.as_ref().map(|_| REDACTED))
+            .field("poll_interval_secs", poll_interval_secs)
+            .field(
+                "authorizations_poll_interval_secs",
+                authorizations_poll_interval_secs,
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CustomServiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            url,
+            service_type,
+            auth,
+            headers,
+            parameters,
+            enabled,
+        } = self;
+        f.debug_struct("CustomServiceConfig")
+            .field("name", name)
+            .field("url", url)
+            .field("service_type", service_type)
+            .field("auth", auth)
+            .field("headers", &RedactedValues(headers))
+            .field("parameters", &RedactedValues(parameters))
+            .field("enabled", enabled)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CustomAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            auth_type,
+            parameters,
+            credentials,
+        } = self;
+        f.debug_struct("CustomAuthConfig")
+            .field("auth_type", auth_type)
+            .field("parameters", &RedactedValues(parameters))
+            .field("credentials", &RedactedValues(credentials))
             .finish()
     }
 }
@@ -1758,6 +1847,31 @@ mod tests {
         let mut qb = QrzLogbookConfig::default();
         qb.api_key = "qrzLogbookKEY".into();
         assert!(!format!("{qb:?}").contains("qrzLogbookKEY"));
+
+        // PAN-363: the cqdx Personal Access Token, alone and inside the
+        // network config.
+        let mut cqdx = CqdxConfig::default();
+        cqdx.token = Some("pat_cqdxSECRET".into());
+        let s = format!("{cqdx:?}");
+        assert!(!s.contains("pat_cqdxSECRET"), "cqdx token leaked: {s}");
+        assert!(s.contains("<redacted>"), "cqdx token not redacted: {s}");
+        let network = NetworkConfig {
+            cqdx,
+            ..Default::default()
+        };
+        let s = format!("{network:?}");
+        assert!(!s.contains("pat_cqdxSECRET"), "cqdx token leaked: {s}");
+        assert!(s.contains("<redacted>"), "cqdx token not redacted: {s}");
+
+        // PAN-363: LoTW uses the shared `<redacted>` marker.
+        let mut lotw = LotwUploadConfig::default();
+        lotw.password = "lotwPW_SECRET".into();
+        let s = format!("{lotw:?}");
+        assert!(!s.contains("lotwPW_SECRET"), "LoTW password leaked: {s}");
+        assert!(
+            s.contains(r#"password: "<redacted>""#),
+            "LoTW password not redacted with the shared marker: {s}"
+        );
     }
 
     #[test]
@@ -2422,3 +2536,7 @@ tx_allow_list = ["client-key-1", "client-key-2"]
 #[cfg(test)]
 #[path = "network/tests/wsjtx_decode_ingest_tests.rs"]
 mod wsjtx_decode_ingest_tests;
+
+#[cfg(test)]
+#[path = "network/tests/debug_redaction_tests.rs"]
+mod debug_redaction_tests;

@@ -74,7 +74,10 @@ fn hash(samples: &[f32]) -> String {
     for s in samples {
         h.update(s.to_le_bytes());
     }
-    format!("{:x}", h.finalize())
+    h.finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 fn write_wav(path: &Path, samples: &[f32]) -> anyhow::Result<()> {
     let mut w = hound::WavWriter::create(
@@ -440,7 +443,7 @@ fn supplemental(out: &Path) -> anyhow::Result<()> {
             let eligible = d.eligible_timing_calls(&d.chrono_replay_snapshot(), time);
             let start = Instant::now();
             let decoded = d.decode_wav(&path)?;
-            arms[arm].push(serde_json::json!({"slot":slot,"path":path,"audio_sha256":format!("{:x}",Sha256::digest(bytes)),
+            arms[arm].push(serde_json::json!({"slot":slot,"path":path,"audio_sha256":Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "eligible":eligible,"decoded":decoded.iter().map(|m|&m.message).collect::<Vec<_>>(),"diagnostics":d.timing_diagnostics(),"elapsed_seconds":start.elapsed().as_secs_f64(),"truth":null}));
         }
     }
