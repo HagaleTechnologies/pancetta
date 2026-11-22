@@ -2,11 +2,10 @@
 
 Test modules live in `src/<module>/tests/<name>.rs` and are declared with
 `#[cfg(test)] #[path = "..."] mod <name>;` (PAN-326, CONTRIBUTING.md § Unit Tests).
-Of the four files PAN-326 names, `qso_manager.rs` and `station_agent/mod.rs`
-follow this. `coordinator/tx.rs` and `coordinator/qso.rs` still hold their inline
-modules until a follow-up moves them. Many other files, such as `decoder.rs`,
-`coordinator/hamlib.rs` and `priority_evaluator.rs`, also still hold inline test
-modules.
+All four files PAN-326 names — `qso_manager.rs`, `station_agent/mod.rs`,
+`coordinator/tx.rs` and `coordinator/qso.rs` — follow this (PAN-417 moved the
+last two). Many other files, such as `decoder.rs`, `coordinator/hamlib.rs` and
+`priority_evaluator.rs`, still hold inline test modules.
 
 The `#[path]` string is relative to the directory that holds the declaring file.
 From `qso_manager.rs` it is `"qso_manager/tests/x.rs"`. Writing `"tests/x.rs"`
@@ -20,22 +19,22 @@ would then reach that parent, not the code under test.
 
 A new directory under `pancetta/src/coordinator/` is a new row in
 `docs/ARCHITECTURE.md`'s coordinator module table, and the `architecture_drift`
-test fails until the row exists. Moving `coordinator/qso.rs`'s tests creates
-`coordinator/qso/`. Regenerate the table in the same PR with
+test fails until the row exists. `coordinator/qso/` exists with its row, as do
+`tx/` and `station_agent/`. Regenerate the table in the same PR that adds a
+directory with
 `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`.
-`tx/` and `station_agent/` already have rows.
 
-`include_str!` resolves from the test file. When `tx.rs` moves,
-`pan273_worker_unkey_tests` reads `tx.rs` with `include_str!("tx.rs")`, and that
-must become `include_str!("../../tx.rs")`. `pan115_worker_gate_tests` holds the TX
-worker harness: thirteen sibling modules in `tx.rs`, plus `hamlib.rs` and
-`tx/abort_transcripts.rs`, import it, so renaming it edits all of them.
+`include_str!` resolves from the test file. `worker_unkey_tests` reads
+`tx.rs` with `include_str!("../../tx.rs")`. `worker_gate_tests` holds the TX
+worker harness: thirteen sibling modules in `tx/tests/`, plus `hamlib.rs`,
+`tx/abort_transcripts.rs`, `tx/tests/drive_calibration_tests.rs` and
+`tx/tests/tx_drive_tests.rs`, import it, so renaming it edits all of them.
 
 Renaming a test module renames every test in it, which changes `--list` output,
 nextest filters and `scripts/pan325_load_loop.sh`.
 
 When moving a module, copy the text and run `cargo fmt --all`. Do not dedent by
-hand: a string literal in `tx.rs`'s `pan183_attempt_identity_tests` has leading
+hand: a string literal in `tx/tests/attempt_identity_tests.rs` has leading
 spaces that are part of its value. Review a move with `git diff --patience`; the
 default diff misaligns repeated test lines.
 
