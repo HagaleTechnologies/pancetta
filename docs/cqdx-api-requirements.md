@@ -276,3 +276,46 @@ I'm operating right now" (a band-fill) from "needed everywhere" (ATNO).
   DX Hunter ATNO/band-fill display. Pancetta degrades gracefully on a
   per-band error until this ships: it keeps the last loaded needed set, or
   reports the needed status as unknown when none has loaded (PAN-93).
+
+### `GET /api/v1/pota`: active POTA/SOTA activations (read since PAN-359)
+
+cqdx.io already serves this route; it is the data behind the POTA/SOTA
+activation badge on its spot rows. Pancetta reads it to write ADIF `SIG` and
+`SIG_INFO` on a logged QSO whose partner is activating a park or summit.
+
+**Response (200), as served (cqdx CQD-630):**
+```json
+{
+  "activations": [
+    {"callsign": "7N1ICA/1", "type": "sota", "reference": "JA/YN-036",
+     "name": "Onigatake", "frequency": "7.005", "mode": "CW",
+     "spotTime": "2026-11-06T02:48:13.285492Z"}
+  ],
+  "byCallsign": {"7N1ICA/1": ["..."]},
+  "updatedAt": 1793934000
+}
+```
+
+**What pancetta reads:** only `activations[].callsign`, `.type`, `.reference`
+and `.spotTime`. `byCallsign`, `updatedAt`, `name`, `frequency`, `mode` and
+any other field are ignored, every field is optional (a `null` string reads
+as empty), and a row that is not a JSON object is skipped.
+
+**Notes:**
+- Fetched inside the live-spot poller, only when `[network.cqdx]` is
+  configured, at most once every 120 s, with the same bearer token as every
+  other call.
+- `type` `pota` maps to `SIG=POTA` and `sota` to `SIG=SOTA` (case-insensitive);
+  other types are skipped. Rows whose callsign or reference is not plausible
+  are skipped. When a callsign has several rows the newest `spotTime` wins.
+- A row is used for a QSO only when the feed listed that callsign at most
+  30 minutes before the QSO ended.
+- A `404` means "not offered": nothing is written and spot polling continues.
+  Any other failure is logged at debug level and never stops, delays or counts
+  against live spot polling.
+- **Contract:** this route is not in dispensa's frozen `cqdx-api.v1` set.
+  Pending dispensa question (to be filed before merge): "From: pancetta. To:
+  cqdx. Ask: pancetta (PAN-359) reads `GET /api/v1/pota`
+  `activations[].{callsign,type,reference,spotTime}` to write ADIF
+  SIG/SIG_INFO. Please add the route to `cqdx-api.v1` `x-endpoints` with those
+  four fields, or name the endpoint pancetta should use instead."
