@@ -98,7 +98,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     let mut h = Sha256::new();
     h.update(&bytes);
-    Ok(format!("{:x}", h.finalize()))
+    Ok(h.finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 fn read_wav_samples(path: &Path) -> anyhow::Result<Vec<f32>> {

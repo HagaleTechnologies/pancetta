@@ -1475,7 +1475,11 @@ fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 /// Task W0.2: look up the jt9 oracle's cached decodes for `wav_path` (from
@@ -1789,7 +1793,11 @@ fn corpus_provenance(
             .to_string(),
         manifest_sha256: sha256_file(manifest_path)?,
         config_sha256,
-        wav_set_sha256: format!("{:x}", set.finalize()),
+        wav_set_sha256: set
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
         wav_count: entries.len(),
     })
 }
@@ -2366,7 +2374,10 @@ fn run_noise_tier(
             manifest_path.display(),
             entry.wav_path.display()
         );
-        let actual = format!("{:x}", Sha256::digest(std::fs::read(&entry.wav_path)?));
+        let actual = Sha256::digest(std::fs::read(&entry.wav_path)?)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         anyhow::ensure!(
             actual.eq_ignore_ascii_case(&entry.wav_sha256),
             "noise WAV SHA-256 mismatch: {} expected {} got {}",

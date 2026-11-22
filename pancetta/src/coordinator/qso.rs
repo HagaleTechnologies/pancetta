@@ -14670,6 +14670,54 @@ mod replay_history_seed_tests {
             .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME)
     }
 
+    /// PAN-424: start the QSO component and wait until its task reaches the
+    /// receiver loop. `qso_consumer_ready` is released only after the local
+    /// writers and the upload subscriber have started, so a QSO completed
+    /// after this returns has live subscribers. The fixed 500 ms sleep this
+    /// replaces raced a slow startup on a loaded CI runner (PR #683, run
+    /// 44019998471): shutdown aborted the QSO task before it had spawned the
+    /// upload subscriber, so the completion was never queued.
+    async fn start_qso_component_and_wait_until_ready(coordinator: &mut ApplicationCoordinator) {
+        let mut ready = coordinator.qso_consumer_ready.subscribe();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ready.wait_for(|ready| *ready),
+        )
+        .await
+        .expect("QSO consumer never became ready")
+        .expect("qso_consumer_ready sender dropped");
+    }
+
+    /// How long [`wait_for_queued_upload`] waits for the worker.
+    const UPLOAD_QUEUED_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// PAN-424: bounded poll until the upload worker holds work for
+    /// `destination`. The worker publishes its health only after adding a
+    /// batch and saving the queue, so a non-empty entry means the upload is
+    /// queued on disk. Returns false on timeout so the caller can still shut
+    /// the coordinator down before failing.
+    async fn wait_for_queued_upload(
+        health: &std::sync::Arc<std::sync::Mutex<super::super::upload_outbox::UploadHealth>>,
+        destination: pancetta_dx::upload_outbox::UploadDestination,
+    ) -> bool {
+        let queued = || {
+            health
+                .lock()
+                .unwrap()
+                .destinations
+                .iter()
+                .any(|d| d.destination == destination && d.pending + d.held > 0)
+        };
+        tokio::time::timeout(UPLOAD_QUEUED_WAIT, async {
+            while !queued() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// PAN-232 Tier 1: a QSO that completes while its QRZ XML lookup hangs
     /// still has its uploads queued when pancetta shuts down, without the
     /// QRZ data, shutdown does not wait for the lookup, and the next start
@@ -14790,8 +14838,7 @@ mod replay_history_seed_tests {
     async fn qso_completed_after_the_shutdown_flag_still_has_its_uploads_queued() {
         let tmp = tempfile::tempdir().unwrap();
         let mut coordinator = clublog_coordinator(tmp.path()).await;
-        coordinator.start_qso_component().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        start_qso_component_and_wait_until_ready(&mut coordinator).await;
         let manager = coordinator
             .qso_manager_watch
             .borrow()
@@ -14803,7 +14850,18 @@ mod replay_history_seed_tests {
         // More than four of the subscriber's shutdown polls.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         super::replay_local_log_tests::complete_one_qso(&manager).await;
+        // The subscriber queued the completion it received after the flag
+        // flipped. Observed, not slept past; checked again on disk below.
+        let queued = wait_for_queued_upload(
+            &coordinator.upload_health,
+            pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+        )
+        .await;
         coordinator.shutdown().await.unwrap();
+        assert!(
+            queued,
+            "the QSO's ClubLog upload was not queued within {UPLOAD_QUEUED_WAIT:?} of completing"
+        );
         let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(outbox_path(tmp.path()));
         assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
         assert_eq!(store.entries()[0].call, "K1DEF");
@@ -14816,8 +14874,7 @@ mod replay_history_seed_tests {
     async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_and_the_upload_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let mut coordinator = clublog_coordinator(tmp.path()).await;
-        coordinator.start_qso_component().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        start_qso_component_and_wait_until_ready(&mut coordinator).await;
         let manager = coordinator
             .qso_manager_watch
             .borrow()
@@ -14849,8 +14906,7 @@ mod replay_history_seed_tests {
     async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_without_uploads() {
         let tmp = tempfile::tempdir().unwrap();
         let mut coordinator = live_coordinator_with_home(tmp.path()).await;
-        coordinator.start_qso_component().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        start_qso_component_and_wait_until_ready(&mut coordinator).await;
         let manager = coordinator
             .qso_manager_watch
             .borrow()

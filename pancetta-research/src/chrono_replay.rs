@@ -220,7 +220,10 @@ mod pan160_tests {
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("sample.wav");
         std::fs::write(&wav, b"wav").unwrap();
-        let sha = format!("{:x}", Sha256::digest(b"wav"));
+        let sha = Sha256::digest(b"wav")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let cache_path = dir.path().join(format!("{sha}.json"));
         let cache = BaselineCache {
             schema_version: 1,
@@ -340,7 +343,12 @@ pub fn preflight_timing_history(
             _ => reject(wav.clone(), "invalid or non-increasing timestamp".into()),
         }
         match std::fs::read(&wav) {
-            Ok(bytes) if format!("{:x}", Sha256::digest(&bytes)) == entry.wav_sha256 => {}
+            Ok(bytes)
+                if Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+                    == entry.wav_sha256 => {}
             Ok(_) => reject(wav.clone(), "WAV SHA mismatch".into()),
             Err(e) => reject(wav.clone(), e.to_string()),
         }

@@ -119,6 +119,15 @@ pub fn dedup_keep_last(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// The built-in `defaults` source that `discover_sources` adds (PAN-360).
+/// Its path, `defaults.toml`, is relative, so it is never read from disk
+/// (that would read the current directory) and never reported as a loaded
+/// file. A `defaults` source a caller adds with an absolute path is an
+/// ordinary file.
+fn is_embedded_defaults(source: &ConfigSource) -> bool {
+    source.name == "defaults" && source.path.is_relative()
+}
+
 /// The shape of a raw JSON config as a TOML value, for the unknown-key
 /// sweep: objects and arrays keep their keys and positions, and every scalar
 /// (including `null`, which TOML lacks) becomes a placeholder, since the
@@ -239,10 +248,9 @@ impl ConfigLoader {
     fn get_default_search_paths() -> ConfigResult<Vec<PathBuf>> {
         let mut paths = Vec::new();
 
-        // Current directory
-        if let Ok(current_dir) = std::env::current_dir() {
-            paths.push(current_dir);
-        }
+        // PAN-360: never the current directory. A config file there is read
+        // only when named with `--config`, so the station behaves the same
+        // from every shell location.
 
         // User configuration directory
         if let Some(config_dir) = dirs::config_dir() {
@@ -374,7 +382,7 @@ impl ConfigLoader {
                     // Report real config files only; the built-in
                     // "defaults" source is not an operator file.
                     if matches!(source.source_type, SourceType::Toml | SourceType::Json)
-                        && source.name != "defaults"
+                        && !is_embedded_defaults(source)
                         && source.path.exists()
                     {
                         if let Ok(mut f) = self.loaded_files.lock() {
@@ -552,7 +560,13 @@ impl ConfigLoader {
     fn load_source(&self, source: &ConfigSource) -> ConfigResult<Config> {
         match &source.source_type {
             SourceType::Toml => {
-                if source.path.exists() {
+                if is_embedded_defaults(source) {
+                    // PAN-360: the built-in defaults are always the embedded
+                    // ones. Their `defaults.toml` path is relative, so
+                    // reading it from disk would read the current directory.
+                    // A caller's absolute `defaults` file is still read below.
+                    self.load_embedded_defaults()
+                } else if source.path.exists() {
                     self.load_from_file(&source.path)
                 } else if source.path.file_name() == Some(std::ffi::OsStr::new("defaults.toml")) {
                     // Load embedded defaults

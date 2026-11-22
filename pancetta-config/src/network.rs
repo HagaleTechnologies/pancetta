@@ -177,7 +177,7 @@ impl std::fmt::Debug for LotwUploadConfig {
             .field("enabled", &self.enabled)
             .field("tqsl_path", &self.tqsl_path)
             .field("station_location", &self.station_location)
-            .field("password", &"[REDACTED]")
+            .field("password", &REDACTED)
             .finish()
     }
 }
@@ -467,8 +467,8 @@ impl ConfigSection for RemoteGatewayConfig {
 /// Station agent configuration — the remote-TX arm/consent gate.
 ///
 /// Default OFF on every field. This section governs the offline safety core
-/// of the station agent (P0–P2): [`enabled`](Self::enabled) will (in a later
-/// phase) gate the remote-control transport, and
+/// of the station agent (P0–P2): [`enabled`](Self::enabled) gates the
+/// remote-control transport, and
 /// [`remote_tx_enabled`](Self::remote_tx_enabled) is the station-agent
 /// channel's LOCAL operator consent gate, seeded into the coordinator's
 /// `ArmState` at startup as that channel's own consent bit. Consent is tracked
@@ -479,13 +479,18 @@ impl ConfigSection for RemoteGatewayConfig {
 /// can arm, so WSJT-X-UDP-originated TX cannot key PTT either (that channel
 /// is additionally gated by its own settings).
 ///
-/// In this phase the remote transport is not built, so [`enabled`](Self::enabled)
-/// has no runtime effect (it is only validated as well-formed).
+/// With [`enabled`](Self::enabled) on, both [`relay_url`](Self::relay_url) and
+/// [`pairing_api_url`](Self::pairing_api_url) set, the agent paired, and either a
+/// non-empty [`tx_allow_list`](Self::tx_allow_list) or cqdx.io auto-populate on, the
+/// station agent dials [`relay_url`](Self::relay_url). The
+/// [`tx_allow_list`](Self::tx_allow_list) field doc says who may connect and who may
+/// arm TX.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationAgentConfig {
-    /// Enable the station-agent remote-control transport. No runtime effect in
-    /// this phase (transport unbuilt); default OFF.
+    /// Enable the station-agent remote-control transport: the relay session and its
+    /// trust refresh. Turning it off is live and disarms remote TX; turning it on
+    /// needs a restart. Default OFF.
     #[serde(default)]
     pub enabled: bool,
 
@@ -546,12 +551,40 @@ pub struct StationAgentConfig {
     #[serde(default)]
     pub key_dir: Option<String>,
 
-    /// STATION-LOCAL allow-list of client `keyId`s permitted to arm TX. Empty
-    /// (default) → **no remote TX is possible** — this mirrors the fail-closed
-    /// capability check ([`crate`]-adjacent `capability`): a `txArmGrant` is only
-    /// honored when its `clientKeyId` is present here. A relay/cloud compromise
-    /// alone can never cause TX because the client-signed grant must reference a
-    /// key in this local list. The operator may populate it after pairing.
+    /// Static admission list of client `keyId`s for the station agent.
+    ///
+    /// The station agent has two trust roots.
+    ///
+    /// - TX is rooted on the station. A client can arm TX only when the
+    ///   operator stored its device key with `pancetta trust-client`
+    ///   (`<key_dir>/clients/<keyId>.pub`), the keyId is TX-eligible, the arm
+    ///   carries the client's signature and a TX-enabled capability token, and
+    ///   [`remote_tx_enabled`](Self::remote_tx_enabled) is `true`. TX-eligible
+    ///   means `localTrust ∩ owner edges` with cqdx.io auto-populate and
+    ///   `localTrust ∩ tx_allow_list` without it. Cloud data alone cannot arm TX.
+    /// - Connection and non-TX control are rooted in cqdx.io under
+    ///   auto-populate (`[network.cqdx]` enabled with a token). Every
+    ///   successful authorization poll replaces the admission set with the
+    ///   keyIds cqdx.io lists for this station, delegated guests included, so
+    ///   this list is the admission set only until the first successful poll.
+    ///   Removing an entry here evicts the peer at once, but the next poll
+    ///   re-admits it while cqdx.io still lists it. In both modes the hello
+    ///   token that sets a peer's `status` or `qsy` scope is signed by the
+    ///   cqdx.io key pinned at pairing.
+    ///
+    /// Without auto-populate this list is the whole admission set and cqdx.io
+    /// alone cannot add a peer. Empty (default) admits no client, so an enabled
+    /// transport never dials the relay.
+    ///
+    /// Residual under auto-populate, accepted 2026-11-07: whoever can add an
+    /// authorization for this station on cqdx.io, a compromised cqdx.io
+    /// included, can connect a key it holds, read the display feed, retune or
+    /// re-split the rig while it is unkeyed and no station-run QSO is active,
+    /// stop a CQ, and take control from the operator's own remote client,
+    /// which disarms that client. While `remote_tx_enabled` is on, the key it
+    /// connected can also queue QSO requests, which cannot transmit without an
+    /// arm. It cannot arm TX. See
+    /// `docs/DECISIONS/remote-operation.md`, "Two trust roots (PAN-362)".
     #[serde(default)]
     pub tx_allow_list: Vec<String>,
 }
@@ -919,7 +952,10 @@ pub struct HealthCheckConfig {
 }
 
 /// Custom service configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): every value in
+/// `headers` and `parameters` prints as `<redacted>`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CustomServiceConfig {
     /// Service name
     pub name: String,
@@ -944,7 +980,10 @@ pub struct CustomServiceConfig {
 }
 
 /// Custom authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): every value in
+/// `parameters` and `credentials` prints as `<redacted>`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CustomAuthConfig {
     /// Authentication type
     pub auth_type: String,
@@ -1017,7 +1056,10 @@ impl Default for DistanceFilters {
 /// `#[serde(default)]` at the container level (see `PskReporterConfig`'s
 /// doc comment for why): a missing field falls back to this struct's own
 /// `Default::default()` (e.g. `poll_interval_secs: 30`), not to `0`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see the redacting block below): a set `token`
+/// prints as `Some("<redacted>")`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CqdxConfig {
     /// Enable cqdx.io integration
@@ -1032,9 +1074,13 @@ pub struct CqdxConfig {
     /// Priority spot poll interval in seconds
     pub poll_interval_secs: u64,
 
-    /// TX-allow-list auto-populate poll interval, in seconds (dispensa
-    /// Q-0043). Separate from `poll_interval_secs` (the priority-spot poll) —
-    /// different concern, potentially different cadence.
+    /// Station-agent trust refresh interval, in seconds (dispensa Q-0043). With
+    /// cqdx.io enabled and a token, each tick fetches the cqdx.io authorizations that
+    /// replace the station agent's admission set and owner edges. In both modes each
+    /// tick rereads the local `clients/<keyId>.pub` keys; with cqdx.io this starts
+    /// after the first successful fetch. Separate from
+    /// `poll_interval_secs` (the priority-spot poll). Minimum 10, checked even with
+    /// cqdx.io disabled.
     pub authorizations_poll_interval_secs: u64,
 }
 
@@ -1333,13 +1379,11 @@ impl ConfigSection for NetworkConfig {
             StationAgentConfig::validate_pairing_api_url(value)?;
         }
 
-        // An empty `tx_allow_list` is NOT a hard error (the operator may add
-        // client keyIds after pairing), but it has two distinct consequences
-        // worth surfacing clearly: no remote TX can occur (remote_tx_enabled
-        // path), AND — since the runtime station-agent component also uses
-        // tx_allow_list to pick the single client keyId it addresses — if the
-        // transport itself is enabled, the relay connection is never even
-        // attempted at all, not merely TX-gated.
+        // An empty `tx_allow_list` is NOT a hard error. Without cqdx.io auto-populate
+        // no client can connect, so an enabled transport never dials the relay. With
+        // auto-populate an empty static list is normal: cqdx.io supplies admission,
+        // and arming TX still needs an owner edge plus a key stored by
+        // `pancetta trust-client` (PAN-309, PAN-362).
         if self.station_agent.tx_allow_list.is_empty() {
             if self.station_agent.enabled && !self.cqdx.enabled {
                 tracing::warn!(
@@ -1347,13 +1391,16 @@ impl ConfigSection for NetworkConfig {
                     "station_agent.enabled = true but tx_allow_list is empty and cqdx auto-populate \
                      is disabled — no client keyId to admit; add the client's keyId to \
                      station_agent.tx_allow_list, or enable cqdx.io integration (dispensa Q-0043) \
-                     so it populates automatically"
+                     so it populates automatically, which lets cqdx.io decide who may connect and \
+                     use non-TX control"
                 );
             } else if self.station_agent.remote_tx_enabled {
                 tracing::warn!(
                     target: "config.station_agent",
-                    "remote_tx_enabled = true but tx_allow_list is empty — NO remote TX can occur until \
-                     client keyIds are added to station_agent.tx_allow_list (fail-closed)"
+                    "remote_tx_enabled = true but tx_allow_list is empty. Without cqdx.io auto-populate \
+                     no client can arm remote TX; with it, a client can arm only after it has an owner \
+                     edge on cqdx.io and its device key is stored with `pancetta trust-client` \
+                     (fail-closed)"
                 );
             }
         }
@@ -1391,8 +1438,28 @@ impl ConfigSection for NetworkConfig {
 // These structs hold plaintext secrets; `#[derive(Debug)]` was removed so a
 // stray `debug!("{:?}", cfg)` or a panic that formats one can never dump a
 // password / api_key / cert secret. Non-secret fields are still shown.
+//
+// PAN-363 adds the cqdx Personal Access Token and the custom-service maps
+// (`headers`, `parameters`, auth `parameters`, `credentials`). Free-form maps
+// cannot be classified by key name, so they print every key with every value
+// `<redacted>`. These newer impls destructure `Self` exhaustively, so a field
+// added later fails to compile until its Debug line is written.
 // ---------------------------------------------------------------------------
 const REDACTED: &str = "<redacted>";
+
+/// Debug view of a map that shows its keys, in sorted order for
+/// deterministic output, and prints every value as [`REDACTED`].
+struct RedactedValues<'a, V>(&'a HashMap<String, V>);
+
+impl<V> std::fmt::Debug for RedactedValues<'_, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.0.keys().collect();
+        keys.sort_unstable();
+        f.debug_map()
+            .entries(keys.into_iter().map(|key| (key, REDACTED)))
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for RemoteGatewayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1402,6 +1469,66 @@ impl std::fmt::Debug for RemoteGatewayConfig {
             .field("auth_token", &self.auth_token.as_ref().map(|_| REDACTED))
             .field("allowed_origins", &self.allowed_origins)
             .field("allow_network_exposure", &self.allow_network_exposure)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CqdxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            base_url,
+            token,
+            poll_interval_secs,
+            authorizations_poll_interval_secs,
+        } = self;
+        f.debug_struct("CqdxConfig")
+            .field("enabled", enabled)
+            .field("base_url", base_url)
+            .field("token", &token.as_ref().map(|_| REDACTED))
+            .field("poll_interval_secs", poll_interval_secs)
+            .field(
+                "authorizations_poll_interval_secs",
+                authorizations_poll_interval_secs,
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CustomServiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            url,
+            service_type,
+            auth,
+            headers,
+            parameters,
+            enabled,
+        } = self;
+        f.debug_struct("CustomServiceConfig")
+            .field("name", name)
+            .field("url", url)
+            .field("service_type", service_type)
+            .field("auth", auth)
+            .field("headers", &RedactedValues(headers))
+            .field("parameters", &RedactedValues(parameters))
+            .field("enabled", enabled)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CustomAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            auth_type,
+            parameters,
+            credentials,
+        } = self;
+        f.debug_struct("CustomAuthConfig")
+            .field("auth_type", auth_type)
+            .field("parameters", &RedactedValues(parameters))
+            .field("credentials", &RedactedValues(credentials))
             .finish()
     }
 }
@@ -1758,6 +1885,31 @@ mod tests {
         let mut qb = QrzLogbookConfig::default();
         qb.api_key = "qrzLogbookKEY".into();
         assert!(!format!("{qb:?}").contains("qrzLogbookKEY"));
+
+        // PAN-363: the cqdx Personal Access Token, alone and inside the
+        // network config.
+        let mut cqdx = CqdxConfig::default();
+        cqdx.token = Some("pat_cqdxSECRET".into());
+        let s = format!("{cqdx:?}");
+        assert!(!s.contains("pat_cqdxSECRET"), "cqdx token leaked: {s}");
+        assert!(s.contains("<redacted>"), "cqdx token not redacted: {s}");
+        let network = NetworkConfig {
+            cqdx,
+            ..Default::default()
+        };
+        let s = format!("{network:?}");
+        assert!(!s.contains("pat_cqdxSECRET"), "cqdx token leaked: {s}");
+        assert!(s.contains("<redacted>"), "cqdx token not redacted: {s}");
+
+        // PAN-363: LoTW uses the shared `<redacted>` marker.
+        let mut lotw = LotwUploadConfig::default();
+        lotw.password = "lotwPW_SECRET".into();
+        let s = format!("{lotw:?}");
+        assert!(!s.contains("lotwPW_SECRET"), "LoTW password leaked: {s}");
+        assert!(
+            s.contains(r#"password: "<redacted>""#),
+            "LoTW password not redacted with the shared marker: {s}"
+        );
     }
 
     #[test]
@@ -2422,3 +2574,7 @@ tx_allow_list = ["client-key-1", "client-key-2"]
 #[cfg(test)]
 #[path = "network/tests/wsjtx_decode_ingest_tests.rs"]
 mod wsjtx_decode_ingest_tests;
+
+#[cfg(test)]
+#[path = "network/tests/debug_redaction_tests.rs"]
+mod debug_redaction_tests;
