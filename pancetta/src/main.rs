@@ -2792,11 +2792,11 @@ fn run_first_time_setup(
     );
     if new_config.rig.interface.enabled {
         println!(
-            "Rig:     {} on {} @ {} (PTT: {:?})",
+            "Rig:     {} on {} @ {} (PTT: {})",
             new_config.rig.model,
             new_config.rig.interface.port,
             new_config.rig.interface.baud_rate,
-            new_config.rig.ptt.method
+            wizard_ptt_summary(&new_config.rig.ptt)
         );
         println!("         Verify the link any time with: pancetta test-rig");
     } else {
@@ -3112,29 +3112,91 @@ fn setup_rig(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// PAN-357: the PTT methods the wizard offers, each one with a keying path.
+fn wizard_ptt_methods() -> [(pancetta_config::rig::PttMethod, &'static str); 3] {
+    use pancetta_config::rig::PttMethod;
+    [
+        (
+            PttMethod::None,
+            "None (default: key through rigctld, same as CAT)",
+        ),
+        (PttMethod::Cat, "CAT (key through rigctld)"),
+        (
+            PttMethod::SerialRts,
+            "Serial RTS (the RTS line of a separate serial port keys the rig)",
+        ),
+    ]
+}
+
+/// PAN-357: `config` with the wizard's PTT method and device applied, or the
+/// validation sentence when those settings cannot key the rig.
+fn apply_wizard_ptt_choice(
+    config: &Config,
+    method: pancetta_config::rig::PttMethod,
+    device: Option<String>,
+) -> Result<Config, String> {
+    let mut candidate = config.clone();
+    candidate.rig.ptt.method = method;
+    candidate.rig.ptt.device = device;
+    match candidate.rig.ptt.refusal(&candidate.rig.interface) {
+        Some(reason) => Err(reason),
+        None => Ok(candidate),
+    }
+}
+
+/// The PTT method as the wizard summaries show it; serial RTS names its port.
+fn wizard_ptt_summary(ptt: &pancetta_config::rig::PttConfig) -> String {
+    use pancetta_config::rig::PttMethod;
+    if ptt.method == PttMethod::SerialRts {
+        let device = ptt.device.as_deref().map(str::trim).unwrap_or("");
+        let device = if device.is_empty() { "not set" } else { device };
+        format!("{:?} ({device})", ptt.method)
+    } else {
+        format!("{:?}", ptt.method)
+    }
+}
+
 fn setup_ptt(config: &mut Config) -> Result<()> {
     use pancetta_config::rig::PttMethod;
 
     println!("--- PTT Control ---");
     println!();
 
-    let methods = [
-        (PttMethod::None, "None (no PTT control)"),
-        (PttMethod::Cat, "CAT (via rig control)"),
-        (PttMethod::Serial, "Serial (RTS/DTR)"),
-        (PttMethod::Vox, "VOX (voice-operated)"),
-    ];
+    let methods = wizard_ptt_methods();
 
     for (i, (_, desc)) in methods.iter().enumerate() {
         println!("    [{}] {}", i + 1, desc);
     }
 
-    let current = format!("{:?}", config.rig.ptt.method);
+    let previous = config.rig.ptt.method.clone();
     if let Some(choice) = prompt_choice(
-        &format!("  Select PTT method [current: {}]: ", current),
+        &format!("  Select PTT method [current: {:?}]: ", previous),
         methods.len(),
     )? {
-        config.rig.ptt.method = methods[choice - 1].0.clone();
+        let method = methods[choice - 1].0.clone();
+        let mut device = config.rig.ptt.device.clone();
+        if method == PttMethod::SerialRts {
+            let current = device.as_deref().map(str::trim).unwrap_or("");
+            let current = if current.is_empty() {
+                "not set"
+            } else {
+                current
+            };
+            let input = prompt_line(&format!(
+                "  Serial PTT port, whose RTS line keys the rig [current: {current}]: "
+            ))?;
+            // An empty answer keeps the current device.
+            if !input.is_empty() {
+                device = Some(input);
+            }
+        }
+        match apply_wizard_ptt_choice(config, method, device) {
+            Ok(updated) => config.rig.ptt = updated.rig.ptt,
+            Err(reason) => {
+                println!("  {reason}");
+                println!("  PTT method left as {previous:?}.");
+            }
+        }
     }
 
     println!();
@@ -3321,7 +3383,7 @@ async fn setup_command() -> Result<()> {
             "  Rig:       {} on {} @ {}",
             config.rig.model, config.rig.interface.port, config.rig.interface.baud_rate
         );
-        println!("  PTT:       {:?}", config.rig.ptt.method);
+        println!("  PTT:       {}", wizard_ptt_summary(&config.rig.ptt));
         println!(
             "  Freq ctrl: {}",
             if config.rig.frequency.control_enabled {
@@ -3397,6 +3459,22 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     println!("Rig model:  {}", config.rig.model);
     println!("rigctld:    {address}");
     println!("PTT method: {:?}", config.rig.ptt.method);
+    // PAN-357: serial_rts keys a separate port, never `rig.interface.port`.
+    let ptt_device = config
+        .rig
+        .ptt
+        .device
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
+    if config.rig.ptt.method == PttMethod::SerialRts {
+        let shown = if ptt_device.is_empty() {
+            "not set"
+        } else {
+            ptt_device
+        };
+        println!("PTT port:   {shown}");
+    }
     let rig = RigctldClient::new(endpoint);
     print!("[1/3] Connecting to rigctld... ");
     std::io::stdout().flush()?;
@@ -3417,10 +3495,13 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     println!("OK ({frequency} Hz)");
     if args.ptt {
         anyhow::ensure!(
-            matches!(config.rig.ptt.method, PttMethod::Cat | PttMethod::Serial),
+            matches!(config.rig.ptt.method, PttMethod::Cat | PttMethod::SerialRts),
             "PTT method {:?} cannot be tested by this command",
             config.rig.ptt.method
         );
+        if let Some(reason) = config.rig.ptt.refusal(&config.rig.interface) {
+            anyhow::bail!("{reason}");
+        }
         println!("[3/3] Testing PTT...");
         std::io::stdout().flush()?;
         // Unlike the coordinator, this command has no polling cache.
@@ -3476,12 +3557,10 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
                 test_rig_pulse_result("PTT", on, off, pulse)?;
                 println!("       PTT OFF");
             }
-            PttMethod::Serial => {
-                let mut port =
-                    serialport::new(&config.rig.interface.port, config.rig.interface.baud_rate)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .open()
-                        .context("cannot open Serial PTT port")?;
+            PttMethod::SerialRts => {
+                // Opens with RTS low; the refusal above rules out a blank
+                // device and the CAT port.
+                let mut port = pancetta_lib::coordinator::open_serial_rts_port(ptt_device)?;
                 test_rig_rts_pulse(
                     |on| port.write_request_to_send(on).map_err(Into::into),
                     &mut interrupted,
@@ -3497,7 +3576,7 @@ async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Gate shared by CAT and Serial; a diagnostic must never skip an unknown dial.
+/// Gate shared by CAT and serial RTS; a diagnostic must never skip an unknown dial.
 fn test_rig_admit_ptt(
     dial: u64,
     split: u64,
@@ -3568,7 +3647,7 @@ mod test_rig_tests {
     fn test_rig_unknown_and_cat_serial_admission() {
         let plan = pancetta_config::BandPlanConfig::default();
         // Both methods use this exact gate before opening/asserting PTT.
-        for _method in ["Cat", "Serial"] {
+        for _method in ["Cat", "SerialRts"] {
             assert!(test_rig_admit_ptt(0, 0, &plan).is_err());
             assert!(test_rig_admit_ptt(14_074_000, 30_000_000, &plan).is_err());
             assert_eq!(
@@ -4821,6 +4900,61 @@ mod wizard_validation_tests {
         let mut cfg = Config::default();
         cfg.station.power_watts = 5000;
         assert!(cfg.validate().is_err());
+    }
+
+    /// PAN-357 AC11: the wizard lists only methods that key the rig.
+    #[test]
+    fn wizard_offers_only_implemented_ptt_methods() {
+        use pancetta_config::rig::PttMethod;
+        assert_eq!(
+            wizard_ptt_methods(),
+            [
+                (
+                    PttMethod::None,
+                    "None (default: key through rigctld, same as CAT)"
+                ),
+                (PttMethod::Cat, "CAT (key through rigctld)"),
+                (
+                    PttMethod::SerialRts,
+                    "Serial RTS (the RTS line of a separate serial port keys the rig)"
+                ),
+            ]
+        );
+    }
+
+    /// PAN-357 AC11: a Serial RTS choice without a separate PTT port is not
+    /// kept; one with a separate port is.
+    #[test]
+    fn wizard_serial_rts_choice_needs_a_separate_port() {
+        use pancetta_config::rig::PttMethod;
+        let mut cfg = Config::default();
+        cfg.rig.interface.enabled = true;
+        cfg.rig.interface.port = "/dev/ttyUSB0".to_string();
+        let needs_device = "rig.ptt.method = \"serial_rts\" needs rig.ptt.device, the serial \
+                            port whose RTS line keys the rig.";
+        for device in [None, Some(String::new()), Some("   ".to_string())] {
+            assert_eq!(
+                apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, device.clone()).unwrap_err(),
+                needs_device,
+                "device {device:?}"
+            );
+        }
+        assert_eq!(
+            apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, Some("/dev/ttyUSB0".to_string()))
+                .unwrap_err(),
+            "rig.ptt.device = \"/dev/ttyUSB0\" is the CAT port (rig.interface.port). rigctld \
+             owns that port; serial_rts needs a separate PTT port."
+        );
+        let chosen =
+            apply_wizard_ptt_choice(&cfg, PttMethod::SerialRts, Some("/dev/ttyUSB1".to_string()))
+                .unwrap();
+        assert_eq!(chosen.rig.ptt.method, PttMethod::SerialRts);
+        assert_eq!(chosen.rig.ptt.device.as_deref(), Some("/dev/ttyUSB1"));
+        assert_eq!(
+            wizard_ptt_summary(&chosen.rig.ptt),
+            "SerialRts (/dev/ttyUSB1)"
+        );
+        assert_eq!(wizard_ptt_summary(&cfg.rig.ptt), "None");
     }
 }
 
