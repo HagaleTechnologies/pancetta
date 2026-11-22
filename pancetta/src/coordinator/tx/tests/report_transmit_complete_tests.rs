@@ -1,4 +1,5 @@
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 async fn check(success: bool, qso_id: Option<&str>) {
     let bus = MessageBus::new(16).unwrap();
@@ -237,7 +238,7 @@ async fn successful_transmit_complete_mirrors_tx_frame_sent_to_qso() {
             remote_binding: Some((true, Some("peer".into()))),
         }
     );
-    let reported_from = chrono::Utc::now();
+    let reported_from = UtcTimestamp::now();
     report_played_transmit_complete(
         &bus,
         true,
@@ -261,7 +262,7 @@ async fn successful_transmit_complete_mirrors_tx_frame_sent_to_qso() {
         msg.message_type,
         MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, aired_at, attempt_id: None })
             if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
-                && aired_at >= reported_from && aired_at <= chrono::Utc::now()
+                && aired_at >= reported_from && aired_at <= UtcTimestamp::now()
     ));
     assert!(qso.try_recv().is_err());
 }

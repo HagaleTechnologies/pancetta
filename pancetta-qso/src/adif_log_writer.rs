@@ -30,6 +30,7 @@
 use crate::adif::{AdifError, AdifProcessor, AdifQso, AdifRecord};
 use crate::logbook_lock::{LogbookGuard, LogbookLock};
 use crate::QsoMetadata;
+use pancetta_core::time::UtcTimestamp;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -504,8 +505,8 @@ mod tests {
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             first_answer_at: None,
-            start_time: chrono::Utc::now(),
-            end_time: Some(chrono::Utc::now()),
+            start_time: UtcTimestamp::now(),
+            end_time: Some(UtcTimestamp::now()),
             reports: SignalReports {
                 sent: Some(-12),
                 received: Some(-15),

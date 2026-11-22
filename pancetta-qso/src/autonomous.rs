@@ -4,7 +4,8 @@
 //! decisions: hunt for interesting CQs, call CQ when idle, manage even/odd slots,
 //! and periodically listen on our TX slot to detect doubling.
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -79,7 +80,7 @@ impl SlotParity {
     /// FT8-grid callers; the live slot gate uses
     /// [`SlotParity::of_time_with_period`].
     pub fn current() -> Self {
-        Self::from_unix_secs(Utc::now().timestamp())
+        Self::from_unix_secs(UtcTimestamp::now().as_second())
     }
 
     /// Parity of the slot containing `t`, for a slot length of `slot_ns`
@@ -88,7 +89,7 @@ impl SlotParity {
     /// [`pancetta_core::slot::SlotParity::of_with_period`], the helper the TX
     /// scheduler, `QsoManager` and decode stamping use, so the operator's gate
     /// and the scheduler agree on which slot is which (PAN-356).
-    pub fn of_time_with_period(t: DateTime<Utc>, slot_ns: i64) -> Self {
+    pub fn of_time_with_period(t: UtcTimestamp, slot_ns: i64) -> Self {
         match pancetta_core::slot::SlotParity::of_with_period(t, effective_slot_ns(slot_ns)) {
             pancetta_core::slot::SlotParity::Even => SlotParity::Even,
             pancetta_core::slot::SlotParity::Odd => SlotParity::Odd,
@@ -233,7 +234,7 @@ impl SlotManager {
 
     /// Decide what to do in the current slot.
     pub fn should_transmit_this_slot(&mut self) -> SlotDecision {
-        self.should_transmit_at(Utc::now().timestamp())
+        self.should_transmit_at(UtcTimestamp::now().as_second())
     }
 
     /// Decide what to do at a given unix timestamp, on the FT8 15 s grid
@@ -245,7 +246,7 @@ impl SlotManager {
     /// Decide what to do at `now`, with slots `slot_ns` nanoseconds long (the
     /// active mode's slot length). Takes full-precision time because a 7.5 s
     /// FT4 boundary cannot be expressed in whole seconds (PAN-356).
-    pub fn should_transmit_at_time(&mut self, now: DateTime<Utc>, slot_ns: i64) -> SlotDecision {
+    pub fn should_transmit_at_time(&mut self, now: UtcTimestamp, slot_ns: i64) -> SlotDecision {
         self.decide_for_parity(SlotParity::of_time_with_period(now, slot_ns))
     }
 
@@ -805,7 +806,7 @@ impl BandStrategy {
     /// band; zero (unknown) changes nothing. Leaving an index that is already
     /// on the live band alone keeps the rotation moving through several
     /// entries on one band (e.g. FT8 and FT4 dials on 20m).
-    pub fn observe_dial(&mut self, live_dial_hz: u64, now: DateTime<Utc>) {
+    pub fn observe_dial(&mut self, live_dial_hz: u64, now: UtcTimestamp) {
         if live_dial_hz == 0 {
             return;
         }
@@ -822,7 +823,7 @@ impl BandStrategy {
     }
 
     /// PAN-385: a CQ tiered `PerBandDxccNew` or higher was decoded.
-    pub fn note_needed_heard(&mut self, now: DateTime<Utc>) {
+    pub fn note_needed_heard(&mut self, now: UtcTimestamp) {
         self.scheduler.note_needed_heard(now);
     }
 
@@ -886,7 +887,7 @@ impl BandStrategy {
 
     /// Mark a hop: reset the low-activity counter, start the settle, point
     /// the round-robin index at the destination's entry and remember it.
-    fn commit_hop(&mut self, to: Option<pancetta_core::Band>, needed: bool, now: DateTime<Utc>) {
+    fn commit_hop(&mut self, to: Option<pancetta_core::Band>, needed: bool, now: UtcTimestamp) {
         self.low_activity_cycles = 0;
         self.settling_cycles = 2;
         if let Some(idx) = to.and_then(|b| self.entry_index_for(b)) {
@@ -902,7 +903,7 @@ impl BandStrategy {
     /// when the executor does not carry the hop out.
     pub fn next_hop(
         &mut self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         slot_ns: i64,
     ) -> Option<(u64, crate::band_scheduler::BandHopReason)> {
         let before = LowActivityState {
@@ -978,7 +979,7 @@ impl BandStrategy {
 
     fn evaluate_hop(
         &mut self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         slot_ns: i64,
     ) -> Option<(u64, crate::band_scheduler::BandHopReason)> {
         use crate::band_scheduler::BandHopReason;
@@ -1069,7 +1070,7 @@ impl BandStrategy {
     /// Needed-activity trigger (Decision 10).
     fn needed_pick(
         &self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         slot_ns: i64,
         current: Option<pancetta_core::Band>,
         active: Option<usize>,
@@ -1083,7 +1084,7 @@ impl BandStrategy {
         if !snapshot.is_fresh(now) {
             return None;
         }
-        let hop_interval = ChronoDuration::nanoseconds(
+        let hop_interval = SignedDuration::from_nanos(
             i64::from(self.config.hop_threshold).saturating_mul(slot_ns),
         );
         if !self.scheduler.needed_dwell_passed(now, hop_interval) {
@@ -1321,9 +1322,9 @@ impl FrequencyAllocator {
 // pancetta's QSO slots and log. (Security review 2026-04-29 I-1.)
 //
 // Stored as a plain `i64` of seconds so the windows can be evaluated
-// against the injectable [`DateTime<Utc>`] clock the sim harness drives
+// against the injectable [`UtcTimestamp`] clock the sim harness drives
 // (mirrors `QsoManager`'s `check_timeouts_at(now)` pattern). The
-// time-dependent maps below key on `DateTime<Utc>` for the same reason.
+// time-dependent maps below key on `UtcTimestamp` for the same reason.
 const RECENT_RESPONSE_WINDOW_SECS: i64 = 60;
 
 /// Snapshot of the fields a `decide_at` self-CQ cycle may mutate
@@ -1470,9 +1471,9 @@ pub struct AutonomousOperator {
     /// FAKECALL FN42` every cycle to flood pancetta's QSO slots and
     /// log. (Security review 2026-04-29 I-1.)
     ///
-    /// Keyed on `DateTime<Utc>` (not `Instant`) so the window can be
+    /// Keyed on `UtcTimestamp` (not `Instant`) so the window can be
     /// evaluated against the sim harness's injectable virtual clock.
-    recently_responded_to: HashMap<String, DateTime<Utc>>,
+    recently_responded_to: HashMap<String, UtcTimestamp>,
     /// DX-busy tracker: callsign → time it was last seen participating in
     /// a non-CQ exchange (report / RR73 / 73) that was NOT directed at us
     /// and was NOT a CQ. If a station appears here within
@@ -1480,9 +1481,9 @@ pub struct AutonomousOperator {
     /// working a third party and suppresses any auto-response to its CQ.
     /// Populated from `feed_decoded_messages`.
     ///
-    /// Keyed on `DateTime<Utc>` (not `Instant`) so the busy window can be
+    /// Keyed on `UtcTimestamp` (not `Instant`) so the busy window can be
     /// evaluated against the sim harness's injectable virtual clock.
-    recently_in_qso: HashMap<String, DateTime<Utc>>,
+    recently_in_qso: HashMap<String, UtcTimestamp>,
     /// Phase-5 hardening #1: optional callsign-continuity FP filter
     /// consulted before responding to any CQ. Defends against OSD
     /// fabrications (`R44XYB`, `OR1QRD`, ...) reaching the TX path.
@@ -1580,7 +1581,7 @@ impl AutonomousOperator {
         let decode_history = DecodeHistory::new(config.frequency.decode_history_cycles);
         let smart_allocator = SmartFrequencyAllocator::new(config.frequency.clone());
         let watchlist =
-            DxWatchlist::new(chrono::Duration::seconds(config.watchlist_ttl_secs as i64));
+            DxWatchlist::new(SignedDuration::from_secs(config.watchlist_ttl_secs as i64));
         let exchange = MessageExchange::new(our_callsign.clone());
         let our_continent = pancetta_core::dxcc::continent_for_callsign(&our_callsign);
 
@@ -2051,23 +2052,23 @@ impl AutonomousOperator {
     /// Uses the real wall clock for the DX-busy bookkeeping. The
     /// deterministic sim harness calls [`Self::feed_decoded_messages_at`]
     /// with the virtual slot `now` instead; this method just forwards to it
-    /// with `Utc::now()`, so production behavior is unchanged.
+    /// with `UtcTimestamp::now()`, so production behavior is unchanged.
     pub fn feed_decoded_messages(
         &mut self,
         messages: &[DecodedMessageInfo],
         evaluator: &dyn DxEvaluator,
     ) {
-        self.feed_decoded_messages_at(messages, evaluator, Utc::now());
+        self.feed_decoded_messages_at(messages, evaluator, UtcTimestamp::now());
     }
 
     /// Feed decoded messages, stamping DX-busy bookkeeping at an explicit
     /// `now` (testable / sim-drivable). [`Self::feed_decoded_messages`]
-    /// forwards here with `Utc::now()` so production behavior is identical.
+    /// forwards here with `UtcTimestamp::now()` so production behavior is identical.
     pub fn feed_decoded_messages_at(
         &mut self,
         messages: &[DecodedMessageInfo],
         evaluator: &dyn DxEvaluator,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) {
         self.feed_decoded_messages_on_dial_at(messages, evaluator, 0, now);
     }
@@ -2079,7 +2080,7 @@ impl AutonomousOperator {
         messages: &[DecodedMessageInfo],
         evaluator: &dyn DxEvaluator,
         live_dial_hz: u64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) {
         // Auto-parity detection. FQ-F2: stamp each message's activity under
         // its OWN decoded slot parity (`m.slot_parity`) rather than the
@@ -2087,9 +2088,15 @@ impl AutonomousOperator {
         // slot boundary must not be attributed to the next slot just because
         // this function happens to run after the boundary. Messages without
         // a tracked parity (test scaffolding / untracked decodes) fall back
+<<<<<<< HEAD
         // to the parity of the caller's `now` (PAN-358: the coordinator passes
         // its slot-clock reading, so this never re-reads the system clock).
         let current_parity = SlotParity::of_time_with_period(now, self.slot_ns());
+=======
+        // to the wall-clock parity, preserving existing behavior for callers
+        // that don't set `slot_parity`.
+        let current_parity = SlotParity::of_time_with_period(UtcTimestamp::now(), self.slot_ns());
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         let mut even_count: u32 = 0;
         let mut odd_count: u32 = 0;
         let mut untracked_count: u32 = 0;
@@ -2148,7 +2155,7 @@ impl AutonomousOperator {
         // that is mid-QSO with a third party. Prune entries older than the
         // configured busy window so the map stays bounded.
         let busy_now = now;
-        let busy_window = ChronoDuration::seconds(self.config.dx_busy_window_secs as i64);
+        let busy_window = SignedDuration::from_secs(self.config.dx_busy_window_secs as i64);
         let cutoff = busy_now - busy_window;
         self.recently_in_qso.retain(|_, t| *t > cutoff);
         for msg in messages {
@@ -2282,12 +2289,12 @@ impl AutonomousOperator {
     /// Returns `true` if we initiated a response to `callsign` within the
     /// last [`RECENT_RESPONSE_WINDOW_SECS`] (60 s). Caller should skip the
     /// CQ. `now` is supplied explicitly so the sim harness can drive it
-    /// from the virtual clock; production passes `Utc::now()`.
-    pub fn is_recently_responded_to(&self, callsign: &str, now: DateTime<Utc>) -> bool {
-        let window = ChronoDuration::seconds(RECENT_RESPONSE_WINDOW_SECS);
+    /// from the virtual clock; production passes `UtcTimestamp::now()`.
+    pub fn is_recently_responded_to(&self, callsign: &str, now: UtcTimestamp) -> bool {
+        let window = SignedDuration::from_secs(RECENT_RESPONSE_WINDOW_SECS);
         self.recently_responded_to
             .get(callsign)
-            .is_some_and(|t| now.signed_duration_since(*t) < window)
+            .is_some_and(|t| now.duration_since(*t) < window)
     }
 
     /// Returns `true` if `callsign` was seen working a third party (a
@@ -2295,20 +2302,20 @@ impl AutonomousOperator {
     /// `config.dx_busy_window_secs`. The autonomous operator suppresses
     /// new auto-responses to such a station even if it briefly CQs again.
     /// `now` is supplied explicitly so the sim harness can drive it from
-    /// the virtual clock; production passes `Utc::now()`.
-    pub fn is_dx_busy(&self, callsign: &str, now: DateTime<Utc>) -> bool {
-        let window = ChronoDuration::seconds(self.config.dx_busy_window_secs as i64);
+    /// the virtual clock; production passes `UtcTimestamp::now()`.
+    pub fn is_dx_busy(&self, callsign: &str, now: UtcTimestamp) -> bool {
+        let window = SignedDuration::from_secs(self.config.dx_busy_window_secs as i64);
         self.recently_in_qso
             .get(callsign)
-            .is_some_and(|t| now.signed_duration_since(*t) < window)
+            .is_some_and(|t| now.duration_since(*t) < window)
     }
 
     /// Record that we just initiated a response to `callsign`. Also
     /// opportunistically prunes entries older than 5 × the window so the
     /// map doesn't grow unbounded. `now` is supplied explicitly for the
-    /// sim harness; production passes `Utc::now()`.
-    fn mark_responded_to(&mut self, callsign: &str, now: DateTime<Utc>) {
-        let cutoff = now - ChronoDuration::seconds(RECENT_RESPONSE_WINDOW_SECS * 5);
+    /// sim harness; production passes `UtcTimestamp::now()`.
+    fn mark_responded_to(&mut self, callsign: &str, now: UtcTimestamp) {
+        let cutoff = now - SignedDuration::from_secs(RECENT_RESPONSE_WINDOW_SECS * 5);
         self.recently_responded_to.retain(|_, t| *t > cutoff);
         self.recently_responded_to.insert(callsign.to_string(), now);
     }
@@ -2775,7 +2782,7 @@ impl AutonomousOperator {
 
     /// Run one cycle of the decision engine. Returns zero or more actions.
     pub fn decide(&mut self) -> Vec<OperatorAction> {
-        self.decide_at_time(Utc::now())
+        self.decide_at_time(UtcTimestamp::now())
     }
 
     /// Run one cycle at a specific unix timestamp (for testing).
@@ -2905,14 +2912,16 @@ impl AutonomousOperator {
     /// Equivalent to [`AutonomousOperator::decide_at_time`] at `unix_secs`
     /// with a zero sub-second part.
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
-        self.decide_at_time(DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now))
+        self.decide_at_time(
+            UtcTimestamp::from_parts(unix_secs, 0).unwrap_or_else(UtcTimestamp::now),
+        )
     }
 
     /// Run one cycle at `now`. The slot gate uses `now` at full precision with
     /// the live slot length (PAN-356); the time-dependent gates below keep
     /// whole-second resolution.
-    pub fn decide_at_time(&mut self, now: DateTime<Utc>) -> Vec<OperatorAction> {
-        let unix_secs = now.timestamp();
+    pub fn decide_at_time(&mut self, now: UtcTimestamp) -> Vec<OperatorAction> {
+        let unix_secs = now.as_second();
         self.skip_log.clear();
         let mut actions = Vec::new();
         // PAN-72: consumed unconditionally, before any state-dependent
@@ -3012,13 +3021,13 @@ impl AutonomousOperator {
                     // evaluate against the slot's virtual `now`, derived
                     // from the `unix_secs` this cycle runs at, so the sim
                     // harness drives them deterministically. Production
-                    // calls `decide()` with `Utc::now()`, so the derived
+                    // calls `decide()` with `UtcTimestamp::now()`, so the derived
                     // `now` equals real now to the second. It shadows the
                     // full-precision `now` on purpose: these gates keep
                     // whole-second resolution; only the slot gate above
                     // needs sub-second time (PAN-356).
                     let now =
-                        DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now);
+                        UtcTimestamp::from_parts(unix_secs, 0).unwrap_or_else(UtcTimestamp::now);
                     // Phase-5 hardening #1: TX-side FP gate. If a
                     // callsign-continuity filter is installed, reject
                     // any CQ whose sender doesn't appear in the trust
@@ -3738,7 +3747,7 @@ fn extract_grid_from_cq(text: &str) -> Option<String> {
 
 /// Simple deterministic jitter in ±200 Hz range using system time low bits.
 fn simple_jitter() -> f64 {
-    let nanos = Utc::now().timestamp_subsec_nanos();
+    let nanos = UtcTimestamp::now().subsec_nanosecond();
     // Map to -200..+200 range.
     ((nanos % 401) as f64) - 200.0
 }
@@ -3867,9 +3876,9 @@ mod tests {
     const PAN356_FT8_SLOT_NS: i64 = 15_000_000_000;
 
     /// The `k`th FT4 slot tick after the base, `latency_ms` late.
-    fn pan356_ft4_tick(k: i64, latency_ms: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from_timestamp(PAN356_BASE_UNIX, 0).expect("valid base")
-            + ChronoDuration::milliseconds(k * 7_500 + latency_ms)
+    fn pan356_ft4_tick(k: i64, latency_ms: i64) -> UtcTimestamp {
+        UtcTimestamp::from_parts(PAN356_BASE_UNIX, 0).expect("valid base")
+            + SignedDuration::from_millis(k * 7_500 + latency_ms)
     }
 
     fn pan356_has_transmit(actions: &[OperatorAction]) -> bool {
@@ -3896,13 +3905,13 @@ mod tests {
                 // FT8 15 s through the period-aware path is the old grid.
                 assert_eq!(
                     SlotParity::of_time_with_period(t, PAN356_FT8_SLOT_NS),
-                    SlotParity::from_unix_secs(t.timestamp()),
+                    SlotParity::from_unix_secs(t.as_second()),
                     "FT8 grid at FT4 tick {k} +{latency_ms} ms"
                 );
                 // A non-positive slot length falls back to FT8 15 s.
                 assert_eq!(
                     SlotParity::of_time_with_period(t, 0),
-                    SlotParity::from_unix_secs(t.timestamp()),
+                    SlotParity::from_unix_secs(t.as_second()),
                     "zero slot length at FT4 tick {k} +{latency_ms} ms"
                 );
             }
@@ -3967,9 +3976,9 @@ mod tests {
             slot_ns.store(PAN356_FT8_SLOT_NS, std::sync::atomic::Ordering::Relaxed);
             let ft8_tx_ticks: Vec<i64> = (0..4i64)
                 .filter(|&j| {
-                    let t = DateTime::<Utc>::from_timestamp(PAN356_BASE_UNIX + 60 + j * 15, 0)
+                    let t = UtcTimestamp::from_parts(PAN356_BASE_UNIX + 60 + j * 15, 0)
                         .expect("valid tick")
-                        + ChronoDuration::milliseconds(latency_ms);
+                        + SignedDuration::from_millis(latency_ms);
                     pan356_has_transmit(&op.decide_at_time(t))
                 })
                 .collect();
@@ -7794,7 +7803,7 @@ mod tests {
         op.feed_decoded_messages_at(
             &messages,
             &PounceTierEvaluator,
-            DateTime::from_timestamp(0, 0).unwrap(),
+            UtcTimestamp::from_parts(0, 0).unwrap(),
         );
         op
     }
@@ -7836,7 +7845,7 @@ mod tests {
         op.feed_decoded_messages_at(
             &pan292_messages(cqs),
             &NullDxEvaluator,
-            DateTime::from_timestamp(0, 0).unwrap(),
+            UtcTimestamp::from_parts(0, 0).unwrap(),
         );
         op
     }
@@ -7943,7 +7952,7 @@ mod tests {
         op.feed_decoded_messages_at(
             &pan292_messages(cqs),
             &PounceTierEvaluator,
-            DateTime::from_timestamp(0, 0).unwrap(),
+            UtcTimestamp::from_parts(0, 0).unwrap(),
         );
         op
     }
@@ -8098,7 +8107,7 @@ mod tests {
                 ("W1ABC", "K5ARH W1ABC -10", 1800.0),
             ]),
             &NullDxEvaluator,
-            DateTime::from_timestamp(0, 0).unwrap(),
+            UtcTimestamp::from_parts(0, 0).unwrap(),
         );
         assert!(op.is_directed_response("K5ARH W1ABC -10"));
         assert_eq!(
@@ -8156,7 +8165,7 @@ mod tests {
                 &[msg],
                 &scorer,
                 live,
-                DateTime::from_timestamp(0, 0).unwrap(),
+                UtcTimestamp::from_parts(0, 0).unwrap(),
             );
             assert_eq!(op.pending_cqs[0].tier, expected, "{captured:?}/{live}");
             assert_eq!(op.pending_cqs[0].frequency_hz, 1500.0);
@@ -8188,7 +8197,7 @@ mod tests {
 
     #[test]
     fn tier_pounce_preserves_recent_busy_and_capacity_gates() {
-        let now = DateTime::from_timestamp(0, 0).unwrap();
+        let now = UtcTimestamp::from_parts(0, 0).unwrap();
         let mut recent = tier_pounce_operator(Some(PriorityTier::Atno), 0, &["VP8PJ"]);
         recent.mark_responded_to("VP8PJ", now);
         assert!(!pounced_on(&recent.decide_at(0), "VP8PJ"));
@@ -8237,7 +8246,11 @@ mod tests {
 
         let evaluator =
             TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
-        op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(
+            &[cq_message("JA1ABC", "PM95")],
+            &evaluator,
+            UtcTimestamp::now(),
+        );
 
         assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
     }
@@ -8248,7 +8261,11 @@ mod tests {
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
 
         let evaluator = TieredTestEvaluator::new().with_tier("W2XYZ", PriorityTier::Standard);
-        op.feed_decoded_messages_at(&[cq_message("W2XYZ", "FN42")], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(
+            &[cq_message("W2XYZ", "FN42")],
+            &evaluator,
+            UtcTimestamp::now(),
+        );
 
         assert!(
             op.watchlist_callsigns().is_empty(),
@@ -8267,7 +8284,7 @@ mod tests {
         op.feed_decoded_messages_at(
             &[cq_message("JA1ABC", "PM95")],
             &NullDxEvaluator,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
 
         assert!(op.watchlist_callsigns().is_empty());
@@ -8278,7 +8295,11 @@ mod tests {
         let config = AutonomousConfig::default();
         let mut op = AutonomousOperator::new(config, "W5AU".to_string(), Some("EM10".to_string()));
         let evaluator = NullDxEvaluator;
-        op.feed_decoded_messages_at(&[cq_message("W5AU/P", "EM10")], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(
+            &[cq_message("W5AU/P", "EM10")],
+            &evaluator,
+            UtcTimestamp::now(),
+        );
         assert!(
             op.pending_cqs.is_empty(),
             "a compound form of our own callsign must not become a CQ candidate"
@@ -8290,7 +8311,11 @@ mod tests {
         let config = AutonomousConfig::default();
         let mut op = AutonomousOperator::new(config, "W5AU".to_string(), Some("EM10".to_string()));
         let evaluator = NullDxEvaluator;
-        op.feed_decoded_messages_at(&[cq_message("<W5AU>", "EM10")], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(
+            &[cq_message("<W5AU>", "EM10")],
+            &evaluator,
+            UtcTimestamp::now(),
+        );
         assert!(
             op.pending_cqs.is_empty(),
             "a resolved AP-hash render of our own callsign must not become a CQ candidate"
@@ -8310,7 +8335,7 @@ mod tests {
         op.feed_decoded_messages_at(
             &[cq_message("<...>", "FN42"), cq_message("FN42", "FN42")],
             &evaluator,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         assert!(
             op.pending_cqs.is_empty(),
@@ -8324,14 +8349,14 @@ mod tests {
         config.watchlist_ttl_secs = 150;
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
 
-        let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+        let t0 = UtcTimestamp::from_parts(1_000_000, 0).unwrap();
         let evaluator =
             TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
         op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, t0);
         assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
 
         // Feed again, 151s later, with no re-hear of JA1ABC at all.
-        let t1 = t0 + ChronoDuration::seconds(151);
+        let t1 = t0 + SignedDuration::from_secs(151);
         op.feed_decoded_messages_at(&[], &evaluator, t1);
 
         assert!(
@@ -8346,13 +8371,13 @@ mod tests {
         config.watchlist_ttl_secs = 150;
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
 
-        let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+        let t0 = UtcTimestamp::from_parts(1_000_000, 0).unwrap();
         let evaluator =
             TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
         op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, t0);
 
         // Feed again, only 30s later, with no re-hear — must still be present.
-        let t1 = t0 + ChronoDuration::seconds(30);
+        let t1 = t0 + SignedDuration::from_secs(30);
         op.feed_decoded_messages_at(&[], &evaluator, t1);
 
         assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
@@ -8717,7 +8742,7 @@ mod tests {
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-    use chrono::Duration as ChronoDuration;
+    use SignedDuration;
 
     fn build_test_operator(our_call: &str) -> AutonomousOperator {
         let config = AutonomousConfig {
@@ -8730,12 +8755,12 @@ mod rate_limit_tests {
     #[test]
     fn skips_recent_cq_from_same_callsign() {
         let mut op = build_test_operator("K5ARH");
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
 
         op.recently_responded_to.insert("AB1CD".to_string(), now);
 
         assert!(
-            op.is_recently_responded_to("AB1CD", now + ChronoDuration::seconds(30)),
+            op.is_recently_responded_to("AB1CD", now + SignedDuration::from_secs(30)),
             "60s window not honored — should still be skipping"
         );
     }
@@ -8743,12 +8768,12 @@ mod rate_limit_tests {
     #[test]
     fn allows_cq_from_callsign_after_window() {
         let mut op = build_test_operator("K5ARH");
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
 
         op.recently_responded_to.insert("AB1CD".to_string(), now);
 
         assert!(
-            !op.is_recently_responded_to("AB1CD", now + ChronoDuration::seconds(70)),
+            !op.is_recently_responded_to("AB1CD", now + SignedDuration::from_secs(70)),
             "after 60s, should accept again"
         );
     }
@@ -8756,9 +8781,9 @@ mod rate_limit_tests {
     #[test]
     fn mark_responded_to_prunes_stale() {
         let mut op = build_test_operator("K5ARH");
-        let stale = Utc::now() - ChronoDuration::seconds(60 * 60); // 1 hour ago
+        let stale = UtcTimestamp::now() - SignedDuration::from_secs(60 * 60); // 1 hour ago
         op.recently_responded_to.insert("STALE".to_string(), stale);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         op.mark_responded_to("FRESH", now);
         // Stale should be pruned (older than 5 × 60s = 300s).
         assert!(!op.recently_responded_to.contains_key("STALE"));
@@ -8769,7 +8794,6 @@ mod rate_limit_tests {
 #[cfg(test)]
 mod dx_busy_tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn op_even(our: &str) -> AutonomousOperator {
         let config = AutonomousConfig {
@@ -8873,7 +8897,7 @@ mod dx_busy_tests {
 
         // A fixed even-parity virtual slot time. Unix epoch (slot 0) is
         // Even; `decide_at(0)` derives the same instant for its gates.
-        let now = Utc.timestamp_opt(0, 0).single().expect("epoch is valid");
+        let now = UtcTimestamp::from_parts(0, 0).expect("epoch is valid");
 
         // Slot A: JA1ABC is working W1XYZ (a third party).
         op.feed_decoded_messages_at(
@@ -8908,7 +8932,7 @@ mod dx_busy_tests {
     fn non_busy_dx_cq_is_answered() {
         let mut op = op_even("K5ARH");
         let evaluator = NullDxEvaluator;
-        let now = Utc.timestamp_opt(0, 0).single().expect("epoch is valid");
+        let now = UtcTimestamp::from_parts(0, 0).expect("epoch is valid");
 
         // JA1ABC simply CQs; never seen in an exchange → answerable.
         op.feed_decoded_messages_at(
@@ -8940,9 +8964,9 @@ mod dx_busy_tests {
     #[test]
     fn busy_flag_expires_after_window() {
         let mut op = op_even("K5ARH");
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         // Manually seed an old busy timestamp beyond the 90s window.
-        let stale = now - ChronoDuration::seconds(120);
+        let stale = now - SignedDuration::from_secs(120);
         op.recently_in_qso.insert("JA1ABC".to_string(), stale);
         assert!(
             !op.is_dx_busy("JA1ABC", now),
@@ -8987,7 +9011,7 @@ mod dx_busy_tests {
         let mut msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0);
         msg.slot_parity = Some(disagreeing);
 
-        op.feed_decoded_messages_at(&[msg], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(&[msg], &evaluator, UtcTimestamp::now());
 
         assert_eq!(
             op.decode_history
@@ -9020,7 +9044,7 @@ mod dx_busy_tests {
         };
 
         let msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0); // slot_parity: None
-        op.feed_decoded_messages_at(&[msg], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(&[msg], &evaluator, UtcTimestamp::now());
 
         assert_eq!(
             op.decode_history
@@ -9056,7 +9080,11 @@ mod dx_busy_tests {
         let mut odd3 = dmi("K5ABC W5XYZ -12", Some("K5ABC"), 1900.0);
         odd3.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
 
-        op.feed_decoded_messages_at(&[even1, even2, odd1, odd2, odd3], &evaluator, Utc::now());
+        op.feed_decoded_messages_at(
+            &[even1, even2, odd1, odd2, odd3],
+            &evaluator,
+            UtcTimestamp::now(),
+        );
 
         assert_eq!(
             op.slot_manager.auto_detect_even_activity, 2,

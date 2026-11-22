@@ -241,7 +241,17 @@ impl super::ApplicationCoordinator {
                 }
             }
         };
-        tokio::join!(direct, drain);
+        // PAN-357: lower and latch the serial PTT line directly, whatever the
+        // Hamlib loop does. A no-op when no line was ever configured.
+        let line = self.ptt_line.clone();
+        let release_line = async move {
+            match tokio::time::timeout(DIRECT_PTT_OFF_BUDGET, line.release_for_shutdown()).await {
+                Ok(Ok(())) => info!("Shutdown: serial PTT line released"),
+                Ok(Err(e)) => warn!("Shutdown: serial PTT line release failed: {e:#}"),
+                Err(_) => warn!("Shutdown: serial PTT line release timed out"),
+            }
+        };
+        tokio::join!(direct, drain, release_line);
 
         // Persist the latest learned drive after the TX worker stops. This
         // also retries a failed background write without delaying unkey.

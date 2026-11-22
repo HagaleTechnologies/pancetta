@@ -9,6 +9,7 @@
 //! close). The append waits at most a bounded time for the writer's fsync
 //! acknowledgement, so a stalled disk can never hold PTT.
 
+use pancetta_core::time::UtcTimestamp;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -44,7 +45,7 @@ pub(crate) struct TxFrameRecord {
     /// The audio thread's playback-start observation, or the enqueue instant
     /// when unconfirmed after 100 ms or not played (PAN-71). Always the same
     /// instant as the TUI's `TxFrameLogged.timestamp`.
-    pub(crate) utc: chrono::DateTime<chrono::Utc>,
+    pub(crate) utc: UtcTimestamp,
     /// `"FT8"`, `"FT4"` or `"FT2"`.
     pub(crate) mode: String,
     /// Effective (split-aware) TX dial; `None` while the dial is unknown.
@@ -59,7 +60,7 @@ pub(crate) struct TxFrameRecord {
 impl TxFrameRecord {
     /// `tx_dial_hz == 0` (the unknown-dial sentinel) records `null`.
     pub(crate) fn new(
-        utc: chrono::DateTime<chrono::Utc>,
+        utc: UtcTimestamp,
         protocol: pancetta_ft8::Protocol,
         tx_dial_hz: u64,
         offset_hz: f64,
@@ -83,8 +84,7 @@ impl TxFrameRecord {
     fn summary(&self) -> String {
         format!(
             "{} {} {:.0} Hz \"{}\"",
-            self.utc
-                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            self.utc.to_rfc3339_z(),
             self.mode,
             self.offset_hz,
             self.text
@@ -596,7 +596,7 @@ mod tests {
 
     pub(super) fn rec(text: &str) -> TxFrameRecord {
         TxFrameRecord::new(
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
             pancetta_ft8::Protocol::Ft8,
             14_074_000,
             1500.0,
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn record_serializes_as_one_json_line_with_schema_v1_fields() {
         let record = TxFrameRecord::new(
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
             pancetta_ft8::Protocol::Ft8,
             14_074_000,
             1500.0,
@@ -1048,9 +1048,7 @@ mod tests {
 
     fn crash_record() -> TxFrameRecord {
         TxFrameRecord::new(
-            chrono::DateTime::parse_from_rfc3339("2026-10-18T14:30:15.012345678Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            str::parse::<UtcTimestamp>("2026-10-18T14:30:15.012345678Z").unwrap(),
             pancetta_ft8::Protocol::Ft8,
             14_074_000,
             1500.0,

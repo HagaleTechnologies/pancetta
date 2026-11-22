@@ -37,6 +37,8 @@ mod health;
 mod n1mm_udp;
 mod pipeline;
 mod psk_reporter;
+mod ptt_line;
+pub use ptt_line::{open_serial_rts_port, resolves_to_cat_port};
 mod qrz_lookup;
 mod qso;
 mod service_notify;
@@ -816,10 +818,7 @@ pub fn try_switch_operating_mode(
     drop(window_guard);
 
     let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
-    let decode_phase_ns = timing
-        .decode_phase
-        .num_nanoseconds()
-        .unwrap_or(13_000_000_000);
+    let decode_phase_ns = timing.decode_phase.as_nanos_i64().unwrap_or(13_000_000_000);
     active_slot_ns.store(timing.slot_ns, Ordering::Relaxed);
     active_decode_phase_ns.store(decode_phase_ns, Ordering::Relaxed);
     active_protocol_mode.store(new_mode.as_u8(), Ordering::Relaxed);
@@ -840,7 +839,7 @@ pub(crate) struct DspTiming {
     pub window_samples: usize,
     /// Phase past the slot boundary at which the decode fires (FT8 → 13s,
     /// FT4 → 6.5s): `cycle_duration − decode_margin`.
-    pub decode_phase: chrono::Duration,
+    pub decode_phase: SignedDuration,
     /// Overlap retained between windows in 12 kHz samples — one full cycle
     /// (FT8 → 180_000 = 15×rate, FT4 → 90_000 = 7.5×rate).
     pub overlap_samples: usize,
@@ -875,7 +874,7 @@ pub(crate) fn derive_dsp_timing(pp: &pancetta_ft8::ProtocolParams) -> DspTiming 
 
     // Decode fires `decode_margin` before the next boundary.
     let decode_phase_secs = pp.cycle_duration - decode_margin_secs(pp.protocol);
-    let decode_phase = chrono::Duration::nanoseconds((decode_phase_secs * 1e9) as i64);
+    let decode_phase = SignedDuration::from_nanos((decode_phase_secs * 1e9) as i64);
 
     // Overlap retained between windows = one full cycle.
     let overlap_seconds = pp.cycle_duration;
@@ -930,7 +929,10 @@ pub(crate) fn data_dir_for(home_override: Option<&std::path::Path>) -> Option<Pa
 }
 
 use anyhow::{Context, Result};
+use jiff::SignedDuration;
 use pancetta_config::Config;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::Ft8Config;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -950,11 +952,11 @@ use util::resample_linear;
 #[derive(Copy, Clone, Debug, PartialEq)]
 struct ActiveQsoFreq {
     primary_hz: f64,
-    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
+    secondary: Option<(f64, UtcTimestamp)>,
 }
 
 impl ActiveQsoFreq {
-    fn live_secondary_hz(&self, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    fn live_secondary_hz(&self, now: UtcTimestamp) -> Option<f64> {
         self.secondary
             .and_then(|(hz, expires_at)| (now < expires_at).then_some(hz))
     }
@@ -990,10 +992,19 @@ pub struct ApplicationCoordinator {
     /// Managed rigctld child process (killed on shutdown)
     rigctld_process: Option<std::process::Child>,
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-357: the serial PTT line, opened once and held for the session.
+    /// `start_hamlib_component` reconciles it with `rig.ptt` and wraps the rig
+    /// in `ptt_line::LineKeyedRig` when it has a target; shutdown lowers and
+    /// latches it alongside the Hamlib drain.
+    pub(crate) ptt_line: Arc<ptt_line::PttLine>,
     /// PAN-251 test seam: when set, `start_hamlib_component` uses this rig
     /// instead of `MockRig::default()` on the rig-control-disabled path.
     #[cfg(test)]
     pub(crate) test_mock_rig: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-357 test seam: when set, `start_hamlib_component` keys this serial
+    /// PTT device on either rig path, whatever `rig.ptt` says.
+    #[cfg(test)]
+    pub(crate) test_ptt_line_device: Option<String>,
     /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
     /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
     /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
@@ -1434,7 +1445,7 @@ pub struct ApplicationCoordinator {
     ///
     /// PAN-72 round-9 fix (Codex round 9, finding 1): the secondary's inner
     /// `Option` now pairs the frequency with its own `expires_at`
-    /// (`(f64, DateTime<Utc>)`) rather than just the frequency. The old
+    /// (`(f64, UtcTimestamp)`) rather than just the frequency. The old
     /// shape let a secondary's grace-expiry go unevaluated forever once no
     /// further `StateChanged`/`TxOffsetApplied` event arrived to recompute
     /// it — carrying `expires_at` through lets the FT8 decode loop
@@ -1541,7 +1552,7 @@ pub struct ApplicationCoordinator {
     /// containing slot's start before stamping `SlotParity`. Derived once at
     /// startup from `[rig].mode` (the same `DspTiming.decode_phase` the DSP
     /// thread uses); set once, not mutated at runtime. mode=FT8 is 13e9 ns,
-    /// byte-identical to the prior hardcoded `Duration::seconds(13)`.
+    /// byte-identical to the prior hardcoded `SignedDuration::from_secs(13)`.
     active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
 
     /// Wall-clock time (ms) the most recently completed decode window spent
@@ -2373,7 +2384,7 @@ impl ApplicationCoordinator {
             &pancetta_ft8::ProtocolParams::from_protocol(active_protocol),
         )
         .decode_phase
-        .num_nanoseconds()
+        .as_nanos_i64()
         .unwrap_or(13_000_000_000);
         info!(
             "Active digital mode: {} (slot {} ns, decode phase {} ns)",
@@ -2608,8 +2619,11 @@ impl ApplicationCoordinator {
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             rigctld_process: None,
             rig_handle: None,
+            ptt_line: Arc::new(ptt_line::PttLine::serial()),
             #[cfg(test)]
             test_mock_rig: None,
+            #[cfg(test)]
+            test_ptt_line_device: None,
             rig_handle_is_real: false,
             hamlib_children: None,
             hamlib_orphans: Vec::new(),
@@ -2674,7 +2688,7 @@ impl ApplicationCoordinator {
             // channel's consent OFF nothing can arm at all.
             remote_tx_arm: {
                 let mut st = pancetta_agent::arm::ArmState::new();
-                let now_ms = chrono::Utc::now().timestamp_millis();
+                let now_ms = UtcTimestamp::now().as_millisecond();
                 let _ = st.set_channel_consent(
                     pancetta_agent::arm::ConsentChannel::StationAgent,
                     station_agent_tx_consent_init,
@@ -3033,7 +3047,11 @@ impl ApplicationCoordinator {
                 self.shutdown_signal.clone(),
                 clock_monitor::ClockMonitorSchedule::default(),
                 Arc::new(|| sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string())),
+<<<<<<< HEAD
                 self.slot_clock(),
+=======
+                Arc::new(UtcTimestamp::now),
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
             ));
         }
 
@@ -4713,7 +4731,7 @@ mod tests {
         // window_seconds = 79 * 0.16 = 12.64 → 12.64 * 12000 = 151_680.
         assert_eq!(t.window_samples, 151_680);
         // decode_phase = 15.0 - 2.0 = 13.0s.
-        assert_eq!(t.decode_phase, chrono::Duration::seconds(13));
+        assert_eq!(t.decode_phase, SignedDuration::from_secs(13));
         // overlap = 15.0 * 12000 = 180_000 (= FT8_SAMPLE_RATE * 15).
         assert_eq!(t.overlap_samples, FT8_SAMPLE_RATE * 15);
         assert_eq!(t.overlap_samples, 180_000);
@@ -4727,7 +4745,7 @@ mod tests {
         // window_seconds = 105 * 0.048 = 5.04 → 5.04 * 12000 = 60_480.
         assert_eq!(t.window_samples, 60_480);
         // decode_phase = 7.5 - 1.0 = 6.5s = 6_500ms.
-        assert_eq!(t.decode_phase, chrono::Duration::milliseconds(6_500));
+        assert_eq!(t.decode_phase, SignedDuration::from_millis(6_500));
         // overlap = 7.5 * 12000 = 90_000 (= FT8_SAMPLE_RATE * 7.5).
         assert_eq!(t.overlap_samples, 90_000);
         // slot_ns = 7.5e9.
@@ -4755,22 +4773,18 @@ mod tests {
     /// Reference epoch: 2026-01-01 00:00:00 UTC (= 1767225600s), the same
     /// instant tx.rs::schedule_tx_tests uses. Slot 0 is Even on the 15s
     /// AND the 7.5s grid.
-    fn epoch_at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
-        use chrono::TimeZone;
-        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+    fn epoch_at(seconds: f64) -> UtcTimestamp {
+        let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        base + SignedDuration::from_nanos((seconds * 1_000_000_000.0) as i64)
     }
 
     /// Recover (slot_start, parity) from a window received `decode_phase`
     /// past a slot boundary — the exact arithmetic the FT8 hot loop runs
     /// at `coordinator/ft8.rs:654-656`.
     fn recover_slot(
-        window_received: chrono::DateTime<chrono::Utc>,
+        window_received: UtcTimestamp,
         t: &DspTiming,
-    ) -> (
-        chrono::DateTime<chrono::Utc>,
-        pancetta_core::slot::SlotParity,
-    ) {
+    ) -> (UtcTimestamp, pancetta_core::slot::SlotParity) {
         let slot_start = window_received - t.decode_phase;
         let parity = pancetta_core::slot::SlotParity::of_with_period(slot_start, t.slot_ns);
         (slot_start, parity)
@@ -4787,7 +4801,7 @@ mod tests {
         // Protocol::slot_ns agrees with the derived value (single source).
         assert_eq!(t.slot_ns, pancetta_ft8::Protocol::Ft4.slot_ns());
 
-        let decode_phase_secs = t.decode_phase.num_nanoseconds().unwrap() as f64 / 1e9;
+        let decode_phase_secs = t.decode_phase.as_nanos_i64().unwrap() as f64 / 1e9;
         assert!((decode_phase_secs - 6.5).abs() < 1e-9);
 
         // For each slot k, a window received at slot_start + decode_phase
@@ -4826,7 +4840,7 @@ mod tests {
         let t = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft8());
         assert_eq!(t.slot_ns, pancetta_core::slot::SLOT_NS);
         assert_eq!(t.slot_ns, pancetta_ft8::Protocol::Ft8.slot_ns());
-        assert_eq!(t.decode_phase, chrono::Duration::seconds(13));
+        assert_eq!(t.decode_phase, SignedDuration::from_secs(13));
 
         for k in 0..4 {
             let slot_start_secs = k as f64 * 15.0;
@@ -5274,7 +5288,7 @@ mod tests {
             assert_eq!(active_slot_ns.load(Ordering::Relaxed), timing.slot_ns);
             assert_eq!(
                 active_decode_phase_ns.load(Ordering::Relaxed),
-                timing.decode_phase.num_nanoseconds().unwrap(),
+                timing.decode_phase.as_nanos_i64().unwrap(),
             );
         }
     }
@@ -5801,18 +5815,18 @@ mod active_qso_freq_tests {
 
     #[test]
     fn active_qso_freq_secondary_expires_without_write() {
-        let expires_at = chrono::Utc::now();
+        let expires_at = pancetta_core::time::UtcTimestamp::now();
         let hint = ActiveQsoFreq {
             primary_hz: 1900.0,
             secondary: Some((1500.0, expires_at)),
         };
         assert_eq!(
-            hint.live_secondary_hz(expires_at - chrono::Duration::nanoseconds(1)),
+            hint.live_secondary_hz(expires_at - jiff::SignedDuration::from_nanos(1)),
             Some(1500.0)
         );
         assert_eq!(hint.live_secondary_hz(expires_at), None);
         assert_eq!(
-            hint.live_secondary_hz(expires_at + chrono::Duration::nanoseconds(1)),
+            hint.live_secondary_hz(expires_at + jiff::SignedDuration::from_nanos(1)),
             None
         );
         assert_eq!(hint.primary_hz, 1900.0);

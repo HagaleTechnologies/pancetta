@@ -1,6 +1,8 @@
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
-fn add_and_accept(store: &mut OutboxStore, qso_id: Uuid, remote_id: &str, now: DateTime<Utc>) {
+fn add_and_accept(store: &mut OutboxStore, qso_id: Uuid, remote_id: &str, now: UtcTimestamp) {
     let added = store.add(
         vec![NewUpload {
             qso_id,
@@ -33,7 +35,7 @@ fn remote_id(store: &OutboxStore, qso_id: Uuid) -> Option<&str> {
 fn accepted_receipts_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(OUTBOX_FILE_NAME);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let original = Uuid::new_v4();
     let mut store = OutboxStore::open(path.clone()).0;
     store.add(
@@ -98,7 +100,7 @@ fn accepted_receipts_round_trip() {
         qso_id: repeated,
         destination: UploadDestination::Cqdx,
         remote_id: "stale".into(),
-        accepted_at: now + chrono::Duration::hours(1),
+        accepted_at: now + SignedDuration::from_hours(1),
     };
     accepted.insert(10, serde_json::to_value(&stale).unwrap());
     for n in 201..=205u128 {
@@ -106,7 +108,7 @@ fn accepted_receipts_round_trip() {
             qso_id: Uuid::from_u128(n),
             destination: UploadDestination::Cqdx,
             remote_id: format!("id-{n}"),
-            accepted_at: now - chrono::Duration::hours(1),
+            accepted_at: now - SignedDuration::from_hours(1),
         };
         accepted.push(serde_json::to_value(&extra).unwrap());
     }

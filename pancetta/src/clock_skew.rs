@@ -7,7 +7,14 @@
 //! reading or clock step produces. The monitor task only runs the schedule
 //! and the blocking UDP probe around it.
 
+<<<<<<< HEAD
 use pancetta_core::slot_clock::ClockEvent;
+=======
+use jiff::SignedDuration;
+use pancetta_core::slot_clock::ClockStepDetector;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 use pancetta_core::DiagnosticLevel;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -292,11 +299,19 @@ impl Default for ClockSkewMonitorCore {
 
 impl ClockSkewMonitorCore {
     /// Production schedule ([`ClockSkewTiming::default`]).
+<<<<<<< HEAD
     pub fn new() -> Self {
         Self::with_timing(ClockSkewTiming::default())
     }
 
     pub fn with_timing(timing: ClockSkewTiming) -> Self {
+=======
+    pub fn new(wall_now: UtcTimestamp) -> Self {
+        Self::with_timing(wall_now, ClockSkewTiming::default())
+    }
+
+    pub fn with_timing(wall_now: UtcTimestamp, timing: ClockSkewTiming) -> Self {
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         Self {
             timing,
             reading: Reading::Pending,
@@ -313,9 +328,20 @@ impl ClockSkewMonitorCore {
         self.next_probe_at
     }
 
+<<<<<<< HEAD
     /// One scheduler tick. `step` is the shared slot clock's latest event
     /// when its epoch moved since the previous tick.
     pub fn on_tick(&mut self, mono_since_start: Duration, step: Option<ClockEvent>) -> TickOutcome {
+=======
+    /// One scheduler tick. `mono_since_last` is monotonic time since the
+    /// previous tick (or construction).
+    pub fn on_tick(
+        &mut self,
+        mono_since_start: Duration,
+        wall_now: UtcTimestamp,
+        mono_since_last: Duration,
+    ) -> TickOutcome {
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         let mut step_diag = None;
         if let Some(event) = step {
             let skew = event.skew;
@@ -334,9 +360,9 @@ impl ClockSkewMonitorCore {
             });
             if diag_allowed {
                 self.last_step_diag_at = Some(mono_since_start);
-                let secs = match skew.num_nanoseconds() {
+                let secs = match skew.as_nanos_i64() {
                     Some(ns) => ns as f64 / 1e9,
-                    None => skew.num_milliseconds() as f64 / 1e3,
+                    None => skew.as_millis_i64() as f64 / 1e3,
                 };
                 step_diag = Some(SkewDiag {
                     target: "clock.step",
@@ -443,7 +469,10 @@ impl ClockSkewMonitorCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+<<<<<<< HEAD
     use chrono::{TimeZone, Utc};
+=======
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
@@ -453,6 +482,7 @@ mod tests {
     /// monitor task does; `jump_ms` moves only the wall clock.
     pub(super) struct Sim {
         core: ClockSkewMonitorCore,
+<<<<<<< HEAD
         manual: pancetta_core::slot_clock::ManualClock,
         clock: pancetta_core::SlotClock,
         mono_ms: u64,
@@ -466,6 +496,16 @@ mod tests {
             let clock = manual.slot_clock(Arc::new(std::sync::atomic::AtomicI64::new(
                 pancetta_core::slot::SLOT_NS,
             )));
+=======
+        base: UtcTimestamp,
+        mono_ms: i64,
+        wall_offset_ms: i64,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            let base = UtcTimestamp::from_ymd_hms(2026, 10, 10, 19, 0, 0).unwrap();
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
             Self {
                 core: ClockSkewMonitorCore::new(),
                 manual,
@@ -480,12 +520,17 @@ mod tests {
             self.manual
                 .advance(Duration::from_millis(target_ms - self.mono_ms));
             self.mono_ms = target_ms;
+<<<<<<< HEAD
             let reading = self.clock.read();
             let step = (reading.epoch != self.seen_epoch)
                 .then_some(reading.last_event)
                 .flatten();
             self.seen_epoch = reading.epoch;
             self.core.on_tick(secs(mono_s), step)
+=======
+            let wall = self.base + SignedDuration::from_millis(target_ms + self.wall_offset_ms);
+            self.core.on_tick(secs(mono_s), wall, since_last)
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         }
 
         pub(super) fn jump_ms(&mut self, ms: i64) {

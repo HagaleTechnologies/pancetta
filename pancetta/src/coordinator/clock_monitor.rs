@@ -22,8 +22,13 @@ use crate::clock_skew::{
     ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, ClockStatus, SkewDiag, SNTP_TIMEOUT,
 };
 use crate::message_bus::{ComponentId, DiagnosticLevel, MessageBus};
+<<<<<<< HEAD
 use pancetta_core::slot_clock::{ClockEvent, SlotReading};
 use pancetta_core::SlotClock;
+=======
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +81,7 @@ impl ClockMonitorSchedule {
 /// SNTP probe: the clock offset in seconds (positive = local clock behind).
 pub(crate) type ClockProbe = Arc<dyn Fn() -> Result<f64, String> + Send + Sync>;
 
+<<<<<<< HEAD
 /// PAN-358: the slot-clock events the monitor has already reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MonitorStepCursor {
@@ -110,6 +116,10 @@ impl MonitorStepCursor {
         step
     }
 }
+=======
+/// Wall-clock source (injected so tests can step it).
+pub(crate) type WallClock = Arc<dyn Fn() -> UtcTimestamp + Send + Sync>;
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 
 /// Spawn the monitor task. It exits on the first tick after `shutdown` is
 /// set.
@@ -293,11 +303,22 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     /// A shared slot clock over a `ManualClock`; `step_wall` steps it.
     fn manual_slot_clock() -> (SlotClock, ManualClock) {
         let manual = ManualClock::new(chrono::Utc::now());
         let clock = manual.slot_clock(Arc::new(AtomicI64::new(pancetta_core::slot::SLOT_NS)));
         (clock, manual)
+=======
+    /// `UtcTimestamp::now()` plus a test-controlled offset in milliseconds.
+    fn offset_wall_clock() -> (WallClock, Arc<AtomicI64>) {
+        let offset_ms = Arc::new(AtomicI64::new(0));
+        let off = offset_ms.clone();
+        let wall: WallClock = Arc::new(move || {
+            UtcTimestamp::now() + SignedDuration::from_millis(off.load(Ordering::SeqCst))
+        });
+        (wall, offset_ms)
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
     }
 
     struct Diag {

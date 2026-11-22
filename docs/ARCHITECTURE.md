@@ -137,6 +137,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `n1mm_udp/` | N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382). |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |
+| `ptt_line.rs` | Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357). |
+| `ptt_line/` | Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357). |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
 | `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso/` | QSO state-machine component and ADIF/SQLite persistence wiring. |

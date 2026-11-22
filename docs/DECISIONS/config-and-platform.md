@@ -24,7 +24,7 @@ Six section merges and `Config::merge_with` keep per-field code, and `pancetta-c
 - `NetworkConfig` extends `custom_services`.
 - `Config::merge_with` replaces `contest` only when the overlay has one. The base keeps its `metadata`, appends the overlay's `sources` and stamps `last_modified`.
 
-The `SkipEmpty` rules exist for the environment source. `load_from_environment` starts from `Config::default()` and blanks thirteen fields (the nine with a `PANCETTA_*` variable, plus `qth` and the three zones) so the merge keeps the file's values. Every other field keeps its default, so whenever one `PANCETTA_*` variable is set, every replace-rule section and every `SkipEmpty` field it does not blank (such as `rig.model`, `audio.buffer_size` and `station.tx_late_max_ms`) reverts to its default. PAN-371 kept that behaviour; PAN-460 tracks the fix in the environment source.
+The `SkipEmpty` rules govern file-to-file merges. Environment overrides apply directly to their nine target fields at the environment source's priority, so an override leaves every unrelated file setting intact. Empty strings and parsed zeroes leave their target fields unchanged; malformed numbers are ignored. PAN-460 changed the environment source without changing PAN-371's file merge rules.
 
 Rejected: a derive macro, which needs a proc-macro crate for about a dozen impls, and a default `ConfigSection::merge_with`, which would let a new section that needs a sentinel compile without anyone choosing its rule.
 
@@ -1450,7 +1450,7 @@ is still `~/.pancetta`.
 3. With `--data-dir` and no `--config`, config discovery searches only the
    data directory, plus embedded defaults and `PANCETTA_*` overrides. This
    applies at startup, on reload, in de-brick recovery and in
-   `config --validate`. Merging the usual six places would let a 40 m
+   `config --validate`. Merging the usual five places would let a 40 m
    station silently read the 20 m station's `~/.pancetta/pancetta.toml`.
    With `--config`, the file is read as before.
 4. An explicit config value still wins over the data directory for
@@ -1578,3 +1578,84 @@ non-manifest PR merge should show both heavy lanes skipped with the summary
 line present, and the first push after this change's own merge runs in full
 (it changes `.github/workflows/ci.yml`, a cache-key input — the exception
 exercising itself).
+
+## No config discovery in the working directory (PAN-360, 2026-11-22)
+
+1. The current directory is no longer a config search location. It was
+   the first row of the default search, so the same user and `HOME` got a
+   different station depending on where the shell was. A stray
+   `pancetta.toml` in a shared directory could also leak fields that
+   survive a later file under the merge rules (`SkipNone` fields such as
+   `station.operator_name` and `rig.data_mode`, `Extend` maps such as
+   `network.custom_services`) past a good `~/.pancetta` file (review
+   L2-32).
+2. The other five rows, the file-name order, the merge rules and
+   `--config` are unchanged. `--config ./pancetta.toml` still reads a
+   file in the working directory, resolved against it.
+3. No hint is printed for a `pancetta.toml` in the working directory that
+   is now ignored. A hint would stat the directory the change says must
+   not matter. When the cwd file was the only config, the station falls
+   back to `N0CALL`, which refuses to transmit. When another file remains,
+   settings the cwd file layered on top of it stop applying without a
+   message, so the CHANGELOG and `docs/UPGRADING.md` tell operators to run
+   `config --validate`, which lists every file read, and to copy the keys
+   they still need into the file that remains.
+4. The built-in defaults source always loads the embedded defaults. It
+   carried the relative path `defaults.toml`, so a file of that name in
+   the working directory replaced the defaults without appearing in the
+   `config --validate` report. A caller that adds a `defaults` source with
+   an absolute path still has that file read, and it is listed like any
+   other config file.
+
+## Off chrono: jiff and `UtcTimestamp` (PAN-441, 2026-11-22)
+
+RUSTSEC-2026-0543 marks every chrono release unmaintained, and `deny.toml`
+carried a temporary ignore for it (PAN-430/PAN-431). The workspace now uses
+`jiff` 0.2 (`default-features = false`, `std` + `serde`; no time-zone
+database, every use is UTC), sqlx's unused `chrono` feature is off, chrono is
+gone from `Cargo.lock`, the ignore is deleted, and
+`scripts/ci/test-dependency-policy.py` forbids chrono for every target.
+
+**jiff, not `time`.** jiff's MSRV (1.70) sits below `pancetta-core`'s
+registry MSRV of 1.88, where `time` 0.3.55 needs exactly 1.88; jiff's
+`strptime` accepts the ADIF date and time shapes chrono accepted, where
+`time` rejected four; and its RFC 3339 reader is about as lenient as chrono's.
+
+**One instant type.** `pancetta_core::time::UtcTimestamp` wraps
+`jiff::Timestamp` and replaces `DateTime<Utc>` everywhere. Its serde and
+`Debug` forms write `YYYY-MM-DDTHH:MM:SS[.frac]Z`, `to_rfc3339()` writes
+`+00:00`, and `Display` writes `YYYY-MM-DD HH:MM:SS[.frac] UTC`, exactly as
+chrono did. The fraction is omitted when zero and otherwise printed with 3, 6
+or 9 digits (jiff's own writer trims trailing zeros, so `.500` would become
+`.5`). Keeping the digit groups keeps SQLite's text `ORDER BY created_at`
+and the `check_duplicate` text comparison in time order, and keeps stored
+JSON, ADIF `APP_PANCETTA_CONTEST_CONTEXT` values and the qso.db checksums byte
+for byte. Parsing trims leading whitespace and truncates fractions past nine
+digits, so every string chrono read still reads, except text with
+whitespace inside the date, time or offset (`2026 -11-04T14:30:00Z`), which
+chrono skipped and jiff rejects. A wrapper, rather than a
+`#[serde(with = ...)]` annotation per field, covers the 84 serialized fields
+(tuple fields included) by construction. `pancetta/tests/utc_timestamp_invariant.rs`
+fails on any raw `jiff::Timestamp` outside `pancetta-core/src/time.rs`, its
+tests and `pancetta/src/build_identity.rs` (the build script cannot depend on
+`pancetta-core`). The fixtures in `pancetta-qso/tests/fixtures/pan441/` were
+written by the chrono build and still round-trip byte for byte.
+
+**Durations and civil types.** Durations use `jiff::SignedDuration` directly;
+no serialized type holds one, so only log text changes (`TimeDelta { secs:
+180, nanos: 0 }` becomes `3m`). `SignedDurationExt` gives the `i64`
+millisecond, microsecond and nanosecond readings and `to_std` the chrono
+code used. `UtcTimestamp`'s calendar accessors return chrono's widths (`u32`,
+`i32`), because jiff's `i8` fields overflow in arithmetic such as `hour * 60`.
+`NaiveDate`/`NaiveTime`/`NaiveDateTime` became `jiff::civil::{Date, Time,
+DateTime}`.
+
+**Two narrowed edges, malformed data only.** jiff cannot hold a leap second,
+so ADIF `TIME_ON 235960` or a stored `...:60Z` now reads as `:59`
+(`adif_leap_second_reads_as_59`); chrono's `Utc::now()` never produced one.
+jiff's range ends near year 9999, so ADIF `QSO_DATE 99991231` now fails with
+`AdifError::InvalidDateTime` (`adif_year_9999_is_rejected`) where chrono
+accepted it. `UtcTimestamp::strftime` writes a year below 0 with the sign
+inside the four-character `%Y` width (`-027`, where chrono wrote `-0027`);
+only malformed data carries such a year, and
+`documented_narrowings_from_chrono_hold` pins both narrowings.

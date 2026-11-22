@@ -288,32 +288,115 @@ pub struct PttConfig {
 }
 
 /// PTT control methods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PttMethod {
-    /// No PTT control
+    /// Default. Keys through rigctld (`T 1`/`T 0`), the same as `Cat`.
     None,
 
-    /// CAT command PTT
+    /// Keys through rigctld (`T 1`/`T 0`).
     Cat,
 
-    /// Serial port RTS/DTR
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     Serial,
 
-    /// Parallel port
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     Parallel,
 
-    /// USB device
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     Usb,
 
-    /// Sound card PTT
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     SoundCard,
 
-    /// VOX only
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     Vox,
 
-    /// Network PTT (for remote rigs)
+    /// Not implemented; refused by validation while rig control is enabled
+    /// (PAN-357).
     Network,
+
+    /// RTS line of `rig.ptt.device` keys the rig (PAN-357).
+    #[serde(alias = "serial-rts")]
+    SerialRts,
+}
+
+impl PttMethod {
+    /// The name this method has in a config file (its serde name).
+    pub fn config_name(&self) -> &'static str {
+        match self {
+            PttMethod::None => "none",
+            PttMethod::Cat => "cat",
+            PttMethod::Serial => "serial",
+            PttMethod::Parallel => "parallel",
+            PttMethod::Usb => "usb",
+            PttMethod::SoundCard => "sound_card",
+            PttMethod::Vox => "vox",
+            PttMethod::Network => "network",
+            PttMethod::SerialRts => "serial_rts",
+        }
+    }
+}
+
+impl PttConfig {
+    /// PAN-357: why these PTT settings cannot key the rig, or `None` when
+    /// they can. Only checked while rig control is enabled: with
+    /// `interface.enabled = false` PTT goes to the mock rig and keys nothing.
+    /// Returns the first failing rule, in order: unimplemented method, plain
+    /// `serial`, missing or blank device, device equal to the CAT port, and
+    /// negative polarity.
+    pub fn refusal(&self, interface: &CatInterfaceConfig) -> Option<String> {
+        if !interface.enabled {
+            return None;
+        }
+        match self.method {
+            PttMethod::None | PttMethod::Cat => None,
+            PttMethod::Serial => Some(
+                "rig.ptt.method = \"serial\" is not implemented: it does not say which line \
+                 keys the rig. Use \"serial_rts\" with rig.ptt.device."
+                    .to_string(),
+            ),
+            PttMethod::Parallel
+            | PttMethod::Usb
+            | PttMethod::SoundCard
+            | PttMethod::Vox
+            | PttMethod::Network => Some(format!(
+                "rig.ptt.method = \"{}\" is not implemented. Use \"cat\" or \"none\" to key \
+                 through rigctld, or \"serial_rts\" with rig.ptt.device to key the RTS line of \
+                 a separate serial port.",
+                self.method.config_name()
+            )),
+            PttMethod::SerialRts => {
+                let device = self.device.as_deref().map(str::trim).unwrap_or("");
+                if device.is_empty() {
+                    return Some(
+                        "rig.ptt.method = \"serial_rts\" needs rig.ptt.device, the serial port \
+                         whose RTS line keys the rig."
+                            .to_string(),
+                    );
+                }
+                if device == interface.port.trim() {
+                    return Some(format!(
+                        "rig.ptt.device = \"{device}\" is the CAT port (rig.interface.port). \
+                         rigctld owns that port; serial_rts needs a separate PTT port."
+                    ));
+                }
+                if matches!(self.polarity, PttPolarity::Negative) {
+                    return Some(
+                        "rig.ptt.polarity = \"negative\" is not implemented for serial_rts: an \
+                         inverted RTS line would key the rig whenever pancetta is not holding it."
+                            .to_string(),
+                    );
+                }
+                None
+            }
+        }
+    }
 }
 
 /// PTT signal polarity
@@ -1201,6 +1284,12 @@ impl ConfigSection for RigConfig {
                     field: "interface.data_bits".to_string(),
                     value: self.interface.data_bits.to_string(),
                 });
+            }
+
+            // PAN-357: refuse a PTT method that has no keying path instead of
+            // letting TX silently key through CAT.
+            if let Some(reason) = self.ptt.refusal(&self.interface) {
+                return Err(ConfigError::Validation(reason));
             }
         }
 
@@ -2114,3 +2203,7 @@ attenuator_db = 12
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rig/tests/ptt_method_tests.rs"]
+mod ptt_method_tests;

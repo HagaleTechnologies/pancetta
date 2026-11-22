@@ -4,12 +4,12 @@
 
 use crate::adif::{AdifParse, AdifProcessor, AdifQso, AdifRecord};
 use crate::adif_import::{band_of, UnreadableRecord};
-use chrono::NaiveDate;
+use jiff::civil;
 use pancetta_core::Band;
 
 #[derive(Debug, Default)]
 pub struct ExportFilter {
-    pub since: Option<NaiveDate>,
+    pub since: Option<civil::Date>,
     pub band: Option<Band>,
     pub mode: Option<String>,
     pub callsign: Option<String>,
@@ -18,7 +18,7 @@ pub struct ExportFilter {
 impl ExportFilter {
     pub fn matches(&self, q: &AdifQso) -> bool {
         self.since
-            .is_none_or(|date| q.qso_date.date_naive() >= date)
+            .is_none_or(|date| q.qso_date.to_civil().date() >= date)
             && self.band.is_none_or(|band| {
                 band_of(q).is_some_and(|b| b.eq_ignore_ascii_case(&band.to_string()))
             })
@@ -133,7 +133,7 @@ mod tests {
             export(
                 &text,
                 ExportFilter {
-                    since: Some(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()),
+                    since: Some(civil::date(2026, 10, 1)),
                     ..Default::default()
                 }
             )
@@ -217,7 +217,7 @@ mod tests {
         let text = record("K1ABC", "20261001", "<BAND:3>20m<MODE:3>FT8")
             + &record("W1XYZ", "20261001", "<BAND:3>40m<MODE:3>FT8");
         let filter = ExportFilter {
-            since: Some(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()),
+            since: Some(civil::date(2026, 10, 1)),
             band: Some("20m".parse().unwrap()),
             mode: Some("ft8".into()),
             callsign: Some("abc".into()),

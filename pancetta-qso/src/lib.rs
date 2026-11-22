@@ -34,7 +34,7 @@
 //!
 //! ```rust
 //! use pancetta_qso::*;
-//! use chrono::Utc;
+//! use pancetta_qso::UtcTimestamp;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -541,7 +541,7 @@ pub struct VersionInfo {
 }
 
 /// Re-export commonly used external types for convenience
-pub use chrono::{DateTime, Utc};
+pub use pancetta_core::time::UtcTimestamp;
 pub use uuid::Uuid;
 
 #[cfg(test)]

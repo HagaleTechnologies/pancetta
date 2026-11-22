@@ -174,7 +174,7 @@ fn bad_frequency_fails() {
 }
 #[test]
 fn unsupported_ptt_fails() {
-    for method in ["none", "vox"] {
+    for method in ["none", "vox", "serial"] {
         let log = run(
             Daemon::start("14074000", "0\nVFOA", "", "", ""),
             method,
@@ -311,14 +311,93 @@ fn serial_ptt_refuses_before_opening_port() {
     ] {
         let log = run(
             Daemon::start("14074000", split, tx, "", ""),
-            "serial",
-            "",
+            "serial_rts",
+            "device = '/nonexistent/pan357-ptt'",
             true,
             false,
             reason,
         );
         assert!(!log.iter().any(|(c, _)| c.starts_with("T ")));
     }
+}
+
+/// PAN-357 AC10: the RTS pulse opens `rig.ptt.device`, never the CAT port,
+/// after the band-plan check, and an unopenable port fails without keying.
+#[test]
+fn serial_rts_ptt_opens_the_ptt_device() {
+    let d = Daemon::start("14074000", "0\nVFOA", "", "", "");
+    let (_dir, mut cmd) = command(
+        d.port,
+        true,
+        "serial_rts",
+        "device = '/nonexistent/pan357-ptt'",
+        true,
+    );
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let all = format!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(
+        stdout.contains("PTT port:   /nonexistent/pan357-ptt"),
+        "{all}"
+    );
+    assert!(
+        stdout.contains("Band-plan check: OK (14074000 Hz)"),
+        "{all}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: Rig test failed: cannot open serial PTT port /nonexistent/pan357-ptt: "
+        ),
+        "{all}"
+    );
+    assert!(!stderr.contains("/nonexistent/pan339"), "{all}");
+    assert!(!all.contains("RTS ON"), "{all}");
+    assert!(!all.contains("Rig test complete."), "{all}");
+    let log = d.finish();
+    assert!(!log.iter().any(|(c, _)| c.starts_with("T ")));
+}
+
+/// PAN-357 review: a `rig.ptt.device` that is a link to the CAT port passes
+/// the by-name rule, so `test-rig --ptt` resolves both paths before it opens
+/// anything and never pulses RTS on the CAT port.
+#[cfg(unix)]
+#[test]
+fn serial_rts_ptt_refuses_a_link_to_the_cat_port() {
+    let links = tempfile::tempdir().unwrap();
+    let cat = links.path().join("cat-port");
+    std::fs::write(&cat, "").unwrap();
+    let link = links.path().join("by-id-link");
+    std::os::unix::fs::symlink(&cat, &link).unwrap();
+    let d = Daemon::start("14074000", "0\nVFOA", "", "", "");
+    let (dir, raw) = raw_command(
+        d.port,
+        true,
+        "serial_rts",
+        &format!("device = '{}'", link.display()),
+        true,
+    );
+    // Point the CAT port at the link's target.
+    let config = dir.path().join("station.toml");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("/nonexistent/pan339", &cat.display().to_string());
+    std::fs::write(&config, text).unwrap();
+    let mut cmd = Command::from_std(raw);
+    cmd.timeout(Duration::from_secs(30));
+    let out = cmd.output().unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(all.contains("resolves to the CAT port"), "{all}");
+    assert!(!all.contains("RTS ON"), "{all}");
+    assert!(!all.contains("cannot open serial PTT port"), "{all}");
+    let log = d.finish();
+    assert!(!log.iter().any(|(c, _)| c.starts_with("T ")));
 }
 
 #[test]

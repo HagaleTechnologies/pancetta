@@ -13,7 +13,7 @@
 //!     --output-prefix research/corpus/curated/ft8
 
 use anyhow::Context;
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::curated::{CuratedEntry, CuratedManifest, ScoreBreakdown};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::noise::estimate_noise_floor_db;
@@ -165,7 +165,7 @@ fn write_manifest(
     let manifest = CuratedManifest {
         schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
         label: label.to_string(),
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         scoring_decoder: scoring_decoder.to_string(),
         entries,
     };

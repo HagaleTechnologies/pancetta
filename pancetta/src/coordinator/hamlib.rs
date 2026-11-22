@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -113,11 +114,11 @@ async fn observe_hardware_ptt(
     rig: &dyn pancetta_hamlib::RigControl,
     safety: &super::receive_overload::GainSafety,
 ) -> Result<()> {
-    let asked_ms = chrono::Utc::now().timestamp_millis();
+    let asked_ms = UtcTimestamp::now().as_millisecond();
     if rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off {
         safety.observed_ptt_off(asked_ms);
     } else {
-        safety.observed_ptt_on(chrono::Utc::now().timestamp_millis());
+        safety.observed_ptt_on(UtcTimestamp::now().as_millisecond());
     }
     Ok(())
 }
@@ -166,7 +167,7 @@ impl ReceiveOverloadRuntime {
                 if let (Ok(a), Ok(b)) = (rig.get_attenuator().await, rig.get_attenuator().await) {
                     if a == b {
                         bus.receive_gain
-                            .recover_gain(chrono::Utc::now().timestamp_millis());
+                            .recover_gain(UtcTimestamp::now().as_millisecond());
                     }
                 }
             }
@@ -215,7 +216,7 @@ impl ReceiveOverloadRuntime {
                 }
                 bus.receive_gain.end_recovery(
                     matches!(confirmation, Ok(Ok(true)))
-                        .then(|| chrono::Utc::now().timestamp_millis()),
+                        .then(|| UtcTimestamp::now().as_millisecond()),
                 );
             }
         }
@@ -252,7 +253,7 @@ impl ReceiveOverloadRuntime {
                 _ => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
             }
         }
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = UtcTimestamp::now().as_millisecond();
         for measurement in measurements.try_iter() {
             if measurement.slot >= now.div_euclid(15000) - 1 {
                 self.policy.observe(measurement);
@@ -310,7 +311,7 @@ impl ReceiveOverloadRuntime {
         if !reserved {
             return;
         }
-        let remaining = slot * 15000 - 250 - chrono::Utc::now().timestamp_millis();
+        let remaining = slot * 15000 - 250 - UtcTimestamp::now().as_millisecond();
         if remaining <= 0 {
             bus.receive_gain.cancel_gain();
             return;
@@ -1424,7 +1425,7 @@ impl super::ApplicationCoordinator {
                         self.ptt_active.store(false, Ordering::Release);
                         self.message_bus
                             .receive_gain
-                            .confirmed_off(chrono::Utc::now().timestamp_millis());
+                            .confirmed_off(UtcTimestamp::now().as_millisecond());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -1545,7 +1546,7 @@ impl super::ApplicationCoordinator {
             if ptt_off {
                 self.message_bus
                     .receive_gain
-                    .confirmed_off(chrono::Utc::now().timestamp_millis());
+                    .confirmed_off(UtcTimestamp::now().as_millisecond());
             }
             for message in safe_messages {
                 self.replay_or_fallback(&sender, message).await;
@@ -1663,7 +1664,7 @@ impl super::ApplicationCoordinator {
                         self.ptt_active.store(false, Ordering::Release);
                         self.message_bus
                             .receive_gain
-                            .confirmed_off(chrono::Utc::now().timestamp_millis());
+                            .confirmed_off(UtcTimestamp::now().as_millisecond());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -2106,6 +2107,66 @@ impl super::ApplicationCoordinator {
             };
             Arc::new(client)
         };
+
+        // PAN-357: `rig.ptt.method = "serial_rts"` keys the RTS line of
+        // `rig.ptt.device` instead of CAT. Reconcile the coordinator's single
+        // line with this start's target, then wrap the rig so every
+        // `set_ptt` below (command loop, watchdog, teardown, overload guard)
+        // drives the line and every other call still reaches rigctld.
+        let ptt_line_target = super::ptt_line::line_target(&rig_config, rig_enabled);
+        #[cfg(test)]
+        let ptt_line_target = self.test_ptt_line_device.clone().or(ptt_line_target);
+        if let Err(e) = self
+            .ptt_line
+            .configure(ptt_line_target.clone(), &rig_config.interface.port)
+            .await
+        {
+            warn!("Serial PTT: {e:#}");
+            let consequence = if self.ptt_line.has_device() {
+                "TX will not key until the port opens; each key-down retries it."
+            } else {
+                "TX will not key until rig.ptt.device names a separate port."
+            };
+            report_rig_error(
+                &self.message_bus,
+                format!("Serial PTT: {e:#}. {consequence}"),
+            )
+            .await;
+        }
+        // A line the reconcile could not switch away from (it may still be
+        // asserted) keeps the wrapper even when the new settings key by CAT:
+        // the wrapper's unkeys drive that line and its `get_ptt` reports it,
+        // so the watchdog and the PAN-272 latch stay RTS-aware, and its
+        // key-downs are refused until the line is confirmed low (PR #745
+        // review).
+        let line_retained = ptt_line_target.is_none() && self.ptt_line.has_device();
+        let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> =
+            if ptt_line_target.is_some() || line_retained {
+                match ptt_line_target.as_deref() {
+                    Some(device) => {
+                        info!("PTT keys the RTS line of {device} (rig.ptt.method = serial_rts)")
+                    }
+                    None => warn!(
+                        "Serial PTT: the previous PTT line may still be asserted; TX is \
+                         refused until it is confirmed low"
+                    ),
+                }
+                let keyed = super::ptt_line::LineKeyedRig::new(rig, self.ptt_line.clone());
+                let keyed = if line_retained {
+                    keyed.keying_cat_after_release()
+                } else {
+                    keyed
+                };
+                // Only a managed data mode guards key-downs and CAT
+                // mutations, as it does inside `RigctldClient`.
+                Arc::new(if rig_config.data_mode.is_some() {
+                    keyed.with_data_mode(self.message_bus.data_mode.clone())
+                } else {
+                    keyed
+                })
+            } else {
+                rig
+            };
         self.rig_handle = Some(rig.clone());
         self.rig_handle_is_real = rig_enabled;
 
@@ -2866,7 +2927,7 @@ impl super::ApplicationCoordinator {
                                 {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
-                                        overload_watchdog_safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+                                        overload_watchdog_safety.confirmed_off(UtcTimestamp::now().as_millisecond());
                                         // PAN-272: a failed unkey was already delivered,
                                         // so its TX worker guard cleared `ptt_active`.
                                         // A set flag now belongs to the next
@@ -3125,7 +3186,7 @@ impl super::ApplicationCoordinator {
                 if startup_ptt_off_succeeded {
                     message_bus_for_connect
                         .receive_gain
-                        .confirmed_off(chrono::Utc::now().timestamp_millis());
+                        .confirmed_off(UtcTimestamp::now().as_millisecond());
                 }
                 let mut overload = ReceiveOverloadRuntime::default();
                 overload.sweep_configured = overload_sweep_configured;
@@ -3425,7 +3486,7 @@ impl super::ApplicationCoordinator {
                                             && !message_bus_for_connect
                                                 .receive_gain
                                                 .hardware_ptt_on(
-                                                    chrono::Utc::now().timestamp_millis(),
+                                                    UtcTimestamp::now().as_millisecond(),
                                                 )
                                         {
                                             continue;
@@ -3500,7 +3561,7 @@ impl super::ApplicationCoordinator {
                                                     message_bus_for_connect
                                                         .receive_gain
                                                         .confirmed_off(
-                                                            chrono::Utc::now().timestamp_millis(),
+                                                            UtcTimestamp::now().as_millisecond(),
                                                         );
                                                     gain_tx_gate.fetch_and(!2, Ordering::AcqRel);
                                                     confirm_ptt_off(
@@ -9411,7 +9472,7 @@ mod receive_overload_notice_tests {
             runtime.generation = previous_generation;
             rig.connect().await.unwrap();
             bus.receive_gain
-                .confirmed_off(chrono::Utc::now().timestamp_millis());
+                .confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 runtime.tick(
@@ -9576,7 +9637,7 @@ mod receive_overload_notice_tests {
         rig.connect().await.unwrap();
         let bus = MessageBus::new(8).unwrap();
         bus.receive_gain
-            .confirmed_off(chrono::Utc::now().timestamp_millis());
+            .confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
         let (_sender, measurements) = crossbeam_channel::bounded(2);
         let mut runtime = ReceiveOverloadRuntime::default();
         runtime.sweep_configured = true;
@@ -9781,7 +9842,7 @@ mod receive_overload_notice_tests {
         });
         rig.connect().await.unwrap();
         let safety = GainSafety::default();
-        safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+        safety.confirmed_off(pancetta_core::time::UtcTimestamp::now().as_millisecond());
         super::observe_hardware_ptt(&rig, &safety).await.unwrap();
         assert!(safety.receiving());
         let epoch = safety.epoch();
@@ -9794,7 +9855,7 @@ mod receive_overload_notice_tests {
             epoch,
             "queued windows from before the key are stale"
         );
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = pancetta_core::time::UtcTimestamp::now().as_millisecond();
         assert_eq!(
             safety.window_validity(now + 1, now + 1),
             WindowValidity::KnownTx
@@ -9875,7 +9936,7 @@ mod receive_gain_tests {
     #[tokio::test]
     async fn pan302_reloaded_presets_apply_on_band_crossing() {
         use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
-        let mut h = super::super::tx::pan115_worker_gate_tests::worker_harness().await;
+        let mut h = super::super::tx::worker_gate_tests::worker_harness().await;
         let rig = MockRig::new(MockRigConfig {
             connection_delay_ms: 0,
             operation_delay_ms: 0,

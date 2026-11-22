@@ -19,7 +19,9 @@ server = "https://ntfy.sh"
 topic = ""
 
 [alerts.webhook]
+allow_private_targets = false
 enabled = false
+max_per_minute = 10
 min_tier = "atno"
 url = ""
 

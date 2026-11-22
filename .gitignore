@@ -79,6 +79,9 @@ pancetta.toml
 # ADIF logs + the SQLite QSO index + WAV captures (callsigns/grids/timestamps).
 *.adi
 *.adif
+# PAN-441 byte fixtures: made-up contacts written for tests (example and
+# public calls such as W1AW), never operator log data. Add nothing else here.
+!pancetta-qso/tests/fixtures/pan441/*.adi
 qso.db
 qso.db-*
 recordings/

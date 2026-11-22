@@ -20,6 +20,9 @@
 //! method of `qso_manager.rs`.
 
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 
 impl QsoManager {
     /// PAN-78: whether a MANUAL open of `callsign` at `step`, on `frequency`'s
@@ -868,7 +871,7 @@ impl QsoManager {
         &self,
         callsign: &str,
         frequency: f64,
-        within: chrono::Duration,
+        within: SignedDuration,
     ) -> Option<QsoId> {
         self.find_recently_completed_manual_qso_for_at(callsign, frequency, within, self.now_utc())
             .await
@@ -886,8 +889,8 @@ impl QsoManager {
         &self,
         callsign: &str,
         frequency: f64,
-        within: chrono::Duration,
-        now: DateTime<Utc>,
+        within: SignedDuration,
+        now: UtcTimestamp,
     ) -> Option<QsoId> {
         let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
         let key = callsign.to_uppercase();
@@ -950,7 +953,7 @@ impl QsoManager {
         qsos: &mut HashMap<QsoId, QsoProgress>,
         candidate_ids: &[QsoId],
         new_band: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Vec<SupersededQso> {
         let mut superseded = Vec::new();
         for qso_id in candidate_ids {
@@ -1044,7 +1047,7 @@ impl QsoManager {
     /// (PAN-128).
     /// Failed TX outcomes can reverse accounting via [`Self::roll_back_unsent_attempt_at`].
     /// The ledger emission anchor preserves cadence even when accounting is restored.
-    pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
+    pub async fn rearm_manual_calls_at(&self, now: UtcTimestamp) {
         // Re-arm only when at least one transmit slot has elapsed since the
         // last call, to keep ~one call per slot.
         //
@@ -1127,7 +1130,8 @@ impl QsoManager {
                 .keep_call_ledger
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let cutoff = now - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * slot_millis);
+            let cutoff =
+                now - SignedDuration::from_millis(UNSENT_ATTEMPT_RETENTION_SLOTS * slot_millis);
             for entry in ledger.values_mut() {
                 entry
                     .attempts
@@ -1240,7 +1244,7 @@ impl QsoManager {
                     .metadata
                     .last_call_at
                     .max(ledger.get(&qso_id).and_then(|entry| entry.last_emitted_at))
-                    .map(|t| (now - t).num_milliseconds())
+                    .map(|t| (now - t).as_millis_i64())
                     .unwrap_or(i64::MAX);
                 if elapsed_since_last < slot_millis {
                     continue;
@@ -1488,6 +1492,7 @@ impl QsoManager {
         }
     }
 
+<<<<<<< HEAD
     /// One watchdog pass at a fresh slot-clock reading (PAN-296, PAN-358).
     ///
     /// When the clock reported an event (a wall-clock step of 250 ms or
@@ -1543,6 +1548,41 @@ impl QsoManager {
             }
             self.watchdog_clock_epoch
                 .store(reading.epoch, std::sync::atomic::Ordering::Release);
+=======
+    pub(super) async fn watchdog_pass_at(
+        &self,
+        now: UtcTimestamp,
+        mono_now: std::time::Instant,
+        detector: &mut pancetta_core::slot_clock::ClockStepDetector,
+        last_mono: &mut std::time::Instant,
+    ) {
+        let step = detector.observe(now, mono_now.duration_since(*last_mono));
+        *last_mono = mono_now;
+        if let Some(skew) = step {
+            let qsos = self.qsos.write().await;
+            let mut anchors = self
+                .watchdog_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            anchors.clear();
+            for (&id, progress) in qsos.iter().filter(|(_, p)| p.state.is_active()) {
+                anchors.insert(
+                    id,
+                    WatchdogAnchors {
+                        state: watchdog_state_identity(&progress.state, now)
+                            .map(|identity| (identity, now)),
+                        first_call: progress
+                            .metadata
+                            .first_call_at
+                            .map(|original| (original, now)),
+                    },
+                );
+            }
+            warn!(
+                skew_ms = skew.as_millis_i64(),
+                "Wall-clock step: reset active QSO watchdog budgets"
+            );
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         }
         // Preserve rearm-before-retirement ordering and independent call caps.
         self.rearm_manual_calls_at(reading.now).await;
@@ -1557,7 +1597,7 @@ impl QsoManager {
     /// mapping cleared) once it has either transmitted
     /// `manual_call_max_calls` calls OR `manual_call_watchdog_minutes`
     /// have elapsed since the first call — whichever comes first.
-    pub async fn check_timeouts_at(&self, now: DateTime<Utc>) {
+    pub async fn check_timeouts_at(&self, now: UtcTimestamp) {
         // PAN-280: a completion whose closing frame never got a TX outcome
         // reverts first, so the exemption below applies to it at once.
         self.expire_pending_completions_at(now).await;
@@ -1728,7 +1768,7 @@ impl QsoManager {
             // state's `started_at`, so a healthy, progressing QSO never trips this.
             if active_tx_state {
                 if let Some(dur) = state_age {
-                    if dur.num_seconds() > self.config.timeouts.repetitive_tx_timeout_secs as i64 {
+                    if dur.as_secs() > self.config.timeouts.repetitive_tx_timeout_secs as i64 {
                         timeouts.push((qso_id, QsoFailureReason::Timeout));
                         continue;
                     }
@@ -1756,9 +1796,10 @@ impl QsoManager {
                 )
             {
                 let max_calls = self.config.timeouts.manual_call_max_calls;
-                let watchdog =
-                    Duration::minutes(self.config.timeouts.manual_call_watchdog_minutes as i64);
-                let elapsed = first_call_age.unwrap_or_else(Duration::zero);
+                let watchdog = SignedDuration::from_mins(
+                    self.config.timeouts.manual_call_watchdog_minutes as i64,
+                );
+                let elapsed = first_call_age.unwrap_or(SignedDuration::ZERO);
 
                 // C3 race guard: if this QSO made a forward state advance in the
                 // current watchdog cycle (the DX just answered), grant a
@@ -1805,7 +1846,7 @@ impl QsoManager {
                 // while we wait, and the time watchdog still applies.
                 let attempt_unresolved = {
                     let cutoff = now
-                        - Duration::milliseconds(
+                        - SignedDuration::from_millis(
                             UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis(),
                         );
                     self.keep_call_ledger
@@ -1853,7 +1894,7 @@ impl QsoManager {
                 // the real-clock `started_at` the engine stamps — casting a
                 // negative `num_seconds()` to `u64` would wrap to a huge value
                 // and spuriously retire a just-opened QSO.
-                if duration.num_seconds() > timeout_seconds as i64 {
+                if duration.as_secs() > timeout_seconds as i64 {
                     timeouts.push((qso_id, QsoFailureReason::Timeout));
                 }
             }

@@ -13,7 +13,7 @@
 //! - [`Lane`] is the retry state of one destination. Callers always pass
 //!   `now`, so every transition is testable without a clock.
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -105,11 +105,11 @@ pub struct OutboxEntry {
     /// credential.
     pub payload: String,
     /// When it entered the queue.
-    pub enqueued_at: DateTime<Utc>,
+    pub enqueued_at: UtcTimestamp,
     /// Attempts made so far.
     pub attempts: u32,
     /// When the last attempt finished.
-    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_attempt_at: Option<UtcTimestamp>,
     /// Why the last attempt failed (no credentials).
     pub last_error: Option<String>,
     /// Pending or held.
@@ -122,7 +122,7 @@ pub struct AcceptedReceipt {
     pub qso_id: Uuid,
     pub destination: UploadDestination,
     pub remote_id: String,
-    pub accepted_at: DateTime<Utc>,
+    pub accepted_at: UtcTimestamp,
 }
 
 /// An upload to add to the queue.
@@ -221,7 +221,7 @@ impl OutboxStore {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (store, None),
             Err(e) => {
-                let q = store.quarantine(format!("could not read: {e}"), Utc::now());
+                let q = store.quarantine(format!("could not read: {e}"), UtcTimestamp::now());
                 return (store, Some(q));
             }
         };
@@ -242,7 +242,7 @@ impl OutboxStore {
             Ok(f) => format!("unknown schema_version {}", f.schema_version),
             Err(e) => format!("not valid queue JSON: {e}"),
         };
-        let q = store.quarantine(reason, Utc::now());
+        let q = store.quarantine(reason, UtcTimestamp::now());
         (store, Some(q))
     }
 
@@ -251,11 +251,11 @@ impl OutboxStore {
     /// part keeps two quarantines in the same second (or after the clock steps
     /// back) from resolving to one path, where `rename` would replace the
     /// first (PAN-232).
-    fn quarantine(&self, reason: String, now: DateTime<Utc>) -> Quarantine {
+    fn quarantine(&self, reason: String, now: UtcTimestamp) -> Quarantine {
         let mut name = self.path.as_os_str().to_owned();
         name.push(format!(
             ".corrupt-{}-{}",
-            now.timestamp(),
+            now.as_second(),
             Uuid::new_v4().simple()
         ));
         let target = PathBuf::from(name);
@@ -366,7 +366,7 @@ impl OutboxStore {
 
     /// Queue a batch. An upload already queued for the same QSO and
     /// destination is skipped; past capacity, new uploads are refused.
-    pub fn add(&mut self, batch: Vec<NewUpload>, now: DateTime<Utc>) -> AddResult {
+    pub fn add(&mut self, batch: Vec<NewUpload>, now: UtcTimestamp) -> AddResult {
         let mut result = AddResult::default();
         for up in batch {
             if self
@@ -447,7 +447,7 @@ impl OutboxStore {
         &mut self,
         id: Uuid,
         remote_id: Option<String>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<OutboxEntry> {
         let entry = self.delivered(id)?;
         if let Some(remote_id) = remote_id.filter(|id| !id.is_empty()) {
@@ -485,7 +485,7 @@ impl OutboxStore {
     }
 
     /// Record a failed attempt; the entry stays pending.
-    pub fn record_failure(&mut self, id: Uuid, now: DateTime<Utc>, text: &str) {
+    pub fn record_failure(&mut self, id: Uuid, now: UtcTimestamp, text: &str) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.attempts = e.attempts.saturating_add(1);
             e.last_attempt_at = Some(now);
@@ -494,7 +494,7 @@ impl OutboxStore {
     }
 
     /// Record a refused attempt and hold the entry until the next start.
-    pub fn hold(&mut self, id: Uuid, now: DateTime<Utc>, text: &str) {
+    pub fn hold(&mut self, id: Uuid, now: UtcTimestamp, text: &str) {
         self.record_failure(id, now, text);
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.state = EntryState::Held;
@@ -948,14 +948,20 @@ mod tests {
         let existing = &UploadDestination::ALL[..4];
         store.add(
             existing.iter().map(|&d| up(id, d, "K1ABC")).collect(),
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
         let (mut store, quarantine) = OutboxStore::open(path.clone());
         assert!(quarantine.is_none());
         assert_eq!(store.len(), 4);
-        store.add(vec![up(id, UploadDestination::Lotw, "K1ABC")], Utc::now());
-        store.add(vec![up(id, UploadDestination::Lotw, "K1ABC")], Utc::now());
+        store.add(
+            vec![up(id, UploadDestination::Lotw, "K1ABC")],
+            UtcTimestamp::now(),
+        );
+        store.add(
+            vec![up(id, UploadDestination::Lotw, "K1ABC")],
+            UtcTimestamp::now(),
+        );
         assert_eq!(store.len(), 5);
         OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
         let (again, quarantine) = OutboxStore::open(path);
@@ -979,7 +985,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(&dir);
         let (mut store, _) = OutboxStore::open(path.clone());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         store.add(
             vec![
                 up(Uuid::new_v4(), UploadDestination::ClubLog, "K1ABC"),
@@ -1040,7 +1046,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(&dir);
         let (store, _) = OutboxStore::open(path.clone());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         std::fs::write(&path, b"{ first").unwrap();
         let first = store.quarantine("first".to_string(), now);
         std::fs::write(&path, b"{ second").unwrap();
@@ -1083,7 +1089,7 @@ mod tests {
         let (mut store, _) = OutboxStore::open(path.clone());
         store.add(
             vec![up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A")],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
         assert_eq!(std::fs::read(&stale).unwrap(), b"garbage");
@@ -1144,13 +1150,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = OutboxStore::open(path_in(&dir));
         let qso = Uuid::new_v4();
-        let r1 = store.add(vec![up(qso, UploadDestination::Eqsl, "K1ABC")], Utc::now());
+        let r1 = store.add(
+            vec![up(qso, UploadDestination::Eqsl, "K1ABC")],
+            UtcTimestamp::now(),
+        );
         let r2 = store.add(
             vec![
                 up(qso, UploadDestination::Eqsl, "K1ABC"),
                 up(qso, UploadDestination::ClubLog, "K1ABC"),
             ],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         assert_eq!(r1.added, 1);
         assert_eq!(r2.added, 1);
@@ -1168,7 +1177,7 @@ mod tests {
                 up(Uuid::new_v4(), UploadDestination::ClubLog, "B1B"),
                 up(Uuid::new_v4(), UploadDestination::ClubLog, "C1C"),
             ],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         assert_eq!(r.added, 2);
         assert_eq!(r.refused_full, 1);
@@ -1179,7 +1188,7 @@ mod tests {
     fn next_for_prefers_untried_then_least_recently_tried() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = OutboxStore::open(path_in(&dir));
-        let t0 = Utc::now();
+        let t0 = UtcTimestamp::now();
         store.add(
             vec![
                 up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A"),
@@ -1193,17 +1202,17 @@ mod tests {
             store.next_for(UploadDestination::ClubLog).unwrap().id,
             ids[0]
         );
-        store.record_failure(ids[0], t0 + chrono::Duration::seconds(10), "x");
+        store.record_failure(ids[0], t0 + jiff::SignedDuration::from_secs(10), "x");
         assert_eq!(
             store.next_for(UploadDestination::ClubLog).unwrap().id,
             ids[1]
         );
-        store.record_failure(ids[1], t0 + chrono::Duration::seconds(5), "x");
+        store.record_failure(ids[1], t0 + jiff::SignedDuration::from_secs(5), "x");
         assert_eq!(
             store.next_for(UploadDestination::ClubLog).unwrap().id,
             ids[2]
         );
-        store.record_failure(ids[2], t0 + chrono::Duration::seconds(20), "x");
+        store.record_failure(ids[2], t0 + jiff::SignedDuration::from_secs(20), "x");
         // All tried: the one tried longest ago (B at +5 s).
         assert_eq!(
             store.next_for(UploadDestination::ClubLog).unwrap().id,
@@ -1218,10 +1227,10 @@ mod tests {
         let (mut store, _) = OutboxStore::open(path_in(&dir));
         store.add(
             vec![up(Uuid::new_v4(), UploadDestination::Eqsl, "A1A")],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         let id = store.entries()[0].id;
-        store.hold(id, Utc::now(), "HTTP 400");
+        store.hold(id, UtcTimestamp::now(), "HTTP 400");
         assert!(store.next_for(UploadDestination::Eqsl).is_none());
         assert_eq!(store.release_held(), 1);
         assert_eq!(store.next_for(UploadDestination::Eqsl).unwrap().id, id);
@@ -1233,10 +1242,10 @@ mod tests {
         let (mut store, _) = OutboxStore::open(path_in(&dir));
         store.add(
             vec![up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A")],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         let id = store.entries()[0].id;
-        store.record_failure(id, Utc::now(), &"x".repeat(1000));
+        store.record_failure(id, UtcTimestamp::now(), &"x".repeat(1000));
         let err = store.entries()[0].last_error.clone().unwrap();
         assert_eq!(err.chars().count(), LAST_ERROR_MAX_CHARS + 1);
         assert!(err.ends_with('…'));
@@ -1251,7 +1260,7 @@ mod tests {
         let (mut store, _) = OutboxStore::open(path.clone());
         store.add(
             vec![up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A")],
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -1262,7 +1271,7 @@ mod tests {
     fn counts_report_pending_held_and_last_error_per_destination() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = OutboxStore::open(path_in(&dir));
-        let t0 = Utc::now();
+        let t0 = UtcTimestamp::now();
         store.add(
             vec![
                 up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A"),
@@ -1274,7 +1283,7 @@ mod tests {
         );
         let ids: Vec<Uuid> = store.entries().iter().map(|e| e.id).collect();
         store.record_failure(ids[0], t0, "older");
-        store.record_failure(ids[1], t0 + chrono::Duration::seconds(1), "newer");
+        store.record_failure(ids[1], t0 + jiff::SignedDuration::from_secs(1), "newer");
         store.hold(ids[2], t0, "HTTP 400");
         let c = store.counts(UploadDestination::ClubLog);
         assert_eq!(c.pending, 2);

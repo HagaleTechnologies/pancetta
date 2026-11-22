@@ -19,6 +19,7 @@
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::DecodedMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -347,7 +348,7 @@ pub enum MessageType {
         text: String,
         freq_hz: f64,
         qso_id: Option<String>,
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp: UtcTimestamp,
     },
 
     /// TX-policy state echo. Sent by the Hamlib poll loop's SWR trip
@@ -521,7 +522,7 @@ pub enum MessageType {
         success: bool,
         /// Populated only when `success` is false (e.g. "Timeout").
         reason: Option<String>,
-        completed_at: chrono::DateTime<chrono::Utc>,
+        completed_at: UtcTimestamp,
     },
 
     /// Waterfall spectrogram data for TUI display
@@ -546,7 +547,7 @@ pub enum MessageType {
         audio_bin_start_hz: f64,
         bin_width_hz: f64,
         mags_db: Vec<f32>,
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp: UtcTimestamp,
     },
 }
 
@@ -625,7 +626,7 @@ pub struct RecentQsoOutcome {
     /// Operating frequency in Hz at the time of the outcome.
     pub freq_hz: u32,
     /// When the outcome was recorded.
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: UtcTimestamp,
     /// Short human-readable summary lines built from the QSO's metadata
     /// (start time, exchanged reports, final outcome) — a brief digest, NOT
     /// the full per-message `state_history` timeline (that's Task 4).
@@ -643,7 +644,7 @@ pub struct ActiveQsoSnapshotItem {
     /// Human-readable state name (compact form: "wait rpt", "sending RR73").
     pub state: String,
     /// When this QSO started — TUI renders an elapsed timer from this.
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: UtcTimestamp,
     /// Audio frequency in Hz where we're working this QSO.
     pub frequency_hz: f64,
     /// Parity our station transmits in for this QSO. Used by the TUI
@@ -654,11 +655,11 @@ pub struct ActiveQsoSnapshotItem {
     /// drives the QSO-detail panel's TX line).
     pub last_tx_text: Option<String>,
     /// When the last TX message was recorded.
-    pub last_tx_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_tx_at: Option<UtcTimestamp>,
     /// Raw text of the last message we received from the contra station.
     pub last_rx_text: Option<String>,
     /// When the last RX message was recorded.
-    pub last_rx_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_rx_at: Option<UtcTimestamp>,
     /// Measured SNR (dB) of the last message received from them.
     pub snr_rx: Option<i32>,
     /// Signal report we sent them (their signal at our end).
@@ -695,7 +696,7 @@ pub struct ActiveQsoSnapshotItem {
     /// elapsed-time bound (`first_call_at + manual_call_watchdog_minutes`).
     /// The TUI renders a live countdown ("stops 3:12"). `None` when this QSO
     /// is not in a manual keep-calling state.
-    pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub watchdog_deadline: Option<UtcTimestamp>,
     /// #41: a short summary of what the DX is doing on the band right now,
     /// from their latest decoded frame (e.g. "CQ", "→ W1XYZ R-12", "→ us -09").
     /// Lets the operator see — even before the DX answers — whether they're
@@ -716,7 +717,7 @@ pub struct ActiveQsoSnapshotItem {
     pub pending_freq_drift_hz: Option<f64>,
     /// When the pending drift candidate above was first noted. Paired with
     /// `pending_freq_drift_hz`; always `Some` exactly when that is.
-    pub pending_freq_drift_since: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_freq_drift_since: Option<UtcTimestamp>,
 }
 
 /// One entry in the cross-parity manual-call queue (#40), included in
@@ -1001,7 +1002,7 @@ pub enum QsoMessage {
     TxFrameScheduled {
         qso_id: String,
         attempt_id: pancetta_qso::TxAttemptId,
-        target_slot: chrono::DateTime<chrono::Utc>,
+        target_slot: UtcTimestamp,
     },
     /// PAN-182: a QSO frame that aired, mirrored by Ft8Transmitter after
     /// playback alongside the Autonomous completion. Qso uses it to release
@@ -1016,7 +1017,7 @@ pub enum QsoMessage {
         /// When the worker reported it, after playback. An earlier slot's
         /// identical keep-call frame reports before the trigger's own slot
         /// starts, so it cannot release the hold.
-        aired_at: chrono::DateTime<chrono::Utc>,
+        aired_at: UtcTimestamp,
         /// PAN-280: the aired frame's attempt (the pivot target's, after a
         /// pivot), so Qso can settle the TX report against the call that
         /// charged it (the auto-73 resend marker). `None` when the frame
@@ -1383,7 +1384,7 @@ impl<T> AckSlot<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackStartState {
     /// The audio thread observed the callback take the first sample at this time.
-    Started(chrono::DateTime<chrono::Utc>),
+    Started(UtcTimestamp),
     /// The buffer could not be queued, was discarded, or lost its output stream.
     NotStarted,
     /// Every copy of the unsettled acknowledgement was dropped.
@@ -1397,7 +1398,7 @@ pub enum PlaybackStartState {
 /// real-time callback, because the shared slot takes a mutex.
 #[derive(Clone)]
 pub struct PlaybackStartAck {
-    slot: AckSlot<Option<chrono::DateTime<chrono::Utc>>>,
+    slot: AckSlot<Option<UtcTimestamp>>,
     tx_drive_attempt: Option<Arc<crate::coordinator::tx_meter::TxDriveAttempt>>,
 }
 
@@ -1423,7 +1424,7 @@ impl PlaybackStartAck {
     }
 
     /// Report the audio thread's observation time. Later settlements do nothing.
-    pub fn started(&self, at: chrono::DateTime<chrono::Utc>) {
+    pub fn started(&self, at: UtcTimestamp) {
         if let Some(attempt) = &self.tx_drive_attempt {
             attempt.started();
         }
@@ -1444,7 +1445,7 @@ impl std::fmt::Debug for PlaybackStartAck {
 
 /// The TX worker's half of a [`PlaybackStartAck`].
 pub struct PlaybackStartWaiter {
-    rx: oneshot::Receiver<Option<chrono::DateTime<chrono::Utc>>>,
+    rx: oneshot::Receiver<Option<UtcTimestamp>>,
     settled: Option<PlaybackStartState>,
 }
 
@@ -2308,7 +2309,7 @@ mod tests {
     #[tokio::test]
     async fn pan71_playback_start_ack_reports_the_settled_instant() {
         let (ack, mut waiter) = PlaybackStartAck::new();
-        let at = chrono::Utc::now();
+        let at = UtcTimestamp::now();
         ack.clone().started(at);
         ack.not_started();
         assert_eq!(
@@ -2356,7 +2357,7 @@ mod tests {
             waiter.wait_for(Duration::from_millis(1)).await,
             PlaybackStartState::Pending
         );
-        let at = chrono::Utc::now();
+        let at = UtcTimestamp::now();
         ack.started(at);
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,

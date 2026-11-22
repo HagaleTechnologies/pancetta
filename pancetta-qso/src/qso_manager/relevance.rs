@@ -146,8 +146,8 @@ impl QsoManager {
                                     .unwrap_or(p.metadata.frequency),
                             );
                             return completed_band == want_band
-                                && now.signed_duration_since(*completed_at).num_seconds()
-                                    <= COMPLETED_QSO_REWORK_GRACE.num_seconds();
+                                && now.duration_since(*completed_at).as_secs()
+                                    <= COMPLETED_QSO_REWORK_GRACE.as_secs();
                         }
                         false
                     })

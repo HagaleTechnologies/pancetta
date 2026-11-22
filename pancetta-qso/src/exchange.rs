@@ -5,6 +5,7 @@
 
 use crate::states::*;
 use lazy_static::lazy_static;
+use pancetta_core::time::UtcTimestamp;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -1514,7 +1515,7 @@ mod tests {
         QsoState::RespondingToCq {
             target_callsign: "K5TD".to_string(),
             frequency: 14_074_000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
         }
     }
 

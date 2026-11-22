@@ -10,6 +10,8 @@
 //! WaitingForReport survive the generic 30s timeout under the manual
 //! keep-call watchdog (mirroring SendingReport's existing exemption).
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 const OUR: &str = "W1ABC"; // test_config()'s our_callsign
 const CALLER: &str = "K1DEF";
@@ -134,7 +136,7 @@ async fn repeated_cq_response_stays_and_resends_identical_report() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(last_call_at + Duration::seconds(15))
+        .rearm_manual_calls_at(last_call_at + SignedDuration::from_secs(15))
         .await;
     let rearmed = sends(&drain(&mut rx));
     assert_eq!(
@@ -181,7 +183,7 @@ async fn repeated_cq_response_stays_and_resends_identical_report() {
         .last_call_at
         .unwrap();
     manager
-        .rearm_manual_calls_at(last_call_at2 + Duration::seconds(15))
+        .rearm_manual_calls_at(last_call_at2 + SignedDuration::from_secs(15))
         .await;
     let rearmed2 = sends(&drain(&mut rx));
     assert_eq!(rearmed2.len(), 1);
@@ -258,7 +260,7 @@ async fn manual_waiting_for_report_survives_generic_timeout_but_not_watchdog() {
     // Well past the generic 30s report_timeout, but well within the 5-min
     // manual watchdog — must still be alive.
     manager
-        .check_timeouts_at(Utc::now() + Duration::seconds(90))
+        .check_timeouts_at(UtcTimestamp::now() + SignedDuration::from_secs(90))
         .await;
     assert!(
         manager.get_qso(qso_id).await.is_ok(),
@@ -274,7 +276,7 @@ async fn manual_waiting_for_report_survives_generic_timeout_but_not_watchdog() {
         .first_call_at
         .unwrap();
     manager
-        .check_timeouts_at(first_call_at + Duration::minutes(6))
+        .check_timeouts_at(first_call_at + SignedDuration::from_mins(6))
         .await;
     assert!(
         matches!(

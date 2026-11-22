@@ -109,6 +109,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
         ),
         ("psk_reporter", "PSKReporter component."),
         (
+            "ptt_line",
+            "Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357).",
+        ),
+        (
             "qrz_lookup",
             "Interactive, session-cached QRZ station lookups.",
         ),

@@ -107,7 +107,7 @@ parameter at all four call sites (Step 4b/4d, single and multi TX).
   the gate then proceeds, which is the pre-PAN-141 behaviour for that cycle.
 - **Tests.** Unit tests in `schedule_tx_tests` pin cross-band, cross-grid,
   intra-band retune, unknown dial, filter order, Step 4d and the bundle mask.
-  `pan146_dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
+  `dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
   with a fresh 20 m sighting keys, and the same call on 20 m is held.
 
 ## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
@@ -210,7 +210,7 @@ frequency-based unattended exception is introduced. See [configuration](../CONFI
 
 `pancetta/src/coordinator/qso.rs`: the TX coalescer (`coalesce_transmit_requests`) already multi-streams concurrent same-parity QSOs into one `MultiTransmitRequest`, so selecting 2+ DX in the **same window** runs them at once. The manual `StartQso` handler parity-gates each pick: same/idle side starts immediately; a **cross-window** pick is deferred into `PendingManualCalls` (dedup by callsign, bounded 16) with an operator status line, never preempting a live QSO. `promote_pending_manual_calls` drains the queue when a QSO goes terminal — on completion **after the 45s TX grace** (so the trailing 73 and the new opposite-window call never key in sequential slots) and immediately on failure — adopting the freed side (or the oldest queued call's parity when idle) and starting matching calls, oldest first, up to the free capacity (PAN-78; see below); cross-parity ones, and matching ones with no free slot, keep waiting. Pure `partition_pending_calls` split (unit-tested). Operator rule: queue cross-parity, never preempt, flip sides only when the current side's QSOs all finish. As of the 2026-07-18 review's Batch 2, `RespondToCaller` (the manual answer-a-caller path) runs through this same `admit_new_qso` gate too — previously it was the one manual entry point that admitted immediately regardless of the committed side.
 
-Queued-call expiry (PAN-289): each queued call is stamped on both clocks (`QueueStamp`: a monotonic `Instant` and a `chrono::Utc` wall time). Its age is the larger of the two elapsed times, with a negative wall elapsed counted as zero. The wall clock counts time the machine spent asleep, which `Instant` does not (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS), so a call queued just before a sleep cannot fire on wake. The monotonic clock keeps a backward NTP step from extending a call's life; a forward step expires calls early, the safe direction. A call at or past `QUEUED_CALL_TTL` (10 minutes) is retired by the 15 s watchdog and also dropped at the start of every `promote_pending_manual_calls` pass, before the parity partition, so an expired head can neither start nor choose the side an idle station adopts. Both paths report through `report_expired_calls` with the same status line and diagnostic. The snapshot's `waited_secs` uses the same age.
+Queued-call expiry (PAN-289): each queued call is stamped on both clocks (`QueueStamp`: a monotonic `Instant` and a `UtcTimestamp` (jiff) wall time). Its age is the larger of the two elapsed times, with a negative wall elapsed counted as zero. The wall clock counts time the machine spent asleep, which `Instant` does not (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS), so a call queued just before a sleep cannot fire on wake. The monotonic clock keeps a backward NTP step from extending a call's life; a forward step expires calls early, the safe direction. A call at or past `QUEUED_CALL_TTL` (10 minutes) is retired by the 15 s watchdog and also dropped at the start of every `promote_pending_manual_calls` pass, before the parity partition, so an expired head can neither start nor choose the side an idle station adopts. Both paths report through `report_expired_calls` with the same status line and diagnostic. The snapshot's `waited_secs` uses the same age.
 
 Bundles are **not** allowed to silently disagree on parity or collide in frequency: `coalesce_transmit_requests` and the autonomous plan-bundler both exclude (never coerce) a retained stream whose `tx_parity` disagrees with the bundle's anchor, or whose `frequency_offset` falls within `MIN_TX_SEPARATION_HZ` of an already-retained stream — an excluded stream is not dropped, it transmits individually on its own parity/offset next cycle (Batch 2 for the parity check, Batch 3 for the frequency check). This closes a real gap: a bundle previously assumed its folded streams "naturally" shared one parity, which wasn't actually enforced anywhere.
 
@@ -904,7 +904,7 @@ and `pan76_fox_off_and_straight_on_starts_a_fresh_cq`.
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 
 PAN-72 had already replaced the autonomous loop's one-shot `interval_at` anchor with a 250 ms poll
-that re-reads `chrono::Utc::now()`, so a **forward** jump re-anchored on the next poll. A
+that re-reads `UtcTimestamp::now()` (jiff), so a **forward** jump re-anchored on the next poll. A
 **backward** step still broke three components. Measured on `0823dd2` with scratch reproductions:
 0 autonomous slot ticks in 599 s after a 600 s step (expected ~40); the next DSP decode window
 613 s away; the TX worker's Step 6 sleeping 600.08 s with PTT keyed; and after a forward jump
@@ -1103,7 +1103,7 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   same best-effort semantics as its old `send_message`.
 - **Tests.** `message_bus.rs` holds the table's write lock and asserts the rig route enqueues
   inside the hold within a 50 ms cap, with a hazard pin showing the table path still waits.
-  `pan202_key_down_worker_tests` parks the real TX worker between its last gate and the
+  `key_down_worker_tests` parks the real TX worker between its last gate and the
   key-down with a `#[cfg(test)]` `KeyDownProbe`, holds the table (`hold_channel_table`), and
   requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
   helper is tested directly.
@@ -1141,7 +1141,7 @@ tune in the same state played a tone with no carrier.
   worker: its command loop skips a key-down during a receive-gain transition, while the restart
   inhibit is active, or when `hardware_ptt_on` refuses (`coordinator/hamlib.rs`, the `SetPtt`
   handling). So `TxFrameSent` is still not proof of keying.
-- **Tests.** `pan278_dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
+- **Tests.** `dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
   after the outcome settles (draining earlier lets the key-down through and hides the defect).
   It covers single TX, a two-item bundle, a tune, and the no-route proceed path on
   `worker_harness_without_rig`.
@@ -1296,6 +1296,84 @@ Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
 
+Superseded for runtime keying by PAN-357 below.
+
+## The PTT method selects the keying path (PAN-357, 2026-11-22)
+
+Before this change `[rig.ptt].method` never chose how a transmission keyed (PAN-121 above). Every
+key-down ended at `RigctldClient::set_ptt` (`T 1`/`T 0`), and validation accepted every value, so
+`vox` or `serial` keyed through CAT without saying so. Now validation refuses every method with no
+keying path (`PttConfig::refusal`, `pancetta-config/src/rig.rs`), and `serial_rts` keys the RTS
+line of a separate serial port (`pancetta/src/coordinator/ptt_line.rs`). `pancetta test-rig --ptt`
+opens `rig.ptt.device` for `serial_rts` and refuses `serial` as untestable.
+
+- **Refuse only while rig control is on.** With `[rig.interface] enabled = false`, PTT goes to the
+  mock rig and keys nothing, so no method keys silently there. Refusing would reject decode-only
+  stations.
+- **`none` still keys through rigctld.** It is the default and keyed by CAT before. Making it
+  "never key" would stop TX on working stations, so only its labels and docs changed.
+- **`SerialRts` is `serial_rts`, with the alias `serial-rts`.** The schema is snake_case. The alias
+  makes the ticket's spelling parse, and a save writes `serial_rts`.
+- **The refused variants stay in the enum.** They must parse so validation can name the value.
+  Removing them would turn the refusal back into serde's `unknown variant`.
+- **`serial_rts` needs a separate `rig.ptt.device`, with no fallback to the CAT port.** rigctld
+  owns that port, pancetta's exclusive open would block a managed rigctld respawn, and two
+  programs would drive one line. Validation compares trimmed strings. `PttLine::configure` also
+  refuses a device that canonicalizes to the CAT port, which catches `/dev/serial/by-id` symlinks.
+  There is no path-shape check, because by-id paths are the recommended Linux form.
+- **`polarity = "negative"` is refused for `serial_rts`.** Linux lowers RTS when the port closes
+  (HUPCL) or the process exits, so an inverted line would key the rig whenever pancetta is not
+  running.
+- **Under `serial_rts` only the line keys, never `T 1`/`T 0`.** No scenario asks for both, sending
+  both could double-key, and a failed `T 0` would make a confirmed line drop look like a failed
+  unkey.
+- **The wrapper sits below `RigControl`.** `start_hamlib_component` wraps the rig it built in
+  `ptt_line::LineKeyedRig`, so all six Hamlib `set_ptt` sites and every producer (TX worker,
+  bundles, tune, manual PTT, SWR halt, autonomous halt) drive the line. `PttGuard`,
+  `send_ptt_command`, the `SetPtt` arm, the PAN-322 abort golden and the PAN-272/273/277/278
+  invariants are unchanged. `get_ptt` reports On while the line may be asserted, and every other
+  `RigControl` method forwards to the inner rig. Hamlib's `-P RTS` was rejected: it cannot cover
+  an external rigctld, and pancetta cannot test it without a fake daemon that records argv.
+- **A managed data mode keeps its keyed guard.** With `rig.data_mode` set, `RigctldClient`
+  refuses a mode or VFO change while it knows the rig is keyed, but under serial RTS it never
+  sees the key-down. So the wrapper refuses a key-down while the data mode is not ready, refuses
+  `set_frequency`, `set_vfo`, `set_memory_channel`, `set_split` and `set_split_freq` while the
+  line may be asserted, and drops the line before a (re)connect prepares the mode, as the
+  client's own connect sends `T 0` first. A key-down and those calls are serialized. Without a
+  data mode they forward unchanged.
+- **One `PttLine` per coordinator, opened once and held for the session.** Reopening per frame
+  would pulse RTS on Linux at every open, and a per-generation handle would hit `EBUSY` on restart
+  while the old `Arc` is alive. `configure` reconciles it at each Hamlib start: it reuses an open
+  handle for the same device, and lowers and closes the old one when the target changes or goes
+  away. Shutdown lowers and latches it directly, concurrently with the Hamlib drain and
+  independent of the Hamlib loop.
+- **Blocking serial calls run on `spawn_blocking`.** USB-serial modem-line ioctls can block, and
+  `block_in_place` panics on the current_thread runtimes the Hamlib tests use.
+- **A poisoned line lock refuses key-down and lets unkey proceed** with the recovered state. TX
+  fails closed and an unkey is never blocked.
+- **No new TX hard-mute cause for an unopened line.** A refused key-down already plays audio
+  unkeyed for CAT (the `SetPtt` arm only logs it), and a mute cause would touch the PAN-89 parity
+  test, the readiness strip and every `tx_hard_mute_reason` caller. A failed open is reported at
+  Hamlib start as a rig error (`Serial PTT: cannot open serial PTT port …`), and each key-down
+  retries it.
+- **CM108, DTR and RTS on the CAT port are refused, tracked in PAN-476.** CM108 needs a HID path,
+  DTR glitches at open on Linux, and both fit rigctld's `-P` better.
+- **The picker and the wizard offer None, CAT and Serial RTS.** The relay checks the candidate PTT
+  settings before writing, so `serial_rts` without a device is refused with `Rig not applied:
+  <reason>`, and an operator with a device set can switch live. The wizard prompts for the device
+  and keeps the previous method when a choice breaks a rule.
+- **One PR.** With validation alone, `serial_rts` would validate but still key by CAT, so the
+  schema and the keying path ship together.
+
+Line level at open. Linux raises DTR and RTS when a tty opens with a nonzero baud rate, even with
+`dtr_on_open(false)`, so `open_serial_rts_port` writes RTS low immediately after the open. That
+can still leave a brief pulse at open, which is one reason the port is opened once per session.
+On Windows, `FlowControl::None` sets `RtsControl::Disable`, so the port opens with RTS low. On
+Linux, HUPCL lowers RTS when the port closes or the process exits, including after `kill -9`.
+These statements come from reading serialport 4.10.1 and Linux tty behavior, not from a device. A
+pty has no modem lines, so tests drive a fake line through `PttLine::with_opener`. Hardware
+qualification is pending.
+
 ## Shutdown unkeys through the Hamlib loop (PAN-277, 2026-11-10)
 
 The signal handler sets the shutdown flag before coordinator cleanup runs. The
@@ -1358,7 +1436,7 @@ PAN-322 moves each outcome into one handler. Behaviour and log lines do not chan
   it can be copied into a worktree at `git merge-base origin/main HEAD` and run there.
 - **The real worker, not `coord_sim`.** `pancetta/tests/coord_sim.rs` copies the decision chain and
   never starts the TX worker. The cells run the real worker on a real `MessageBus` through
-  `pan115_worker_gate_tests::worker_harness_with_clock`, with `ptt_lead_ms = 2000`, a clock offset
+  `worker_gate_tests::worker_harness_with_clock`, with `ptt_lead_ms = 2000`, a clock offset
   that expires the remote arm, and `max_concurrent_qsos = 2` for bundles.
 - **Per-channel format.** Each cell lists `pre|post <channel> <event>`, split at a marker id from
   the bus's global counter. Channels go in the order hamlib, autonomous, qso, tui, audio, each in

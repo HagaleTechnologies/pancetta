@@ -1,5 +1,6 @@
 //! Changed startup snapshots of the ADIF source of truth.
 use pancetta_config::DatabaseConfig;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::logbook_lock::LogbookLock;
 use std::{
     fs::{self, OpenOptions},
@@ -68,7 +69,9 @@ pub(super) async fn startup(source: &Path, settings: &DatabaseConfig) -> io::Res
         source,
         &directory,
         settings.adif_backup_retain_count,
-        &chrono::Utc::now().format("%Y%m%d_%H%M%S_%6f").to_string(),
+        &UtcTimestamp::now()
+            .strftime("%Y%m%d_%H%M%S_%6f")
+            .to_string(),
         |f, bytes| {
             f.write_all(bytes)?;
             f.sync_all()

@@ -1,11 +1,11 @@
-use super::pan115_worker_gate_tests::{worker_harness_in_home, worker_harness_with};
+use super::worker_gate_tests::{worker_harness_in_home, worker_harness_with};
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType, RigControlMessage};
 use pancetta_config::Config;
 use pancetta_core::tx_meter::TxMeterCapability;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-async fn station() -> super::pan115_worker_gate_tests::Harness {
+async fn station() -> super::worker_gate_tests::Harness {
     let mut config = Config::default();
     config.audio.auto_drive.enabled = true;
     config.audio.levels.output_gain_ceiling_db = 5.0;
@@ -27,7 +27,7 @@ async fn station() -> super::pan115_worker_gate_tests::Harness {
     h
 }
 
-async fn request(h: &super::pan115_worker_gate_tests::Harness) {
+async fn request(h: &super::worker_gate_tests::Harness) {
     h.coordinator
         .message_bus
         .send_message(ComponentMessage::new(

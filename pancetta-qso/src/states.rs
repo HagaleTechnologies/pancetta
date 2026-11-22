@@ -3,7 +3,8 @@
 //! This module defines the various states a QSO can be in during the
 //! standard FT8 communication flow and contest operations.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ pub enum QsoState {
     /// Calling CQ and waiting for response
     CallingCq {
         frequency: f64,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
         call_count: u32,
     },
 
@@ -37,14 +38,14 @@ pub enum QsoState {
     RespondingToCq {
         target_callsign: String,
         frequency: f64,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     },
 
     /// Waiting for signal report
     WaitingForReport {
         their_callsign: String,
         frequency: f64,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
         /// Their grid square, latched from the opening CqResponse (CQer
         /// flow) so it can be carried through to the logged QSO. `None`
         /// when the response carried no grid.
@@ -67,7 +68,7 @@ pub enum QsoState {
         their_report: Option<SignalReport>,
         our_report: SignalReport,
         frequency: f64,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     },
 
     /// Waiting for confirmation (RR73 or similar)
@@ -77,7 +78,7 @@ pub enum QsoState {
         our_report: SignalReport,
         frequency: f64,
         grid_square: Option<GridSquare>,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     },
 
     /// Sending final confirmation
@@ -87,7 +88,7 @@ pub enum QsoState {
         our_report: SignalReport,
         frequency: f64,
         grid_square: Option<GridSquare>,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     },
 
     /// QSO completed successfully
@@ -97,14 +98,14 @@ pub enum QsoState {
         our_report: SignalReport,
         frequency: f64,
         grid_square: Option<GridSquare>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         duration_seconds: u32,
     },
 
     /// QSO failed or timed out
     Failed {
         reason: QsoFailureReason,
-        failed_at: DateTime<Utc>,
+        failed_at: UtcTimestamp,
         last_state: Box<QsoState>,
     },
 
@@ -121,7 +122,7 @@ pub enum ContestState {
         our_serial: SerialNumber,
         their_serial: Option<SerialNumber>,
         frequency: f64,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     },
 
     /// Contest QSO completed
@@ -130,7 +131,7 @@ pub enum ContestState {
         our_serial: SerialNumber,
         their_serial: SerialNumber,
         frequency: f64,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         contest_category: String,
     },
 }
@@ -332,7 +333,7 @@ pub struct StateTransition {
     pub to_state: QsoState,
 
     /// Timestamp of transition
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
 
     /// Reason for transition
     pub reason: TransitionReason,
@@ -364,7 +365,7 @@ pub enum TransitionReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QsoMessage {
     /// Message timestamp
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
 
     /// Message direction
     pub direction: MessageDirection,
@@ -402,7 +403,7 @@ pub struct PreSwitchOffset {
     /// The offset we left, in Hz.
     pub offset_hz: f64,
     /// When we left it.
-    pub left_at: DateTime<Utc>,
+    pub left_at: UtcTimestamp,
     /// `true` when the operator's `u` nudge forced the move, `false` when the
     /// silence-driven stall detector did.
     ///
@@ -473,15 +474,15 @@ pub struct QsoMetadata {
     pub mode: String,
 
     /// QSO start time
-    pub start_time: DateTime<Utc>,
+    pub start_time: UtcTimestamp,
 
     /// Receive time of the first accepted answer to our CQ, latched once.
     /// None until answered, and for QSOs created with a known partner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_answer_at: Option<DateTime<Utc>>,
+    pub first_answer_at: Option<UtcTimestamp>,
 
     /// QSO end time (if completed)
-    pub end_time: Option<DateTime<Utc>>,
+    pub end_time: Option<UtcTimestamp>,
 
     /// Signal reports
     pub reports: SignalReports,
@@ -562,14 +563,14 @@ pub struct QsoMetadata {
     /// Timestamp of the first call transmitted for this QSO. Used by the
     /// manual watchdog's elapsed-time bound (`manual_call_watchdog_minutes`).
     #[serde(default)]
-    pub first_call_at: Option<DateTime<Utc>>,
+    pub first_call_at: Option<UtcTimestamp>,
 
     /// Timestamp of the most recent call transmitted (manual keep-calling).
     /// PAN-75 restores this stamp for a remembered emission reported as not
     /// sent. Rearm pacing uses the later of this stamp and the separate
     /// ledger last-emitted anchor, so rollback cannot accelerate cadence.
     #[serde(default)]
-    pub last_call_at: Option<DateTime<Utc>>,
+    pub last_call_at: Option<UtcTimestamp>,
 
     /// C3 race guard: set `true` whenever this (manual) QSO makes a forward
     /// state advance, and cleared by each manual-watchdog pass. It grants a
@@ -688,7 +689,7 @@ pub struct QsoMetadata {
     /// scoped fast-path decoding one audio window twice) can never independently
     /// satisfy the "two strikes" requirement.
     #[serde(default)]
-    pub pending_freq_drift: Option<(f64, DateTime<Utc>)>,
+    pub pending_freq_drift: Option<(f64, UtcTimestamp)>,
 
     /// The TX offset this QSO most recently moved AWAY from, together with the
     /// instant it left — `None` normally, set by
@@ -958,13 +959,13 @@ pub enum QsoValidation {
     /// QSO is duplicate
     Duplicate {
         original_qso_id: QsoId,
-        original_timestamp: DateTime<Utc>,
+        original_timestamp: UtcTimestamp,
     },
 }
 
 impl QsoMetadata {
     /// Start of the contact for logging and display, falling back to creation time.
-    pub fn contact_started_at(&self) -> DateTime<Utc> {
+    pub fn contact_started_at(&self) -> UtcTimestamp {
         self.first_answer_at.unwrap_or(self.start_time)
     }
 }
@@ -1052,7 +1053,7 @@ impl QsoState {
     }
 
     /// Get the duration of the current state
-    pub fn state_duration(&self, now: DateTime<Utc>) -> Option<chrono::Duration> {
+    pub fn state_duration(&self, now: UtcTimestamp) -> Option<SignedDuration> {
         let start_time = match self {
             QsoState::CallingCq { started_at, .. }
             | QsoState::RespondingToCq { started_at, .. }
@@ -1275,7 +1276,7 @@ mod tests {
     fn set_frequency_writes_active_states_and_refuses_terminal_ones() {
         let mut calling = QsoState::CallingCq {
             frequency: 1000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             call_count: 1,
         };
         assert!(calling.set_frequency(1750.0));
@@ -1286,7 +1287,7 @@ mod tests {
         let mut completed = QsoState::Completed {
             their_callsign: "K1DEF".to_string(),
             frequency: 1000.0,
-            completed_at: chrono::Utc::now(),
+            completed_at: UtcTimestamp::now(),
             our_report: -10,
             their_report: -12,
             grid_square: None,
@@ -1315,7 +1316,7 @@ mod tests {
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             first_answer_at: None,
-            start_time: Utc::now(),
+            start_time: UtcTimestamp::now(),
             end_time: None,
             reports: SignalReports::default(),
             grids: GridSquares::default(),
@@ -1452,7 +1453,7 @@ mod tests {
             our_report: -10,
             frequency: 14074000.0,
             grid_square: Some("FN42".to_string()),
-            completed_at: Utc::now(),
+            completed_at: UtcTimestamp::now(),
             duration_seconds: 120,
         };
         assert!(completed.is_terminal());
@@ -1461,7 +1462,7 @@ mod tests {
         let active = QsoState::WaitingForReport {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             their_grid: None,
             our_report: -10,
         };
@@ -1478,7 +1479,7 @@ mod tests {
         let resp = QsoState::RespondingToCq {
             target_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = resp.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 0);
@@ -1490,7 +1491,7 @@ mod tests {
         let wait_rpt = QsoState::WaitingForReport {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             their_grid: None,
             our_report: -10,
         };
@@ -1504,7 +1505,7 @@ mod tests {
             their_report: Some(-12),
             our_report: -15,
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = send_rpt.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 2);
@@ -1520,7 +1521,7 @@ mod tests {
             their_report: None,
             our_report: 5,
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = send_rpt_pos.ladder_view(QsoRole::Caller).unwrap();
         assert!(
@@ -1535,7 +1536,7 @@ mod tests {
             our_report: -15,
             frequency: 14074000.0,
             grid_square: None,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = wait_conf.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 3);
@@ -1549,7 +1550,7 @@ mod tests {
         let wait_rpt = QsoState::WaitingForReport {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             their_grid: None,
             our_report: -10,
         };
@@ -1562,7 +1563,7 @@ mod tests {
             their_report: None,
             our_report: -7,
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = send_rpt.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
@@ -1575,7 +1576,7 @@ mod tests {
             our_report: -15,
             frequency: 14074000.0,
             grid_square: None,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = wait_conf.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
@@ -1587,7 +1588,7 @@ mod tests {
     fn test_ladder_view_cqer_flow() {
         let cq = QsoState::CallingCq {
             frequency: 14074000.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             call_count: 1,
         };
         let v = cq.ladder_view(QsoRole::Cqer).unwrap();
@@ -1603,7 +1604,7 @@ mod tests {
             our_report: -15,
             frequency: 14074000.0,
             grid_square: None,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         let v = send_conf.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.index, 4);
@@ -1619,14 +1620,14 @@ mod tests {
             our_report: -10,
             frequency: 14074000.0,
             grid_square: None,
-            completed_at: Utc::now(),
+            completed_at: UtcTimestamp::now(),
             duration_seconds: 120,
         };
         assert!(completed.ladder_view(QsoRole::Caller).is_none());
 
         let failed = QsoState::Failed {
             reason: QsoFailureReason::UserCancelled,
-            failed_at: Utc::now(),
+            failed_at: UtcTimestamp::now(),
             last_state: Box::new(QsoState::Idle),
         };
         assert!(failed.ladder_view(QsoRole::Caller).is_none());
@@ -1660,7 +1661,7 @@ mod tests {
 
         let failed = QsoState::Failed {
             reason: QsoFailureReason::SupervisorRestart,
-            failed_at: Utc::now(),
+            failed_at: UtcTimestamp::now(),
             last_state: Box::new(QsoState::Idle),
         };
         assert!(failed.ladder_view(QsoRole::Caller).is_none());
@@ -1673,7 +1674,7 @@ mod tests {
 
         let failed = QsoState::Failed {
             reason: reason.clone(),
-            failed_at: Utc::now(),
+            failed_at: UtcTimestamp::now(),
             last_state: Box::new(QsoState::Idle),
         };
         assert!(matches!(

@@ -25,7 +25,9 @@
 
 use crate::async_database::QsoDatabase;
 use crate::states::*;
-use chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -309,7 +311,7 @@ const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 /// window's job is only to bound how long the vacated offset stays worth
 /// considering at all.
 ///
-/// Round 8 redesign (fix 1): originally a hardcoded `chrono::Duration::seconds(30)`
+/// Round 8 redesign (fix 1): originally a hardcoded `SignedDuration::from_secs(30)`
 /// constant — "two FT8 slots" only by coincidence, since FT4's slot is 7.5 s
 /// and FT2's is 3.2 s. Now derived from the SAME `active_slot_ns` atomic
 /// [`rearm_slot_millis_from_ns`] already converts, so the grace window scales
@@ -317,8 +319,8 @@ const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 /// (mirroring [`rearm_slot_millis_from_ns`]) so the coordinator can derive
 /// the identical value from its own copy of the `active_slot_ns` atomic —
 /// one source of truth, two call sites.
-pub fn pre_switch_offset_grace_from_slot_ns(slot_ns: i64) -> chrono::Duration {
-    chrono::Duration::milliseconds(2 * rearm_slot_millis_from_ns(slot_ns))
+pub fn pre_switch_offset_grace_from_slot_ns(slot_ns: i64) -> SignedDuration {
+    SignedDuration::from_millis(2 * rearm_slot_millis_from_ns(slot_ns))
 }
 
 /// The offset this QSO moved away from, if it did so recently enough for a
@@ -327,12 +329,12 @@ pub fn pre_switch_offset_grace_from_slot_ns(slot_ns: i64) -> chrono::Duration {
 /// [`crate::states::QsoMetadata::pre_switch_offset`].
 fn live_pre_switch_offset_at(
     metadata: &crate::states::QsoMetadata,
-    now: DateTime<Utc>,
-    grace: chrono::Duration,
+    now: UtcTimestamp,
+    grace: SignedDuration,
 ) -> Option<crate::states::PreSwitchOffset> {
     metadata
         .pre_switch_offset
-        .filter(|pre| now.signed_duration_since(pre.left_at) <= grace)
+        .filter(|pre| now.duration_since(pre.left_at) <= grace)
 }
 
 /// FIX B (one-QSO-per-(callsign,band) close idempotency,
@@ -348,7 +350,7 @@ fn live_pre_switch_offset_at(
 /// be incoherent for the QSO engine to still treat a completed QSO as
 /// "reworkable" after the coordinator has already purged its TX liveness, or
 /// vice versa.
-pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::seconds(45);
+pub const COMPLETED_QSO_REWORK_GRACE: SignedDuration = SignedDuration::from_secs(45);
 
 /// The rearm/stall cadence used when no slot-length source was ever injected:
 /// FT8's historical 15-second transmit slot. See
@@ -491,11 +493,11 @@ fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
 /// values this returns, which can add at most one extra count at the
 /// boundary.
 fn keep_call_tx_slot(
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     slot_millis: i64,
     tx_late_max_ms: u64,
     tx_parity: Option<pancetta_core::slot::SlotParity>,
-) -> DateTime<Utc> {
+) -> UtcTimestamp {
     let slot_ns = slot_millis * 1_000_000;
     match tx_parity {
         Some(p) => {
@@ -504,14 +506,16 @@ fn keep_call_tx_slot(
             // acceptance cap the worker passes it.
             let cur_start = pancetta_core::slot::current_slot_start_with_period(now, slot_ns);
             if pancetta_core::slot::SlotParity::of_with_period(cur_start, slot_ns) == p {
-                let mstr_in_cur_slot = (now - cur_start).num_milliseconds().max(0);
+                let mstr_in_cur_slot = (now - cur_start).as_millis_i64().max(0);
                 if mstr_in_cur_slot <= keep_call_acceptance_cap_ms(slot_millis, tx_late_max_ms) {
                     return cur_start;
                 }
             }
             pancetta_core::slot::next_slot_with_parity_with_period(now, p, slot_ns)
         }
-        None => pancetta_core::slot::next_slot_start_with_period(now, Duration::zero(), slot_ns),
+        None => {
+            pancetta_core::slot::next_slot_start_with_period(now, SignedDuration::ZERO, slot_ns)
+        }
     }
 }
 
@@ -1125,7 +1129,7 @@ pub enum QsoEvent {
         qso_id: QsoId,
         old_state: QsoState,
         new_state: QsoState,
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
     },
 
     /// Message received
@@ -1311,11 +1315,11 @@ const UNSENT_ATTEMPT_OFFSET_EPSILON_HZ: f64 = 0.5;
 const STALL_TRIGGER_HOLD_SLOTS: i64 = 4;
 
 fn stall_trigger_hold_expired(
-    emitted_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    emitted_at: UtcTimestamp,
+    now: UtcTimestamp,
     slot_millis: i64,
 ) -> bool {
-    now - emitted_at >= Duration::milliseconds(STALL_TRIGGER_HOLD_SLOTS * slot_millis)
+    now - emitted_at >= SignedDuration::from_millis(STALL_TRIGGER_HOLD_SLOTS * slot_millis)
 }
 
 // The pivot-safe "same frame" test shared by the not-sent rollback
@@ -1347,9 +1351,9 @@ pub struct TxAttemptId(pub u64);
 #[derive(Debug, Clone)]
 struct KeepCallAttempt {
     attempt_id: TxAttemptId,
-    emitted_at: DateTime<Utc>,
+    emitted_at: UtcTimestamp,
     raw_text: String,
-    prev_last_call_at: Option<DateTime<Utc>>,
+    prev_last_call_at: Option<UtcTimestamp>,
     // This attempt holds its `tx_slot`'s stall increment (PAN-128): exactly
     // one surviving attempt per own-parity TX slot carries `true`, so
     // `stall_cycles` rises once per own TX slot, not once per emission.
@@ -1362,7 +1366,7 @@ struct KeepCallAttempt {
     // never inherit one either (`resend_last_tx`, the offset-switch
     // retransmit, and anything a stall reset cleared — the reset retires
     // the slot key with the increment).
-    tx_slot: Option<DateTime<Utc>>,
+    tx_slot: Option<UtcTimestamp>,
     recorded_sent: bool,
     // What the emission carried besides its text. A TX pivot can replace a
     // frame with one that differs only in offset or remote binding.
@@ -1390,11 +1394,11 @@ impl KeepCallAttempt {
 #[derive(Debug, Clone)]
 struct PendingStallTrigger {
     attempt_id: TxAttemptId,
-    emitted_at: DateTime<Utc>,
+    emitted_at: UtcTimestamp,
     // The own-parity TX slot the trigger feeds; no frame that aired before
     // it started can be the trigger. Follows its attempt's re-key to the
     // TX worker's scheduled slot (PAN-223).
-    tx_slot: Option<DateTime<Utc>>,
+    tx_slot: Option<UtcTimestamp>,
     raw_text: String,
     frequency_hz: f64,
     remote_origin: bool,
@@ -1430,7 +1434,7 @@ impl PendingStallTrigger {
         &self,
         message_text: &str,
         aired: &UnsentAttemptPayload,
-        aired_at: DateTime<Utc>,
+        aired_at: UtcTimestamp,
     ) -> bool {
         self.raw_text == message_text
             && self.tx_slot.is_none_or(|slot| aired_at >= slot)
@@ -1446,7 +1450,7 @@ impl PendingStallTrigger {
 #[derive(Debug, Default)]
 struct KeepCallLedger {
     // Never rolled back: keeps pacing independent of TX accounting.
-    last_emitted_at: Option<DateTime<Utc>>,
+    last_emitted_at: Option<UtcTimestamp>,
     attempts: VecDeque<KeepCallAttempt>,
     // A rollback took `stall_cycles` back below the switch threshold, so any
     // stall action already raised is stale. Cleared when an action is raised
@@ -1466,7 +1470,7 @@ struct KeepCallLedger {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AiredFrame {
     offset_hz: f64,
-    aired_at: DateTime<Utc>,
+    aired_at: UtcTimestamp,
 }
 
 /// PAN-83: the TX offset of the frame a reply answered, when the aired
@@ -1485,13 +1489,13 @@ struct AiredFrame {
 /// falls back to the relocation's provenance.
 fn answered_frame_offset_hz(
     last_aired: Option<AiredFrame>,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
     reply_parity: Option<pancetta_core::slot::SlotParity>,
     slot_ns: i64,
 ) -> Option<f64> {
     let reply_parity = reply_parity?;
     let frame = last_aired?;
-    let slot = Duration::nanoseconds(slot_ns);
+    let slot = SignedDuration::from_nanos(slot_ns);
     let cur = pancetta_core::slot::current_slot_start_with_period(received_at, slot_ns);
     let reply_slot =
         if pancetta_core::slot::SlotParity::of_with_period(cur, slot_ns) == reply_parity {
@@ -1618,10 +1622,10 @@ enum CompletionRestore {
     Revert {
         state: QsoState,
         reports: SignalReports,
-        end_time: Option<DateTime<Utc>>,
+        end_time: Option<UtcTimestamp>,
         completed_rf_frequency_hz: Option<f64>,
         /// The `Sent` record the completion appended: `(timestamp, raw_text)`.
-        sent_record: Option<(DateTime<Utc>, String)>,
+        sent_record: Option<(UtcTimestamp, String)>,
     },
 }
 
@@ -1639,7 +1643,7 @@ struct PendingCompletion {
     frequency_hz: f64,
     remote_origin: bool,
     remote_client_key_id: Option<String>,
-    queued_at: DateTime<Utc>,
+    queued_at: UtcTimestamp,
     /// The `Completed` state this record created; commit and revert act only
     /// while the QSO still holds exactly this state.
     completed_state: QsoState,
@@ -1729,14 +1733,14 @@ impl TxRelocationEpochs {
 
 // Historical UTC timestamps remain untouched. A state identity includes its
 // variant as well as its original start, so transitions discard only state grace.
-type WatchdogStateIdentity = (std::mem::Discriminant<QsoState>, DateTime<Utc>);
+type WatchdogStateIdentity = (std::mem::Discriminant<QsoState>, UtcTimestamp);
 
 struct WatchdogAnchors {
-    state: Option<(WatchdogStateIdentity, DateTime<Utc>)>,
-    first_call: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    state: Option<(WatchdogStateIdentity, UtcTimestamp)>,
+    first_call: Option<(UtcTimestamp, UtcTimestamp)>,
 }
 
-fn watchdog_state_identity(state: &QsoState, now: DateTime<Utc>) -> Option<WatchdogStateIdentity> {
+fn watchdog_state_identity(state: &QsoState, now: UtcTimestamp) -> Option<WatchdogStateIdentity> {
     state
         .state_duration(now)
         .map(|age| (std::mem::discriminant(state), now - age))
@@ -1770,7 +1774,7 @@ pub struct QsoManager {
     /// PAN-280: when a QSO's pending completion was reverted to its pre-close
     /// state. `check_timeouts_at` exempts it from every timeout for one
     /// [`COMPLETED_QSO_REWORK_GRACE`]. Same lock rules as above.
-    completion_reverted_at: Arc<std::sync::Mutex<HashMap<QsoId, DateTime<Utc>>>>,
+    completion_reverted_at: Arc<std::sync::Mutex<HashMap<QsoId, UtcTimestamp>>>,
 
     /// PAN-183: allocates [`TxAttemptId`]s, shared across clones like the
     /// ledger so ids stay unique per process.
@@ -2207,14 +2211,19 @@ impl QsoManager {
             // QsoState::Completed { .. }.)
             if let QsoState::Completed { completed_at, .. } = &p.state {
                 return Self::completed_band(p) == want_band
-                    && now.signed_duration_since(*completed_at).num_seconds() <= window_secs;
+                    && now.duration_since(*completed_at).as_secs() <= window_secs;
             }
             false
         })
     }
 
+<<<<<<< HEAD
     fn now_utc(&self) -> DateTime<Utc> {
         self.slot_clock.now()
+=======
+    fn now_utc(&self) -> UtcTimestamp {
+        (self.utc_clock)()
+>>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
     }
 
     /// A manager on a virtual clock that never reports a step
@@ -2463,7 +2472,7 @@ impl QsoManager {
     /// The live [`pre_switch_offset_grace_from_slot_ns`] window for the
     /// currently active protocol (PAN-72 round-8 redesign, fix 1) — reads the
     /// same `active_slot_ns` atomic [`Self::rearm_slot_millis`] does.
-    fn pre_switch_offset_grace(&self) -> chrono::Duration {
+    fn pre_switch_offset_grace(&self) -> SignedDuration {
         pre_switch_offset_grace_from_slot_ns(
             self.active_slot_ns
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -2559,7 +2568,7 @@ impl QsoManager {
     /// resolves the previously-ambiguous `None` case.
     fn latch_cq_parity_if_none(
         tx_parity: Option<pancetta_core::slot::SlotParity>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<pancetta_core::slot::SlotParity> {
         use pancetta_core::slot::{next_slot_with_parity, SlotParity};
         Some(tx_parity.unwrap_or_else(|| {
@@ -3766,7 +3775,7 @@ impl QsoManager {
     /// and changes nothing unless the QSO exists and is `Completed`. Not part of
     /// the supported API; hidden from rustdoc like `pancetta_qso::sim`.
     #[doc(hidden)]
-    pub async fn backdate_completion_for_test(&self, qso_id: QsoId, by: chrono::Duration) -> bool {
+    pub async fn backdate_completion_for_test(&self, qso_id: QsoId, by: SignedDuration) -> bool {
         let mut qsos = self.qsos.write().await;
         let Some(progress) = qsos.get_mut(&qso_id) else {
             return false;
@@ -3840,7 +3849,9 @@ impl QsoManager {
         attempt: KeepCallAttempt,
     ) {
         let cutoff = attempt.emitted_at
-            - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis());
+            - SignedDuration::from_millis(
+                UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis(),
+            );
         let entry = ledger.entry(qso_id).or_default();
         entry.last_emitted_at = Some(attempt.emitted_at);
         entry.attempts.push_back(attempt);
@@ -3880,7 +3891,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         message_text: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> UnsentAttemptRollback {
         self.roll_back_replaced_attempt_at(qso_id, message_text, None, None, now)
             .await
@@ -3906,7 +3917,7 @@ impl QsoManager {
         message_text: &str,
         replaced: Option<&UnsentAttemptPayload>,
         attempt_id: Option<TxAttemptId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> UnsentAttemptRollback {
         let mut qsos = self.qsos.write().await;
         let Some(progress) = qsos.get_mut(&qso_id).filter(|p| p.state.is_active()) else {
@@ -3919,8 +3930,10 @@ impl QsoManager {
         let Some(entry) = ledger.get_mut(&qso_id) else {
             return UnsentAttemptRollback::NoMatchingAttempt;
         };
-        let cutoff =
-            now - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis());
+        let cutoff = now
+            - SignedDuration::from_millis(
+                UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis(),
+            );
         entry
             .attempts
             .retain(|attempt| attempt.emitted_at >= cutoff);
@@ -4056,7 +4069,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         attempt_id: TxAttemptId,
-        target_slot: DateTime<Utc>,
+        target_slot: UtcTimestamp,
     ) -> ScheduledTxSlot {
         let mut qsos = self.qsos.write().await;
         let Some(progress) = qsos.get_mut(&qso_id).filter(|p| p.state.is_active()) else {
@@ -4150,7 +4163,7 @@ impl QsoManager {
         qso_id: QsoId,
         message_text: &str,
         aired: &UnsentAttemptPayload,
-        aired_at: DateTime<Utc>,
+        aired_at: UtcTimestamp,
     ) -> bool {
         let qsos = self.qsos.write().await;
         if !qsos.get(&qso_id).is_some_and(|p| p.state.is_active()) {
@@ -4222,7 +4235,7 @@ impl QsoManager {
     fn keep_call_attempt_slots(
         &self,
         qso_id: QsoId,
-    ) -> Vec<(TxAttemptId, bool, Option<DateTime<Utc>>)> {
+    ) -> Vec<(TxAttemptId, bool, Option<UtcTimestamp>)> {
         self.keep_call_ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4278,7 +4291,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         progress: &mut QsoProgress,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<(MessageType, f64, TxAttemptId)> {
         let message = Self::last_sent_frame(progress)?;
         Some(self.charge_frame_locked(qso_id, progress, now, message))
@@ -4299,7 +4312,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         progress: &mut QsoProgress,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         message: MessageType,
     ) -> (MessageType, f64, TxAttemptId) {
         let frequency = progress.metadata.frequency;
@@ -4359,7 +4372,7 @@ impl QsoManager {
         attempt_id: Option<TxAttemptId>,
         message_text: &str,
         aired: &UnsentAttemptPayload,
-        aired_at: DateTime<Utc>,
+        aired_at: UtcTimestamp,
     ) -> CompletionAired {
         let event = {
             let qsos = self.qsos.read().await;
@@ -4426,7 +4439,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         attempt_id: Option<TxAttemptId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> UnsentCompletion {
         let Some(attempt_id) = attempt_id else {
             return UnsentCompletion::NotPending;
@@ -4466,8 +4479,8 @@ impl QsoManager {
     /// PAN-280: revert every pending completion whose closing frame has had
     /// no TX outcome for [`PENDING_COMPLETION_EXPIRY_SLOTS`] slots (at least
     /// [`PENDING_COMPLETION_EXPIRY_FLOOR_MS`]). Returns how many reverted.
-    pub async fn expire_pending_completions_at(&self, now: DateTime<Utc>) -> usize {
-        let expiry = Duration::milliseconds(
+    pub async fn expire_pending_completions_at(&self, now: UtcTimestamp) -> usize {
+        let expiry = SignedDuration::from_millis(
             (PENDING_COMPLETION_EXPIRY_SLOTS * self.rearm_slot_millis())
                 .max(PENDING_COMPLETION_EXPIRY_FLOOR_MS),
         );
@@ -4513,7 +4526,7 @@ impl QsoManager {
         qsos: &mut HashMap<QsoId, QsoProgress>,
         qso_id: QsoId,
         record: PendingCompletion,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Option<RevertedCompletion> {
         let progress = qsos.get_mut(&qso_id)?;
         if progress.state != record.completed_state {
@@ -4648,7 +4661,7 @@ impl QsoManager {
         &self,
         callsign: &str,
         frequency: f64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<bool, QsoManagerError> {
         let config = &self.config.duplicate_checking;
         if !config.enabled || config.time_window_hours == 0 {
@@ -4697,7 +4710,12 @@ impl QsoManager {
         if self.has_active_qso_with(callsign).await {
             return Ok(true);
         }
-        let cutoff = now - Duration::hours(config.time_window_hours as i64);
+        // Past jiff's year -9999 the window covers every contact.
+        let cutoff = now
+            .checked_sub(SignedDuration::from_hours(i64::from(
+                config.time_window_hours,
+            )))
+            .unwrap_or(UtcTimestamp::MIN);
         let qsos = self.qsos.read().await;
         Ok(qsos.values().any(|p| {
             matches!(p.state, QsoState::Completed { .. })
@@ -4841,7 +4859,7 @@ impl QsoManager {
     /// already durably written it by the time this runs.
     async fn cleanup_completed_qsos(&self) {
         let mut qsos = self.qsos.write().await;
-        let cutoff_time = self.now_utc() - Duration::hours(1); // Keep completed QSOs for 1 hour
+        let cutoff_time = self.now_utc() - SignedDuration::from_hours(1); // Keep completed QSOs for 1 hour
 
         let to_remove: Vec<QsoId> = qsos
             .iter()

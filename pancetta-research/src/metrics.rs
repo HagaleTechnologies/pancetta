@@ -436,7 +436,7 @@ mod tests {
     fn make_card(tiers: BTreeMap<String, TierResult>) -> Scorecard {
         Scorecard {
             schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
-            generated_at: chrono::Utc::now(),
+            generated_at: pancetta_core::time::UtcTimestamp::now(),
             mode: crate::Mode::Ft8,
             git: crate::scorecard::GitInfo {
                 branch: "test".into(),
