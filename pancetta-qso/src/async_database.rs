@@ -1976,6 +1976,10 @@ impl QsoDatabase {
 // QsoDatabase is automatically Send + Sync thanks to SqlitePool
 
 #[cfg(test)]
+#[path = "async_database/tests/stored_timestamp_bytes_tests.rs"]
+mod stored_timestamp_bytes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -53,6 +53,16 @@ def check(target):
         p = packages[key]
         if p['name'].startswith('sqlx'):
             assert not any('tls' in f for f in nodes[key]['features']), nodes[key]
+            # PAN-441: sqlx's unused `chrono` feature stays off.
+            assert 'chrono' not in nodes[key]['features'], nodes[key]
+    # PAN-441: only workspace members may still depend on chrono directly
+    # (RUSTSEC-2026-0543, see deny.toml); no third-party crate pulls it in.
+    chrono_users = sorted(
+        packages[key]['name'] for key in reached
+        if key not in members
+        and any(packages[edge['pkg']]['name'] == 'chrono' for edge in nodes[key]['deps'])
+    )
+    assert not chrono_users, (target, chrono_users)
     print(f'{target or "all targets"}: dependency policy passed')
 
 workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['dependencies']
