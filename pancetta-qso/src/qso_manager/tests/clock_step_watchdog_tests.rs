@@ -17,10 +17,7 @@ fn config() -> QsoManagerConfig {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: default_active_mode(),
-<<<<<<< HEAD
         activation: crate::sig_reference::ActivationReference::default(),
-    })
-=======
     }
 }
 
@@ -65,7 +62,6 @@ async fn pass_at(
 ) {
     move_to(clock, base, wall_secs, mono_secs, mono);
     manager.watchdog_pass().await;
->>>>>>> b0966d387d6d752e826e925de3f45b2d6fe12343
 }
 
 async fn open(manager: &QsoManager, call: &str, at: UtcTimestamp) -> QsoId {

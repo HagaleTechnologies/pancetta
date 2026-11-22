@@ -3392,20 +3392,17 @@ impl super::ApplicationCoordinator {
 
         let mut qso_manager = pancetta_qso::QsoManager::new(qso_config);
         qso_manager.require_persistent_history();
-<<<<<<< HEAD
         // PAN-359: share the coordinator's worked-station activation book,
         // which the cqdx bridge's spot poller fills from cqdx.io, so a QSO
         // with a listed activator logs SIG / SIG_INFO. Set before the
         // supervisor clone below so that handle reads the same book.
         qso_manager.set_worked_reference_source(self.worked_references.clone());
-=======
         // PAN-358: the watchdog reads the coordinator's one slot clock (over
         // the same `active_slot_ns` atomic) and takes its PAN-296 budget
         // resets from that clock's events, not a detector of its own. Set
         // before the supervisor clone below, so that handle reads the same
         // clock.
         qso_manager.set_slot_clock(self.slot_clock());
->>>>>>> b0966d387d6d752e826e925de3f45b2d6fe12343
         // Task 6 (task-supervision): store a cheap Arc-based handle clone so
         // the task supervisor (health.rs) can still enumerate and fail
         // in-flight QSOs after this component's task panics and dies. See
