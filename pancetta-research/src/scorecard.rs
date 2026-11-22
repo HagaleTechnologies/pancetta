@@ -1,6 +1,6 @@
 use crate::decoder::{BudgetAnchor, WindowTiming};
 use crate::Mode;
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use std::path::Path;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scorecard {
     pub schema_version: u32,
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: UtcTimestamp,
     pub mode: Mode,
     pub git: GitInfo,
     pub build: BuildInfo,

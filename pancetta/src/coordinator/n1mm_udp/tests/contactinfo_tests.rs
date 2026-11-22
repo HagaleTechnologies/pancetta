@@ -1,7 +1,7 @@
 // PAN-382. The pure `<contactinfo>` builder: document shape, values, escaping,
 // band tokens and skip reasons.
 use super::*;
-use chrono::{TimeZone, Utc};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{GridSquares, SignalReports};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -58,8 +58,8 @@ pub(super) const ELEMENTS: [&str; 45] = [
 /// Every `QsoMetadata` field named, so a new field fails to compile here.
 /// K5ARH works K1ABC on 14 074 200.4 Hz, FT8, reports -10/-8.
 pub(super) fn metadata() -> QsoMetadata {
-    let start = Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 40).unwrap();
-    let end = Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 56).unwrap();
+    let start = UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 34, 40).unwrap();
+    let end = UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 34, 56).unwrap();
     QsoMetadata {
         qso_id: pancetta_qso::QsoId::new_v4(),
         our_callsign: "K5ARH".to_string(),
@@ -237,7 +237,7 @@ fn contactinfo_carries_call_band_mode_time_reports_and_grid() {
 #[test]
 fn contactinfo_uses_the_first_answer_time() {
     let mut meta = metadata();
-    meta.first_answer_at = Some(Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 47).unwrap());
+    meta.first_answer_at = Some(UtcTimestamp::from_ymd_hms(2020, 10, 30, 12, 34, 47).unwrap());
     let parsed = parse(&render(&meta, 100, false));
     assert_eq!(parsed.value("timestamp"), "2020-10-30 12:34:47");
 }

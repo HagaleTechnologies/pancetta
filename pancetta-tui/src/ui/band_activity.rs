@@ -1,6 +1,7 @@
 use super::need_display::{atno_style, band_marker, need_marker, needed_style};
 use crate::dx_need::canonical_grid_square;
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Rect},
     style::Modifier,
@@ -187,7 +188,7 @@ fn create_message_row<'a>(
         !is_active_panel && msg.call_sign.as_deref().is_some_and(|c| app.is_focused(c));
 
     // Always show HH:MM:SS in UTC — FT8 timing needs seconds granularity
-    let time_short = msg.timestamp.format("%H:%M:%S").to_string();
+    let time_short = msg.timestamp.strftime("%H:%M:%S").to_string();
 
     // #172: own-TX rows have no meaningful RX SNR (snr is a 0 sentinel);
     // render "TX" instead so it's never mistaken for a real 0 dB decode —
@@ -485,7 +486,7 @@ fn is_valid_callsign(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::theme;
-    use chrono::Utc;
+    use pancetta_core::time::UtcTimestamp;
 
     struct Need(crate::dx_need::DxNeedStatus);
     impl crate::dx_need::DxNeedLookup for Need {
@@ -722,7 +723,7 @@ mod tests {
         crate::app::ActiveQsoBanner {
             their_callsign: call.into(),
             state: "wait rpt".into(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1234.0,
             tx_parity: None,
             last_tx_text: None,
@@ -809,7 +810,7 @@ mod tests {
 
     fn fixture_message(call: &str) -> DecodedMessageView {
         DecodedMessageView {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".to_string(),
             snr: -10,

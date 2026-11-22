@@ -1,5 +1,6 @@
 //! Durable contest refresh, independent of UI presence and TX timing.
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{
     async_database::QsoDatabase,
     contest::{ledger::*, scoring::*},
@@ -157,7 +158,7 @@ pub(super) fn start(
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let state = if first {
                 first = false;
                 ContestScoreState::Loading

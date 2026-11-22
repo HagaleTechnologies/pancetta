@@ -10,6 +10,9 @@
 //! panic in the audio output path would leave the rig stuck on TX.
 
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -93,7 +96,7 @@ mod on_ptt_wait_tests {
     }
 
     fn forward_jump() -> pancetta_core::slot_clock::WallClockJump {
-        pancetta_core::slot_clock::WallClockJump::Forward(chrono::Duration::seconds(5))
+        pancetta_core::slot_clock::WallClockJump::Forward(SignedDuration::from_secs(5))
     }
 
     /// A bus with the three channels Step 4 sends on.
@@ -904,7 +907,7 @@ mod interruptible_sleep_tests {
         ))
         .unwrap();
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         let mut st = pancetta_agent::arm::ArmState::new();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -935,7 +938,7 @@ mod interruptible_sleep_tests {
             arm_clone
                 .lock()
                 .unwrap()
-                .disarm(chrono::Utc::now().timestamp_millis());
+                .disarm(UtcTimestamp::now().as_millisecond());
         });
 
         let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -1000,7 +1003,7 @@ mod interruptible_sleep_tests {
         ))
         .unwrap();
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         let mut st = pancetta_agent::arm::ArmState::new();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -1051,7 +1054,7 @@ mod interruptible_sleep_tests {
             arm_clone
                 .lock()
                 .unwrap()
-                .disarm(chrono::Utc::now().timestamp_millis());
+                .disarm(UtcTimestamp::now().as_millisecond());
         });
 
         let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -1101,7 +1104,7 @@ mod interruptible_sleep_tests {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let pivoted_once = std::collections::HashMap::new();
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         let mut st = pancetta_agent::arm::ArmState::new();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -1132,7 +1135,7 @@ mod interruptible_sleep_tests {
             arm_clone
                 .lock()
                 .unwrap()
-                .disarm(chrono::Utc::now().timestamp_millis());
+                .disarm(UtcTimestamp::now().as_millisecond());
         });
 
         let inbox = super::TxInbox::new(rx.clone(), Default::default());
@@ -1792,7 +1795,7 @@ mod interruptible_sleep_tests {
             ))
             .unwrap();
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         let mut st = pancetta_agent::arm::ArmState::new();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
@@ -1821,7 +1824,7 @@ mod interruptible_sleep_tests {
             arm_clone
                 .lock()
                 .unwrap()
-                .disarm(chrono::Utc::now().timestamp_millis());
+                .disarm(UtcTimestamp::now().as_millisecond());
         });
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
@@ -2665,11 +2668,8 @@ impl SlotTimingContext {
     }
 
     /// The PTT engage instant: `target_slot` minus `ptt_lead_ms`.
-    fn ptt_target(
-        &self,
-        target_slot: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
-        target_slot - chrono::Duration::milliseconds(self.ptt_lead_ms as i64)
+    fn ptt_target(&self, target_slot: UtcTimestamp) -> UtcTimestamp {
+        target_slot - SignedDuration::from_millis(self.ptt_lead_ms as i64)
     }
 }
 
@@ -2682,7 +2682,7 @@ impl SlotTimingContext {
         sample_rate: u32,
         slot_ns: i64,
         tx_self_parity: pancetta_config::station::TxSelfParity,
-        request_received_at: chrono::DateTime<chrono::Utc>,
+        request_received_at: UtcTimestamp,
     ) -> Self {
         Self {
             active_protocol: pancetta_ft8::Protocol::Ft8,
@@ -2714,7 +2714,7 @@ mod slot_timing_context_tests {
             ptt_lead_ms,
             sample_rate: 12_000,
             slot_ns: pancetta_core::slot::SLOT_NS,
-            request_received_at: chrono::Utc::now(),
+            request_received_at: pancetta_core::time::UtcTimestamp::now(),
         }
     }
 
@@ -2737,11 +2737,11 @@ mod slot_timing_context_tests {
 
     #[test]
     fn ptt_target_is_target_slot_minus_ptt_lead() {
-        let target_slot = chrono::Utc::now();
+        let target_slot = pancetta_core::time::UtcTimestamp::now();
         for lead_ms in [80u64, 2000] {
             assert_eq!(
                 ctx(pancetta_ft8::Protocol::Ft8, 3000, lead_ms).ptt_target(target_slot),
-                target_slot - chrono::Duration::milliseconds(lead_ms as i64)
+                target_slot - jiff::SignedDuration::from_millis(lead_ms as i64)
             );
         }
     }
@@ -2750,17 +2750,16 @@ mod slot_timing_context_tests {
 #[cfg(test)]
 mod schedule_tx_tests {
     use super::*;
-    use chrono::TimeZone;
     use pancetta_core::slot::{SlotParity, SLOT_NS};
 
     /// FT4 slot period in nanoseconds (7.5s). FT8 is `SLOT_NS` (15s).
     const FT4_SLOT_NS: i64 = 7_500_000_000;
 
-    fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
+    fn at(seconds: f64) -> UtcTimestamp {
         // Reference: 2026-01-01 00:00:00 UTC. timestamp() = 1767225600,
         // divisible by 15. Slot 0 is Even (= 1767225600 / 15 % 2 = 0).
-        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+        let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        base + SignedDuration::from_nanos((seconds * 1_000_000_000.0) as i64)
     }
 
     #[test]
@@ -2769,7 +2768,7 @@ mod schedule_tx_tests {
         // (wrong), so we advance to next Odd = :15. mstr_relative_to_target
         // = max(0, :05 - :15) = 0. 0 < 500 → pad 500ms, cursor 0.
         let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
         assert_eq!(s.silent_pad_samples, 500 * 12); // 12 samples/ms at 12kHz
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2780,7 +2779,7 @@ mod schedule_tx_tests {
         // mstr_in_current_slot = 500ms ≤ 8000 → target current slot :15.
         // mstr_relative_to_target = 500 = DELAY_MS → pad 0, cursor 0.
         let s = schedule_tx(at(15.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
         assert_eq!(s.silent_pad_samples, 0);
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2791,7 +2790,7 @@ mod schedule_tx_tests {
         // mstr_in_current_slot = 5000 ≤ 8000 → target current slot :15.
         // mstr_relative_to_target = 5000 > 500 → cursor = 4500ms × SR.
         let s = schedule_tx(at(20.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
         assert_eq!(s.silent_pad_samples, 0);
         assert_eq!(s.cursor_offset_samples, 4500 * 12);
     }
@@ -2803,7 +2802,7 @@ mod schedule_tx_tests {
         // advance to next Odd = :45. mstr_relative_to_target = 0 (target
         // is in future) → pad 500ms, cursor 0.
         let s = schedule_tx(at(24.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 45_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2816,8 +2815,8 @@ mod schedule_tx_tests {
         // cursor 0. Most importantly: target is :15, NEVER :30 (the
         // collision case the original bug produced).
         let s = schedule_tx(at(14.6), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
-        assert_ne!((s.target_slot - at(0.0)).num_milliseconds(), 30_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
+        assert_ne!((s.target_slot - at(0.0)).as_millis_i64(), 30_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2828,7 +2827,7 @@ mod schedule_tx_tests {
         // and we're 0ms in — fully viable. Target the current slot,
         // pad 500ms before audio starts.
         let s = schedule_tx(at(15.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 15_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2839,7 +2838,7 @@ mod schedule_tx_tests {
         // Even though parity matches, we're too late for skip-ahead.
         // Defer to next Odd = :45.
         let s = schedule_tx(at(29.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 45_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
@@ -2854,10 +2853,10 @@ mod schedule_tx_tests {
         // pad 500ms, cursor 0. The target MUST land on a 7.5s-grid
         // boundary of the requested (Odd) parity — :07.5, NOT :15.
         let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 7_500);
         // boundary lands on the 7.5s grid
         assert_eq!(
-            (s.target_slot - at(0.0)).num_milliseconds() % 7_500,
+            (s.target_slot - at(0.0)).as_millis_i64() % 7_500,
             0,
             "target must sit on a 7.5s slot boundary"
         );
@@ -2877,7 +2876,7 @@ mod schedule_tx_tests {
         // ≤ 8000 → target current slot :07.5. mstr_relative_to_target
         // = 2500 > 500 → cursor = 2000ms × SR; no defer to :22.5.
         let s = schedule_tx(at(10.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 7_500);
         assert_eq!(s.silent_pad_samples, 0);
         assert_eq!(s.cursor_offset_samples, 2_000 * 12);
     }
@@ -3913,7 +3912,7 @@ mod schedule_tx_tests {
         let target_slot = at(30.0);
         assert_eq!(
             super::key_time_gate_denial(
-                target_slot + chrono::Duration::seconds(9),
+                target_slot + SignedDuration::from_secs(9),
                 target_slot,
                 3000
             ),
@@ -3925,7 +3924,7 @@ mod schedule_tx_tests {
         );
         assert_eq!(
             super::key_time_gate_denial(
-                target_slot + chrono::Duration::milliseconds(3001),
+                target_slot + SignedDuration::from_millis(3001),
                 target_slot,
                 3000
             ),
@@ -3936,7 +3935,7 @@ mod schedule_tx_tests {
         );
         assert!(super::key_time_gate_denial(target_slot, target_slot, 3000).is_none());
         assert!(super::key_time_gate_denial(
-            target_slot + chrono::Duration::milliseconds(3000),
+            target_slot + SignedDuration::from_millis(3000),
             target_slot,
             3000
         )
@@ -4371,10 +4370,10 @@ mod schedule_tx_tests {
     const PTT_LEAD_MS: i64 = 80;
 
     /// `(ptt_target, target_slot)` for an FT8 frame keyed at `slot_s`.
-    fn ptt_and_slot(slot_s: f64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    fn ptt_and_slot(slot_s: f64) -> (UtcTimestamp, UtcTimestamp) {
         let target_slot = at(slot_s);
         (
-            target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS),
+            target_slot - SignedDuration::from_millis(PTT_LEAD_MS),
             target_slot,
         )
     }
@@ -4382,12 +4381,12 @@ mod schedule_tx_tests {
     #[test]
     fn ptt_wait_sleeps_in_chunks_until_the_target() {
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let far = ptt_target - chrono::Duration::seconds(20);
+        let far = ptt_target - SignedDuration::from_secs(20);
         assert_eq!(
             ptt_wait_step(far, ptt_target, target_slot, true, 8000, SLOT_NS),
             PttWaitStep::Sleep(Duration::from_millis(50))
         );
-        let near = ptt_target - chrono::Duration::milliseconds(30);
+        let near = ptt_target - SignedDuration::from_millis(30);
         assert_eq!(
             ptt_wait_step(near, ptt_target, target_slot, true, 8000, SLOT_NS),
             PttWaitStep::Sleep(Duration::from_millis(30))
@@ -4408,7 +4407,7 @@ mod schedule_tx_tests {
         // A request that was already a late start when the wait began keeps
         // today's path, even past late_max: schedule_tx already decided it.
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = target_slot + chrono::Duration::seconds(9);
+        let now = target_slot + SignedDuration::from_secs(9);
         assert_eq!(
             ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
             PttWaitStep::Reached
@@ -4422,19 +4421,19 @@ mod schedule_tx_tests {
         // Exactly at cap: keys (matches schedule_tx's `mstr <= tx_late_max_ms`).
         let (_, target_slot) = ptt_and_slot(30.0);
         assert!(!key_time_too_late(
-            target_slot + chrono::Duration::milliseconds(3000),
+            target_slot + SignedDuration::from_millis(3000),
             target_slot,
             3000
         ));
         // 1ms past cap: drops.
         assert!(key_time_too_late(
-            target_slot + chrono::Duration::milliseconds(3001),
+            target_slot + SignedDuration::from_millis(3001),
             target_slot,
             3000
         ));
         // Deferred target (slot in the future): never late.
         assert!(!key_time_too_late(
-            target_slot - chrono::Duration::seconds(5),
+            target_slot - SignedDuration::from_secs(5),
             target_slot,
             3000
         ));
@@ -4445,7 +4444,7 @@ mod schedule_tx_tests {
         // The PAN-117 gherkin: several seconds of slot elapsed, default-ish cap.
         let (_, target_slot) = ptt_and_slot(30.0);
         assert!(key_time_too_late(
-            target_slot + chrono::Duration::seconds(9),
+            target_slot + SignedDuration::from_secs(9),
             target_slot,
             3000
         ));
@@ -4487,7 +4486,7 @@ mod schedule_tx_tests {
         );
         assert!(s.deferred, "2.3s arrival must defer at the 3000ms default");
         assert_eq!(
-            (s.target_slot - at(0.0)).num_milliseconds(),
+            (s.target_slot - at(0.0)).as_millis_i64(),
             30_000,
             "deferral targets the next Even slot, 30s out"
         );
@@ -4501,7 +4500,7 @@ mod schedule_tx_tests {
         );
         assert!(!s.deferred, "a 1.0s arrival still makes the current slot");
         assert_eq!(
-            (s.target_slot - at(0.0)).num_milliseconds(),
+            (s.target_slot - at(0.0)).as_millis_i64(),
             0,
             "same-slot acceptance targets the current Even slot"
         );
@@ -4556,7 +4555,7 @@ mod schedule_tx_tests {
             SLOT_NS,
         );
         assert!(!s.deferred, "a direct 2.0s bundle makes the current slot");
-        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 0);
+        assert_eq!((s.target_slot - at(0.0)).as_millis_i64(), 0);
         // A coalesced bundle frozen at the same instant already lost 800ms
         // to the base wait, so it still defers.
         let s = schedule_tx(
@@ -4572,7 +4571,7 @@ mod schedule_tx_tests {
     #[test]
     fn ptt_wait_forward_jump_within_late_policy_ships_late() {
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = target_slot + chrono::Duration::seconds(5);
+        let now = target_slot + SignedDuration::from_secs(5);
         assert_eq!(
             ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
             PttWaitStep::Reached
@@ -4582,7 +4581,7 @@ mod schedule_tx_tests {
     #[test]
     fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = target_slot + chrono::Duration::seconds(3600);
+        let now = target_slot + SignedDuration::from_secs(3600);
         match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
             PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
                 assert_eq!(d, now - ptt_target);
@@ -4594,10 +4593,10 @@ mod schedule_tx_tests {
     #[test]
     fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = ptt_target - chrono::Duration::seconds(620);
+        let now = ptt_target - SignedDuration::from_secs(620);
         match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
             PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-                assert_eq!(d, chrono::Duration::seconds(620));
+                assert_eq!(d, SignedDuration::from_secs(620));
             }
             other => panic!("expected ClockJumped(Backward), got {other:?}"),
         }
@@ -4607,7 +4606,7 @@ mod schedule_tx_tests {
     fn ptt_wait_small_backward_step_is_waited_out() {
         // 25 s ahead is inside schedule_tx's two-slot horizon (30 s for FT8).
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = ptt_target - chrono::Duration::seconds(25);
+        let now = ptt_target - SignedDuration::from_secs(25);
         assert_eq!(
             ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
             PttWaitStep::Sleep(Duration::from_millis(50))
@@ -4618,7 +4617,7 @@ mod schedule_tx_tests {
     fn ptt_wait_bounds_scale_with_ft4() {
         // 16 s ahead: beyond FT4's 2 × 7.5 s horizon, inside FT8's 30 s.
         let (ptt_target, target_slot) = ptt_and_slot(30.0);
-        let now = ptt_target - chrono::Duration::seconds(16);
+        let now = ptt_target - SignedDuration::from_secs(16);
         assert!(matches!(
             ptt_wait_step(now, ptt_target, target_slot, true, 8000, FT4_SLOT_NS),
             PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(_))
@@ -4638,16 +4637,11 @@ mod schedule_tx_tests {
     }
 
     /// Injectable wall clock for the `wait_for_ptt_instant` tests.
-    fn test_wall_clock(
-        start: chrono::DateTime<chrono::Utc>,
-    ) -> std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>> {
+    fn test_wall_clock(start: UtcTimestamp) -> std::sync::Arc<std::sync::Mutex<UtcTimestamp>> {
         std::sync::Arc::new(std::sync::Mutex::new(start))
     }
 
-    fn shift_clock(
-        clock: &std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
-        by: chrono::Duration,
-    ) {
+    fn shift_clock(clock: &std::sync::Arc<std::sync::Mutex<UtcTimestamp>>, by: SignedDuration) {
         let mut now = clock.lock().unwrap();
         *now += by;
     }
@@ -4664,11 +4658,11 @@ mod schedule_tx_tests {
         let ticker = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                shift_clock(&ticker_clock, chrono::Duration::milliseconds(20));
+                shift_clock(&ticker_clock, SignedDuration::from_millis(20));
             }
         });
-        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
-        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let ptt_target = start_wall + SignedDuration::from_millis(200);
+        let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
         let reader = clock.clone();
         let started = std::time::Instant::now();
         let outcome = wait_for_ptt_instant(
@@ -4705,10 +4699,10 @@ mod schedule_tx_tests {
         let stepper_clock = clock.clone();
         let stepper = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(60)).await;
-            shift_clock(&stepper_clock, -chrono::Duration::seconds(600));
+            shift_clock(&stepper_clock, -SignedDuration::from_secs(600));
         });
-        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
-        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let ptt_target = start_wall + SignedDuration::from_millis(200);
+        let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
         let reader = clock.clone();
         let started = std::time::Instant::now();
         let outcome = wait_for_ptt_instant(
@@ -4725,7 +4719,7 @@ mod schedule_tx_tests {
         let _ = stepper.await;
         match outcome {
             PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-                assert!(d > chrono::Duration::seconds(600), "jump size {d:?}");
+                assert!(d > SignedDuration::from_secs(600), "jump size {d:?}");
             }
             other => panic!("expected ClockJumped(Backward), got {other:?}"),
         }
@@ -4747,10 +4741,10 @@ mod schedule_tx_tests {
         let jumper_clock = clock.clone();
         let jumper = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(60)).await;
-            shift_clock(&jumper_clock, chrono::Duration::seconds(3600));
+            shift_clock(&jumper_clock, SignedDuration::from_secs(3600));
         });
-        let ptt_target = start_wall + chrono::Duration::seconds(10);
-        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let ptt_target = start_wall + SignedDuration::from_secs(10);
+        let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
         let reader = clock.clone();
         let started = std::time::Instant::now();
         let outcome = wait_for_ptt_instant(
@@ -4767,7 +4761,7 @@ mod schedule_tx_tests {
         let _ = jumper.await;
         match outcome {
             PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
-                assert_eq!(d, chrono::Duration::seconds(3590));
+                assert_eq!(d, SignedDuration::from_secs(3590));
             }
             other => panic!("expected ClockJumped(Forward), got {other:?}"),
         }
@@ -4784,8 +4778,8 @@ mod schedule_tx_tests {
         // A frozen wall clock 10 s short of the target: only a flag can end
         // the wait.
         let start_wall = at(10.0);
-        let ptt_target = start_wall + chrono::Duration::seconds(10);
-        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let ptt_target = start_wall + SignedDuration::from_secs(10);
+        let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
 
         for flip_shutdown in [false, true] {
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -4831,7 +4825,7 @@ mod schedule_tx_tests {
             SLOT_NS,
             &shutdown,
             &abort,
-            || -> chrono::DateTime<chrono::Utc> { panic!("clock read after abort") },
+            || -> UtcTimestamp { panic!("clock read after abort") },
         )
         .await;
         assert_eq!(outcome, PttWait::Interrupted);
@@ -5055,7 +5049,7 @@ mod disarm_interrupt_signal_tests {
 
         fn armed_client_a() -> Arc<std::sync::Mutex<ArmState>> {
             let mut state = ArmState::new();
-            let now_ms = chrono::Utc::now().timestamp_millis();
+            let now_ms = UtcTimestamp::now().as_millisecond();
             state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
             state.arm(
                 VerifiedArmGrant {
@@ -5105,7 +5099,7 @@ mod disarm_interrupt_signal_tests {
             arm.lock().unwrap().set_channel_consent(
                 ConsentChannel::StationAgent,
                 false,
-                chrono::Utc::now().timestamp_millis(),
+                UtcTimestamp::now().as_millisecond(),
             );
             assert!(!tx_send_authorized(
                 TxOrigin::Remote,
@@ -5231,7 +5225,7 @@ mod disarm_interrupt_signal_tests {
         // mismatch, exactly like a stale Step 4b-arm success gone bad in the
         // pre-PTT gap.
         let mut st = pancetta_agent::arm::ArmState::new();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
             true,
@@ -5351,7 +5345,6 @@ mod supersede_rekey_tests;
 mod tx_frame_logged_tests {
     use super::*;
     use crate::message_bus::{ComponentId, MessageBus, MessageType};
-    use chrono::TimeZone;
 
     #[tokio::test]
     async fn log_tx_frame_emits_the_given_fields_and_timestamp() {
@@ -5361,7 +5354,7 @@ mod tx_frame_logged_tests {
         // A late-but-viable key: the caller passes the ACTUAL audio-start
         // instant, which can be well past the nominal slot boundary — this
         // must round-trip untouched, not get snapped to any slot grid.
-        let actual_audio_start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 22).unwrap();
+        let actual_audio_start = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 22).unwrap();
         log_tx_frame(
             &bus,
             "K5ARH JA1ABC -12".to_string(),
@@ -5400,7 +5393,7 @@ mod tx_frame_logged_tests {
             "CQ K5ARH EM10".to_string(),
             1200.0,
             None,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         )
         .await;
 
@@ -7729,7 +7722,7 @@ pub(super) mod pan115_worker_gate_tests {
             let start = tokio::time::Instant::now();
             let base = pancetta_core::time::slot_grid_origin();
             let clock: pancetta_core::time::UtcClock =
-                Arc::new(move || base + chrono::Duration::from_std(start.elapsed()).unwrap());
+                Arc::new(move || base + jiff::SignedDuration::try_from(start.elapsed()).unwrap());
             let mut config = Config::default();
             config.station.tx_self_parity = TxSelfParity::Even;
             let h = build_worker_harness(
@@ -7801,7 +7794,7 @@ pub(super) mod pan115_worker_gate_tests {
             }
             wait_for_ptt_gate(&h).await;
             if target > base {
-                let lead = (target - clock()).num_milliseconds();
+                let lead = (target - clock()).as_millis();
                 assert!(
                     (450..=500).contains(&lead),
                     "sleep retains its scheduled 500ms lead: {lead}"
@@ -7826,7 +7819,7 @@ pub(super) mod pan115_worker_gate_tests {
         for autonomous in [false, true] {
             let mut config = Config::default();
             config.station.tx_late_max_ms = 8000;
-            let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+            let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
             let h = build_worker_harness(
                 config,
                 |_| {},
@@ -7900,7 +7893,7 @@ pub(super) mod pan115_worker_gate_tests {
         // `source == Autonomous` and `Config::default()`, and must key.
         let mut config = Config::default();
         config.station.tx_late_max_ms = 8000;
-        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
         let h = build_worker_harness(
             config,
             |_| {},
@@ -7967,7 +7960,7 @@ pub(super) mod pan115_worker_gate_tests {
         let mut config = Config::default();
         config.station.tx_late_max_ms = 8000;
         config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
-        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
         let h = build_worker_harness(
             config,
             |_| {},
@@ -8064,7 +8057,7 @@ pub(super) mod pan115_worker_gate_tests {
             let mut config = Config::default();
             config.station.tx_late_max_ms = 8000;
             config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
-            let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+            let now = pancetta_core::time::slot_grid_origin() + jiff::SignedDuration::from_secs(2);
             let h = build_worker_harness(
                 config,
                 |_| {},
@@ -9754,7 +9747,7 @@ mod pan136_bundle_binding_worker_tests {
     fn arm_client(h: &Harness, client_key: &str) -> tokio::task::JoinHandle<()> {
         use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
         let jti = format!("pan136-{client_key}");
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
         {
             let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
             arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
@@ -11227,7 +11220,7 @@ mod pan122_tx_log_worker_tests {
         let log = coordinator.ensure_tx_frame_log();
         assert_eq!(log.path(), None);
         let record = TxFrameRecord::new(
-            chrono::Utc::now(),
+            pancetta_core::time::UtcTimestamp::now(),
             pancetta_ft8::Protocol::Ft8,
             0,
             1500.0,
@@ -11819,15 +11812,14 @@ mod pan278_dropped_ptt_on_tests {
 #[cfg(test)]
 mod pan223_frame_scheduled_report_tests {
     use super::*;
-    use chrono::TimeZone;
     use pancetta_core::slot::{SlotParity, SLOT_NS};
     use pancetta_qso::TxAttemptId;
 
     /// 2026-01-01 00:00:00 UTC is an Even FT8 slot start (as in
     /// `schedule_tx_tests::at`).
-    fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
-        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+    fn at(seconds: f64) -> UtcTimestamp {
+        let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        base + SignedDuration::from_nanos((seconds * 1_000_000_000.0) as i64)
     }
 
     /// 2.3 s into own slot 0: past FT8's 1.7 s acceptance cap, so deferred
@@ -11941,7 +11933,7 @@ mod pan223_scheduled_slot_worker_tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    type Report = (String, TxAttemptId, chrono::DateTime<chrono::Utc>);
+    type Report = (String, TxAttemptId, pancetta_core::time::UtcTimestamp);
 
     /// Dial on 20m and `qsos` live, as the QSO coordinator leaves them.
     fn setup(h: &Harness, qsos: &[&str]) {
@@ -12007,9 +11999,10 @@ mod pan223_scheduled_slot_worker_tests {
 
     /// The start of the slot after the current one, and its parity: a
     /// request with that parity always defers to it.
-    fn next_slot() -> (chrono::DateTime<chrono::Utc>, SlotParity) {
-        let next = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS)
-            + chrono::Duration::nanoseconds(SLOT_NS);
+    fn next_slot() -> (pancetta_core::time::UtcTimestamp, SlotParity) {
+        let next =
+            current_slot_start_with_period(pancetta_core::time::UtcTimestamp::now(), SLOT_NS)
+                + jiff::SignedDuration::from_nanos(SLOT_NS);
         (next, SlotParity::of_with_period(next, SLOT_NS))
     }
 
@@ -12034,17 +12027,17 @@ mod pan223_scheduled_slot_worker_tests {
         let h = worker_harness().await;
         setup(&h, &["qa"]);
         // Wait until 2.0-12.0 s into a slot (at most ~5 s).
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let phase = now - current_slot_start_with_period(now, SLOT_NS);
-        let wait = if phase < chrono::Duration::milliseconds(2_000) {
-            chrono::Duration::milliseconds(2_000) - phase
-        } else if phase > chrono::Duration::milliseconds(12_000) {
-            chrono::Duration::milliseconds(17_000) - phase
+        let wait = if phase < jiff::SignedDuration::from_millis(2_000) {
+            jiff::SignedDuration::from_millis(2_000) - phase
+        } else if phase > jiff::SignedDuration::from_millis(12_000) {
+            jiff::SignedDuration::from_millis(17_000) - phase
         } else {
-            chrono::Duration::zero()
+            jiff::SignedDuration::ZERO
         };
-        tokio::time::sleep(wait.to_std().unwrap()).await;
-        let s = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS);
+        tokio::time::sleep(std::time::Duration::try_from(wait).unwrap()).await;
+        let s = current_slot_start_with_period(pancetta_core::time::UtcTimestamp::now(), SLOT_NS);
         let own = SlotParity::of_with_period(s, SLOT_NS);
 
         send(&h, request("qa", 42, own)).await;
@@ -12055,7 +12048,7 @@ mod pan223_scheduled_slot_worker_tests {
             vec![(
                 "qa".to_string(),
                 TxAttemptId(42),
-                s + chrono::Duration::seconds(30)
+                s + jiff::SignedDuration::from_secs(30)
             )],
             "dequeued past the cap of own slot {s}, the frame is scheduled into the next own slot"
         );
@@ -12424,7 +12417,7 @@ mod pan183_attempt_identity_tests {
                 22,
             ),
         ];
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
             pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
             pancetta_core::slot::SLOT_NS,
@@ -12578,7 +12571,7 @@ mod pan71_playback_start_tests {
         let origin = tokio::time::Instant::now();
         Arc::new(move || {
             pancetta_core::time::slot_grid_origin()
-                + chrono::Duration::from_std(origin.elapsed()).unwrap()
+                + SignedDuration::try_from(origin.elapsed()).unwrap()
         })
     }
 
@@ -12613,9 +12606,9 @@ mod pan71_playback_start_tests {
 
     #[derive(Clone, Debug)]
     struct Seen {
-        received_at: chrono::DateTime<chrono::Utc>,
+        received_at: UtcTimestamp,
         flush_first: bool,
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        started_at: Option<UtcTimestamp>,
     }
 
     struct FakeAudio {
@@ -12652,7 +12645,7 @@ mod pan71_playback_start_tests {
                         let ack = playback_started.expect("logged frame must carry an ack");
                         let received_at = utc_clock();
                         let started_at = if let Behaviour::StartAfter(d) = behaviour {
-                            Some(received_at + chrono::Duration::from_std(d).unwrap())
+                            Some(received_at + SignedDuration::try_from(d).unwrap())
                         } else {
                             None
                         };
@@ -12678,7 +12671,7 @@ mod pan71_playback_start_tests {
         FakeAudio { seen, task }
     }
 
-    async fn await_event(h: &Harness, wanted: &str) -> chrono::DateTime<chrono::Utc> {
+    async fn await_event(h: &Harness, wanted: &str) -> UtcTimestamp {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         loop {
             while let Ok(msg) = h.tui_rx.try_recv() {
@@ -12789,11 +12782,7 @@ mod pan71_playback_start_tests {
     async fn fallback_event(
         h: &Harness,
         behaviour: Behaviour,
-    ) -> (
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        Seen,
-    ) {
+    ) -> (UtcTimestamp, UtcTimestamp, Seen) {
         let audio = spawn_fake_audio_thread(h, behaviour).await;
         request(h, TEXT).await;
         let at = await_event(h, TEXT).await;
@@ -12801,8 +12790,7 @@ mod pan71_playback_start_tests {
         let seen = audio.seen.lock().unwrap()[0].clone();
         // The enqueue instant, not the timeout instant a bound later.
         assert!(
-            at <= seen.received_at
-                + chrono::Duration::from_std(TX_PLAYBACK_START_WAIT / 2).unwrap()
+            at <= seen.received_at + SignedDuration::try_from(TX_PLAYBACK_START_WAIT / 2).unwrap()
         );
         (at, observed, seen)
     }
@@ -12819,7 +12807,7 @@ mod pan71_playback_start_tests {
         let h = worker_harness().await;
         if matches!(behaviour, Behaviour::Hold) {
             let (at, observed, _) = fallback_event(&h, behaviour).await;
-            assert!(observed - at >= chrono::Duration::milliseconds(98));
+            assert!(observed - at >= SignedDuration::from_millis(98));
             assert_eq!(await_record(&h).await.utc, at);
             return;
         }
@@ -12834,8 +12822,7 @@ mod pan71_playback_start_tests {
             fallback_event(&timed, behaviour)
         );
         assert!(
-            observed - seen.received_at
-                < chrono::Duration::from_std(TX_PLAYBACK_START_WAIT).unwrap()
+            observed - seen.received_at < SignedDuration::try_from(TX_PLAYBACK_START_WAIT).unwrap()
         );
         assert_eq!(await_record(&h).await.utc, at);
     }
@@ -12972,8 +12959,8 @@ mod pan71_playback_start_tests {
         assert_eq!(waveforms.len(), 2);
         assert_ne!(waveforms[0], waveforms[1], "supersede changes the waveform");
         assert_eq!(
-            starts[0].timestamp().div_euclid(15),
-            starts[1].timestamp().div_euclid(15),
+            starts[0].as_second().div_euclid(15),
+            starts[1].as_second().div_euclid(15),
             "replacement must requeue into the same FT8 slot"
         );
         assert_eq!(
@@ -13031,7 +13018,7 @@ mod pan71_playback_start_tests {
     async fn frame_log_instant_started_uses_reported_time() {
         let (ack, mut waiter) = PlaybackStartAck::new();
         let fallback = pancetta_core::time::slot_grid_origin();
-        let at = fallback + chrono::Duration::milliseconds(37);
+        let at = fallback + SignedDuration::from_millis(37);
         ack.started(at);
         assert_eq!(frame_log_instant(&mut waiter, fallback, TEXT).await, at);
     }
@@ -13272,7 +13259,7 @@ mod pan279_settlement_worker_tests {
     }
 
     fn parity_now() -> pancetta_core::slot::SlotParity {
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         pancetta_core::slot::SlotParity::of_with_period(
             pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
             pancetta_core::slot::SLOT_NS,

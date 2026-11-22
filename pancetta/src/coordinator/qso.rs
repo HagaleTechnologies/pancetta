@@ -16,6 +16,9 @@
 
 use super::ActiveQsoFreq;
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -41,13 +44,13 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 /// The resend re-keys the completed QSO by id
 /// (`QsoManager::resend_completed_close`, PAN-275); it never opens a QSO, so
 /// the contact is logged once however late in the window the repeat comes.
-const AUTO_73_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
+const AUTO_73_WINDOW: SignedDuration = SignedDuration::from_mins(3);
 /// Maximum number of auto re-sends of our 73 per completed manual QSO.
 const AUTO_73_MAX_RESENDS: u8 = 3;
 /// Minimum spacing between auto re-sends (one FT8 slot is 15 s; we use a
 /// slightly-under-slot guard so we fire at most once per slot even if the
 /// DX's RR73 is decoded a hair early/late).
-const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
+const AUTO_73_MIN_SPACING: SignedDuration = SignedDuration::from_secs(14);
 /// SM-F3/TX-F10: minimum time that must elapse since `completed_at` before
 /// the FIRST auto-resend (`resends` 0 → 1) is allowed to fire.
 ///
@@ -64,7 +67,7 @@ const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
 /// comfortably covers it while staying tiny next to [`AUTO_73_WINDOW`] (3
 /// min), so a truly later, genuine repeat of RR73 (the DX really didn't copy
 /// our first 73) is unaffected.
-const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::seconds(32);
+const AUTO_73_FIRST_RESEND_MIN_DELAY: SignedDuration = SignedDuration::from_secs(32);
 
 /// One recently-completed **manual** QSO, tracked so we can auto-re-send our
 /// 73 if the DX keeps sending RR73/RRR. Keyed (in the map) by uppercased
@@ -72,12 +75,12 @@ const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::secon
 #[derive(Debug, Clone)]
 struct RecentManualCompletion {
     /// When the QSO completed (window + pruning are measured from here).
-    completed_at: chrono::DateTime<chrono::Utc>,
+    completed_at: UtcTimestamp,
     /// How many auto re-sends we have already done (bounded by
     /// [`AUTO_73_MAX_RESENDS`]).
     resends: u8,
     /// When we last auto-re-sent (one-per-slot guard). `None` = never yet.
-    last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_resend_at: Option<UtcTimestamp>,
     /// SECURITY: `true` iff the completed QSO was remote-initiated. The auto-73
     /// resend is itself a TX, so it must inherit the origin — a remote QSO's
     /// auto-73 is `TxOrigin::Remote` and armed-TX gated (fail-closed: if the
@@ -115,10 +118,10 @@ struct PendingAuto73Resend {
     /// The emitted resend frame's attempt id, echoed on its TX report.
     attempt_id: pancetta_qso::TxAttemptId,
     /// The `last_resend_at` stamp this resend set.
-    committed_at: chrono::DateTime<chrono::Utc>,
+    committed_at: UtcTimestamp,
     /// `last_resend_at` before this resend, restored on a refund while the
     /// field still holds this resend's own stamp.
-    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_last_resend_at: Option<UtcTimestamp>,
 }
 
 /// item-2-auto-73 (PAN-275): record a manual completion for the auto-73.
@@ -130,9 +133,9 @@ fn stash_auto_73_completion(
     map: &mut HashMap<String, RecentManualCompletion>,
     callsign: &str,
     fresh: RecentManualCompletion,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) {
-    map.retain(|_, e| now.signed_duration_since(e.completed_at) < AUTO_73_WINDOW);
+    map.retain(|_, e| now.duration_since(e.completed_at) < AUTO_73_WINDOW);
     match map.entry(callsign.to_uppercase()) {
         std::collections::hash_map::Entry::Occupied(o) if o.get().qso_id == fresh.qso_id => {}
         std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -452,14 +455,14 @@ struct PendingManualCall {
 #[derive(Debug, Clone, Copy)]
 struct QueueStamp {
     mono: std::time::Instant,
-    wall: chrono::DateTime<chrono::Utc>,
+    wall: UtcTimestamp,
 }
 
 impl QueueStamp {
     fn now() -> Self {
         Self {
             mono: std::time::Instant::now(),
-            wall: chrono::Utc::now(),
+            wall: UtcTimestamp::now(),
         }
     }
 
@@ -505,7 +508,7 @@ struct DxActivity {
     /// Short human summary, e.g. "CQ", "→ W1XYZ R-12", "→ us -09".
     summary: String,
     /// When this frame was decoded (drives the staleness/"(silent)" display).
-    at: chrono::DateTime<chrono::Utc>,
+    at: UtcTimestamp,
 }
 
 /// Shared map (uppercased callsign → latest [`DxActivity`]) updated by the
@@ -518,7 +521,7 @@ const DX_ACTIVITY_MAX: usize = 256;
 
 /// Entries older than this are treated as stale (DX has gone quiet) and not
 /// surfaced; also the pruning horizon.
-const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
+const DX_ACTIVITY_TTL: SignedDuration = SignedDuration::from_secs(150);
 
 /// Compute the TX audio offset for a new **manual** QSO (StartQso /
 /// RespondToCaller) from the operator's held-offset state and the live active
@@ -689,7 +692,7 @@ fn record_dx_activity(
     map: &DxActivityMap,
     msg: &pancetta_qso::states::MessageType,
     our_call: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) {
     let Some((from, summary)) = dx_activity_summary(msg, our_call) else {
         return;
@@ -698,7 +701,7 @@ fn record_dx_activity(
         m.insert(from.to_uppercase(), DxActivity { summary, at: now });
         // Cheap bound: prune by age, and if still over the cap drop the oldest.
         if m.len() > DX_ACTIVITY_MAX {
-            m.retain(|_, a| now.signed_duration_since(a.at) < DX_ACTIVITY_TTL);
+            m.retain(|_, a| now.duration_since(a.at) < DX_ACTIVITY_TTL);
             while m.len() > DX_ACTIVITY_MAX {
                 if let Some(oldest_key) = m.iter().min_by_key(|(_, a)| a.at).map(|(k, _)| k.clone())
                 {
@@ -713,11 +716,7 @@ fn record_dx_activity(
 
 /// Look up the freshest non-stale activity summary for a callsign (#41),
 /// compound-call aware. Returns `None` if unknown or stale.
-fn lookup_dx_activity(
-    map: &DxActivityMap,
-    callsign: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
+fn lookup_dx_activity(map: &DxActivityMap, callsign: &str, now: UtcTimestamp) -> Option<String> {
     let m = map.read().ok()?;
     // Exact (uppercased) hit first; fall back to a compound-call match.
     let entry = m.get(&callsign.to_uppercase()).or_else(|| {
@@ -725,7 +724,7 @@ fn lookup_dx_activity(
             .find(|(k, _)| pancetta_qso::exchange::callsigns_match(k, callsign))
             .map(|(_, a)| a)
     })?;
-    if now.signed_duration_since(entry.at) < DX_ACTIVITY_TTL {
+    if now.duration_since(entry.at) < DX_ACTIVITY_TTL {
         Some(entry.summary.clone())
     } else {
         None
@@ -1164,7 +1163,7 @@ async fn maybe_auto_resend_73(
         return;
     }
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
 
     // Decide under the map lock: is this a stashed manual completion still in
     // window and under the cap, with the per-slot guard satisfied? We mutate
@@ -1179,7 +1178,7 @@ async fn maybe_auto_resend_73(
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
-        map.retain(|_, e| now.signed_duration_since(e.completed_at) < AUTO_73_WINDOW);
+        map.retain(|_, e| now.duration_since(e.completed_at) < AUTO_73_WINDOW);
 
         let Some(entry) = map.get_mut(&key) else {
             return;
@@ -1199,12 +1198,12 @@ async fn maybe_auto_resend_73(
         // attempt, so a genuine later RR73 (past this guard) still gets its
         // full allotment.
         if entry.resends == 0
-            && now.signed_duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
+            && now.duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
         {
             return;
         }
         if let Some(last) = entry.last_resend_at {
-            if now.signed_duration_since(last) < AUTO_73_MIN_SPACING {
+            if now.duration_since(last) < AUTO_73_MIN_SPACING {
                 // Already re-sent this slot — ignore the duplicate decode.
                 return;
             }
@@ -1406,9 +1405,9 @@ async fn roll_back_auto_73_commit(
     completions: &RecentManualCompletions,
     key: &str,
     qso_id: pancetta_qso::QsoId,
-    committed_at: chrono::DateTime<chrono::Utc>,
+    committed_at: UtcTimestamp,
     prev_resends: u8,
-    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_last_resend_at: Option<UtcTimestamp>,
 ) {
     let mut map = completions.lock().await;
     if let Some(entry) = map.get_mut(key) {
@@ -1537,7 +1536,7 @@ async fn handle_tx_frame_sent(
     qso_id: &str,
     message_text: &str,
     aired: &pancetta_qso::UnsentAttemptPayload,
-    aired_at: chrono::DateTime<chrono::Utc>,
+    aired_at: UtcTimestamp,
     attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
     match qso_id.parse::<pancetta_qso::QsoId>() {
@@ -2134,7 +2133,7 @@ async fn fox_grace_hound_count(
         Ok(set) => set.iter().cloned().collect(),
         Err(_) => return 0,
     };
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut count = 0usize;
     for key in keys {
         let Ok(id) = uuid::Uuid::parse_str(&key) else {
@@ -2503,7 +2502,7 @@ fn timeout_detail(
             return "watchdog timeout — no reply after we sent the report".to_string();
         }
         if metadata.first_call_at.is_some_and(|started| {
-            chrono::Utc::now() - started >= chrono::Duration::minutes(watchdog_minutes as i64)
+            UtcTimestamp::now() - started >= SignedDuration::from_mins(watchdog_minutes as i64)
         }) {
             return format!("watchdog timeout — no reply in {watchdog_minutes} min");
         }
@@ -2785,7 +2784,7 @@ mod pan6_diagnostic_tests {
     }
 
     fn metadata(initiated_by: CallInitiation, call_count: u32, age_minutes: i64) -> QsoMetadata {
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         QsoMetadata {
             qso_id: pancetta_qso::QsoId::new_v4(),
             our_callsign: "K5ARH".into(),
@@ -2808,7 +2807,7 @@ mod pan6_diagnostic_tests {
             initiated_by,
             role: Default::default(),
             call_count,
-            first_call_at: Some(now - chrono::Duration::minutes(age_minutes)),
+            first_call_at: Some(now - SignedDuration::from_mins(age_minutes)),
             last_call_at: Some(now),
             progressed_this_cycle: false,
             stall_cycles: 0,
@@ -2828,7 +2827,7 @@ mod pan6_diagnostic_tests {
     fn calling() -> QsoState {
         QsoState::CallingCq {
             frequency: 14_074_000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             call_count: 1,
         }
     }
@@ -2862,7 +2861,7 @@ mod pan6_diagnostic_tests {
         let state = QsoState::WaitingForReport {
             their_callsign: "W1AW".into(),
             frequency: 14_074_000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             their_grid: None,
             our_report: -10,
         };
@@ -3170,7 +3169,7 @@ fn recent_qso_outcome(
     let mut brief_timeline = vec![format!(
         "{} started at {}",
         their_call,
-        metadata.contact_started_at().format("%H:%M:%S")
+        metadata.contact_started_at().strftime("%H:%M:%S")
     )];
     if let Some(sent) = metadata.reports.sent {
         brief_timeline.push(format!("Report sent: {sent:+}"));
@@ -3193,7 +3192,7 @@ fn recent_qso_outcome(
         outcome,
         last_state,
         freq_hz: metadata.frequency as u32,
-        ts: chrono::Utc::now(),
+        ts: UtcTimestamp::now(),
         brief_timeline,
     }
 }
@@ -3497,7 +3496,7 @@ mod ap_ranking_tests {
         pancetta_qso::QsoState::WaitingForReport {
             their_callsign: their_callsign.to_string(),
             frequency: 14_074_000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             their_grid: Some("FN31".to_string()),
             our_report: -12,
         }
@@ -3507,7 +3506,7 @@ mod ap_ranking_tests {
         qso_id: pancetta_qso::QsoId,
         our_callsign: &str,
     ) -> pancetta_qso::QsoMetadata {
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         pancetta_qso::QsoMetadata {
             qso_id,
             our_callsign: our_callsign.to_string(),
@@ -3573,7 +3572,7 @@ mod ap_ranking_tests {
     fn qso_ap_candidate_from_progress_returns_none_for_calling_cq_and_idle() {
         let calling_cq = pancetta_qso::QsoState::CallingCq {
             frequency: 14_074_000.0,
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             call_count: 1,
         };
         let metadata = empty_metadata(pancetta_qso::QsoId::new_v4(), "K5ARH");
@@ -4894,7 +4893,7 @@ impl super::ApplicationCoordinator {
                                             band: history_band,
                                             success: true,
                                             reason: None,
-                                            completed_at: chrono::Utc::now(),
+                                            completed_at: UtcTimestamp::now(),
                                         },
                                         Instant::now(),
                                     );
@@ -4964,7 +4963,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-259: neither are Hound completions — a
                                     // Hound never sends 73 after the Fox's RR73.
                                     if stashes_auto_73(&metadata) {
-                                        let now = chrono::Utc::now();
+                                        let now = UtcTimestamp::now();
                                         let entry = RecentManualCompletion {
                                             completed_at: now,
                                             resends: 0,
@@ -5073,7 +5072,7 @@ impl super::ApplicationCoordinator {
                                             band: history_band,
                                             success: false,
                                             reason: Some(failure_reason_text(&reason)),
-                                            completed_at: chrono::Utc::now(),
+                                            completed_at: UtcTimestamp::now(),
                                         },
                                         Instant::now(),
                                     );
@@ -5474,7 +5473,7 @@ impl super::ApplicationCoordinator {
                                                 &dx_activity,
                                                 &msg_type,
                                                 &our_callsign,
-                                                chrono::Utc::now(),
+                                                UtcTimestamp::now(),
                                             );
                                         }
                                     }
@@ -7215,7 +7214,7 @@ fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
 fn secondary_decoder_hint_freq_for(
     progress: &pancetta_qso::QsoProgress,
     slot_ns: i64,
-) -> Option<(f64, chrono::DateTime<chrono::Utc>)> {
+) -> Option<(f64, UtcTimestamp)> {
     if !matches!(
         progress.state,
         pancetta_qso::states::QsoState::CallingCq { .. }
@@ -7225,13 +7224,14 @@ fn secondary_decoder_hint_freq_for(
     let pre = progress.metadata.pre_switch_offset?;
     let grace = pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(slot_ns);
     let expires_at = pre.left_at + grace;
-    (expires_at > chrono::Utc::now()).then_some((pre.offset_hz, expires_at))
+    (expires_at > UtcTimestamp::now()).then_some((pre.offset_hz, expires_at))
 }
 
 #[cfg(test)]
 mod secondary_decoder_hint_tests {
     use super::secondary_decoder_hint_freq_for;
-    use chrono::{Duration, Utc};
+    use jiff::SignedDuration;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_qso::states::PreSwitchOffset;
     use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReports};
 
@@ -7240,7 +7240,7 @@ mod secondary_decoder_hint_tests {
     const FT8_SLOT_NS: i64 = 15_000_000_000;
 
     fn calling_cq_progress(pre_switch_offset: Option<PreSwitchOffset>) -> QsoProgress {
-        let start = Utc::now() - Duration::seconds(5);
+        let start = UtcTimestamp::now() - SignedDuration::from_secs(5);
         QsoProgress {
             state: QsoState::CallingCq {
                 frequency: 1900.0,
@@ -7300,7 +7300,7 @@ mod secondary_decoder_hint_tests {
 
     #[test]
     fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
-        let left_at = Utc::now();
+        let left_at = UtcTimestamp::now();
         let progress = calling_cq_progress(Some(PreSwitchOffset {
             offset_hz: 1500.0,
             left_at,
@@ -7324,7 +7324,7 @@ mod secondary_decoder_hint_tests {
     fn a_relocation_past_its_grace_yields_no_secondary() {
         let progress = calling_cq_progress(Some(PreSwitchOffset {
             offset_hz: 1500.0,
-            left_at: Utc::now() - Duration::seconds(31),
+            left_at: UtcTimestamp::now() - SignedDuration::from_secs(31),
             operator_forced: true,
         }));
         assert_eq!(
@@ -7341,7 +7341,7 @@ mod secondary_decoder_hint_tests {
         const FT2_SLOT_NS: i64 = 3_200_000_000; // -> 6.4s grace
         let progress = calling_cq_progress(Some(PreSwitchOffset {
             offset_hz: 1500.0,
-            left_at: Utc::now() - Duration::seconds(10),
+            left_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
             operator_forced: false,
         }));
         assert_eq!(
@@ -7365,13 +7365,13 @@ mod secondary_decoder_hint_tests {
     fn an_established_qso_never_gets_a_secondary_hint() {
         let mut progress = calling_cq_progress(Some(PreSwitchOffset {
             offset_hz: 1500.0,
-            left_at: Utc::now(),
+            left_at: UtcTimestamp::now(),
             operator_forced: true,
         }));
         progress.state = QsoState::RespondingToCq {
             target_callsign: "K9ZZ".to_string(),
             frequency: 1900.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
         };
         assert_eq!(
             secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
@@ -7448,7 +7448,7 @@ async fn build_active_qso_snapshot(
     Vec<crate::message_bus::PendingCallSnapshotItem>,
 ) {
     let active = qso_manager.get_active_qsos().await;
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     // Watchdog config for the manual keep-calling countdown (Batch 2 #1).
     let timeouts = &qso_manager.config().timeouts;
     let max_calls = timeouts.manual_call_max_calls;
@@ -7620,7 +7620,7 @@ fn snapshot_item_from_progress(
         let deadline = progress
             .metadata
             .first_call_at
-            .map(|t| t + chrono::Duration::minutes(watchdog_minutes as i64));
+            .map(|t| t + SignedDuration::from_mins(watchdog_minutes as i64));
         (progress.metadata.call_count, max_calls, deadline)
     } else {
         (0, 0, None)
@@ -7949,7 +7949,7 @@ mod pending_manual_tests {
                     .mono
                     .checked_sub(age)
                     .expect("Instant underflow in test"),
-                wall: now.wall - chrono::Duration::from_std(age).expect("age fits chrono"),
+                wall: now.wall - jiff::SignedDuration::try_from(age).expect("age fits chrono"),
             },
             hound: false,
             fox_freq_hz: None,
@@ -8023,7 +8023,7 @@ mod pending_manual_tests {
     fn stamp_after(
         s: QueueStamp,
         mono_elapsed: std::time::Duration,
-        wall_elapsed: chrono::Duration,
+        wall_elapsed: jiff::SignedDuration,
     ) -> QueueStamp {
         QueueStamp {
             mono: s.mono + mono_elapsed,
@@ -8042,7 +8042,7 @@ mod pending_manual_tests {
         let now = stamp_after(
             s,
             std::time::Duration::from_secs(10),
-            chrono::Duration::seconds(610),
+            jiff::SignedDuration::from_secs(610),
         );
         let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
         assert!(
@@ -8062,7 +8062,7 @@ mod pending_manual_tests {
         let now = stamp_after(
             s,
             std::time::Duration::from_secs(610),
-            chrono::Duration::seconds(-3600),
+            jiff::SignedDuration::from_secs(-3600),
         );
         let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
         assert!(kept.is_empty());
@@ -8079,7 +8079,7 @@ mod pending_manual_tests {
         let now = stamp_after(
             s,
             std::time::Duration::from_secs(10),
-            chrono::Duration::seconds(-3600),
+            jiff::SignedDuration::from_secs(-3600),
         );
         assert_eq!(s.age_at(now), std::time::Duration::from_secs(10));
         let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
@@ -8255,7 +8255,7 @@ mod pending_manual_tests {
         let mut stale = call("JA1AAA", SlotParity::Odd);
         stale.queued_at = QueueStamp {
             mono: std::time::Instant::now(),
-            wall: chrono::Utc::now() - chrono::Duration::minutes(11),
+            wall: pancetta_core::time::UtcTimestamp::now() - jiff::SignedDuration::from_mins(11),
         };
         let fresh = even_dx_call_at("JA2BBB", 1500.0);
         let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([stale, fresh])));
@@ -9212,7 +9212,8 @@ mod ft8_message_classification_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::snapshot_item_from_progress;
-    use chrono::{Duration, Utc};
+    use jiff::SignedDuration;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_qso::{
         GridSquares, MessageDirection, QsoMetadata, QsoProgress, QsoState, SignalReports,
     };
@@ -9220,11 +9221,11 @@ mod snapshot_tests {
     /// Build a QsoProgress mid-exchange: we called them, sent our grid,
     /// and just received their report.
     fn fixture_progress() -> QsoProgress {
-        let start = Utc::now() - Duration::seconds(45);
+        let start = UtcTimestamp::now() - SignedDuration::from_secs(45);
         let their_call = "JA1ABC".to_string();
         let messages = vec![
             pancetta_qso::states::QsoMessage {
-                timestamp: start + Duration::seconds(15),
+                timestamp: start + SignedDuration::from_secs(15),
                 direction: MessageDirection::Sent,
                 message_type: pancetta_qso::states::MessageType::CqResponse {
                     calling_station: their_call.clone(),
@@ -9236,7 +9237,7 @@ mod snapshot_tests {
                 frequency: 1500.0,
             },
             pancetta_qso::states::QsoMessage {
-                timestamp: start + Duration::seconds(30),
+                timestamp: start + SignedDuration::from_secs(30),
                 direction: MessageDirection::Received,
                 message_type: pancetta_qso::states::MessageType::SignalReport {
                     to_station: "K5ARH".to_string(),
@@ -9336,7 +9337,7 @@ mod snapshot_tests {
     fn snapshot_picks_latest_message_per_direction() {
         let mut progress = fixture_progress();
         progress.messages.push(pancetta_qso::states::QsoMessage {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             direction: MessageDirection::Sent,
             message_type: pancetta_qso::states::MessageType::ReportAck {
                 to_station: "JA1ABC".to_string(),
@@ -9361,7 +9362,7 @@ mod snapshot_tests {
         let mut progress = fixture_progress();
         progress.state = QsoState::CallingCq {
             frequency: 1500.0,
-            started_at: Utc::now(),
+            started_at: UtcTimestamp::now(),
             call_count: 1,
         };
         progress.metadata.their_callsign = None;
@@ -9386,7 +9387,7 @@ mod snapshot_tests {
     #[test]
     fn snapshot_surfaces_watchdog_for_manual_keep_calling() {
         let mut progress = fixture_progress();
-        let start = Utc::now() - Duration::seconds(20);
+        let start = UtcTimestamp::now() - SignedDuration::from_secs(20);
         progress.state = QsoState::RespondingToCq {
             target_callsign: "JA1ABC".to_string(),
             frequency: 1500.0,
@@ -9401,7 +9402,7 @@ mod snapshot_tests {
         let deadline = item.watchdog_deadline.expect("deadline");
         assert_eq!(
             deadline,
-            start + Duration::minutes(TEST_WATCHDOG_MIN as i64)
+            start + SignedDuration::from_mins(TEST_WATCHDOG_MIN as i64)
         );
     }
 
@@ -9412,7 +9413,7 @@ mod snapshot_tests {
         let mut progress = fixture_progress();
         progress.metadata.initiated_by = pancetta_qso::CallInitiation::Auto;
         progress.metadata.call_count = 3;
-        progress.metadata.first_call_at = Some(Utc::now());
+        progress.metadata.first_call_at = Some(UtcTimestamp::now());
         let item = snap(&progress).expect("item");
         assert_eq!(item.call_count, 0);
         assert_eq!(item.max_calls, 0);
@@ -9487,10 +9488,10 @@ mod snapshot_tests {
             outcome.brief_timeline[0],
             format!(
                 "JA1ABC started at {}",
-                metadata.start_time.format("%H:%M:%S")
+                metadata.start_time.strftime("%H:%M:%S")
             )
         );
-        metadata.first_answer_at = Some(metadata.start_time + chrono::Duration::minutes(4));
+        metadata.first_answer_at = Some(metadata.start_time + SignedDuration::from_mins(4));
         let answered = super::recent_qso_outcome(
             &their_call,
             crate::message_bus::QsoOutcome::Completed,
@@ -9500,7 +9501,7 @@ mod snapshot_tests {
             answered.brief_timeline[0],
             format!(
                 "JA1ABC started at {}",
-                metadata.first_answer_at.unwrap().format("%H:%M:%S")
+                metadata.first_answer_at.unwrap().strftime("%H:%M:%S")
             )
         );
         assert_eq!(outcome.callsign, "JA1ABC");
@@ -9662,7 +9663,7 @@ mod auto_73_tests {
                 frequency_hz: 1500.0,
                 remote_binding: Some((false, None)),
             },
-            chrono::Utc::now(),
+            pancetta_core::time::UtcTimestamp::now(),
         )
         .await;
         id
@@ -9679,7 +9680,8 @@ mod auto_73_tests {
         map.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                completed_at: pancetta_core::time::UtcTimestamp::now()
+                    - jiff::SignedDuration::from_secs(40),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
@@ -9791,9 +9793,9 @@ mod auto_73_tests {
             m.insert(
                 DX.to_string(),
                 RecentManualCompletion {
-                    completed_at: chrono::Utc::now()
+                    completed_at: pancetta_core::time::UtcTimestamp::now()
                         - AUTO_73_WINDOW
-                        - chrono::Duration::seconds(1),
+                        - jiff::SignedDuration::from_secs(1),
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
@@ -10023,7 +10025,7 @@ mod auto_73_tests {
             m.insert(
                 DX.to_string(),
                 RecentManualCompletion {
-                    completed_at: chrono::Utc::now(),
+                    completed_at: pancetta_core::time::UtcTimestamp::now(),
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
@@ -10081,9 +10083,9 @@ mod auto_73_tests {
             m.insert(
                 DX.to_string(),
                 RecentManualCompletion {
-                    completed_at: chrono::Utc::now()
+                    completed_at: pancetta_core::time::UtcTimestamp::now()
                         - AUTO_73_FIRST_RESEND_MIN_DELAY
-                        - chrono::Duration::seconds(5),
+                        - jiff::SignedDuration::from_secs(5),
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
@@ -10131,7 +10133,8 @@ mod auto_73_tests {
             m.insert(
                 DX.to_string(),
                 RecentManualCompletion {
-                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    completed_at: pancetta_core::time::UtcTimestamp::now()
+                        - jiff::SignedDuration::from_secs(40),
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: true,
@@ -10148,7 +10151,7 @@ mod auto_73_tests {
 
         // client-b holds the arm — a mismatch against the entry's client-a.
         let mut st = pancetta_agent::arm::ArmState::new();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
             true,
@@ -10204,7 +10207,7 @@ mod auto_73_tests {
 
     fn armed_for(client: &str) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
         let mut st = pancetta_agent::arm::ArmState::new();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = pancetta_core::time::UtcTimestamp::now().as_millisecond();
         st.set_channel_consent(
             pancetta_agent::arm::ConsentChannel::StationAgent,
             true,
@@ -10269,7 +10272,8 @@ mod auto_73_tests {
             m.insert(
                 DX.to_string(),
                 RecentManualCompletion {
-                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    completed_at: pancetta_core::time::UtcTimestamp::now()
+                        - jiff::SignedDuration::from_secs(40),
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: true,
@@ -10335,7 +10339,7 @@ mod auto_73_tests {
     async fn rollback_leaves_a_replaced_entry_alone() {
         let map = map_with_dx(uuid::Uuid::new_v4());
         let newer = map.lock().await.get(DX).cloned().unwrap();
-        let committed_at = chrono::Utc::now();
+        let committed_at = pancetta_core::time::UtcTimestamp::now();
         super::roll_back_auto_73_commit(&map, DX, uuid::Uuid::new_v4(), committed_at, 0, None)
             .await;
         let after = map.lock().await.get(DX).cloned().unwrap();
@@ -10353,9 +10357,9 @@ mod auto_73_tests {
 
     fn stashed(
         qso_id: QsoId,
-        completed_at: chrono::DateTime<chrono::Utc>,
+        completed_at: pancetta_core::time::UtcTimestamp,
         resends: u8,
-        last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+        last_resend_at: Option<pancetta_core::time::UtcTimestamp>,
     ) -> RecentManualCompletion {
         RecentManualCompletion {
             completed_at,
@@ -10372,10 +10376,10 @@ mod auto_73_tests {
     /// window and counters, so it can never reset the resend cap.
     #[test]
     fn stash_auto_73_completion_keeps_counters_for_the_same_qso() {
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let id = uuid::Uuid::new_v4();
-        let t = now - chrono::Duration::seconds(20);
-        let completed = now - chrono::Duration::seconds(60);
+        let t = now - jiff::SignedDuration::from_secs(20);
+        let completed = now - jiff::SignedDuration::from_secs(60);
         let mut map = HashMap::new();
         map.insert(DX.to_string(), stashed(id, completed, 2, Some(t)));
 
@@ -10392,7 +10396,7 @@ mod auto_73_tests {
     /// contact: it replaces the entry with a fresh budget.
     #[test]
     fn stash_auto_73_completion_replaces_a_different_qso() {
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let old = uuid::Uuid::new_v4();
         let new = uuid::Uuid::new_v4();
         let mut map = HashMap::new();
@@ -10400,9 +10404,9 @@ mod auto_73_tests {
             DX.to_string(),
             stashed(
                 old,
-                now - chrono::Duration::seconds(60),
+                now - jiff::SignedDuration::from_secs(60),
                 2,
-                Some(now - chrono::Duration::seconds(20)),
+                Some(now - jiff::SignedDuration::from_secs(20)),
             ),
         );
 
@@ -10417,13 +10421,13 @@ mod auto_73_tests {
 
     #[test]
     fn stash_auto_73_completion_inserts_when_vacant_and_prunes_expired() {
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let mut map = HashMap::new();
         map.insert(
             "W9OLD".to_string(),
             stashed(
                 uuid::Uuid::new_v4(),
-                now - AUTO_73_WINDOW - chrono::Duration::seconds(1),
+                now - AUTO_73_WINDOW - jiff::SignedDuration::from_secs(1),
                 0,
                 None,
             ),
@@ -10471,21 +10475,20 @@ mod auto_73_tests {
         // The QSO completed 60 s ago: past the 45 s grace, inside the 3 min
         // window.
         assert!(
-            mgr.backdate_completion_for_test(id, chrono::Duration::seconds(60))
+            mgr.backdate_completion_for_test(id, jiff::SignedDuration::from_secs(60))
                 .await
         );
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let map: RecentManualCompletions = Arc::new(Mutex::new(HashMap::new()));
         stash_auto_73_completion(
             &mut *map.lock().await,
             DX,
-            stashed(id, now - chrono::Duration::seconds(60), 0, None),
+            stashed(id, now - jiff::SignedDuration::from_secs(60), 0, None),
             now,
         );
         let grace = CompletedTxGrace::for_test(
             &mgr,
-            pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE
-                .to_std()
+            std::time::Duration::try_from(pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE)
                 .unwrap(),
         );
         let policy = AtomicU8::new(TxPolicy::Full.as_u8());
@@ -10518,7 +10521,7 @@ mod auto_73_tests {
                     } => {
                         completed += 1;
                         // Feed it through the stash exactly as the arm would.
-                        let at = chrono::Utc::now();
+                        let at = pancetta_core::time::UtcTimestamp::now();
                         let call = metadata.their_callsign.clone().unwrap_or_default();
                         stash_auto_73_completion(
                             &mut *map.lock().await,
@@ -10554,7 +10557,7 @@ mod auto_73_tests {
             if let Some(e) = map.lock().await.get_mut(DX) {
                 e.last_resend_at = e
                     .last_resend_at
-                    .map(|t| t - AUTO_73_MIN_SPACING - chrono::Duration::seconds(1));
+                    .map(|t| t - AUTO_73_MIN_SPACING - jiff::SignedDuration::from_secs(1));
             }
         }
 
@@ -10672,7 +10675,8 @@ mod auto_73_tests {
         m.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                completed_at: pancetta_core::time::UtcTimestamp::now()
+                    - jiff::SignedDuration::from_secs(40),
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: true,
@@ -10759,7 +10763,7 @@ mod auto_73_tests {
                 frequency_hz: 1500.0,
                 remote_binding: Some((false, None)),
             },
-            chrono::Utc::now(),
+            pancetta_core::time::UtcTimestamp::now(),
             opened.attempt_id(),
         )
         .await;
@@ -10884,7 +10888,7 @@ mod auto_73_tests {
                 frequency_hz: 1500.0,
                 remote_binding: Some((true, Some("client-a".into()))),
             },
-            chrono::Utc::now(),
+            pancetta_core::time::UtcTimestamp::now(),
             Some(id_b),
         )
         .await;
@@ -10947,8 +10951,8 @@ mod auto_73_tests {
     #[tokio::test]
     async fn overlapping_auto_73_refund_takes_off_one_unit() {
         let map = map_with_dx(uuid::Uuid::new_v4());
-        let t1 = chrono::Utc::now() - chrono::Duration::seconds(20);
-        let t2 = t1 + chrono::Duration::seconds(15);
+        let t1 = pancetta_core::time::UtcTimestamp::now() - jiff::SignedDuration::from_secs(20);
+        let t2 = t1 + jiff::SignedDuration::from_secs(15);
         {
             let mut m = map.lock().await;
             let e = m.get_mut(DX).unwrap();
@@ -11152,7 +11156,7 @@ fn cqdx_record_from_metadata(
         rst_sent: metadata.reports.sent.map(|r| r.to_string()),
         rst_received: metadata.reports.received.map(|r| r.to_string()),
         start_time: metadata.contact_started_at(),
-        end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
+        end_time: metadata.end_time.unwrap_or_else(UtcTimestamp::now),
     })
 }
 
@@ -12182,7 +12186,7 @@ mod adif_subscriber_tests {
         "ADIF subscriber lagged by 3 QSO events; any QSO completed among them is not in qsos.adi";
 
     fn completed(call: &str) -> QsoEvent {
-        let now = chrono::Utc::now();
+        let now = pancetta_core::time::UtcTimestamp::now();
         let qso_id = pancetta_qso::QsoId::new_v4();
         QsoEvent::QsoCompleted {
             qso_id,
@@ -12233,7 +12237,7 @@ mod adif_subscriber_tests {
             qso_id: pancetta_qso::QsoId::new_v4(),
             old_state: QsoState::Idle,
             new_state: QsoState::Idle,
-            timestamp: chrono::Utc::now(),
+            timestamp: pancetta_core::time::UtcTimestamp::now(),
         }
     }
 
@@ -12452,8 +12456,8 @@ mod adif_subscriber_tests {
 #[cfg(test)]
 mod cqdx_upload_tests {
     use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata, logbook_upload_enabled};
-    use chrono::Utc;
     use pancetta_config::network::CqdxConfig;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
 
     /// Default cqdx config (disabled, no token) must NOT enable the upload —
@@ -12503,7 +12507,7 @@ mod cqdx_upload_tests {
     }
 
     fn metadata_with_call(call: Option<&str>) -> QsoMetadata {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         QsoMetadata {
             qso_id: pancetta_qso::QsoId::new_v4(),
             our_callsign: "K5ARH".to_string(),
@@ -12513,7 +12517,7 @@ mod cqdx_upload_tests {
             mode: "FT8".to_string(),
             first_answer_at: None,
             start_time: now,
-            end_time: Some(now + chrono::Duration::seconds(90)),
+            end_time: Some(now + jiff::SignedDuration::from_secs(90)),
             reports: SignalReports {
                 sent: Some(-8),
                 received: Some(-12),
@@ -12881,7 +12885,7 @@ mod cqdx_upload_tests {
         assert_eq!(rec.rst_received.as_deref(), Some("-12"));
         assert_eq!(rec.start_time, md.start_time);
         assert_eq!(rec.end_time, md.end_time.unwrap());
-        md.first_answer_at = Some(md.start_time + chrono::Duration::minutes(4));
+        md.first_answer_at = Some(md.start_time + jiff::SignedDuration::from_mins(4));
         let rec = cqdx_record_from_metadata(&md).expect("answered record");
         assert_eq!(rec.start_time, md.first_answer_at.unwrap());
     }
@@ -12941,14 +12945,14 @@ mod cqdx_upload_tests {
 #[cfg(test)]
 mod qrz_enrichment_tests {
     use super::merge_qrz_lookup;
-    use chrono::Utc;
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_dx::QrzLookup;
     use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
 
     /// Build a completed QSO metadata with the given their-grid / notes so the
     /// "only fill when missing" merge policy can be exercised in isolation.
     fn metadata(their_grid: Option<&str>, notes: Option<&str>) -> QsoMetadata {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         QsoMetadata {
             qso_id: pancetta_qso::QsoId::new_v4(),
             our_callsign: "K5ARH".to_string(),
@@ -12958,7 +12962,7 @@ mod qrz_enrichment_tests {
             mode: "FT8".to_string(),
             first_answer_at: None,
             start_time: now,
-            end_time: Some(now + chrono::Duration::seconds(90)),
+            end_time: Some(now + jiff::SignedDuration::from_secs(90)),
             reports: SignalReports {
                 sent: Some(-8),
                 received: Some(-12),
@@ -14446,7 +14450,7 @@ mod replay_history_seed_tests {
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 first_answer_at: None,
-                start_time: chrono::Utc::now(),
+                start_time: pancetta_core::time::UtcTimestamp::now(),
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
@@ -15045,7 +15049,7 @@ mod replay_history_seed_tests {
                 our_report: -12,
                 frequency: FREQ_20M_HZ,
                 grid_square: None,
-                completed_at: chrono::Utc::now(),
+                completed_at: pancetta_core::time::UtcTimestamp::now(),
                 duration_seconds: 90,
             };
             db.update_qso(&progress).await.unwrap();
@@ -15101,7 +15105,7 @@ mod replay_history_seed_tests {
                 our_report: -7,
                 frequency: FREQ_20M_HZ,
                 grid_square: None,
-                completed_at: chrono::Utc::now(),
+                completed_at: pancetta_core::time::UtcTimestamp::now(),
                 duration_seconds: 60,
             };
             db.update_qso(&progress).await.unwrap();
@@ -15281,7 +15285,7 @@ mod respond_to_caller_admission_tests {
             .last_call_at
             .unwrap();
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
             .await;
         let qso = manager.get_qso(id).await.unwrap();
         let text = qso.messages.last().unwrap().raw_text.clone();
@@ -15310,7 +15314,7 @@ mod respond_to_caller_admission_tests {
                             remote_binding: Some((false, None)),
                         },
                         // After the rearm's own TX slot has played out.
-                        aired_at: opened + chrono::Duration::minutes(2),
+                        aired_at: opened + jiff::SignedDuration::from_mins(2),
                         attempt_id: None,
                     }),
                     Instant::now(),
@@ -15358,7 +15362,7 @@ mod respond_to_caller_admission_tests {
             .last_call_at
             .unwrap();
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
             .await;
         let before = manager.get_qso(id).await.unwrap();
         assert_eq!(before.metadata.call_count, 2);
@@ -15480,7 +15484,7 @@ mod respond_to_caller_admission_tests {
             .last_call_at
             .unwrap();
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
             .await;
         let mut emitted = None;
         while let Ok(event) = events.try_recv() {
@@ -15541,7 +15545,7 @@ mod respond_to_caller_admission_tests {
             .last_call_at
             .unwrap();
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
             .await;
         let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
         manager.resend_last_tx(id).await.unwrap();
@@ -15631,17 +15635,17 @@ mod respond_to_caller_admission_tests {
             .expect("a manual QSO latches its TX parity");
         let s0 = opened.stall_cycles;
         let x = pancetta_core::slot::next_slot_with_parity_with_period(
-            opened.last_call_at.unwrap() + chrono::Duration::seconds(15),
+            opened.last_call_at.unwrap() + jiff::SignedDuration::from_secs(15),
             own,
             15_000_000_000,
         );
         manager
-            .rearm_manual_calls_at(x + chrono::Duration::milliseconds(1_600))
+            .rearm_manual_calls_at(x + jiff::SignedDuration::from_millis(1_600))
             .await;
         let (_, a) = pan183_next_transmit_request(&tx, &qso).await;
         let a = a.expect("the rearm records a ledger attempt");
         manager
-            .rearm_manual_calls_at(x + chrono::Duration::milliseconds(16_600))
+            .rearm_manual_calls_at(x + jiff::SignedDuration::from_millis(16_600))
             .await;
         assert_eq!(
             manager.get_qso(id).await.unwrap().metadata.stall_cycles,
@@ -15657,7 +15661,7 @@ mod respond_to_caller_admission_tests {
                 MessageType::QsoMessage(QsoMessage::TxFrameScheduled {
                     qso_id: qso.clone(),
                     attempt_id: a,
-                    target_slot: x + chrono::Duration::seconds(30),
+                    target_slot: x + jiff::SignedDuration::from_secs(30),
                 }),
                 Instant::now(),
             ))
@@ -15710,7 +15714,7 @@ mod respond_to_caller_admission_tests {
             .last_call_at
             .unwrap();
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened + jiff::SignedDuration::from_secs(15))
             .await;
         let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
         let before = manager.get_qso(id).await.unwrap();
@@ -16639,10 +16643,10 @@ mod respond_to_caller_admission_tests {
         // distinct own-parity TX slot — the stall counter counts own TX
         // slots, not protocol slots.
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+            .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(45))
+            .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(45))
             .await;
 
         let mut found = false;
@@ -16775,7 +16779,7 @@ mod respond_to_caller_admission_tests {
         // would feed a distinct own-parity TX slot (PAN-128).
         for slot in [15i64, 45, 75, 105] {
             manager
-                .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(slot))
+                .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(slot))
                 .await;
         }
 
@@ -16811,10 +16815,10 @@ mod respond_to_caller_admission_tests {
             .tx_restart_inhibit
             .store(0, std::sync::atomic::Ordering::Relaxed);
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(135))
+            .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(135))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(165))
+            .rearm_manual_calls_at(opened_at + jiff::SignedDuration::from_secs(165))
             .await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -17220,7 +17224,7 @@ mod respond_to_caller_admission_tests {
                      frame is not dropped by the band-collapse filter"
                 );
                 assert!(
-                    expires_at > chrono::Utc::now(),
+                    expires_at > pancetta_core::time::UtcTimestamp::now(),
                     "the secondary hint's expires_at must still be in the future \
                      immediately after the switch"
                 );
@@ -19573,7 +19577,7 @@ mod pan120_tests {
                     frequency_hz: 1500.0,
                     remote_binding: Some((false, None)),
                 },
-                chrono::Utc::now(),
+                UtcTimestamp::now(),
             )
             .await;
         drain(&mut rx)
@@ -19594,7 +19598,7 @@ mod pan120_tests {
         let id = complete_by_answer(&st, "K5ARH W1ABC RR73").await;
         assert!(
             st.manager
-                .backdate_completion_for_test(id, chrono::Duration::seconds(130))
+                .backdate_completion_for_test(id, SignedDuration::from_secs(130))
                 .await
         );
         let mut rx = st.manager.subscribe();
@@ -19617,7 +19621,7 @@ mod pan120_tests {
         let id = complete_by_answer(&st, "K5ARH W1ABC RR73").await;
         assert!(
             st.manager
-                .backdate_completion_for_test(id, chrono::Duration::seconds(130))
+                .backdate_completion_for_test(id, SignedDuration::from_secs(130))
                 .await
         );
         let mut rx = st.manager.subscribe();
@@ -20675,15 +20679,15 @@ mod pan50_live_contest {
         let dir = tempfile::tempdir().unwrap();
         let adif = dir.path().join("qsos.adi");
         let index = dir.path().join("qso.db");
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let context = ContestScoringContext::new(
             "live",
             "us-state-qso-party",
             KSQP_FT_2026,
             "KS",
             vec![ContestPeriod {
-                start: now - chrono::Duration::minutes(1),
-                end: now + chrono::Duration::minutes(10),
+                start: now - SignedDuration::from_mins(1),
+                end: now + SignedDuration::from_mins(10),
             }],
         )
         .unwrap();
@@ -20765,7 +20769,7 @@ mod pan50_live_contest {
             rebuilt.contest_ledger(&context, "W1ABC").await.unwrap()
         );
         assert_eq!(
-            reduce_contest_score(&context, &facts, chrono::Utc::now())
+            reduce_contest_score(&context, &facts, UtcTimestamp::now())
                 .unwrap()
                 .score,
             1

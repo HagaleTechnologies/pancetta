@@ -21,7 +21,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
-chrono = { workspace = true }
 
 # Async utilities
 async-trait = "0.1"

@@ -5,6 +5,7 @@
 pub(crate) mod auth;
 pub(crate) mod translate;
 
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -999,7 +1000,7 @@ mod server_tests {
             audio_bin_start_hz: 0.0,
             bin_width_hz: 2.93,
             mags_db: vec![-100.0, -90.0],
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
         };
 
         // Two bus messages through the same pump state should get distinct,

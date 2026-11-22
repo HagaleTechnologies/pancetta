@@ -25,6 +25,7 @@
 //! State changes are published as [`UploadHealth`] for the readiness strip and
 //! emitted as one Diagnostics row each. LoTW uses this same queue and retry policy.
 
+use jiff::SignedDuration;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_dx::upload_outbox::{
     EntryState, Lane, NewUpload, OutboxStore, RetryDelay, RetrySchedule, UploadDestination,
     OUTBOX_MAX_ENTRIES,
@@ -852,7 +853,7 @@ impl<T: OutboxTransport> Worker<T> {
         let batch_ids: Vec<(Uuid, UploadDestination)> =
             batch.iter().map(|n| (n.qso_id, n.destination)).collect();
         let before = store.len();
-        let r = store.add(batch, Utc::now());
+        let r = store.add(batch, UtcTimestamp::now());
         if r.added > 0 {
             // Held until a write succeeds; with `persist_blocked` that is
             // never this session, so they wait for the next start.
@@ -931,7 +932,7 @@ impl<T: OutboxTransport> Worker<T> {
                         ""
                     },
                 );
-                store.accept(id, remote_id, Utc::now());
+                store.accept(id, remote_id, UtcTimestamp::now());
                 let recovered = lane.delivered(now, self.timing.drain_spacing);
                 if duplicate {
                     info!(
@@ -955,7 +956,7 @@ impl<T: OutboxTransport> Worker<T> {
                 class: UploadFailureClass::Transient,
                 text,
             } => {
-                store.record_failure(id, Utc::now(), &text);
+                store.record_failure(id, UtcTimestamp::now(), &text);
                 // PAN-344: a transient failure stays Pending with its reason.
                 Self::record_status(
                     &self.statuses,
@@ -1006,7 +1007,7 @@ impl<T: OutboxTransport> Worker<T> {
                 class: UploadFailureClass::LoginRejected,
                 text,
             } => {
-                store.record_failure(id, Utc::now(), &text);
+                store.record_failure(id, UtcTimestamp::now(), &text);
                 lane.login_rejected(text.clone());
                 warn!(
                     target: "qso.upload",
@@ -1053,7 +1054,7 @@ impl<T: OutboxTransport> Worker<T> {
                 class: UploadFailureClass::RecordRejected,
                 text,
             } => {
-                store.hold(id, Utc::now(), &text);
+                store.hold(id, UtcTimestamp::now(), &text);
                 lane.record_rejected(now, self.timing.drain_spacing);
                 warn!(
                     target: "qso.upload",
@@ -1392,15 +1393,15 @@ mod tests {
         let second = rig.entries()[0].clone();
         assert!(
             second.last_attempt_at.unwrap() - first.last_attempt_at.unwrap()
-                >= chrono::Duration::milliseconds(200)
+                >= SignedDuration::from_millis(200)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(rig.entries()[0].attempts, 2);
         lotw_script(&binary, "exit 0");
         wait_until(|| rig.entries().is_empty()).await;
         // Recovery cannot bypass the second backoff either.
-        let accepted = Utc::now();
-        assert!(accepted - second.last_attempt_at.unwrap() >= chrono::Duration::milliseconds(400));
+        let accepted = UtcTimestamp::now();
+        assert!(accepted - second.last_attempt_at.unwrap() >= SignedDuration::from_millis(400));
         rig.stop().await;
     }
 
@@ -2140,10 +2141,10 @@ mod tests {
 
     fn seed(path: &std::path::Path, uploads: Vec<NewUpload>, hold: usize) {
         let (mut store, _) = OutboxStore::open(path.to_path_buf());
-        store.add(uploads, Utc::now());
+        store.add(uploads, UtcTimestamp::now());
         let ids: Vec<Uuid> = store.entries().iter().map(|e| e.id).collect();
         for id in ids.iter().take(hold) {
-            store.hold(*id, Utc::now(), "HTTP 400");
+            store.hold(*id, UtcTimestamp::now(), "HTTP 400");
         }
         OutboxStore::write_atomic(path, &store.to_bytes().unwrap()).unwrap();
     }
@@ -2847,9 +2848,7 @@ mod tests {
     }
 
     pub(super) fn cqdx_record_json() -> String {
-        let t = chrono::DateTime::parse_from_rfc3339("2026-10-17T14:02:11Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let t = str::parse::<UtcTimestamp>("2026-10-17T14:02:11Z").unwrap();
         serde_json::to_string(&pancetta_cqdx::QsoRecord {
             callsign: "K1ABC".into(),
             remote_grid: Some("FN42".into()),

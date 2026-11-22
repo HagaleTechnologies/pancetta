@@ -25,7 +25,7 @@
 //! existing hard-200/wild-100 WAVs get free truth.
 
 use anyhow::Context;
-use chrono::{TimeZone, Utc};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::chrono_replay::{ChronoReplayEntry, ChronoReplayManifest};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -146,7 +146,7 @@ fn parse_filename_timestamp(filename: &str) -> String {
             let h: u32 = time[0..2].parse().unwrap_or(0);
             let mi: u32 = time[2..4].parse().unwrap_or(0);
             let s: u32 = time[4..6].parse().unwrap_or(0);
-            if let chrono::LocalResult::Single(dt) = Utc.with_ymd_and_hms(y, mo, d, h, mi, s) {
+            if let Some(dt) = UtcTimestamp::from_ymd_hms(y, mo, d, h, mi, s) {
                 return dt.to_rfc3339();
             }
         }
@@ -226,10 +226,10 @@ fn main() -> anyhow::Result<()> {
 
     // Compute span_seconds when both timestamps parsed cleanly.
     let span_seconds = match (
-        chrono::DateTime::parse_from_rfc3339(&first_ts),
-        chrono::DateTime::parse_from_rfc3339(&last_ts),
+        str::parse::<UtcTimestamp>(&first_ts),
+        str::parse::<UtcTimestamp>(&last_ts),
     ) {
-        (Ok(a), Ok(b)) => (b - a).num_seconds() as f64,
+        (Ok(a), Ok(b)) => (b - a).as_secs() as f64,
         _ => 0.0,
     };
 
@@ -242,7 +242,7 @@ fn main() -> anyhow::Result<()> {
     let manifest = ChronoReplayManifest {
         schema_version: ChronoReplayManifest::CURRENT_SCHEMA_VERSION,
         label,
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         source_session_label: args.session_prefix.clone(),
         first_wav_timestamp: first_ts,
         last_wav_timestamp: last_ts,

@@ -1,5 +1,6 @@
 //! PAN-75: exercise real QSO accounting against the production TX coalescer.
-use chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::{slot::SlotParity, TxFreqMode};
 use pancetta_lib::coordinator::{coalesce_transmit_requests, CoalesceEntry};
 use pancetta_lib::message_bus::TxOrigin;
@@ -35,7 +36,7 @@ async fn cycle(
     rx: &mut broadcast::Receiver<QsoEvent>,
     excluded: QsoId,
     cap: u32,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (Vec<QsoId>, usize, Vec<QsoId>) {
     let mut entries = Vec::new();
     let mut actions = Vec::new();
@@ -102,7 +103,7 @@ async fn cap_excluded_manual_qso_keeps_its_call_budget() {
         .first_call_at
         .unwrap();
     for slot in 0..4 {
-        let t = opened + Duration::seconds(15 * slot);
+        let t = opened + SignedDuration::from_secs(15 * slot);
         let (aired, emissions, _) = cycle(&manager, &mut rx, c, 2, t).await;
         assert_eq!(emissions, 1);
         assert!(aired.contains(&a) && aired.contains(&b));
@@ -120,19 +121,19 @@ async fn cap_excluded_manual_qso_keeps_its_call_budget() {
         );
         manager.check_timeouts_at(t).await;
         manager
-            .rearm_manual_calls_at(t + Duration::seconds(15))
+            .rearm_manual_calls_at(t + SignedDuration::from_secs(15))
             .await;
     }
     // A and B reached the cap at slot 3; the cap retires them once that
     // frame is past the rollback window. Rearm stops at the cap, so they
     // emit nothing meanwhile.
     manager
-        .check_timeouts_at(opened + Duration::seconds(15 * 3 + 75))
+        .check_timeouts_at(opened + SignedDuration::from_secs(15 * 3 + 75))
         .await;
     assert!(manager.get_qso(a).await.is_err());
     assert!(manager.get_qso(b).await.is_err());
     for aired_rearms in 1..=3 {
-        let t = opened + Duration::seconds(15 * (3 + aired_rearms));
+        let t = opened + SignedDuration::from_secs(15 * (3 + aired_rearms));
         let (aired, emissions, _) = cycle(&manager, &mut rx, c, 2, t).await;
         assert_eq!(aired, vec![c]);
         assert_eq!(emissions, 1);
@@ -142,11 +143,11 @@ async fn cap_excluded_manual_qso_keeps_its_call_budget() {
         );
         manager.check_timeouts_at(t).await;
         manager
-            .rearm_manual_calls_at(t + Duration::seconds(15))
+            .rearm_manual_calls_at(t + SignedDuration::from_secs(15))
             .await;
     }
     manager
-        .check_timeouts_at(opened + Duration::seconds(15 * 6 + 75))
+        .check_timeouts_at(opened + SignedDuration::from_secs(15 * 6 + 75))
         .await;
     assert!(manager.get_qso(c).await.is_err());
 }
@@ -170,7 +171,7 @@ async fn never_aired_qso_does_not_trip_the_stall_offset_switch() {
     // distinct own-parity TX slot — the stall counter counts own TX slots,
     // not protocol slots — and the threshold trip is phase-independent.
     for slot in 0..=6 {
-        let t = opened + Duration::seconds(slot * 30);
+        let t = opened + SignedDuration::from_secs(slot * 30);
         let (aired, _, actions) = cycle(&manager, &mut rx, b, 1, t).await;
         assert!(!aired.contains(&b));
         assert!(!actions.contains(&b));
@@ -178,7 +179,7 @@ async fn never_aired_qso_does_not_trip_the_stall_offset_switch() {
         assert_eq!(manager.get_qso(b).await.unwrap().metadata.stall_cycles, 0);
         if slot < 6 {
             manager
-                .rearm_manual_calls_at(t + Duration::seconds(30))
+                .rearm_manual_calls_at(t + SignedDuration::from_secs(30))
                 .await;
         }
     }
@@ -203,20 +204,30 @@ async fn truncated_auto_resend_is_not_spent() {
         .unwrap();
     assert!(cycle(&manager, &mut rx, c, 2, opened).await.0.contains(&c));
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(15))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(15))
         .await;
-    assert!(
-        !cycle(&manager, &mut rx, c, 1, opened + Duration::seconds(15))
-            .await
-            .0
-            .contains(&c)
-    );
+    assert!(!cycle(
+        &manager,
+        &mut rx,
+        c,
+        1,
+        opened + SignedDuration::from_secs(15)
+    )
+    .await
+    .0
+    .contains(&c));
     assert_eq!(manager.get_qso(c).await.unwrap().metadata.call_count, 1);
     manager
-        .rearm_manual_calls_at(opened + Duration::seconds(30))
+        .rearm_manual_calls_at(opened + SignedDuration::from_secs(30))
         .await;
-    let (aired, emissions, _) =
-        cycle(&manager, &mut rx, c, 2, opened + Duration::seconds(30)).await;
+    let (aired, emissions, _) = cycle(
+        &manager,
+        &mut rx,
+        c,
+        2,
+        opened + SignedDuration::from_secs(30),
+    )
+    .await;
     assert_eq!(emissions, 1);
     assert!(aired.contains(&c));
 }

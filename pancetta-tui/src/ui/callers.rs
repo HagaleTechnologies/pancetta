@@ -7,6 +7,7 @@
 //! Mirrors the DX-Hunter panel's Table + TableState structure.
 
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
@@ -309,7 +310,7 @@ mod tests {
 
     fn caller_fixture(call: &str) -> DecodedMessageView {
         DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".into(),
             snr: -15,

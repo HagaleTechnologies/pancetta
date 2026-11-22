@@ -23,6 +23,8 @@
 //! Fox response envelope. They use the standard sync threshold so a new
 //! stream is not disadvantaged relative to the previous stream.
 
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use std::ops::RangeInclusive;
 
 use pancetta_ft8::TONE_SPACING;
@@ -207,7 +209,7 @@ pub fn compute_narrow_filter_bins_default_dual(
 /// `secondary` now carries its own `expires_at` alongside the frequency
 /// (see `coordinator::qso`'s `secondary_decoder_hint_freq_for`). `now` is
 /// taken as a plain parameter rather than read internally via
-/// `chrono::Utc::now()` so this stays a pure, deterministically testable
+/// `UtcTimestamp::now()` so this stays a pure, deterministically testable
 /// function — the caller (the FT8 decode loop, which already has a `now`
 /// for this window) supplies it.
 ///
@@ -220,8 +222,8 @@ pub fn compute_narrow_filter_bins_default_dual(
 /// then is sufficient and correct.
 pub fn compute_narrow_filter_bins_dual_with_expiry(
     primary_freq_hz: Option<f64>,
-    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
-    now: chrono::DateTime<chrono::Utc>,
+    secondary: Option<(f64, UtcTimestamp)>,
+    now: UtcTimestamp,
     half_window_hz: f64,
     bin_spacing_hz: f64,
     override_off: bool,
@@ -242,8 +244,8 @@ pub fn compute_narrow_filter_bins_dual_with_expiry(
 /// the expiry-aware sibling of [`compute_narrow_filter_bins_default_dual`].
 pub fn compute_narrow_filter_bins_default_dual_with_expiry(
     primary_freq_hz: Option<f64>,
-    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
-    now: chrono::DateTime<chrono::Utc>,
+    secondary: Option<(f64, UtcTimestamp)>,
+    now: UtcTimestamp,
     override_off: bool,
 ) -> Option<RangeInclusive<usize>> {
     compute_narrow_filter_bins_dual_with_expiry(
@@ -481,12 +483,11 @@ mod tests {
     // `TxOffsetApplied` event); if no further event arrived after the grace
     // window genuinely lapsed, the stale secondary kept widening the decode
     // filter forever. These prove the expiry is now re-checked at every
-    // READ, using the caller-supplied `now` (not `chrono::Utc::now()`
+    // READ, using the caller-supplied `now` (not `UtcTimestamp::now()`
     // internally) so the tests are deterministic.
 
-    fn t(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap()
-            + chrono::Duration::seconds(offset_secs)
+    fn t(offset_secs: i64) -> UtcTimestamp {
+        UtcTimestamp::from_parts(1_700_000_000, 0).unwrap() + SignedDuration::from_secs(offset_secs)
     }
 
     #[test]

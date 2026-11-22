@@ -1,4 +1,6 @@
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -481,15 +483,15 @@ fn multi_qso_table_badge_widths() -> (usize, usize) {
 fn watchdog_line(
     call_count: u32,
     max_calls: u32,
-    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    deadline: Option<UtcTimestamp>,
 ) -> Option<String> {
     if max_calls == 0 {
         return None;
     }
     let mut s = format!("Call {}/{}", call_count, max_calls);
     if let Some(deadline) = deadline {
-        let remaining = deadline.signed_duration_since(chrono::Utc::now());
-        let secs = remaining.num_seconds();
+        let remaining = deadline.duration_since(UtcTimestamp::now());
+        let secs = remaining.as_secs();
         if secs > 0 {
             s.push_str(&format!(" · stops {}:{:02}", secs / 60, secs % 60));
         } else {
@@ -755,11 +757,7 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Build a "TX: JA1ABC K5ARH EM10 (12s ago)" style line for one
 /// direction of the last-message display. Falls back gracefully when
 /// only the timestamp or neither is known.
-fn format_direction_line(
-    label: &str,
-    text: Option<&str>,
-    at: Option<chrono::DateTime<chrono::Utc>>,
-) -> String {
+fn format_direction_line(label: &str, text: Option<&str>, at: Option<UtcTimestamp>) -> String {
     match (text, at) {
         (Some(text), Some(at)) => format!("{}: {} ({})", label, text, format_time_ago(at)),
         (Some(text), None) => format!("{}: {}", label, text),
@@ -831,19 +829,19 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Show QSO timing and progress
     let duration = if let Some(started) = qso.started_at {
-        let elapsed = chrono::Utc::now().signed_duration_since(started);
+        let elapsed = UtcTimestamp::now().duration_since(started);
         format!(
             "Duration: {}m {}s",
-            elapsed.num_minutes(),
-            elapsed.num_seconds() % 60
+            elapsed.as_mins(),
+            elapsed.as_secs() % 60
         )
     } else {
         "Duration: Unknown".to_string()
     };
 
     // FT8 cycle timing (15-second cycles)
-    let now = chrono::Utc::now();
-    let seconds_in_cycle = now.timestamp() % 15;
+    let now = UtcTimestamp::now();
+    let seconds_in_cycle = now.as_second() % 15;
     let cycle_progress = seconds_in_cycle as f64 / 15.0;
 
     let cycle_status = if seconds_in_cycle < 13 {
@@ -1125,14 +1123,14 @@ mod tests {
         assert!(watchdog_line(0, 0, None).is_none());
 
         // Keep-calling, future deadline → "Call 4/10 · stops M:SS".
-        let deadline = chrono::Utc::now() + chrono::Duration::seconds(192);
+        let deadline = UtcTimestamp::now() + SignedDuration::from_secs(192);
         let line = watchdog_line(4, 10, Some(deadline)).expect("line");
         assert!(line.starts_with("Call 4/10 · stops "), "got {line}");
         // ~3:12 (allow drift): minutes component present, MM:SS format.
         assert!(line.contains(':'), "got {line}");
 
         // Past deadline → "stops now".
-        let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let past = UtcTimestamp::now() - SignedDuration::from_secs(5);
         let line = watchdog_line(10, 10, Some(past)).expect("line");
         assert_eq!(line, "Call 10/10 · stops now");
 
@@ -1160,7 +1158,7 @@ mod tests {
         // Same representative watchdog text PAN-142's own doc comments
         // cite ("Call 4/25 · stops 3:12" shape), plus the "  " prefix
         // `render_multi_qso_table` adds before it.
-        let deadline = chrono::Utc::now() + chrono::Duration::seconds(192);
+        let deadline = UtcTimestamp::now() + SignedDuration::from_secs(192);
         let watchdog = watchdog_line(4, 25, Some(deadline)).expect("max_calls > 0");
         let watchdog_width = watchdog.chars().count() + 2;
 
@@ -1205,7 +1203,7 @@ mod tests {
     /// time-ago suffix, degrading gracefully when either is missing.
     #[test]
     fn test_format_direction_line() {
-        let at = chrono::Utc::now() - chrono::Duration::seconds(12);
+        let at = UtcTimestamp::now() - SignedDuration::from_secs(12);
         let line = format_direction_line("TX", Some("JA1ABC K5ARH EM10"), Some(at));
         assert!(line.starts_with("TX: JA1ABC K5ARH EM10 ("));
         assert!(line.ends_with(')'));
@@ -1376,12 +1374,12 @@ mod tests {
             QsoHistoryItem {
                 call_sign: "K5ARH".to_string(),
                 success: true,
-                completed_at: chrono::Utc::now(),
+                completed_at: UtcTimestamp::now(),
             },
             QsoHistoryItem {
                 call_sign: "JA1ABC".to_string(),
                 success: false,
-                completed_at: chrono::Utc::now(),
+                completed_at: UtcTimestamp::now(),
             },
         ];
         let theme = Theme::DARK;
@@ -1408,7 +1406,7 @@ mod tests {
             frequency: 14_074_000.0,
             band: None,
             mode: "FT8".to_string(),
-            last_seen: chrono::Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr: -10,
             distance: None,
             bearing: None,

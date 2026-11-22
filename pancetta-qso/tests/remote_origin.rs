@@ -6,6 +6,7 @@
 //! proof that the flag flows through the reply ladder — the security-critical
 //! property that a remote-initiated QSO's TX is armed-TX gated end to end.
 
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
 use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig};
 
@@ -602,7 +603,7 @@ async fn an_identity_denied_rearm_alone_never_retires_the_qso() {
         .unwrap();
     for slot in 1..=4 {
         manager
-            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15 * slot))
+            .rearm_manual_calls_at(opened + SignedDuration::from_secs(15 * slot))
             .await;
     }
     assert!(manager.get_qso(a).await.unwrap().state.is_active());

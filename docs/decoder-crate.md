@@ -29,7 +29,7 @@ pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "
 Default features only. The default build includes the encoder and modulator
 (`Ft8Encoder`, `Ft8Modulator`) and every decoder pass the station runs
 (PAN-331). Opt-in features stay off: `transmit` (adds the audio/PTT
-transmitter, `Ft8Transmitter`, turns on the `serde` feature, and pulls `cpal`, `serialport`, `chrono`,
+transmitter, `Ft8Transmitter`, turns on the `serde` feature, and pulls `cpal`, `serialport`,
 `parking_lot`, `tokio`, `serde`, `serde_json`, `sha2`), `gpio` (`rppal`), `benchmark` (`hound`, `serde`, `serde_json`,
 `sha2`), `ft2`, `ffi`, `debug-decode`, `serde`. Default is `std` +
 `neural_osd`.
@@ -139,7 +139,7 @@ dependency tree must contain no audio-device, rig-control or network
 crate; `--features transmit` must pull them (proving the gate can bite);
 and a default build must compile the real C decoder (`libft8_lib.a`) when
 the submodule is initialized. The only in-repo dependency is `pancetta-core`
-(`serde`, `serde_json`, `thiserror`, `chrono` — none of them audio, rig or
+(`serde`, `serde_json`, `jiff`, `dirs` — none of them audio, rig or
 network).
 
 ## Submodule / C decoder

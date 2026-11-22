@@ -11,7 +11,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{NaiveTime, Timelike};
+use jiff::civil;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Minutes in one UTC day; the only legal value above 23:59, and only as an end.
@@ -40,9 +40,9 @@ impl UtcWindow {
     ///
     /// When `start > end` the window wraps midnight: it contains every time at
     /// or after `start` and every time before `end`.
-    pub fn contains(&self, t: NaiveTime) -> bool {
+    pub fn contains(&self, t: civil::Time) -> bool {
         // Truncate to the minute: the window boundaries are whole minutes.
-        let minute = (t.hour() * 60 + t.minute()) as u16;
+        let minute = (i16::from(t.hour()) * 60 + i16::from(t.minute())) as u16;
         if self.start_min < self.end_min {
             minute >= self.start_min && minute < self.end_min
         } else {
