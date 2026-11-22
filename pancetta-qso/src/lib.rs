@@ -131,6 +131,10 @@ pub use crate::fox::*;
 pub use crate::frequency::*;
 pub use crate::priority::*;
 pub use crate::qso_manager::*;
+pub use crate::sig_reference::{
+    ActivationReference, WorkedReference, WorkedReferenceBook, MY_SIG_INFO_TAG, MY_SIG_TAG,
+    SIG_INFO_TAG, SIG_TAG, WORKED_REFERENCE_MAX_AGE,
+};
 pub use crate::states::*;
 pub use crate::statistics::*;
 pub use crate::watchlist::*;
@@ -151,6 +155,7 @@ pub mod frequency;
 pub mod logbook_lock;
 pub mod priority;
 pub mod qso_manager;
+pub mod sig_reference;
 pub mod states;
 pub mod statistics;
 

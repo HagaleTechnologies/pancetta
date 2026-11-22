@@ -32,6 +32,7 @@ fn manager_with(max_calls: u32, watchdog_min: u64) -> QsoManager {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: "FT8".to_string(),
+        activation: crate::sig_reference::ActivationReference::default(),
     };
     config.timeouts.manual_call_max_calls = max_calls;
     config.timeouts.manual_call_watchdog_minutes = watchdog_min;

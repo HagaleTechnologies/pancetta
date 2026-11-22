@@ -47,6 +47,20 @@ pub struct StationConfig {
     /// Contest station category (for contest logging)
     pub contest_category: Option<String>,
 
+    /// Your own special-activity programme (for example `"POTA"` or
+    /// `"SOTA"`), written as ADIF `MY_SIG` on every logged QSO (PAN-359).
+    /// Trimmed; empty or blank writes nothing. At most
+    /// [`MY_SIG_MAX_CHARS`] printable ASCII characters, no `<` or `>`.
+    /// Restart required.
+    pub my_sig: Option<String>,
+
+    /// Your own reference in that programme (for example `"K-1234"` or
+    /// `"W2/WE-003"`), written as ADIF `MY_SIG_INFO` on every logged QSO
+    /// (PAN-359). Trimmed; empty or blank writes nothing. At most
+    /// [`MY_SIG_INFO_MAX_CHARS`] printable ASCII characters, no `<` or `>`.
+    /// Restart required.
+    pub my_sig_info: Option<String>,
+
     /// Custom fields for extensibility
     #[serde(default)]
     pub custom_fields: HashMap<String, String>,
@@ -71,6 +85,13 @@ pub struct StationConfig {
     #[serde(default = "default_ptt_lead_ms")]
     pub ptt_lead_ms: u64,
 }
+
+/// Longest `[station] my_sig` accepted, in characters after trimming (PAN-359).
+pub const MY_SIG_MAX_CHARS: usize = 32;
+
+/// Longest `[station] my_sig_info` accepted, in characters after trimming
+/// (PAN-359).
+pub const MY_SIG_INFO_MAX_CHARS: usize = 64;
 
 fn default_tx_late_max_ms() -> u64 {
     3000
@@ -178,6 +199,8 @@ impl Default for StationConfig {
             }],
             operator_name: None,
             contest_category: None,
+            my_sig: None,
+            my_sig_info: None,
             custom_fields: HashMap::new(),
             tx_late_max_ms: 3000,
             tx_self_parity: TxSelfParity::Auto,
@@ -202,6 +225,7 @@ impl ConfigSection for StationConfig {
         self.validate_grid_square()?;
         self.validate_coordinates()?;
         self.validate_antennas()?;
+        self.validate_sig_fields()?;
 
         Ok(())
     }
@@ -252,6 +276,16 @@ impl ConfigSection for StationConfig {
 
         if other.contest_category.is_some() {
             self.contest_category = other.contest_category;
+        }
+
+        // PAN-359: `Some("")` from a higher layer clears a lower layer's
+        // activation reference; `None` keeps it (SkipNone).
+        if other.my_sig.is_some() {
+            self.my_sig = other.my_sig;
+        }
+
+        if other.my_sig_info.is_some() {
+            self.my_sig_info = other.my_sig_info;
         }
 
         if other.tx_late_max_ms != 0 {
@@ -331,6 +365,35 @@ impl StationConfig {
         let cq = self.cq_zone;
         check("cq_zone", "range", cq.into(), 1, 40, Value::from(cq));
         errors
+    }
+
+    /// Validate `my_sig` and `my_sig_info` (PAN-359): after trimming, at
+    /// most [`MY_SIG_MAX_CHARS`] / [`MY_SIG_INFO_MAX_CHARS`] characters,
+    /// each printable ASCII (`' '..='~'`) other than `<` and `>`, which
+    /// would break the ADIF field syntax. Empty and blank values pass and
+    /// mean "unset".
+    fn validate_sig_fields(&self) -> ConfigResult<()> {
+        let rows = [
+            ("station.my_sig", self.my_sig.as_deref(), MY_SIG_MAX_CHARS),
+            (
+                "station.my_sig_info",
+                self.my_sig_info.as_deref(),
+                MY_SIG_INFO_MAX_CHARS,
+            ),
+        ];
+        for (field, value, max) in rows {
+            let Some(raw) = value else { continue };
+            let trimmed = raw.trim();
+            let printable = trimmed
+                .chars()
+                .all(|c| matches!(c, ' '..='~') && c != '<' && c != '>');
+            if !printable || trimmed.chars().count() > max {
+                return Err(ConfigError::Validation(format!(
+                    "{field} must be at most {max} printable ASCII characters other than < and >, got {raw:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Validate the callsign format and characters
@@ -686,3 +749,10 @@ mod tests {
 #[allow(clippy::field_reassign_with_default)]
 #[path = "station/tests/station_bounds_tests.rs"]
 mod station_bounds_tests;
+
+#[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
+#[path = "station/tests/activation_reference_tests.rs"]
+mod activation_reference_tests;

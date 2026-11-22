@@ -63,6 +63,55 @@ pub struct NeededGridsResponse {
     pub grids: Vec<String>,
 }
 
+// --- POTA/SOTA activations ---
+
+/// Envelope for `GET /api/v1/pota`: cqdx.io's current POTA and SOTA
+/// activations (PAN-359).
+///
+/// pancetta reads only `activations[].{callsign,type,reference,spotTime}`;
+/// `byCallsign`, `updatedAt` and every other field are ignored. The route
+/// is not in dispensa's frozen `cqdx-api.v1` set, so every field is
+/// optional and a `null` string reads as empty.
+///
+/// ```json
+/// {"activations":[{"callsign":"7N1ICA/1","type":"sota","reference":"JA/YN-036",
+///   "name":"Onigatake","frequency":"7.005","mode":"CW",
+///   "spotTime":"2026-11-06T02:48:13.285492Z"}],
+///  "byCallsign":{"7N1ICA/1":[...]},"updatedAt":1793934000}
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ActivationsResponse {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub activations: Vec<Activation>,
+}
+
+/// One row of [`ActivationsResponse::activations`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Activation {
+    /// The activator's callsign as the programme spotted it.
+    #[serde(deserialize_with = "null_as_default")]
+    pub callsign: String,
+    /// Programme: `"pota"` or `"sota"` today.
+    #[serde(rename = "type", deserialize_with = "null_as_default")]
+    pub program: String,
+    /// Park or summit reference (for example `"DA-0123"`, `"JA/YN-036"`).
+    #[serde(deserialize_with = "null_as_default")]
+    pub reference: String,
+    /// RFC 3339 time of the spot, when the source gave one.
+    #[serde(rename = "spotTime")]
+    pub spot_time: Option<String>,
+}
+
+/// Read `null` as the type's default instead of failing the whole feed.
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 // --- Live Spot Groups ---
 
 /// A spot group from the cqdx.io live feed, aggregated by (dxCall, band, mode).
