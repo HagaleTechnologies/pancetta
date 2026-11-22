@@ -1654,6 +1654,10 @@ impl fmt::Display for AdifField {
 }
 
 #[cfg(test)]
+#[path = "adif/tests/stored_timestamp_bytes_tests.rs"]
+mod stored_timestamp_bytes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
