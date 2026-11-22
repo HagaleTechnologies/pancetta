@@ -785,3 +785,124 @@ async fn data_mode_refuses_cat_mutations_while_the_line_is_keyed() {
     assert_eq!(inner.get_frequency(Vfo::A).await.unwrap(), 7_074_000);
     plain.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
 }
+
+/// PAN-357 hand-landing: a line dropped while keyed (the coordinator unwinding
+/// after a panic, or any path that skips `release_for_shutdown`) must lower
+/// RTS before its handle closes, never leave the rig keyed.
+#[tokio::test]
+async fn dropping_the_line_lowers_rts_before_closing() {
+    let fake = FakeLines::default();
+    let line = fake.line();
+    line.configure(Some(DEV.into()), CAT).await.unwrap();
+    line.set(true).await.unwrap();
+    drop(line);
+    let events = fake.events();
+    assert_eq!(
+        events[events.len() - 2..],
+        [rts(DEV, false), close(DEV)],
+        "RTS low, then close: {events:?}"
+    );
+}
+
+/// PAN-357 hand-landing: a write that fails mid-transmission (adapter
+/// unplugged, ioctl error) must not leave the line keyed once the port is
+/// back: the failed unkey is retried and the reopen writes RTS low.
+#[tokio::test]
+async fn failed_unkey_write_mid_transmission_is_lowered_on_retry() {
+    let fake = FakeLines::default();
+    let line = fake.line();
+    line.configure(Some(DEV.into()), CAT).await.unwrap();
+    let rig = LineKeyedRig::new(connected_mock().await, line.clone());
+    rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+
+    fake.fail_writes.store(1, Ordering::Release);
+    assert!(rig.set_ptt(Vfo::Current, PttState::Off).await.is_err());
+    assert_eq!(
+        rig.get_ptt(Vfo::Current).await.unwrap(),
+        PttState::On,
+        "a failed unkey is reported as still keyed, so the watchdog retries"
+    );
+    rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+    assert_eq!(fake.events().last(), Some(&rts(DEV, false)));
+    assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+}
+
+/// PAN-357 hand-landing: the real opener, on a device that does not exist,
+/// fails with the device named and asserts nothing.
+#[test]
+fn real_open_of_a_missing_device_fails_and_names_it() {
+    let device = "/nonexistent/pancetta-ptt-test";
+    let err = match open_serial_rts_port(device) {
+        Ok(_) => panic!("a missing device must not open"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.starts_with(&format!("cannot open serial PTT port {device}: ")),
+        "{err}"
+    );
+}
+
+/// PAN-357 hand-landing: a device the operator may not open (permission
+/// denied, e.g. not in the `dialout` group) fails with the cause named.
+#[cfg(unix)]
+#[test]
+fn real_open_of_an_unreadable_device_reports_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root ignores file modes, so there is nothing to observe.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let device = dir.path().join("ttyFAKE");
+    std::fs::write(&device, b"").unwrap();
+    std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let device = device.to_str().unwrap().to_string();
+    let err = match open_serial_rts_port(&device) {
+        Ok(_) => panic!("an unreadable device must not open"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.starts_with(&format!("cannot open serial PTT port {device}: ")),
+        "{err}"
+    );
+    assert!(err.to_lowercase().contains("permission denied"), "{err}");
+}
+
+/// PAN-357 hand-landing: the opened port must carry HUPCL, so the kernel
+/// drops RTS (and DTR) on the last close of the fd. That is what unkeys the
+/// rig when the process dies without running any Rust code (SIGKILL, abort,
+/// OOM kill). Exercised on a pty, which has termios but no modem lines.
+#[cfg(unix)]
+#[test]
+fn hang_up_on_close_is_set_on_the_ptt_fd() {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    let read_cflag = |fd| {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+        t.c_cflag
+    };
+    // Start from a tty with HUPCL clear, as some drivers and udev rules leave it.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+    t.c_cflag &= !libc::HUPCL;
+    assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
+    assert_eq!(read_cflag(slave) & libc::HUPCL, 0);
+
+    set_hang_up_on_close(slave).unwrap();
+    assert_ne!(read_cflag(slave) & libc::HUPCL, 0, "HUPCL must be set");
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+}

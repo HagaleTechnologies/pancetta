@@ -264,3 +264,41 @@ async fn failed_open_is_reported_and_retried_on_key_down() {
     wait_rts(&fake, &rig, false, Duration::from_secs(5)).await;
     c.shutdown().await.unwrap();
 }
+
+/// PAN-357 hand-landing: the existing PTT safety watchdog (14 s ceiling)
+/// drives the serial line too. A key-down nobody unkeys (a stuck or crashed
+/// producer) has RTS forced low by the watchdog, not left asserted.
+#[tokio::test]
+async fn watchdog_lowers_rts_when_a_transmission_overruns() {
+    let fake = FakeLines::default();
+    let (c, rig, _scratch) = started_on(&fake).await;
+    manual_ptt(&c, true);
+    let keyed_at = wait_rts(&fake, &rig, true, Duration::from_secs(5)).await;
+    // No unkey is ever sent. The watchdog ticks every second after 14 s.
+    let unkeyed_at = wait_rts(&fake, &rig, false, Duration::from_secs(20)).await;
+    let held = unkeyed_at - keyed_at;
+    assert!(
+        held >= Duration::from_secs(13),
+        "the watchdog, not an early unkey, lowered RTS after {held:?}"
+    );
+    assert!(!c.ptt_line.is_asserted());
+    c.shutdown().await.unwrap();
+}
+
+/// PAN-357 hand-landing: an unkey whose RTS write fails mid-transmission is
+/// retried by the watchdog on its next tick (PAN-272 `ptt_unkey_failed`), and
+/// the retry reopens the port, which writes RTS low.
+#[tokio::test]
+async fn watchdog_retries_a_failed_rts_unkey_until_the_line_is_low() {
+    let fake = FakeLines::default();
+    let (c, rig, _scratch) = started_on(&fake).await;
+    manual_ptt(&c, true);
+    wait_rts(&fake, &rig, true, Duration::from_secs(5)).await;
+    fake.fail_writes.store(1, Ordering::Release);
+    manual_ptt(&c, false);
+    // Well inside the 14 s ceiling: the failed unkey is retried at once.
+    wait_rts(&fake, &rig, false, Duration::from_secs(5)).await;
+    assert_eq!(fake.opens(), 2, "the retry reopened the port to lower RTS");
+    assert!(!c.ptt_line.is_asserted());
+    c.shutdown().await.unwrap();
+}

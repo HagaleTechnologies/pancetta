@@ -39,14 +39,53 @@ impl RtsLine for Box<dyn serialport::SerialPort> {
 
 /// Open `device` for RTS keying and drop RTS at once. Linux raises DTR and
 /// RTS when a port opens, so the low write must come before anything else.
+/// On unix the port also gets HUPCL, so the kernel drops RTS when the fd
+/// closes however the process ends; a port that cannot take it is refused.
 fn open_port_raw(device: &str) -> serialport::Result<Box<dyn serialport::SerialPort>> {
-    let mut port = serialport::new(device, 9600)
+    let builder = serialport::new(device, 9600)
         .flow_control(serialport::FlowControl::None)
         .dtr_on_open(false)
-        .timeout(Duration::from_secs(2))
-        .open()?;
-    port.write_request_to_send(false)?;
-    Ok(port)
+        .timeout(Duration::from_secs(2));
+    #[cfg(unix)]
+    {
+        use serialport::SerialPort as _;
+        use std::os::unix::io::AsRawFd;
+        let mut port = serialport::TTYPort::open(&builder)?;
+        port.write_request_to_send(false)?;
+        set_hang_up_on_close(port.as_raw_fd()).map_err(|e| {
+            serialport::Error::new(
+                serialport::ErrorKind::Io(e.kind()),
+                format!("cannot set HUPCL (drop RTS on close): {e}"),
+            )
+        })?;
+        Ok(Box::new(port))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut port = builder.open()?;
+        port.write_request_to_send(false)?;
+        Ok(port)
+    }
+}
+
+/// Set HUPCL on a tty, so the kernel drops the modem lines (RTS and DTR)
+/// on the last close of the port. That unkeys the rig when the process dies
+/// without running any Rust code (SIGKILL, abort, OOM kill); `cfmakeraw`
+/// leaves HUPCL as the tty had it, and some drivers or udev rules clear it.
+#[cfg(unix)]
+pub(crate) fn set_hang_up_on_close(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is an open tty the caller owns for the duration of the
+    // call; `termios` is plain data that `tcgetattr` fills in completely.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    termios.c_cflag |= libc::HUPCL;
+    // SAFETY: as above; `termios` came from `tcgetattr` on the same fd.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Open a serial PTT port with RTS low. The baud rate does not matter for
@@ -285,6 +324,23 @@ impl PttLine {
             state.shut = true;
         }
         self.set_blocking(false)
+    }
+}
+
+impl Drop for PttLine {
+    /// Lower RTS before the handle closes: a line dropped without
+    /// `release_for_shutdown` (the coordinator unwinding after a panic) must
+    /// never leave the rig keyed. Best effort; HUPCL backs it on unix.
+    fn drop(&mut self) {
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(handle) = state.handle.as_mut() {
+            if let Err(e) = handle.write_rts(false) {
+                tracing::warn!("Serial PTT: could not lower RTS while closing the port: {e}");
+            }
+        }
     }
 }
 
