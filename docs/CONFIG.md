@@ -289,7 +289,7 @@ baud_rate = 38400
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `model` | string | `"Generic"` | A model name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, ...) or a numeric Hamlib model ID (`"1045"`). Case, hyphens and spaces are ignored; ambiguous names require the numeric ID; for an all-digit model name include the manufacturer (`"Barrett 950"`). Unknown, malformed or ambiguous values fail validation with the closest matches and numeric-ID hint. Empty and `"Generic"` stay placeholders (no model check). See [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md). |
-| `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
+| `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. `rig.ptt.method` is checked only while it is true. |
 | `interface.port` | string | `"/dev/ttyUSB0"` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
 
@@ -342,6 +342,14 @@ to disable automatic mode control.
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
+
+### `[rig.ptt]` — how a transmission keys the rig
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `method` | string | `"none"` | `"none"` and `"cat"` key through rigctld (`T 1`/`T 0`). `"serial_rts"` (or `"serial-rts"`) asserts RTS on `device` for each transmission; rigctld still sets frequency and reads meters. With `[rig.interface].enabled = true`, `"serial"`, `"vox"`, `"parallel"`, `"usb"`, `"sound_card"` and `"network"` fail validation as not implemented. Restart to apply. |
+| `device` | string | absent | Serial port whose RTS line keys the rig. Required by `"serial_rts"`; must not be `[rig.interface].port`. |
+| `polarity` | string | `"positive"` | `"serial_rts"` asserts RTS to transmit; `"negative"` is refused for it. |
 
 ### `[rig.receive_overload_guard]` receive overload protection
 
