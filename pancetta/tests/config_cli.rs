@@ -12,6 +12,9 @@
 //! non-terminal startup never prompts; and `config --validate` never offers
 //! repair even with a terminal on stdin.
 //!
+//! PAN-360: discovery never reads the working directory. A `pancetta.toml`
+//! in the cwd is used only when named with `--config`.
+//!
 //! Each test runs the binary with `$HOME`/XDG pinned to a scratch directory
 //! and an empty scratch cwd, so config discovery sees only what the test
 //! wrote (same env pinning as `replay_mode.rs`'s `ScratchStation`).
@@ -274,34 +277,108 @@ fn validate_with_no_config_file_reports_defaults() {
     assert!(text.contains("N0CALL"), "{text}");
 }
 
+/// PAN-360 scenario 1: with a config in `~/.pancetta` and another in the
+/// working directory, startup without `--config` uses the home file only.
 #[test]
-fn validate_fails_on_broken_file_in_cwd() {
+fn validate_ignores_config_in_cwd() {
+    let s = Scratch::new();
+    let home_file =
+        s.write_default_config("[station]\ncallsign = \"K9HOME\"\ngrid_square = \"EN52\"\n");
+    let cwd_file = s.cwd.path().join("pancetta.toml");
+    std::fs::write(
+        &cwd_file,
+        "[station]\ncallsign = \"K1CWD\"\ngrid_square = \"FN31\"\n",
+    )
+    .unwrap();
+
+    let out = s.validate(None);
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout: {text}\nstderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        text.contains(&format!("Config file: {}", home_file.display())),
+        "{text}"
+    );
+    assert!(!text.contains(&cwd_file.display().to_string()), "{text}");
+    let canonical_cwd_file = std::fs::canonicalize(&cwd_file).unwrap();
+    assert!(
+        !text.contains(&canonical_cwd_file.display().to_string()),
+        "{text}"
+    );
+    assert!(text.contains("Configuration validation: PASS"), "{text}");
+
+    let show = s.command().args(["config", "--show"]).output().unwrap();
+    let shown = stdout(&show);
+    assert!(
+        show.status.success(),
+        "stdout: {shown}\nstderr: {}",
+        stderr(&show)
+    );
+    assert!(shown.contains("Station: K9HOME"), "{shown}");
+    assert!(!shown.contains("K1CWD"), "{shown}");
+}
+
+/// PAN-360: a broken `pancetta.toml` in the working directory is never read,
+/// so with no other config validation passes on built-in defaults and never
+/// mentions the file.
+#[test]
+fn validate_ignores_broken_file_in_cwd() {
     let s = Scratch::new();
     let path = s.cwd.path().join("pancetta.toml");
     std::fs::write(&path, SYNTAX_ERROR).unwrap();
     let out = s.validate(None);
-    assert!(!out.status.success(), "stdout: {}", stdout(&out));
-    // The error names the file it could not load: the cwd copy. The binary
-    // sees its cwd with symlinks resolved, so compare against that form.
-    let cwd_file = std::fs::canonicalize(s.cwd.path())
-        .unwrap()
-        .join("pancetta.toml");
+    let (out_text, err_text) = (stdout(&out), stderr(&out));
     assert!(
-        stderr(&out).contains(&format!(
-            "config file {} failed to load",
-            cwd_file.display()
-        )),
-        "stderr: {}",
+        out.status.success(),
+        "stdout: {out_text}\nstderr: {err_text}"
+    );
+    assert!(out_text.contains("No config file found"), "{out_text}");
+    let canonical = std::fs::canonicalize(&path).unwrap();
+    for text in [&out_text, &err_text] {
+        assert!(!text.contains("FAILED TO LOAD"), "{text}");
+        assert!(!text.contains(&path.display().to_string()), "{text}");
+        assert!(!text.contains(&canonical.display().to_string()), "{text}");
+    }
+}
+
+/// PAN-360 scenario 2: an explicit relative `--config ./pancetta.toml`
+/// still reads the cwd file, ahead of a different `~/.pancetta` file.
+#[test]
+fn validate_reads_relative_config_flag_in_cwd() {
+    let s = Scratch::new();
+    let home_file =
+        s.write_default_config("[station]\ncallsign = \"K9HOME\"\ngrid_square = \"EN52\"\n");
+    std::fs::write(
+        s.cwd.path().join("pancetta.toml"),
+        "[station]\ncallsign = \"K1CWD\"\ngrid_square = \"FN31\"\n",
+    )
+    .unwrap();
+
+    let out = s.validate(Some(Path::new("./pancetta.toml")));
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout: {text}\nstderr: {}",
         stderr(&out)
     );
+    assert!(text.contains("Config file: ./pancetta.toml"), "{text}");
+    assert!(!text.contains(&home_file.display().to_string()), "{text}");
+
+    let show = s
+        .command()
+        .args(["--config", "./pancetta.toml", "config", "--show"])
+        .output()
+        .unwrap();
+    let shown = stdout(&show);
     assert!(
-        stdout(&out).contains(&format!(
-            "{} — FAILED TO LOAD",
-            path.file_name().unwrap().to_string_lossy()
-        )),
-        "stdout: {}",
-        stdout(&out)
+        show.status.success(),
+        "stdout: {shown}\nstderr: {}",
+        stderr(&show)
     );
+    assert!(shown.contains("Station: K1CWD"), "{shown}");
 }
 
 #[test]
@@ -317,8 +394,9 @@ fn validate_reports_unknown_key_warning_for_config_flag() {
 /// PAN-301 scenario 1: plain `--headless` startup (no WAV fixture) stops on
 /// a malformed discovered file before station initialization — nonzero exit
 /// naming the file and the parser's source line, no success log (info
-/// logging is on), no repair offer, file untouched. Both discovery
-/// locations, the home file and the cwd file, are covered separately.
+/// logging is on), no repair offer, file untouched. Two discovery
+/// locations, the home file and the `~/.config/pancetta` file, are covered
+/// separately (PAN-360: the cwd is no longer one).
 #[test]
 fn headless_startup_refuses_broken_config() {
     // Discovered ~/.pancetta/pancetta.toml.
@@ -339,20 +417,18 @@ fn headless_startup_refuses_broken_config() {
     assert!(!all.contains("Re-run first-time setup"), "{all}");
     assert_eq!(std::fs::read(&path).unwrap(), before, "file changed");
 
-    // Discovered pancetta.toml in the working directory. The binary sees
-    // its cwd with symlinks resolved, so compare against that form.
+    // Discovered ~/.config/pancetta/pancetta.toml (the scratch pins
+    // XDG_CONFIG_HOME to <home>/.config).
     let s = Scratch::new();
-    let path = s.cwd.path().join("pancetta.toml");
+    let path = s.home.path().join(".config/pancetta/pancetta.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, SYNTAX_ERROR_LINE_2).unwrap();
     let before = std::fs::read(&path).unwrap();
     let out = s.command().output().unwrap();
     let all = format!("{}{}", stdout(&out), stderr(&out));
     assert_eq!(out.status.code(), Some(1), "{all}");
-    let cwd_file = std::fs::canonicalize(s.cwd.path())
-        .unwrap()
-        .join("pancetta.toml");
     assert!(
-        stderr(&out).contains(&cwd_file.display().to_string()),
+        stderr(&out).contains(&path.display().to_string()),
         "stderr: {}",
         stderr(&out)
     );

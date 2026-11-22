@@ -1446,7 +1446,7 @@ is still `~/.pancetta`.
 3. With `--data-dir` and no `--config`, config discovery searches only the
    data directory, plus embedded defaults and `PANCETTA_*` overrides. This
    applies at startup, on reload, in de-brick recovery and in
-   `config --validate`. Merging the usual six places would let a 40 m
+   `config --validate`. Merging the usual five places would let a 40 m
    station silently read the 20 m station's `~/.pancetta/pancetta.toml`.
    With `--config`, the file is read as before.
 4. An explicit config value still wins over the data directory for
@@ -1574,3 +1574,26 @@ non-manifest PR merge should show both heavy lanes skipped with the summary
 line present, and the first push after this change's own merge runs in full
 (it changes `.github/workflows/ci.yml`, a cache-key input — the exception
 exercising itself).
+
+## No config discovery in the working directory (PAN-360, 2026-11-22)
+
+1. The current directory is no longer a config search location. It was
+   the first row of the default search, so the same user and `HOME` got a
+   different station depending on where the shell was. A stray
+   `pancetta.toml` in a shared directory could also leak fields that
+   survive a later file under the merge rules (`SkipNone` fields such as
+   `station.operator_name` and `rig.data_mode`, `Extend` maps such as
+   `network.custom_services`) past a good `~/.pancetta` file (review
+   L2-32).
+2. The other five rows, the file-name order, the merge rules and
+   `--config` are unchanged. `--config ./pancetta.toml` still reads a
+   file in the working directory, resolved against it.
+3. No hint is printed for a `pancetta.toml` in the working directory that
+   is now ignored. A hint would stat the directory the change says must
+   not matter. A lost cwd config fails safe: the station falls back to
+   `N0CALL`, which refuses to transmit, and `config --validate` lists every
+   file read.
+4. The built-in defaults source always loads the embedded defaults. It
+   carried the relative path `defaults.toml`, so a file of that name in
+   the working directory replaced the defaults without appearing in the
+   `config --validate` report.
