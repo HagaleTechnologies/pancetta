@@ -957,6 +957,45 @@ median-DT clock estimate (it mixes our clock error with audio latency and other 
 no TX inhibit on large skew (a product decision for its own ticket). The in-session skew monitor is
 recorded in `config-and-platform.md`, its title-bar chip in `tui.md`.
 
+## One UTC slot clock (PAN-358, 2026-11-22)
+
+**First slice.** `pancetta_core::SlotClock` is one cloneable clock owned by the coordinator over
+the same `active_slot_ns` atomic. Each read samples the wall and monotonic sources under one lock
+and records a numbered `ClockEvent` when they diverge by 250 ms or more (`CLOCK_STEP_THRESHOLD_MS`),
+so a reading whose time is post-step always carries the post-step epoch. A step of 1 s or more
+(`SLOT_RESYNC_THRESHOLD_MS`) is also a resync. This replaces the PAN-114 deadline-band classifier
+(D2) as the detector for the consumers that now read the clock; its blind zone depended on where
+in the slot the step landed.
+
+- `pancetta_core::slot_timer::SlotTimer` is the old autonomous `SlotTicker` moved to core, with the
+  PAN-72 Fix B and PAN-133 rules unchanged. A resync re-anchors it to the first phase after the
+  event's `observed_at`, without firing (replaces PAN-114 D3 "fire once" for the autonomous
+  tick); a deadline more than one period late with no step re-anchors as `Lagged`.
+- The autonomous tick reads the clock, clears `slot_messages` on a resync or lag in either
+  direction, and passes the reading's `now` to the operator's decode feed, whose untracked-parity
+  fallback now uses that `now`.
+- The DSP decode-window cutter reads the clock through its own `SlotTimer` at the decode phase
+  (replaces PAN-114 D4 and `reanchor_decode_window`). A resync in either direction, or a deadline
+  more than one slot late with no step, re-anchors the window without emitting, flushes the buffer,
+  bumps the overload capture epoch and invalidates sweep captures; the WARN on
+  `pancetta::slot_clock` says which. A sub-second step keeps buffer and deadline. The overload
+  measurement's slot index counts the active period, not 15 s.
+- The clock-skew monitor has no detector of its own. It reports the clock's events: steps of 1 s or
+  more keep the "re-anchored to UTC" text, smaller ones read "under 1 s, slot timing kept".
+- `coordinator/slot_clock_driver.rs` reads the clock every 250 ms and publishes each new event on a
+  `watch` channel. The queued-call TTL task runs a pass on each event as well as every 15 s.
+  Queued calls are stamped with `ClockStamp` from the same clock; the PAN-289 age rule is unchanged.
+- The QSO watchdog reads the clock through `QsoManager::set_slot_clock` and has no detector of its
+  own. `watchdog_pass` resets active budgets (PAN-296, unchanged policy) when the clock's epoch moved,
+  anchored at the latest event's `observed_at`, so the budget runs from the step whichever reader saw
+  it first. `ClockStepDetector` is deleted.
+- `pancetta/tests/slot_clock_invariant.rs` keeps the deleted per-site items out of the scanned crates
+  and checks that each consumer above stays wired to the coordinator's clock.
+
+Still on its own PAN-114 checks until the follow-up lands: the TX worker's pre-PTT wait and Step 6
+hold (D5, D6: `ptt_wait_step` and `ptt_hold_exceeds_bound`). `classify_deadline_jump` no longer has
+a production caller.
+
 ## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
 
 Six-lane review L5 H-7: the `tx_late_max_ms` default was 8000 ms, past the mathematical floor of

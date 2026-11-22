@@ -1,6 +1,6 @@
 use super::{
     compute_manual_tx_offset, compute_spot_call_tx_offset, drain_parked_calls_on_band_change,
-    partition_pending_calls, PendingManualCall, QueueStamp,
+    partition_pending_calls, ClockStamp, PendingManualCall,
 };
 use pancetta_core::slot::SlotParity;
 use std::collections::VecDeque;
@@ -12,7 +12,7 @@ fn call(name: &str, dx: SlotParity) -> PendingManualCall {
         callsign: name.to_string(),
         frequency_hz: 1500.0,
         dx_parity: Some(dx),
-        queued_at: QueueStamp::now(),
+        queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
         hound: false,
         fox_freq_hz: None,
         fox_grid: None,
@@ -125,7 +125,7 @@ fn caller_call(name: &str, dx: SlotParity, step: pancetta_core::ResponseStep) ->
         callsign: name.to_string(),
         frequency_hz: 1500.0,
         dx_parity: Some(dx),
-        queued_at: QueueStamp::now(),
+        queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
         hound: false,
         fox_freq_hz: None,
         fox_grid: None,
@@ -272,17 +272,18 @@ use super::partition_expired;
 
 /// Build a call whose `queued_at` is `age` in the past on both clocks.
 fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingManualCall {
-    let now = QueueStamp::now();
+    let now = crate::coordinator::qso::test_queue_clock().stamp();
     PendingManualCall {
         callsign: name.to_string(),
         frequency_hz: 1500.0,
         dx_parity: Some(dx),
-        queued_at: QueueStamp {
+        queued_at: ClockStamp {
             mono: now
                 .mono
                 .checked_sub(age)
                 .expect("Instant underflow in test"),
-            wall: now.wall - jiff::SignedDuration::try_from(age).expect("age fits chrono"),
+            wall: now.wall
+                - jiff::SignedDuration::try_from(age).expect("age fits a SignedDuration"),
         },
         hound: false,
         fox_freq_hz: None,
@@ -301,7 +302,7 @@ fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingMan
 fn fresh_calls_are_kept() {
     let ttl = std::time::Duration::from_secs(600);
     let q: VecDeque<_> = [call("A", SlotParity::Even), call("B", SlotParity::Odd)].into();
-    let now = QueueStamp::now();
+    let now = crate::coordinator::qso::test_queue_clock().stamp();
     let (kept, expired) = partition_expired(q, now, ttl);
     assert_eq!(kept.len(), 2);
     assert!(expired.is_empty());
@@ -319,7 +320,7 @@ fn expired_calls_are_removed_and_returned() {
         aged_call("C", SlotParity::Even, std::time::Duration::from_secs(720)),
     ]
     .into();
-    let now = QueueStamp::now();
+    let now = crate::coordinator::qso::test_queue_clock().stamp();
     let (kept, expired) = partition_expired(q, now, ttl);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].callsign, "B");
@@ -331,7 +332,7 @@ fn exact_ttl_boundary_expires() {
     // A call that is exactly TTL old should be retired (>=, not >).
     let ttl = std::time::Duration::from_secs(600);
     let q: VecDeque<_> = [aged_call("X", SlotParity::Even, ttl)].into();
-    let now = QueueStamp::now();
+    let now = crate::coordinator::qso::test_queue_clock().stamp();
     let (kept, expired) = partition_expired(q, now, ttl);
     assert!(kept.is_empty());
     assert_eq!(expired, vec!["X"]);
@@ -341,7 +342,7 @@ fn exact_ttl_boundary_expires() {
 fn empty_queue_partition_expired_is_noop() {
     let (kept, expired) = partition_expired(
         VecDeque::new(),
-        QueueStamp::now(),
+        crate::coordinator::qso::test_queue_clock().stamp(),
         std::time::Duration::from_secs(600),
     );
     assert!(kept.is_empty());
@@ -354,11 +355,11 @@ fn empty_queue_partition_expired_is_noop() {
 /// may be negative) after `s`. Only adds to `s`, so a freshly booted CI
 /// host cannot underflow an `Instant`.
 fn stamp_after(
-    s: QueueStamp,
+    s: ClockStamp,
     mono_elapsed: std::time::Duration,
     wall_elapsed: jiff::SignedDuration,
-) -> QueueStamp {
-    QueueStamp {
+) -> ClockStamp {
+    ClockStamp {
         mono: s.mono + mono_elapsed,
         wall: s.wall + wall_elapsed,
     }
@@ -436,7 +437,7 @@ fn queued_call_with_held_offset_opens_at_held_hz() {
         callsign: "DX1ABC".to_string(),
         frequency_hz: 900.0, // DX decoded at 900 Hz
         dx_parity: Some(SlotParity::Even),
-        queued_at: QueueStamp::now(),
+        queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
         hound: false,
         fox_freq_hz: None,
         fox_grid: None,
@@ -467,7 +468,7 @@ fn queued_call_deconflicts_held_offset_against_active_at_promotion() {
         callsign: "DX2XYZ".to_string(),
         frequency_hz: 1200.0, // DX decoded at 1200 Hz
         dx_parity: Some(SlotParity::Odd),
-        queued_at: QueueStamp::now(),
+        queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
         hound: false,
         fox_freq_hz: None,
         fox_grid: None,
@@ -506,7 +507,7 @@ fn queued_call_auto_mode_promotes_tx_eq_rx() {
         callsign: "DX3WWW".to_string(),
         frequency_hz: 1750.0,
         dx_parity: Some(SlotParity::Even),
-        queued_at: QueueStamp::now(),
+        queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
         hound: false,
         fox_freq_hz: None,
         fox_grid: None,
@@ -586,8 +587,8 @@ async fn promotion_discards_expired_call_instead_of_starting_it() {
     let mgr = test_manager("K5ARH").await;
     let bus = MessageBus::new(1000).expect("bus");
     let mut stale = call("JA1AAA", SlotParity::Odd);
-    stale.queued_at = QueueStamp {
-        mono: std::time::Instant::now(),
+    stale.queued_at = ClockStamp {
+        mono: crate::coordinator::qso::test_queue_clock().stamp().mono,
         wall: pancetta_core::time::UtcTimestamp::now() - jiff::SignedDuration::from_mins(11),
     };
     let fresh = even_dx_call_at("JA2BBB", 1500.0);
@@ -599,6 +600,7 @@ async fn promotion_discards_expired_call_instead_of_starting_it() {
         &bus,
         &limits(1),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 
@@ -628,7 +630,15 @@ async fn promotion_starts_no_deferred_call_once_shutdown_has_begun() {
     let mut events = mgr.subscribe();
     let shutdown = std::sync::atomic::AtomicBool::new(true);
 
-    promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+    promote_pending_manual_calls(
+        &mgr,
+        &pending,
+        &bus,
+        &limits(1),
+        &shutdown,
+        &crate::coordinator::qso::test_queue_clock(),
+    )
+    .await;
 
     assert_eq!(mgr.active_qso_count().await, 0, "no QSO was started");
     assert!(
@@ -640,7 +650,15 @@ async fn promotion_starts_no_deferred_call_once_shutdown_has_begun() {
 
     // Control: with the flag clear the same call starts.
     shutdown.store(false, std::sync::atomic::Ordering::Release);
-    promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+    promote_pending_manual_calls(
+        &mgr,
+        &pending,
+        &bus,
+        &limits(1),
+        &shutdown,
+        &crate::coordinator::qso::test_queue_clock(),
+    )
+    .await;
     assert!(mgr.has_active_qso_with("JA2BBB").await);
 }
 
@@ -679,6 +697,7 @@ async fn promotion_keeps_filling_after_a_failed_open() {
         &bus,
         &limits(1),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 
@@ -712,6 +731,7 @@ async fn promotion_waits_for_the_admission_lock() {
                 &bus,
                 &lim,
                 &std::sync::atomic::AtomicBool::new(false),
+                &crate::coordinator::qso::test_queue_clock(),
             )
             .await;
         })
@@ -773,6 +793,7 @@ async fn promotion_respects_cap_from_idle() {
         &bus,
         &limits(1),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 
@@ -810,6 +831,7 @@ async fn promotion_fills_only_free_slots() {
         &bus,
         &limits(2),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 
@@ -842,6 +864,7 @@ async fn promotion_with_no_free_slot_keeps_queue_intact() {
         &bus,
         &limits(1),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 
@@ -883,6 +906,7 @@ async fn respond_to_caller_shaped_queued_call_promotes_at_its_own_step() {
         &bus,
         &limits(1),
         &std::sync::atomic::AtomicBool::new(false),
+        &crate::coordinator::qso::test_queue_clock(),
     )
     .await;
 

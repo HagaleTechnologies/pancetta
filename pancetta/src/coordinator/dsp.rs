@@ -28,6 +28,8 @@
 
 use anyhow::Result;
 use jiff::SignedDuration;
+use pancetta_core::slot_clock::SlotReading;
+use pancetta_core::slot_timer::{Reanchor, SlotTimer};
 use pancetta_core::time::SignedDurationExt as _;
 use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::Ordering;
@@ -253,7 +255,7 @@ impl DecimationStage {
 
 /// The one destructive-flush action, shared by every cause that clears the
 /// capture buffer mid-stream (gain/capture-epoch change, dial change, mode
-/// change, forward wall-clock jump; supervisor restart rebuilds the whole
+/// change, slot-clock resync or lag; supervisor restart rebuilds the whole
 /// worker). Clearing the buffer without resetting the decimation stage
 /// would splice the pre-flush filter history (or subsample phase) onto
 /// post-flush audio — a discontinuity inside the "fresh" stream.
@@ -412,34 +414,66 @@ fn mode_flush_decision(cached_mode: u8, cur_mode: u8) -> bool {
     cached_mode != cur_mode
 }
 
-/// PAN-114: re-anchor the decode-window trigger after a wall-clock jump.
-///
-/// `next_window_time` is always "the next decode phase strictly after some
-/// earlier `now`", so it never sits more than one slot ahead, and the DSP
-/// thread (fed every audio batch) never passes it by a whole slot. Outside
-/// that band the wall clock jumped: a backward NTP step left it up to the
-/// size of the step in the future (measured: 613 s of silence after a 600 s
-/// step), and a sleep/wake or forward step left it far in the past.
-///
-/// Returns `(next_phase_with_period(now, decode_phase, slot_ns), Some(jump))`
-/// on a jump and `(next_window_time, None)` otherwise, so the no-jump emit
-/// path is untouched.
-fn reanchor_decode_window(
-    now: UtcTimestamp,
-    next_window_time: UtcTimestamp,
-    decode_phase: SignedDuration,
+/// One DSP decode-window poll on the shared slot clock (PAN-358).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DecodeWindowClock {
+    /// The decode deadline has passed: emit once the buffer holds a full
+    /// window, then advance the timer. A due deadline stays due until then.
+    pub due: bool,
+    /// The buffer spans a resync or a lag: flush it, bump the overload
+    /// capture epoch and invalidate sweep captures.
+    pub flush: bool,
+    /// Why the timer re-anchored instead of firing, for the WARN line.
+    pub reanchor: Option<Reanchor>,
+}
+
+/// PAN-358: poll the decode-window timer at `reading` with the DSP's active
+/// slot period. A resync (a wall-clock step of 1 s or more, either
+/// direction) or a deadline more than one slot late with no step re-anchors
+/// the window to the first decode phase after the step without emitting,
+/// and the buffer, which spans the discontinuity, is flushed. A sub-second
+/// step keeps buffer and deadline.
+pub(super) fn decode_window_clock_step(
+    timer: &mut SlotTimer,
+    reading: &SlotReading,
     slot_ns: i64,
-) -> (
-    UtcTimestamp,
-    Option<pancetta_core::slot_clock::WallClockJump>,
-) {
-    match pancetta_core::slot_clock::classify_deadline_jump(now, next_window_time, slot_ns) {
-        Some(jump) => (
-            pancetta_core::slot::next_phase_with_period(now, decode_phase, slot_ns),
-            Some(jump),
-        ),
-        None => (next_window_time, None),
+) -> DecodeWindowClock {
+    let poll = timer.poll(reading, slot_ns);
+    // A resync re-anchors from the event's `observed_at`, which another
+    // reader of the shared clock may have taken before this read. A decode
+    // phase between the two is already past: skip it, so the flushed buffer
+    // is never emitted under a slot whose audio it does not hold.
+    if matches!(poll.reanchor, Some(Reanchor::ClockStep(_))) && timer.deadline() <= reading.now {
+        timer.advance(reading);
     }
+    DecodeWindowClock {
+        due: poll.due,
+        flush: poll.reanchor.is_some(),
+        reanchor: poll.reanchor,
+    }
+}
+
+/// The WARN text for a decode-window re-anchor.
+pub(super) fn decode_window_reanchor_text(reanchor: &Reanchor) -> String {
+    match reanchor {
+        Reanchor::ClockStep(event) => format!(
+            "DSP decode window re-anchored to UTC after a {:+.1} s clock step",
+            event.jump().signed_secs()
+        ),
+        Reanchor::Lagged { .. } => {
+            "DSP decode window more than one slot late; re-anchored to UTC (no clock step)"
+                .to_string()
+        }
+    }
+}
+
+/// Receive-overload measurement slot index: the slot `slot_boundary` starts,
+/// counted on the active period `slot_ns` (FT8: the same number as
+/// `as_second().div_euclid(15)`).
+pub(super) fn overload_slot_index(slot_boundary: UtcTimestamp, slot_ns: i64) -> i64 {
+    slot_boundary
+        .as_nanosecond()
+        .div_euclid(i128::from(slot_ns.max(1))) as i64
 }
 
 /// Manage WAV recording of 12kHz mono FT8 windows for decoder validation.
@@ -929,6 +963,9 @@ impl super::ApplicationCoordinator {
         let seed_mode_u8 = active_operating_mode.as_u8();
 
         let initialized = self.service_notify.dsp.clone();
+        // PAN-358: the decode-window cutter reads the coordinator's one slot
+        // clock.
+        let slot_clock = self.slot_clock();
         let handle = tokio::task::spawn_blocking(move || {
             // FT8 timing: transmissions start at 0/15/30/45 second marks.
             // We need 12.64 seconds of audio at 12kHz = 151,680 samples per window.
@@ -1049,14 +1086,11 @@ impl super::ApplicationCoordinator {
             // Schedule decode `decode_phase` past the slot start (FT8 → 13s,
             // 0.36s after the 12.64s message end; FT4 → 6.5s). Slots start at
             // the protocol's `slot_ns` cadence aligned to UTC.
-            let mut next_window_time = pancetta_core::slot::next_phase_with_period(
-                UtcTimestamp::now(),
-                dsp_decode_phase,
-                dsp_slot_ns,
-            );
+            let mut window_timer =
+                SlotTimer::new(&slot_clock.read(), dsp_decode_phase, dsp_slot_ns);
             info!(
                 "DSP: first window at {}",
-                next_window_time.strftime("%H:%M:%S")
+                window_timer.deadline().strftime("%H:%M:%S")
             );
 
             let _initialized =
@@ -1248,11 +1282,8 @@ impl super::ApplicationCoordinator {
                                 &mut decimate_stage,
                             );
                             bin_history.clear();
-                            next_window_time = pancetta_core::slot::next_phase_with_period(
-                                UtcTimestamp::now(),
-                                dsp_decode_phase,
-                                dsp_slot_ns,
-                            );
+                            window_timer =
+                                SlotTimer::new(&slot_clock.read(), dsp_decode_phase, dsp_slot_ns);
                             cached_mode_u8 = cur_mode_u8;
                         }
 
@@ -1389,20 +1420,17 @@ impl super::ApplicationCoordinator {
                         // `−WINDOW_LEAD_SECS` correction in ft8.rs), so a station that
                         // transmits on the slot boundary reads DT ≈ 0 instead of the
                         // ≈ +2 s the old "last 15 s of buffer" slice produced. Anchoring
-                        // to the *scheduled* boundary (derived from `next_window_time`)
+                        // to the *scheduled* boundary (derived from the window timer's deadline)
                         // rather than `now` also removes the 0–1 s emit-trigger jitter
                         // from the DT value. See `WINDOW_LEAD_SECS` in `coordinator/mod.rs`.
                         // Overlap retained between windows = one full cycle
                         // (FT8 → 180_000 = 15s×12kHz; FT4 → 90_000 = 7.5s×12kHz).
                         let ideal_samples = dsp_overlap_samples;
-                        let now = UtcTimestamp::now();
-                        let (reanchored, jump) = reanchor_decode_window(
-                            now,
-                            next_window_time,
-                            dsp_decode_phase,
-                            dsp_slot_ns,
-                        );
-                        if let Some(jump) = jump {
+                        let reading = slot_clock.read();
+                        let now = reading.now;
+                        let window_clock =
+                            decode_window_clock_step(&mut window_timer, &reading, dsp_slot_ns);
+                        if window_clock.flush {
                             if overload_enabled {
                                 overload_valid_since = now.as_millisecond();
                                 overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
@@ -1410,29 +1438,29 @@ impl super::ApplicationCoordinator {
                             if let Ok(mut registry) = sweep_capture.lock() {
                                 registry.invalidate_all("clock discontinuity during capture");
                             }
-                            next_window_time = reanchored;
-                            if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
-                            {
-                                // Same flush as an intra-band dial change
-                                // (above): the buffer spans the jump.
-                                // `bin_history` (the waterfall noise floor) is
-                                // kept — the band did not change.
-                                destructive_capture_flush(
-                                    &mut ft8_buffer,
-                                    &mut last_live_wf_samples,
-                                    &mut decimate_stage,
-                                );
-                            }
-                            warn!(
-                                target: "pancetta::slot_clock",
-                                "DSP decode window re-anchored to UTC after a wall-clock jump: {jump:?}"
+                            // Same flush as an intra-band dial change
+                            // (above): the buffer spans the resync or the
+                            // lag. `bin_history` (the waterfall noise floor)
+                            // is kept — the band did not change.
+                            destructive_capture_flush(
+                                &mut ft8_buffer,
+                                &mut last_live_wf_samples,
+                                &mut decimate_stage,
                             );
                         }
-                        if ft8_buffer.len() >= ft8_window_samples && now >= next_window_time {
-                            // Scheduled slot boundary for this window: next_window_time
-                            // is the decode-phase instant, `decode_phase` past the
-                            // boundary (FT8 → :13/:28/:43/:58; FT4 → :6.5 cadence).
-                            let slot_boundary = next_window_time - dsp_decode_phase;
+                        if let Some(reanchor) = window_clock.reanchor.as_ref() {
+                            warn!(
+                                target: "pancetta::slot_clock",
+                                "{}",
+                                decode_window_reanchor_text(reanchor)
+                            );
+                        }
+                        if ft8_buffer.len() >= ft8_window_samples && window_clock.due {
+                            // Scheduled slot boundary for this window: the
+                            // timer's deadline is the decode-phase instant,
+                            // `decode_phase` past the boundary (FT8 →
+                            // :13/:28/:43/:58; FT4 → :6.5 cadence).
+                            let slot_boundary = window_timer.deadline() - dsp_decode_phase;
                             // PAN-320: the FIR path's newest output sample
                             // reflects input ~312.5 µs in the past, so the
                             // buffer's effective end (what
@@ -1470,7 +1498,7 @@ impl super::ApplicationCoordinator {
                                     gain_safety.window_validity(capture_start, now.as_millisecond())
                                 };
                                 let measurement = Measurement {
-                                    slot: slot_boundary.as_second().div_euclid(15),
+                                    slot: overload_slot_index(slot_boundary, dsp_slot_ns),
                                     identity: Identity {
                                         dial_hz: cur_dial_hz,
                                         connection_generation: overload_connection
@@ -1591,12 +1619,9 @@ impl super::ApplicationCoordinator {
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
                             // Schedule next decode at `decode_phase` into the
-                            // next slot (FT8 → 13s; FT4 → 6.5s).
-                            next_window_time = pancetta_core::slot::next_phase_with_period(
-                                UtcTimestamp::now(),
-                                dsp_decode_phase,
-                                dsp_slot_ns,
-                            );
+                            // next slot (FT8 → 13s; FT4 → 6.5s), from a fresh
+                            // read of the slot clock.
+                            window_timer.advance(&slot_clock.read());
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1982,7 +2007,7 @@ mod dial_change_state_tests {
 /// explicit sample indices; nothing sleeps and no rig is involved.
 #[cfg(test)]
 mod dial_change_signal_tests {
-    use super::{apply_dial_change, boundary_anchored_slice};
+    use super::{apply_dial_change, boundary_anchored_slice, decode_window_clock_step};
     use crate::coordinator::pipeline::DecodeWindow;
     use crate::coordinator::{derive_dsp_timing, WINDOW_LEAD_SECS};
     use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
@@ -2050,7 +2075,11 @@ mod dial_change_signal_tests {
         ft8_buffer: Vec<f32>,
         last_live_wf_samples: usize,
         bin_history: Vec<std::collections::VecDeque<f32>>,
-        next_window_time: pancetta_core::time::UtcTimestamp,
+        /// PAN-358: the capture's time follows the sample count on a
+        /// `ManualClock`, read through a `SlotClock` like the DSP loop.
+        manual: pancetta_core::slot_clock::ManualClock,
+        clock: pancetta_core::SlotClock,
+        timer: pancetta_core::slot_timer::SlotTimer,
         decoder: Ft8Decoder,
     }
 
@@ -2058,17 +2087,24 @@ mod dial_change_signal_tests {
         /// Capture already seeded on `seed_dial_hz`, before `START_SECS`.
         fn new(seed_dial_hz: u64) -> Self {
             let timing = Self::timing();
+            let manual = pancetta_core::slot_clock::ManualClock::new(utc(START_SECS));
+            let clock = manual.slot_clock(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                timing.slot_ns,
+            )));
+            let timer = pancetta_core::slot_timer::SlotTimer::new(
+                &clock.read(),
+                timing.decode_phase,
+                timing.slot_ns,
+            );
             Self {
                 live_dial_hz: AtomicU64::new(seed_dial_hz),
                 last_known_dial_hz: seed_dial_hz,
                 ft8_buffer: Vec::new(),
                 last_live_wf_samples: 0,
                 bin_history: Vec::new(),
-                next_window_time: pancetta_core::slot::next_phase_with_period(
-                    utc(START_SECS),
-                    timing.decode_phase,
-                    timing.slot_ns,
-                ),
+                manual,
+                clock,
+                timer,
                 decoder: Ft8Decoder::new(Ft8Config::default()).expect("decoder"),
             }
         }
@@ -2093,11 +2129,20 @@ mod dial_change_signal_tests {
                 &mut self.last_live_wf_samples,
                 &mut self.bin_history,
             );
-            let now = utc(START_SECS + end as f64 / SR as f64);
-            if self.ft8_buffer.len() < timing.window_samples || now < self.next_window_time {
+            // Time follows the sample count on both clocks (no step).
+            let target = utc(START_SECS + end as f64 / SR as f64);
+            let elapsed = target - self.manual.now();
+            self.manual.advance(
+                std::time::Duration::try_from(elapsed).expect("sample time never runs backward"),
+            );
+            let reading = self.clock.read();
+            let now = reading.now;
+            let p = decode_window_clock_step(&mut self.timer, &reading, timing.slot_ns);
+            assert!(!p.flush, "the fixture has no clock step or lag");
+            if self.ft8_buffer.len() < timing.window_samples || !p.due {
                 return None;
             }
-            let slot_boundary = self.next_window_time - timing.decode_phase;
+            let slot_boundary = self.timer.deadline() - timing.decode_phase;
             let (start, len) = boundary_anchored_slice(
                 self.ft8_buffer.len(),
                 now,
@@ -2116,11 +2161,7 @@ mod dial_change_signal_tests {
                 self.ft8_buffer.drain(..excess);
                 self.last_live_wf_samples = self.ft8_buffer.len();
             }
-            self.next_window_time = pancetta_core::slot::next_phase_with_period(
-                now,
-                timing.decode_phase,
-                timing.slot_ns,
-            );
+            self.timer.advance(&self.clock.read());
             let texts = self
                 .decoder
                 .decode_window(&window.samples)
@@ -2806,58 +2847,8 @@ mod dead_air_tests {
 }
 
 #[cfg(test)]
-mod reanchor_decode_window_tests {
-    use super::reanchor_decode_window;
-    use pancetta_core::slot_clock::WallClockJump;
-
-    const FT8_SLOT_NS: i64 = 15_000_000_000;
-
-    fn decode_phase() -> jiff::SignedDuration {
-        jiff::SignedDuration::from_secs(13)
-    }
-
-    fn utc(secs: i64) -> pancetta_core::time::UtcTimestamp {
-        pancetta_core::time::UtcTimestamp::UNIX_EPOCH + jiff::SignedDuration::from_secs(secs)
-    }
-
-    fn window_after(t: pancetta_core::time::UtcTimestamp) -> pancetta_core::time::UtcTimestamp {
-        pancetta_core::slot::next_phase_with_period(t, decode_phase(), FT8_SLOT_NS)
-    }
-
-    #[test]
-    fn decode_window_reanchors_after_backward_step() {
-        let t = utc(1_000_000_005);
-        let next_window_time = window_after(t);
-        let now = t - jiff::SignedDuration::from_secs(600);
-        let (reanchored, jump) =
-            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
-        assert_eq!(reanchored, window_after(now));
-        assert!(reanchored > now);
-        assert!(reanchored - now <= jiff::SignedDuration::from_secs(15));
-        assert!(matches!(jump, Some(WallClockJump::Backward(_))));
-    }
-
-    #[test]
-    fn decode_window_reports_forward_jump_for_flush() {
-        let next_window_time = window_after(utc(1_000_000_005));
-        let now = next_window_time + jiff::SignedDuration::from_secs(3600);
-        let (reanchored, jump) =
-            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
-        assert!(matches!(jump, Some(WallClockJump::Forward(_))));
-        assert!(reanchored > now);
-        assert!(reanchored - now <= jiff::SignedDuration::from_secs(15));
-    }
-
-    #[test]
-    fn decode_window_unchanged_without_jump() {
-        let next_window_time = window_after(utc(1_000_000_005));
-        let now = next_window_time + jiff::SignedDuration::from_millis(40);
-        assert_eq!(
-            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS),
-            (next_window_time, None)
-        );
-    }
-}
+#[path = "dsp/tests/decode_window_clock_tests.rs"]
+mod decode_window_clock_tests;
 
 #[cfg(test)]
 mod wav_recorder_tests {
