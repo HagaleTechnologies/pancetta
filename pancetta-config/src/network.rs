@@ -467,8 +467,8 @@ impl ConfigSection for RemoteGatewayConfig {
 /// Station agent configuration — the remote-TX arm/consent gate.
 ///
 /// Default OFF on every field. This section governs the offline safety core
-/// of the station agent (P0–P2): [`enabled`](Self::enabled) will (in a later
-/// phase) gate the remote-control transport, and
+/// of the station agent (P0–P2): [`enabled`](Self::enabled) gates the
+/// remote-control transport, and
 /// [`remote_tx_enabled`](Self::remote_tx_enabled) is the station-agent
 /// channel's LOCAL operator consent gate, seeded into the coordinator's
 /// `ArmState` at startup as that channel's own consent bit. Consent is tracked
@@ -479,13 +479,16 @@ impl ConfigSection for RemoteGatewayConfig {
 /// can arm, so WSJT-X-UDP-originated TX cannot key PTT either (that channel
 /// is additionally gated by its own settings).
 ///
-/// In this phase the remote transport is not built, so [`enabled`](Self::enabled)
-/// has no runtime effect (it is only validated as well-formed).
+/// With [`enabled`](Self::enabled) on, the agent paired and a client to admit, the
+/// station agent dials [`relay_url`](Self::relay_url). The
+/// [`tx_allow_list`](Self::tx_allow_list) field doc says who may connect and who may
+/// arm TX.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationAgentConfig {
-    /// Enable the station-agent remote-control transport. No runtime effect in
-    /// this phase (transport unbuilt); default OFF.
+    /// Enable the station-agent remote-control transport: the relay session and its
+    /// trust refresh. Turning it off is live and disarms remote TX; turning it on
+    /// needs a restart. Default OFF.
     #[serde(default)]
     pub enabled: bool,
 
@@ -546,12 +549,40 @@ pub struct StationAgentConfig {
     #[serde(default)]
     pub key_dir: Option<String>,
 
-    /// STATION-LOCAL allow-list of client `keyId`s permitted to arm TX. Empty
-    /// (default) → **no remote TX is possible** — this mirrors the fail-closed
-    /// capability check ([`crate`]-adjacent `capability`): a `txArmGrant` is only
-    /// honored when its `clientKeyId` is present here. A relay/cloud compromise
-    /// alone can never cause TX because the client-signed grant must reference a
-    /// key in this local list. The operator may populate it after pairing.
+    /// Static admission list of client `keyId`s for the station agent.
+    ///
+    /// The station agent has two trust roots.
+    ///
+    /// - TX is rooted on the station. A client can arm TX only when the
+    ///   operator stored its device key with `pancetta trust-client`
+    ///   (`<key_dir>/clients/<keyId>.pub`), the keyId is TX-eligible, the arm
+    ///   carries the client's signature and a TX-enabled capability token, and
+    ///   [`remote_tx_enabled`](Self::remote_tx_enabled) is `true`. TX-eligible
+    ///   means `localTrust ∩ owner edges` with cqdx.io auto-populate and
+    ///   `localTrust ∩ tx_allow_list` without it. Cloud data alone cannot arm TX.
+    /// - Connection and non-TX control are rooted in cqdx.io under
+    ///   auto-populate (`[network.cqdx]` enabled with a token). Every
+    ///   successful authorization poll replaces the admission set with the
+    ///   keyIds cqdx.io lists for this station, delegated guests included, so
+    ///   this list is the admission set only until the first successful poll.
+    ///   Removing an entry here evicts the peer at once, but the next poll
+    ///   re-admits it while cqdx.io still lists it. In both modes the hello
+    ///   token that sets a peer's `status` or `qsy` scope is signed by the
+    ///   cqdx.io key pinned at pairing.
+    ///
+    /// Without auto-populate this list is the whole admission set and cqdx.io
+    /// alone cannot add a peer. Empty (default) admits no client, so an enabled
+    /// transport never dials the relay.
+    ///
+    /// Residual under auto-populate, accepted 2026-11-07: whoever can add an
+    /// authorization for this station on cqdx.io, a compromised cqdx.io
+    /// included, can connect a key it holds, read the display feed, retune or
+    /// re-split the rig while it is unkeyed and no station-run QSO is active,
+    /// stop a CQ, and take control from the operator's own remote client,
+    /// which disarms that client. While `remote_tx_enabled` is on, the key it
+    /// connected can also queue QSO requests, which cannot transmit without an
+    /// arm. It cannot arm TX. See
+    /// `docs/DECISIONS/remote-operation.md`, "Two trust roots (PAN-362)".
     #[serde(default)]
     pub tx_allow_list: Vec<String>,
 }
@@ -1032,9 +1063,13 @@ pub struct CqdxConfig {
     /// Priority spot poll interval in seconds
     pub poll_interval_secs: u64,
 
-    /// TX-allow-list auto-populate poll interval, in seconds (dispensa
-    /// Q-0043). Separate from `poll_interval_secs` (the priority-spot poll) —
-    /// different concern, potentially different cadence.
+    /// Station-agent trust refresh interval, in seconds (dispensa Q-0043). With
+    /// cqdx.io enabled and a token, each tick fetches the cqdx.io authorizations that
+    /// replace the station agent's admission set and owner edges. In both modes each
+    /// tick rereads the local `clients/<keyId>.pub` keys; with cqdx.io this starts
+    /// after the first successful fetch. Separate from
+    /// `poll_interval_secs` (the priority-spot poll). Minimum 10, checked even with
+    /// cqdx.io disabled.
     pub authorizations_poll_interval_secs: u64,
 }
 
@@ -1333,13 +1368,11 @@ impl ConfigSection for NetworkConfig {
             StationAgentConfig::validate_pairing_api_url(value)?;
         }
 
-        // An empty `tx_allow_list` is NOT a hard error (the operator may add
-        // client keyIds after pairing), but it has two distinct consequences
-        // worth surfacing clearly: no remote TX can occur (remote_tx_enabled
-        // path), AND — since the runtime station-agent component also uses
-        // tx_allow_list to pick the single client keyId it addresses — if the
-        // transport itself is enabled, the relay connection is never even
-        // attempted at all, not merely TX-gated.
+        // An empty `tx_allow_list` is NOT a hard error. Without cqdx.io auto-populate
+        // no client can connect, so an enabled transport never dials the relay. With
+        // auto-populate an empty static list is normal: cqdx.io supplies admission,
+        // and arming TX still needs an owner edge plus a key stored by
+        // `pancetta trust-client` (PAN-309, PAN-362).
         if self.station_agent.tx_allow_list.is_empty() {
             if self.station_agent.enabled && !self.cqdx.enabled {
                 tracing::warn!(
@@ -1347,13 +1380,16 @@ impl ConfigSection for NetworkConfig {
                     "station_agent.enabled = true but tx_allow_list is empty and cqdx auto-populate \
                      is disabled — no client keyId to admit; add the client's keyId to \
                      station_agent.tx_allow_list, or enable cqdx.io integration (dispensa Q-0043) \
-                     so it populates automatically"
+                     so it populates automatically, which lets cqdx.io decide who may connect and \
+                     use non-TX control"
                 );
             } else if self.station_agent.remote_tx_enabled {
                 tracing::warn!(
                     target: "config.station_agent",
-                    "remote_tx_enabled = true but tx_allow_list is empty — NO remote TX can occur until \
-                     client keyIds are added to station_agent.tx_allow_list (fail-closed)"
+                    "remote_tx_enabled = true but tx_allow_list is empty. Without cqdx.io auto-populate \
+                     no client can arm remote TX; with it, a client can arm only after it has an owner \
+                     edge on cqdx.io and its device key is stored with `pancetta trust-client` \
+                     (fail-closed)"
                 );
             }
         }

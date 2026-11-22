@@ -172,9 +172,13 @@ the station:
   control: an operator can grant a delegate device — panino, the companion
   remote-control client, or a browser — scoped, revocable access to the
   pancetta-controlled rig. Delegated guests get status/QSY visibility and
-  can request a QSO/TX action, but never authorization to actually key the
-  radio — only the station's own (non-delegated) client can arm TX, subject
-  to the remote-TX arm described above.
+  can request a QSO/TX action, but never authorization to key the radio.
+  Only the station's own (non-delegated) client can arm TX, and only after
+  the operator stores its device key on the station with
+  `pancetta trust-client`. With the integration on, cqdx.io decides which
+  clients may connect and use status or QSY, so a cqdx.io compromise
+  reaches non-TX control but cannot transmit alone
+  ([SECURITY.md](SECURITY.md#remote-operation)).
 
 Not every path is equally mature yet — see [Why not (yet)](#why-not-yet) for
 current status.
@@ -406,7 +410,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status; inbound WSJT-X Decode display (*Unreleased*, PAN-381): loopback listener, display and scoring only; not yet checked against a real WSJT-X; [compatibility](docs/INTEROP.md) | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | N1MM contactinfo UDP | Integration-tested, *Unreleased* | Opt-in `[logging] n1mm_udp`: one datagram per logged QSO to one IP address and port; never under --replay. Local sockets only; no logger checked yet ([compatibility](docs/INTEROP.md)) | [N1MM emitter](pancetta/src/coordinator/n1mm_udp.rs) |
-| Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
+| Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`), a device key stored with `pancetta trust-client` and a signed arm. With cqdx.io integration on, cqdx.io decides who may connect and use non-TX control ([trust roots](SECURITY.md#remote-operation)) | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import and entity enrichment *Unreleased* | Offline COUNTRY/DXCC/CQZ/ITUZ inference uses prefix and exact-call zone overrides. Stored fields take precedence individually; unresolved calls gain no inferred fields. Old rows can gain fields on export; existing files are not rewritten. Automated coverage; live qualification pending. Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
 | Separate data directories and one station per directory (`--data-dir`) | Integration-tested, *Unreleased* | PAN-376: config, logbook, logs, keys and upload queue live in the `--data-dir` directory (default `~/.pancetta`); a second live station on one directory refuses with `another pancetta is running (pid N)`. Linux CI only; Windows lock and paths compile-checked, not run; macOS relaunch with `--data-dir` unverified | [data directory](pancetta/tests/data_dir_cli.rs), [instance lock](pancetta/tests/instance_lock_cli.rs) |
