@@ -11,7 +11,7 @@
 //! active QSOs with the same station on the same band.
 //! `rearm_manual_calls_at` re-sends the frame in flight once per slot, for
 //! manual QSOs and, up to `AUTO_RESEND_MAX_CALLS`, for autonomous ones.
-//! `watchdog_pass_at` runs it before `check_timeouts_at`, which retires
+//! `watchdog_pass` runs it before `check_timeouts_at`, which retires
 //! calls that hit the manual watchdog and applies every QSO's per-state
 //! timeouts.
 //!
@@ -1488,43 +1488,55 @@ impl QsoManager {
         }
     }
 
-    pub(super) async fn watchdog_pass_at(
-        &self,
-        now: DateTime<Utc>,
-        mono_now: std::time::Instant,
-        detector: &mut pancetta_core::slot_clock::ClockStepDetector,
-        last_mono: &mut std::time::Instant,
-    ) {
-        let step = detector.observe(now, mono_now.duration_since(*last_mono));
-        *last_mono = mono_now;
-        if let Some(skew) = step {
-            let qsos = self.qsos.write().await;
-            let mut anchors = self
-                .watchdog_anchors
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            anchors.clear();
-            for (&id, progress) in qsos.iter().filter(|(_, p)| p.state.is_active()) {
-                anchors.insert(
-                    id,
-                    WatchdogAnchors {
-                        state: watchdog_state_identity(&progress.state, now)
-                            .map(|identity| (identity, now)),
-                        first_call: progress
-                            .metadata
-                            .first_call_at
-                            .map(|original| (original, now)),
-                    },
+    /// One watchdog pass at a fresh slot-clock reading (PAN-296, PAN-358).
+    ///
+    /// When the clock reported an event (a wall-clock step of 250 ms or
+    /// more) since the last applied one, every active QSO's timeout budget
+    /// restarts at the latest event's `observed_at`, so the budget runs from
+    /// the step whichever reader saw it first. Then manual calls rearm and
+    /// timeouts apply at the reading's `now`, in that order.
+    pub async fn watchdog_pass(&self) {
+        let reading = self.slot_clock.read();
+        let applied = self
+            .watchdog_clock_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if reading.epoch != applied {
+            if let Some(event) = reading.last_event {
+                let at = event.observed_at;
+                let qsos = self.qsos.write().await;
+                let mut anchors = self
+                    .watchdog_anchors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                anchors.clear();
+                // A state or first call that began after the step (between
+                // the event and this pass) runs from its own start, never
+                // from an instant before it existed.
+                for (&id, progress) in qsos.iter().filter(|(_, p)| p.state.is_active()) {
+                    anchors.insert(
+                        id,
+                        WatchdogAnchors {
+                            state: watchdog_state_identity(&progress.state, reading.now)
+                                .map(|identity| (identity, at.max(identity.1))),
+                            first_call: progress
+                                .metadata
+                                .first_call_at
+                                .map(|original| (original, at.max(original))),
+                        },
+                    );
+                }
+                warn!(
+                    skew_ms = event.skew.num_milliseconds(),
+                    epoch = event.epoch,
+                    "Wall-clock step: reset active QSO watchdog budgets"
                 );
             }
-            warn!(
-                skew_ms = skew.num_milliseconds(),
-                "Wall-clock step: reset active QSO watchdog budgets"
-            );
+            self.watchdog_clock_epoch
+                .store(reading.epoch, std::sync::atomic::Ordering::Release);
         }
         // Preserve rearm-before-retirement ordering and independent call caps.
-        self.rearm_manual_calls_at(now).await;
-        self.check_timeouts_at(now).await;
+        self.rearm_manual_calls_at(reading.now).await;
+        self.check_timeouts_at(reading.now).await;
     }
 
     /// Watchdog pass at an explicit time (for testability).

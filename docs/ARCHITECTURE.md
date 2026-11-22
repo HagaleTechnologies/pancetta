@@ -153,6 +153,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `session_state.rs` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |
 | `session_state/` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |
 | `shutdown.rs` | Graceful shutdown, task join and direct rigctld PTT-off budgets. |
+| `slot_clock_driver.rs` | Publishes the shared slot clock's step events every 250 ms (PAN-358). |
+| `slot_clock_driver/` | Publishes the shared slot clock's step events every 250 ms (PAN-358). |
 | `spot_call.rs` | Space on a network spot: QSY to its dial and call (PAN-287). |
 | `station_agent/` | Station agent component (remote operation, Noise transport). |
 | `swr_guard.rs` | SWR protection trip logic (PAN-251). |
@@ -177,6 +179,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `wav_playback.rs` | WAV file playback for offline testing. |
 | `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |
 <!-- coordinator-modules:end -->
+
+PAN-358: `pancetta_core::SlotClock` is the one time source for slot timing in the autonomous tick, the clock-skew monitor, the QSO watchdog and the queued-call TTL. The coordinator owns it over `active_slot_ns`, and `slot_clock_driver.rs` publishes its step events so the queued-call TTL task wakes on a step.
 
 **Communication model**: crossbeam channels carry point-to-point data (audio samples,
 decoded messages, waterfall frames). A `MessageBus` handles broadcast control events
