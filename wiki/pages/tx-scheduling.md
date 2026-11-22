@@ -144,19 +144,31 @@ does not hold the worker before its final band-plan check. Keep these event
 boundaries when changing the tests; a settling sleep cannot establish either
 ordering.
 
-PTT-method gotcha (PAN-121): `[rig.ptt].method` does not choose how TX is keyed.
-Normal PTT always goes to rigctld as `T 1`/`T 0`, and managed rigctld is spawned
-without a PTT option. Setup, the rig picker and bookmarks only store or print the
-method; only `test-rig --ptt` acts on it. PAN-339 makes that diagnostic use
-the existing daemon for link checks and CAT PTT; Serial still pulses RTS.
-Link-only testing never opens the configured serial device.
-CAT and Serial pulses both require fresh split-aware band admission.
-Unknown split state refuses PTT even with edge warnings disabled. PTT setters
-require `RPRT 0`, and the diagnostic attempts unkey after key-down errors or
-Ctrl+C. Mock-daemon tests in `pancetta/tests/test_rig_cli.rs` prove protocol
-behavior, not physical rig operation.
-There is no CM108 variant. See
-[the audit](../../docs/DECISIONS/tx-scheduling.md#what-the-configured-ptt-method-actually-controls-pan-121-2026-11-01).
+PTT-method gotcha (PAN-357): `[rig.ptt].method` changes how TX is keyed only
+for `serial_rts`. `none` (the default) and `cat` key through rigctld with
+`T 1`/`T 0`. Under `serial_rts`, the Hamlib component's rig is
+`ptt_line::LineKeyedRig` wrapping the rig it built. Its `set_ptt` drives the
+RTS line of `rig.ptt.device` and never sends CAT `T 1`, so every key-down and
+unkey path (TX frames, bundles, tune, manual PTT, halts, teardown) moves the
+line, while rigctld still sets frequency and reads meters. `get_ptt` reports
+On while the line may be asserted. The coordinator's one `PttLine` is opened
+once, reconciled at each Hamlib start, and lowered and latched by shutdown
+alongside the drain. While `rig.interface.enabled` is true, validation refuses
+`serial`, `vox`, `parallel`, `usb`, `sound_card` and `network`, a `serial_rts`
+with no device or with the CAT port as its device, and `polarity = "negative"`
+under `serial_rts`, so the station does not start. With rig control off
+nothing is checked. Managed rigctld is still spawned without a PTT option.
+CM108, DTR and RTS on the CAT port are refused and tracked in PAN-476; there
+is no CM108 variant. `test-rig --ptt` (PAN-339) uses the existing daemon for
+link checks and CAT PTT, and pulses RTS on `rig.ptt.device` for `serial_rts`.
+Link-only testing never opens a serial device. Both pulses require fresh
+split-aware band admission. Unknown split state refuses PTT even with edge
+warnings disabled. PTT setters require `RPRT 0`, and the diagnostic attempts
+unkey after key-down errors or Ctrl+C. Mock-daemon tests in
+`pancetta/tests/test_rig_cli.rs` and the fake line in
+`pancetta/src/coordinator/ptt_line/tests/` prove protocol behavior, not
+physical rig operation. See
+[the decision](../../docs/DECISIONS/tx-scheduling.md#the-ptt-method-selects-the-keying-path-pan-357-2026-11-22).
 
 Supersede gotcha (PAN-322): a supersede that arrives in the PTT lead, after
 key-down and before the target slot starts (Step 6), is always `NotViable`.

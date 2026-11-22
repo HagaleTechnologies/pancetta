@@ -2106,6 +2106,46 @@ impl super::ApplicationCoordinator {
             };
             Arc::new(client)
         };
+
+        // PAN-357: `rig.ptt.method = "serial_rts"` keys the RTS line of
+        // `rig.ptt.device` instead of CAT. Reconcile the coordinator's single
+        // line with this start's target, then wrap the rig so every
+        // `set_ptt` below (command loop, watchdog, teardown, overload guard)
+        // drives the line and every other call still reaches rigctld.
+        let ptt_line_target = super::ptt_line::line_target(&rig_config, rig_enabled);
+        #[cfg(test)]
+        let ptt_line_target = self.test_ptt_line_device.clone().or(ptt_line_target);
+        if let Err(e) = self
+            .ptt_line
+            .configure(ptt_line_target.clone(), &rig_config.interface.port)
+            .await
+        {
+            warn!("Serial PTT: {e:#}");
+            let consequence = if self.ptt_line.has_device() {
+                "TX will not key until the port opens; each key-down retries it."
+            } else {
+                "TX will not key until rig.ptt.device names a separate port."
+            };
+            report_rig_error(
+                &self.message_bus,
+                format!("Serial PTT: {e:#}. {consequence}"),
+            )
+            .await;
+        }
+        let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> =
+            if let Some(device) = ptt_line_target.as_deref() {
+                info!("PTT keys the RTS line of {device} (rig.ptt.method = serial_rts)");
+                let keyed = super::ptt_line::LineKeyedRig::new(rig, self.ptt_line.clone());
+                // Only a managed data mode guards key-downs and CAT
+                // mutations, as it does inside `RigctldClient`.
+                Arc::new(if rig_config.data_mode.is_some() {
+                    keyed.with_data_mode(self.message_bus.data_mode.clone())
+                } else {
+                    keyed
+                })
+            } else {
+                rig
+            };
         self.rig_handle = Some(rig.clone());
         self.rig_handle_is_real = rig_enabled;
 

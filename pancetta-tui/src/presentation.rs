@@ -51,6 +51,7 @@ pub(crate) fn ptt_label(method: &PttMethod) -> &'static str {
         PttMethod::SoundCard => "sound card",
         PttMethod::Vox => "VOX",
         PttMethod::Network => "network",
+        PttMethod::SerialRts => "serial RTS",
     }
 }
 
@@ -253,6 +254,7 @@ mod tests {
             (SoundCard, "sound card"),
             (Vox, "VOX"),
             (Network, "network"),
+            (SerialRts, "serial RTS"),
         ] {
             assert_eq!(ptt_label(&method), expected);
         }

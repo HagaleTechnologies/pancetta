@@ -1012,19 +1012,18 @@ pub const RIG_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
 /// `live_baud_rate`/`live_ptt_method` instead of indexing into the array.
 const NOT_ENUMERATED: usize = usize::MAX;
 
-/// The 4 PTT methods the wizard offers (`setup_ptt`, `pancetta/src/main.rs:1409-1414`).
+/// The PTT methods the picker offers: the ones that have a keying path
+/// (PAN-357), the same three the setup wizard offers (`setup_ptt` in
+/// `pancetta/src/main.rs`). `None` and `Cat` key through rigctld and
+/// `SerialRts` keys the RTS line of a separate serial port; every other
+/// method is refused by validation while rig control is on. A live method
+/// outside this list still shows and is kept on apply ([`NOT_ENUMERATED`]);
+/// a bookmark that stores one is refused on load.
 /// Deliberately a function, not a `const` array: `PttMethod` doesn't derive
-/// `Copy` (nor `PartialEq` — comparisons below use `Debug` formatting,
-/// mirroring `setup_ptt`'s own `format!("{:?}", ...)` comparison at
-/// `pancetta/src/main.rs:1420`).
-pub fn rig_ptt_methods() -> [pancetta_config::rig::PttMethod; 4] {
+/// `Copy`.
+pub fn rig_ptt_methods() -> [pancetta_config::rig::PttMethod; 3] {
     use pancetta_config::rig::PttMethod;
-    [
-        PttMethod::None,
-        PttMethod::Cat,
-        PttMethod::Serial,
-        PttMethod::Vox,
-    ]
+    [PttMethod::None, PttMethod::Cat, PttMethod::SerialRts]
 }
 
 /// State for the live rig-config picker modal (`i` key, PAN-59). Mirrors
@@ -1247,7 +1246,7 @@ impl RigSelectionState {
         let baud_idx = RIG_BAUD_RATES.iter().position(|b| *b == bookmark.baud_rate);
         let ptt_idx = rig_ptt_methods()
             .iter()
-            .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method));
+            .position(|m| *m == bookmark.ptt_method);
         let (Some(baud_idx), Some(ptt_idx)) = (baud_idx, ptt_idx) else {
             return Err(format!(
                 "Bookmark '{}' has a baud rate or PTT method the picker doesn't support \
@@ -5311,7 +5310,7 @@ impl App {
             .unwrap_or(NOT_ENUMERATED);
         let selected_ptt_idx = rig_ptt_methods()
             .iter()
-            .position(|m| format!("{:?}", m) == format!("{:?}", current_ptt_method))
+            .position(|m| *m == current_ptt_method)
             .unwrap_or(NOT_ENUMERATED);
 
         self.rig_selection.available_ports = available_ports;
@@ -9949,7 +9948,7 @@ mod tests {
                 model: "FTdx10".to_string(),
                 port: String::new(),
                 baud_rate: 9600,
-                // Not one of the 4 choices `rig_ptt_methods()` offers.
+                // Not one of the choices `rig_ptt_methods()` offers.
                 ptt_method: pancetta_config::rig::PttMethod::Parallel,
             }],
             ..Default::default()
@@ -9965,6 +9964,63 @@ mod tests {
             matches!(state.selected_ptt(), pancetta_config::rig::PttMethod::Cat),
             "a rejected load must leave the PTT field untouched"
         );
+    }
+
+    /// PAN-357 (AC11): the picker offers only the PTT methods that have a
+    /// keying path, in the order Up/Down cycles them, with these labels.
+    #[test]
+    fn rig_ptt_methods_are_the_implemented_methods() {
+        use pancetta_config::rig::PttMethod;
+        let methods = rig_ptt_methods();
+        assert_eq!(
+            methods,
+            [PttMethod::None, PttMethod::Cat, PttMethod::SerialRts]
+        );
+        let labels: Vec<&str> = methods.iter().map(crate::presentation::ptt_label).collect();
+        assert_eq!(labels, ["none", "CAT", "serial RTS"]);
+    }
+
+    /// PAN-357: `serial` and `vox` left the picker's choices, so a
+    /// bookmark that stores either is refused whole, like any other
+    /// unsupported PTT method; one that stores `serial_rts` loads.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_serial_or_vox_is_rejected() {
+        use pancetta_config::rig::PttMethod;
+        for method in [PttMethod::Serial, PttMethod::Vox] {
+            let mut state = RigSelectionState {
+                model: "Unchanged".to_string(),
+                selected_ptt_idx: 1, // Cat
+                bookmarks: vec![pancetta_config::rig::RigBookmark {
+                    name: "OldPtt".to_string(),
+                    model: "FTdx10".to_string(),
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 9600,
+                    ptt_method: method.clone(),
+                }],
+                ..Default::default()
+            };
+            let err = state.load_bookmark(0).unwrap_err();
+            assert!(
+                err.contains("PTT method the picker doesn't support"),
+                "{method:?}: {err}"
+            );
+            assert_eq!(state.model, "Unchanged");
+            assert_eq!(state.selected_ptt(), PttMethod::Cat);
+        }
+
+        let mut state = RigSelectionState {
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Rts".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 9600,
+                ptt_method: PttMethod::SerialRts,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(0), Ok(()));
+        assert_eq!(state.selected_ptt_idx, 2);
+        assert_eq!(state.selected_ptt(), PttMethod::SerialRts);
     }
 
     #[test]
@@ -10007,7 +10063,7 @@ mod tests {
             "FTdx10".to_string(),
             "/dev/ttyUSB1".to_string(),
             38400,
-            pancetta_config::rig::PttMethod::Serial,
+            pancetta_config::rig::PttMethod::SerialRts,
             vec![],
             0,
         );
@@ -10015,10 +10071,11 @@ mod tests {
         assert_eq!(app.rig_selection.selected_port_idx, 1);
         assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB1");
         assert_eq!(app.rig_selection.selected_baud(), 38400);
-        assert!(matches!(
+        assert_eq!(app.rig_selection.selected_ptt_idx, 2);
+        assert_eq!(
             app.rig_selection.selected_ptt(),
-            pancetta_config::rig::PttMethod::Serial
-        ));
+            pancetta_config::rig::PttMethod::SerialRts
+        );
     }
 
     /// I-2a fix (PAN-59 final review): when the configured port isn't
@@ -10083,7 +10140,7 @@ mod tests {
     }
 
     /// PAN-64: same bug, PTT side -- e.g. a hand-edited
-    /// `PttMethod::Parallel` (schema-valid, not one of the picker's 4
+    /// `PttMethod::Parallel` (schema-valid, not one of the picker's
     /// choices). Previously substituted with `PttMethod::None`.
     #[tokio::test]
     async fn apply_rig_config_update_preserves_unenumerated_ptt_method() {
@@ -10346,7 +10403,7 @@ mod tests {
             "IC-7300".to_string(),
             "/dev/ttyUSB0".to_string(),
             19200,
-            pancetta_config::rig::PttMethod::Serial,
+            pancetta_config::rig::PttMethod::SerialRts,
             vec![rig_bookmark("A")],
             0,
         );
@@ -10355,10 +10412,10 @@ mod tests {
         assert_eq!(rs.model, "IC-7300");
         assert_eq!(rs.selected_port(), "/dev/ttyUSB0");
         assert_eq!(rs.selected_baud(), 19200);
-        assert!(matches!(
+        assert_eq!(
             rs.selected_ptt(),
-            pancetta_config::rig::PttMethod::Serial
-        ));
+            pancetta_config::rig::PttMethod::SerialRts
+        );
         assert_eq!(rs.committed_model, "IC-7300");
         assert_eq!(rs.bookmarks.len(), 1);
     }

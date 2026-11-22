@@ -4060,6 +4060,22 @@ impl super::ApplicationCoordinator {
                                         level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
+                            } else if let Some(reason) = {
+                                let cfg = cmd_config.read().await;
+                                select_rig_ptt_refusal(&cfg.rig, &port, &ptt_method)
+                            } {
+                                // PAN-357: refuse PTT settings validation
+                                // would reject (e.g. `serial_rts` with no
+                                // `rig.ptt.device`) before writing anything.
+                                warn!("TUI SelectRig: {reason} -- not applied");
+                                cmd_rig_select_seq.fetch_add(1, Ordering::AcqRel);
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "rig".to_string(),
+                                        status: format!("Rig not applied: {reason}"),
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                    },
+                                );
                             } else {
                                 // Persist the operator's choice to the in-memory
                                 // config and to `cmd_config_path` so it survives
@@ -6044,6 +6060,20 @@ where
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
     }))
+}
+
+/// PAN-357: why the rig picker's candidate (live rig settings with the
+/// picked CAT port and PTT method) could not key the rig, or `None` when it
+/// can. The same rules `Config::validate` applies to `rig.ptt`.
+fn select_rig_ptt_refusal(
+    live: &pancetta_config::rig::RigConfig,
+    port: &str,
+    method: &pancetta_config::rig::PttMethod,
+) -> Option<String> {
+    let mut candidate = live.clone();
+    candidate.interface.port = port.to_string();
+    candidate.ptt.method = method.clone();
+    candidate.ptt.refusal(&candidate.interface)
 }
 
 #[cfg(test)]
@@ -10148,6 +10178,10 @@ pub(super) fn record_tui_failure(
             .get_or_insert_with(|| format!("{error:#}"));
     }
 }
+
+#[cfg(test)]
+#[path = "tui_relay/tests/select_rig_ptt_tests.rs"]
+mod select_rig_ptt_tests;
 
 #[cfg(test)]
 #[path = "tui_relay/tests/waterfall_session_tests.rs"]
