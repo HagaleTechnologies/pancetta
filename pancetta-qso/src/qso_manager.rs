@@ -2217,13 +2217,8 @@ impl QsoManager {
         })
     }
 
-<<<<<<< HEAD
-    fn now_utc(&self) -> DateTime<Utc> {
-        self.slot_clock.now()
-=======
     fn now_utc(&self) -> UtcTimestamp {
-        (self.utc_clock)()
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
+        self.slot_clock.now()
     }
 
     /// A manager on a virtual clock that never reports a step

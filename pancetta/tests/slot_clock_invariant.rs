@@ -1,7 +1,8 @@
 //! PAN-358 invariant: one UTC slot clock.
 //!
-//! The autonomous slot tick, the QSO watchdog, the queued-call TTL and the
-//! clock-skew monitor read time through the coordinator's one
+//! The autonomous slot tick, the DSP decode-window cutter, the QSO watchdog,
+//! the queued-call TTL and the clock-skew monitor read time through the
+//! coordinator's one
 //! `pancetta_core::SlotClock`, the only wall-clock step detector for them.
 //! This scan keeps the per-site detectors and slot math those consumers used
 //! to carry from coming back, and checks that each consumer stays wired to
@@ -9,9 +10,9 @@
 //! comment is stale documentation. Needles are built at runtime so this file
 //! never matches itself.
 //!
-//! The DSP decode-window cutter and the TX worker still carry their PAN-114
-//! checks (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"); their
-//! needles join this scan when they move onto the clock.
+//! The TX worker still carries its PAN-114 checks
+//! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"); its needles
+//! join this scan when it moves onto the clock.
 
 use std::path::{Path, PathBuf};
 
@@ -74,6 +75,8 @@ fn no_per_site_slot_clock_code_remains() {
         needle("Queue", "Stamp"),
         // The watchdog pass that took its own detector.
         needle("watchdog_pass", "_at"),
+        // The DSP cutter's own deadline-band re-anchor.
+        needle("reanchor_decode", "_window"),
     ];
     let root = workspace_root();
     let mut found = Vec::new();
@@ -106,6 +109,16 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
     assert!(
         autonomous.contains(&needle("SlotTimer", "::new")),
         "the autonomous slot tick must run on a core SlotTimer"
+    );
+
+    let dsp = read("pancetta/src/coordinator/dsp.rs");
+    assert!(
+        dsp.contains(&needle("let slot_clock = self.slot", "_clock();")),
+        "the DSP cutter must read the coordinator's SlotClock"
+    );
+    assert!(
+        dsp.contains(&needle("decode_window_clock", "_step(&mut window_timer")),
+        "the DSP cutter must poll its SlotTimer through decode_window_clock_step"
     );
 
     let qso = read("pancetta/src/coordinator/qso.rs");

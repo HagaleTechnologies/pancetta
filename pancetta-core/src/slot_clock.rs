@@ -16,16 +16,11 @@
 //! `slot::next_phase_with_period`). A healthy deadline is therefore never
 //! more than one period ahead of the wall clock.
 
-<<<<<<< HEAD
-use crate::time::UtcClock;
-use chrono::{DateTime, Duration, Utc};
+use crate::time::SignedDurationExt as _;
+use crate::time::{UtcClock, UtcTimestamp};
+use jiff::SignedDuration;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-=======
-use crate::time::SignedDurationExt as _;
-use crate::time::UtcTimestamp;
-use jiff::SignedDuration;
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 
 /// A wall-clock jump inferred from a slot deadline that left the healthy
 /// one-period band around `now`.
@@ -84,7 +79,6 @@ pub fn classify_deadline_jump(
 /// moves the wall clock at most 500 ppm (0.5 ms/s).
 pub const CLOCK_STEP_THRESHOLD_MS: i64 = 250;
 
-<<<<<<< HEAD
 /// Smallest wall-vs-monotonic divergence that re-anchors slot timing (a
 /// resync). Equals the TX worker's PTT hold slack: a smaller step cannot
 /// move a UTC-anchored deadline off the grid in a way any consumer acts on.
@@ -107,9 +101,9 @@ pub struct ClockEvent {
     pub epoch: u64,
     /// Wall elapsed minus monotonic elapsed between the two reads that
     /// bracket the step; positive when the clock stepped forward or slept.
-    pub skew: Duration,
+    pub skew: SignedDuration,
     /// Wall time of the read that observed the step.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     /// Active slot period at that read.
     pub slot_ns: i64,
     /// `|skew| >= SLOT_RESYNC_THRESHOLD_MS`.
@@ -119,7 +113,7 @@ pub struct ClockEvent {
 impl ClockEvent {
     /// The step as a [`WallClockJump`] carrying its real size.
     pub fn jump(&self) -> WallClockJump {
-        if self.skew >= Duration::zero() {
+        if self.skew >= SignedDuration::ZERO {
             WallClockJump::Forward(self.skew)
         } else {
             WallClockJump::Backward(-self.skew)
@@ -128,40 +122,8 @@ impl ClockEvent {
 
     /// Start of the slot the step landed in: every consumer that re-anchors
     /// on this event lands in this slot.
-    pub fn slot_start(&self) -> DateTime<Utc> {
+    pub fn slot_start(&self) -> UtcTimestamp {
         crate::slot::current_slot_start_with_period(self.observed_at, self.slot_ns)
-=======
-/// Detects wall-clock steps (and, where the monotonic clock stops during
-/// suspend — Linux, macOS — system sleep) by comparing wall-clock progress
-/// with monotonic progress between observations.
-#[derive(Debug, Clone)]
-pub struct ClockStepDetector {
-    last_wall: UtcTimestamp,
-}
-
-impl ClockStepDetector {
-    /// Start a detector baselined at `wall_now`.
-    pub fn new(wall_now: UtcTimestamp) -> Self {
-        Self {
-            last_wall: wall_now,
-        }
-    }
-
-    /// `mono_elapsed` is monotonic time since the previous call (or `new`).
-    /// Returns wall-minus-monotonic skew when it reaches the threshold
-    /// (positive = jumped forward / slept, negative = stepped back).
-    /// Always re-baselines.
-    pub fn observe(
-        &mut self,
-        wall_now: UtcTimestamp,
-        mono_elapsed: std::time::Duration,
-    ) -> Option<SignedDuration> {
-        let wall_elapsed = wall_now - self.last_wall;
-        self.last_wall = wall_now;
-        let mono = SignedDuration::try_from(mono_elapsed).unwrap_or(SignedDuration::MAX);
-        let skew = wall_elapsed - mono;
-        (skew.as_millis_i64().abs() >= CLOCK_STEP_THRESHOLD_MS).then_some(skew)
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
     }
 }
 
@@ -170,7 +132,7 @@ impl ClockStepDetector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotReading {
     /// Wall time of this read.
-    pub now: DateTime<Utc>,
+    pub now: UtcTimestamp,
     /// Active slot period; a non-positive source falls back to
     /// [`crate::slot::SLOT_NS`].
     pub slot_ns: i64,
@@ -188,7 +150,7 @@ pub struct SlotReading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockStamp {
     /// Wall time of the sample.
-    pub wall: DateTime<Utc>,
+    pub wall: UtcTimestamp,
     /// Monotonic time of the sample.
     pub mono: std::time::Duration,
 }
@@ -199,14 +161,14 @@ impl ClockStamp {
     /// A negative wall elapsed (the wall clock stepped back) counts as zero.
     pub fn age_at(&self, now: ClockStamp) -> std::time::Duration {
         let mono = now.mono.saturating_sub(self.mono);
-        let wall = (now.wall - self.wall).to_std().unwrap_or_default();
+        let wall = (now.wall - self.wall).try_into().unwrap_or_default();
         mono.max(wall)
     }
 }
 
 #[derive(Debug)]
 struct ClockState {
-    last_wall: DateTime<Utc>,
+    last_wall: UtcTimestamp,
     last_mono: std::time::Duration,
     epoch: u64,
     resync_epoch: u64,
@@ -220,7 +182,7 @@ enum MonoSource {
     Clock(MonoClock),
     /// Derived from the wall source (`wall - origin`, clamped at zero), for
     /// virtual-clock harnesses: wall and "monotonic" never diverge.
-    FromWall(DateTime<Utc>),
+    FromWall(UtcTimestamp),
 }
 
 struct ClockInner {
@@ -247,11 +209,11 @@ impl std::fmt::Debug for SlotClock {
 }
 
 impl SlotClock {
-    /// The production clock: `Utc::now` and `Instant` since construction.
+    /// The production clock: `UtcTimestamp::now` and `Instant` since construction.
     pub fn system(slot_ns: Arc<AtomicI64>) -> Self {
         let origin = std::time::Instant::now();
         Self::new(
-            Arc::new(Utc::now),
+            Arc::new(UtcTimestamp::now),
             Arc::new(move || origin.elapsed()),
             slot_ns,
         )
@@ -291,7 +253,7 @@ impl SlotClock {
         mono: MonoSource,
         slot_ns: Arc<AtomicI64>,
         detect: bool,
-        last_wall: DateTime<Utc>,
+        last_wall: UtcTimestamp,
         last_mono: std::time::Duration,
     ) -> Self {
         Self {
@@ -351,7 +313,7 @@ impl SlotClock {
                         let wall = (self.inner.wall)();
                         break (
                             wall,
-                            (wall - *origin).to_std().unwrap_or_default(),
+                            (wall - *origin).try_into().unwrap_or_default(),
                             std::time::Duration::ZERO,
                         );
                     }
@@ -363,10 +325,10 @@ impl SlotClock {
         let mut stepped = false;
         if self.inner.detect {
             let wall_elapsed = wall - state.last_wall;
-            let mono_elapsed =
-                Duration::from_std(mono.saturating_sub(state.last_mono)).unwrap_or(Duration::MAX);
+            let mono_elapsed = SignedDuration::try_from(mono.saturating_sub(state.last_mono))
+                .unwrap_or(SignedDuration::MAX);
             let skew = wall_elapsed - mono_elapsed;
-            let abs_ms = skew.num_milliseconds().abs();
+            let abs_ms = skew.as_millis_i64().abs();
             // A bracket that stayed wide leaves the monotonic instant of the
             // wall read uncertain by half its width: still report a step
             // larger than that uncertainty, so a post-step `now` never goes
@@ -416,7 +378,7 @@ impl SlotClock {
     }
 
     /// Wall time of a fresh read.
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> UtcTimestamp {
         self.read().now
     }
 
@@ -448,13 +410,13 @@ impl SlotClock {
 /// Test and simulation aid: wall and monotonic time moved by hand.
 #[derive(Clone, Debug)]
 pub struct ManualClock {
-    wall: Arc<Mutex<DateTime<Utc>>>,
+    wall: Arc<Mutex<UtcTimestamp>>,
     mono: Arc<Mutex<std::time::Duration>>,
 }
 
 impl ManualClock {
     /// Both clocks start at `start` (monotonic zero).
-    pub fn new(start: DateTime<Utc>) -> Self {
+    pub fn new(start: UtcTimestamp) -> Self {
         Self {
             wall: Arc::new(Mutex::new(start)),
             mono: Arc::new(Mutex::new(std::time::Duration::ZERO)),
@@ -462,7 +424,7 @@ impl ManualClock {
     }
 
     /// Current wall time.
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> UtcTimestamp {
         *self.wall.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -470,12 +432,12 @@ impl ManualClock {
     pub fn advance(&self, by: std::time::Duration) {
         let mut wall = self.wall.lock().unwrap_or_else(|p| p.into_inner());
         let mut mono = self.mono.lock().unwrap_or_else(|p| p.into_inner());
-        *wall += Duration::from_std(by).unwrap_or(Duration::MAX);
+        *wall += SignedDuration::try_from(by).unwrap_or(SignedDuration::MAX);
         *mono += by;
     }
 
     /// Move the wall clock alone: a step, or a suspend on Linux/macOS.
-    pub fn step_wall(&self, by: Duration) {
+    pub fn step_wall(&self, by: SignedDuration) {
         let mut wall = self.wall.lock().unwrap_or_else(|p| p.into_inner());
         *wall += by;
     }
@@ -591,74 +553,4 @@ mod tests {
             -600.0
         );
     }
-<<<<<<< HEAD
-=======
-
-    #[test]
-    fn step_detector_ignores_matching_wall_and_monotonic_progress() {
-        let t0 = at(0.0);
-        let mut d = ClockStepDetector::new(t0);
-        assert_eq!(
-            d.observe(
-                t0 + SignedDuration::from_secs(1),
-                std::time::Duration::from_secs(1)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn step_detector_ignores_ntp_slew_sized_divergence() {
-        let t0 = at(0.0);
-        let mut d = ClockStepDetector::new(t0);
-        assert_eq!(
-            d.observe(
-                t0 + SignedDuration::from_micros(1_000_500),
-                std::time::Duration::from_secs(1)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn step_detector_reports_forward_step_and_suspend() {
-        let t0 = at(0.0);
-        let mut d = ClockStepDetector::new(t0);
-        assert_eq!(
-            d.observe(
-                t0 + SignedDuration::from_secs(3601),
-                std::time::Duration::from_secs(1)
-            ),
-            Some(SignedDuration::from_secs(3600))
-        );
-    }
-
-    #[test]
-    fn step_detector_reports_backward_step() {
-        let t0 = at(1_000.0);
-        let mut d = ClockStepDetector::new(t0);
-        assert_eq!(
-            d.observe(
-                t0 - SignedDuration::from_secs(599),
-                std::time::Duration::from_secs(1)
-            ),
-            Some(SignedDuration::from_secs(-600))
-        );
-    }
-
-    #[test]
-    fn step_detector_rebaselines_after_reporting() {
-        let t0 = at(0.0);
-        let mut d = ClockStepDetector::new(t0);
-        let t1 = t0 + SignedDuration::from_secs(3601);
-        assert!(d.observe(t1, std::time::Duration::from_secs(1)).is_some());
-        assert_eq!(
-            d.observe(
-                t1 + SignedDuration::from_secs(1),
-                std::time::Duration::from_secs(1)
-            ),
-            None
-        );
-    }
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
 }

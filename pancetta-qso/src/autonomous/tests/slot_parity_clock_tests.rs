@@ -3,7 +3,7 @@
 //! clock.
 
 use super::*;
-use chrono::TimeZone;
+use pancetta_core::time::UtcTimestamp;
 
 fn untracked(text: &str, call: &str, freq: f64) -> DecodedMessageInfo {
     DecodedMessageInfo {
@@ -33,7 +33,7 @@ fn operator() -> AutonomousOperator {
 fn untracked_parity_uses_the_callers_now() {
     // Ten years from the real clock, so the system clock cannot agree by
     // accident: 00:00:15 is an odd FT8 slot, 00:00:30 an even one.
-    let odd_now = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 20).unwrap();
+    let odd_now = UtcTimestamp::from_ymd_hms(2036, 1, 1, 0, 0, 20).unwrap();
     let mut op = operator();
     op.feed_decoded_messages_on_dial_at(
         &[
@@ -47,7 +47,7 @@ fn untracked_parity_uses_the_callers_now() {
     assert_eq!(op.slot_manager.auto_detect_odd_activity, 2);
     assert_eq!(op.slot_manager.auto_detect_even_activity, 0);
 
-    let even_now = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 35).unwrap();
+    let even_now = UtcTimestamp::from_ymd_hms(2036, 1, 1, 0, 0, 35).unwrap();
     let mut op = operator();
     op.feed_decoded_messages_on_dial_at(
         &[untracked("K3ABC W3XYZ -12", "K3ABC", 1700.0)],

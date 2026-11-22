@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::slot_clock::{ManualClock, SlotClock};
-use chrono::TimeZone;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
@@ -11,8 +10,8 @@ const FT8_SLOT_NS: i64 = 15_000_000_000;
 const FT4_SLOT_NS: i64 = 7_500_000_000;
 const FT2_SLOT_NS: i64 = 3_200_000_000;
 
-fn at(millis: i64) -> DateTime<Utc> {
-    Utc.timestamp_nanos(0) + Duration::milliseconds(millis)
+fn at(millis: i64) -> UtcTimestamp {
+    UtcTimestamp::from_nanosecond_i64(0) + SignedDuration::from_millis(millis)
 }
 
 /// A reading with no clock event (as on a virtual clock without detection).
@@ -28,7 +27,7 @@ fn r(millis: i64) -> SlotReading {
 }
 
 /// A reading that carries resync event `epoch`, observed at this instant.
-fn resync_reading(millis: i64, skew: Duration, epoch: u64) -> SlotReading {
+fn resync_reading(millis: i64, skew: SignedDuration, epoch: u64) -> SlotReading {
     let event = ClockEvent {
         epoch,
         skew,
@@ -47,15 +46,15 @@ fn resync_reading(millis: i64, skew: Duration, epoch: u64) -> SlotReading {
 }
 
 fn manual_at(seconds: f64) -> (ManualClock, SlotClock) {
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let manual = ManualClock::new(base + Duration::nanoseconds((seconds * 1e9) as i64));
+    let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let manual = ManualClock::new(base + SignedDuration::from_nanos((seconds * 1e9) as i64));
     let clock = manual.slot_clock(Arc::new(AtomicI64::new(FT8_SLOT_NS)));
     (manual, clock)
 }
 
-fn base_plus(seconds: f64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
-        + Duration::nanoseconds((seconds * 1e9).round() as i64)
+fn base_plus(seconds: f64) -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap()
+        + SignedDuration::from_nanos((seconds * 1e9).round() as i64)
 }
 
 fn ms(n: u64) -> std::time::Duration {
@@ -63,7 +62,7 @@ fn ms(n: u64) -> std::time::Duration {
 }
 
 /// Poll once; on due, advance and return the boundary that fired.
-fn poll_fire(timer: &mut SlotTimer, reading: &SlotReading, slot_ns: i64) -> Option<DateTime<Utc>> {
+fn poll_fire(timer: &mut SlotTimer, reading: &SlotReading, slot_ns: i64) -> Option<UtcTimestamp> {
     let p = timer.poll(reading, slot_ns);
     if p.due {
         let fired = timer.deadline();
@@ -76,7 +75,7 @@ fn poll_fire(timer: &mut SlotTimer, reading: &SlotReading, slot_ns: i64) -> Opti
 
 #[test]
 fn slot_timer_recovers_ft2_boundary_crossed_between_polls_once() {
-    let mut t = SlotTimer::new(&r(98_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(98_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(!t.poll(&r(99_000), FT8_SLOT_NS).due);
     assert_eq!(t.deadline(), at(105_000));
     assert_eq!(
@@ -99,7 +98,7 @@ fn slot_timer_recovers_ft2_boundary_crossed_between_polls_once() {
 #[test]
 fn slot_timer_recovers_ft4_boundary_at_or_before_current_poll() {
     for observed_at in [97_500, 97_750] {
-        let mut t = SlotTimer::new(&r(97_250), Duration::zero(), FT8_SLOT_NS);
+        let mut t = SlotTimer::new(&r(97_250), SignedDuration::ZERO, FT8_SLOT_NS);
         assert_eq!(
             t.poll(&r(observed_at), FT4_SLOT_NS),
             SlotPoll {
@@ -120,7 +119,7 @@ fn slot_timer_recovers_ft4_boundary_at_or_before_current_poll() {
 
 #[test]
 fn slot_timer_mode_switch_without_crossed_boundary_only_recomputes() {
-    let mut t = SlotTimer::new(&r(97_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(97_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(
         t.poll(&r(97_250), FT4_SLOT_NS),
         SlotPoll {
@@ -135,7 +134,7 @@ fn slot_timer_mode_switch_without_crossed_boundary_only_recomputes() {
 
 #[test]
 fn slot_timer_non_due_poll_advances_boundary_recovery_history() {
-    let mut t = SlotTimer::new(&r(97_250), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(97_250), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(!t.poll(&r(97_750), FT8_SLOT_NS).due);
     assert_eq!(
         t.poll(&r(98_000), FT4_SLOT_NS),
@@ -150,7 +149,7 @@ fn slot_timer_non_due_poll_advances_boundary_recovery_history() {
 
 #[test]
 fn slot_timer_boundary_at_previous_poll_is_excluded() {
-    let mut t = SlotTimer::new(&r(97_250), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(97_250), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(!t.poll(&r(97_500), FT8_SLOT_NS).due);
     assert_eq!(
         t.poll(&r(97_750), FT4_SLOT_NS),
@@ -164,8 +163,8 @@ fn slot_timer_boundary_at_previous_poll_is_excluded() {
 
 #[test]
 fn slot_timer_backward_step_with_mode_switch_updates_history_without_firing() {
-    let mut t = SlotTimer::new(&r(700_000), Duration::zero(), FT8_SLOT_NS);
-    let step = resync_reading(99_000, Duration::milliseconds(-601_000), 1);
+    let mut t = SlotTimer::new(&r(700_000), SignedDuration::ZERO, FT8_SLOT_NS);
+    let step = resync_reading(99_000, SignedDuration::from_millis(-601_000), 1);
     let p = t.poll(&step, FT4_SLOT_NS);
     assert!(!p.due);
     assert!(matches!(p.reanchor, Some(Reanchor::ClockStep(e)) if e.epoch == 1));
@@ -192,7 +191,7 @@ fn slot_timer_backward_step_with_mode_switch_updates_history_without_firing() {
 
 #[test]
 fn slot_timer_delayed_mode_switch_recovers_only_one_tick() {
-    let mut t = SlotTimer::new(&r(90_250), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(90_250), SignedDuration::ZERO, FT8_SLOT_NS);
     // Cross 92.8 s, 96 s and 99.2 s without reaching the old 105 s deadline.
     assert!(t.poll(&r(99_250), FT2_SLOT_NS).due);
     t.advance(&r(99_250));
@@ -209,14 +208,14 @@ fn slot_timer_delayed_mode_switch_recovers_only_one_tick() {
 
 #[test]
 fn no_fire_before_deadline() {
-    let mut t = SlotTimer::new(&r(10_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(10_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(!t.poll(&r(10_000), FT8_SLOT_NS).due);
     assert_eq!(t.deadline(), at(15_000), "unchanged while not yet due");
 }
 
 #[test]
 fn fires_exactly_at_deadline_and_recomputes_next_ft8_boundary() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(poll_fire(&mut t, &r(15_000), FT8_SLOT_NS), Some(at(15_000)));
     assert_eq!(t.deadline(), at(30_000));
 }
@@ -224,7 +223,7 @@ fn fires_exactly_at_deadline_and_recomputes_next_ft8_boundary() {
 #[test]
 fn ft8_cadence_unchanged_across_repeated_250ms_polls() {
     let mut now = 3_200;
-    let mut t = SlotTimer::new(&r(now), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(now), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), at(15_000));
     let mut fired_at = Vec::new();
     for _ in 0..400 {
@@ -248,21 +247,21 @@ fn ft8_cadence_unchanged_across_repeated_250ms_polls() {
 
 #[test]
 fn mid_run_mode_change_to_ft4_shortens_the_next_deadline() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(poll_fire(&mut t, &r(15_000), FT4_SLOT_NS).is_some());
     assert_eq!(t.deadline(), at(22_500));
 }
 
 #[test]
 fn mid_run_mode_change_to_ft2_shortens_the_next_deadline() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(poll_fire(&mut t, &r(15_000), FT2_SLOT_NS).is_some());
     assert_eq!(t.deadline(), at(16_000));
 }
 
 #[test]
 fn mid_wait_mode_change_shortens_the_deadline_before_it_would_have_fired() {
-    let mut t = SlotTimer::new(&r(1_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(1_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), at(15_000));
     assert!(!t.poll(&r(5_000), FT4_SLOT_NS).due);
     assert_eq!(t.deadline(), at(7_500));
@@ -274,7 +273,7 @@ fn mid_wait_mode_change_shortens_the_deadline_before_it_would_have_fired() {
 #[test]
 fn mode_aware_wrapper_is_a_no_op_when_slot_ns_never_changes() {
     let mut now = 3_200;
-    let mut t = SlotTimer::new(&r(now), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(now), SignedDuration::ZERO, FT8_SLOT_NS);
     let mut fired_at = Vec::new();
     for _ in 0..400 {
         now += 250;
@@ -286,12 +285,12 @@ fn mode_aware_wrapper_is_a_no_op_when_slot_ns_never_changes() {
     assert_eq!(fired_at.len(), 6);
     assert!(fired_at
         .iter()
-        .all(|b| b.timestamp_nanos_opt().unwrap() % FT8_SLOT_NS == 0));
+        .all(|b| b.as_nanosecond_i64().unwrap() % FT8_SLOT_NS == 0));
 }
 
 #[test]
 fn mode_mismatch_discovered_exactly_when_the_stale_deadline_fires_still_fires() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(t.poll(&r(15_000), FT4_SLOT_NS).due);
     t.advance(&r(15_000));
     assert_eq!(t.deadline(), at(22_500));
@@ -300,7 +299,7 @@ fn mode_mismatch_discovered_exactly_when_the_stale_deadline_fires_still_fires() 
 
 #[test]
 fn mode_mismatch_discovered_after_the_stale_deadline_is_overdue_still_fires() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(t.poll(&r(15_250), FT4_SLOT_NS).due);
     t.advance(&r(15_250));
     assert_eq!(t.deadline(), at(22_500));
@@ -309,7 +308,7 @@ fn mode_mismatch_discovered_after_the_stale_deadline_is_overdue_still_fires() {
 
 #[test]
 fn small_backward_step_inside_one_period_is_waited_out_unchanged() {
-    let mut t = SlotTimer::new(&r(95_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(95_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), at(105_000));
     // The clock steps back 3 s with no resync: 13 s ahead is waited out.
     assert_eq!(
@@ -327,7 +326,7 @@ fn slot_timer_keeps_firing_on_utc_boundaries_after_a_backward_step() {
     // A backward step the clock did not report (no detection): the timer
     // still returns to the UTC grid instead of stalling.
     let seeded_at = 1_000_003_200;
-    let mut t = SlotTimer::new(&r(seeded_at), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(seeded_at), SignedDuration::ZERO, FT8_SLOT_NS);
     let step_at = seeded_at - 600_000;
     let mut now = step_at;
     let mut fires = 0;
@@ -337,10 +336,10 @@ fn slot_timer_keeps_firing_on_utc_boundaries_after_a_backward_step() {
         if poll_fire(&mut t, &r(now), FT8_SLOT_NS).is_some() {
             fires += 1;
             first_fire.get_or_insert(now);
-            let ns = deadline_before.timestamp_nanos_opt().unwrap();
+            let ns = deadline_before.as_nanosecond_i64().unwrap();
             assert_eq!(ns % FT8_SLOT_NS, 0, "fired off the UTC slot grid");
             assert!(at(now) >= deadline_before);
-            assert!(at(now) - deadline_before < Duration::milliseconds(250));
+            assert!(at(now) - deadline_before < SignedDuration::from_millis(250));
         }
         now += 250;
     }
@@ -353,7 +352,7 @@ fn slot_timer_keeps_firing_on_utc_boundaries_after_a_backward_step() {
 
 #[test]
 fn slot_timer_mode_switch_is_not_reported_as_a_reanchor() {
-    let mut t = SlotTimer::new(&r(99_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(99_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(
         t.poll(&r(100_000), FT4_SLOT_NS),
         SlotPoll {
@@ -370,7 +369,7 @@ fn slot_timer_mode_switch_is_not_reported_as_a_reanchor() {
 #[test]
 fn timer_without_steps_matches_the_ft8_deadline_sequence() {
     let (manual, clock) = manual_at(5.0);
-    let mut t = SlotTimer::new(&clock.read(), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_SLOT_NS);
     let mut fires = Vec::new();
     for _ in 0..600 {
         manual.advance(ms(250));
@@ -387,15 +386,15 @@ fn timer_without_steps_matches_the_ft8_deadline_sequence() {
 #[test]
 fn forward_resync_reanchors_from_the_observed_instant_without_firing() {
     let (manual, clock) = manual_at(5.0);
-    let mut t = SlotTimer::new(&clock.read(), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_SLOT_NS);
     manual.advance(ms(250));
     assert!(!t.poll(&clock.read(), FT8_SLOT_NS).due);
     let pre_step_deadline = t.deadline();
     assert_eq!(pre_step_deadline, base_plus(15.0));
-    manual.step_wall(Duration::milliseconds(3_604_300));
+    manual.step_wall(SignedDuration::from_millis(3_604_300));
     let reading = clock.read();
     let event = reading.last_resync.expect("a resync");
-    assert_eq!(event.skew, Duration::milliseconds(3_604_300));
+    assert_eq!(event.skew, SignedDuration::from_millis(3_604_300));
     let p = t.poll(&reading, FT8_SLOT_NS);
     assert_eq!(
         p,
@@ -404,7 +403,7 @@ fn forward_resync_reanchors_from_the_observed_instant_without_firing() {
             reanchor: Some(Reanchor::ClockStep(event))
         }
     );
-    let first = next_phase_with_period(event.observed_at, Duration::zero(), FT8_SLOT_NS);
+    let first = next_phase_with_period(event.observed_at, SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), first);
     let mut fires = Vec::new();
     for _ in 0..120 {
@@ -424,15 +423,15 @@ fn forward_resync_reanchors_from_the_observed_instant_without_firing() {
 #[test]
 fn backward_resync_reanchors_on_the_next_poll() {
     let (manual, clock) = manual_at(605.0);
-    let mut t = SlotTimer::new(&clock.read(), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), base_plus(615.0));
     manual.advance(ms(250));
-    manual.step_wall(Duration::seconds(-600));
+    manual.step_wall(SignedDuration::from_secs(-600));
     let reading = clock.read();
     let p = t.poll(&reading, FT8_SLOT_NS);
     assert!(!p.due);
     assert!(
-        matches!(p.reanchor, Some(Reanchor::ClockStep(e)) if e.skew == Duration::seconds(-600))
+        matches!(p.reanchor, Some(Reanchor::ClockStep(e)) if e.skew == SignedDuration::from_secs(-600))
     );
     assert_eq!(t.deadline(), base_plus(15.0));
     let mut fired = None;
@@ -445,7 +444,7 @@ fn backward_resync_reanchors_on_the_next_poll() {
 
 #[test]
 fn lag_without_a_step_reanchors_without_firing() {
-    let mut t = SlotTimer::new(&r(5_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(5_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert_eq!(t.deadline(), at(15_000));
     let p = t.poll(&r(31_000), FT8_SLOT_NS);
     assert_eq!(
@@ -453,7 +452,7 @@ fn lag_without_a_step_reanchors_without_firing() {
         SlotPoll {
             due: false,
             reanchor: Some(Reanchor::Lagged {
-                behind: Duration::seconds(16),
+                behind: SignedDuration::from_secs(16),
                 slot_start: at(30_000)
             })
         }
@@ -464,14 +463,14 @@ fn lag_without_a_step_reanchors_without_firing() {
 #[test]
 fn small_backward_drift_never_refires_a_boundary() {
     let (manual, clock) = manual_at(14.85);
-    let mut t = SlotTimer::new(&clock.read(), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_SLOT_NS);
     let mut fires = Vec::new();
     manual.advance(ms(250));
     if let Some(b) = poll_fire(&mut t, &clock.read(), FT8_SLOT_NS) {
         fires.push(b);
     }
     assert_eq!(fires, vec![base_plus(15.0)]);
-    manual.step_wall(Duration::milliseconds(-500));
+    manual.step_wall(SignedDuration::from_millis(-500));
     while manual.now() < base_plus(30.2) {
         let reading = clock.read();
         assert_eq!(reading.resync_epoch, 0);
@@ -485,7 +484,7 @@ fn small_backward_drift_never_refires_a_boundary() {
 
 #[test]
 fn due_deadline_waits_for_advance() {
-    let mut t = SlotTimer::new(&r(14_750), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(14_750), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(t.poll(&r(15_000), FT8_SLOT_NS).due);
     assert!(t.poll(&r(15_250), FT8_SLOT_NS).due);
     assert_eq!(t.deadline(), at(15_000));
@@ -496,7 +495,7 @@ fn due_deadline_waits_for_advance() {
 
 #[test]
 fn offset_timer_fires_on_the_phase() {
-    let mut t = SlotTimer::new(&r(0), Duration::seconds(13), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(0), SignedDuration::from_secs(13), FT8_SLOT_NS);
     let mut fires = Vec::new();
     let mut now = 0;
     while now <= 60_000 {
@@ -510,21 +509,21 @@ fn offset_timer_fires_on_the_phase() {
 
 #[test]
 fn a_second_resync_reanchors_again() {
-    let mut t = SlotTimer::new(&r(5_000), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&r(5_000), SignedDuration::ZERO, FT8_SLOT_NS);
     assert!(t
         .poll(
-            &resync_reading(65_000, Duration::seconds(60), 1),
+            &resync_reading(65_000, SignedDuration::from_secs(60), 1),
             FT8_SLOT_NS
         )
         .reanchor
         .is_some());
     assert_eq!(t.deadline(), at(75_000));
     // The same epoch does not re-anchor twice.
-    let mut same = resync_reading(65_000, Duration::seconds(60), 1);
+    let mut same = resync_reading(65_000, SignedDuration::from_secs(60), 1);
     same.now = at(66_000);
     assert_eq!(t.poll(&same, FT8_SLOT_NS).reanchor, None);
     let p = t.poll(
-        &resync_reading(125_000, Duration::seconds(59), 2),
+        &resync_reading(125_000, SignedDuration::from_secs(59), 2),
         FT8_SLOT_NS,
     );
     assert!(matches!(p.reanchor, Some(Reanchor::ClockStep(e)) if e.epoch == 2));
@@ -536,13 +535,13 @@ fn backward_resync_never_refires_the_boundary_that_just_fired() {
     // Fires 00:00:15 at the 00:00:15.1 poll, then a -1.5 s step lands the
     // wall clock at 00:00:13.6, before the boundary that just fired.
     let (manual, clock) = manual_at(14.85);
-    let mut t = SlotTimer::new(&clock.read(), Duration::zero(), FT8_SLOT_NS);
+    let mut t = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_SLOT_NS);
     manual.advance(ms(250));
     assert_eq!(
         poll_fire(&mut t, &clock.read(), FT8_SLOT_NS),
         Some(base_plus(15.0))
     );
-    manual.step_wall(Duration::milliseconds(-1500));
+    manual.step_wall(SignedDuration::from_millis(-1500));
     let reading = clock.read();
     let p = t.poll(&reading, FT8_SLOT_NS);
     assert!(!p.due);

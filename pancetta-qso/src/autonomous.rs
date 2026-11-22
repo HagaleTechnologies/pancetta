@@ -2088,15 +2088,9 @@ impl AutonomousOperator {
         // slot boundary must not be attributed to the next slot just because
         // this function happens to run after the boundary. Messages without
         // a tracked parity (test scaffolding / untracked decodes) fall back
-<<<<<<< HEAD
         // to the parity of the caller's `now` (PAN-358: the coordinator passes
         // its slot-clock reading, so this never re-reads the system clock).
         let current_parity = SlotParity::of_time_with_period(now, self.slot_ns());
-=======
-        // to the wall-clock parity, preserving existing behavior for callers
-        // that don't set `slot_parity`.
-        let current_parity = SlotParity::of_time_with_period(UtcTimestamp::now(), self.slot_ns());
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         let mut even_count: u32 = 0;
         let mut odd_count: u32 = 0;
         let mut untracked_count: u32 = 0;

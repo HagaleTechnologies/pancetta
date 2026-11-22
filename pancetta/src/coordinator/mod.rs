@@ -3047,11 +3047,7 @@ impl ApplicationCoordinator {
                 self.shutdown_signal.clone(),
                 clock_monitor::ClockMonitorSchedule::default(),
                 Arc::new(|| sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string())),
-<<<<<<< HEAD
                 self.slot_clock(),
-=======
-                Arc::new(UtcTimestamp::now),
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
             ));
         }
 

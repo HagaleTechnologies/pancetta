@@ -17,10 +17,11 @@ use super::autonomous::autonomous_slot_poll;
 use super::clock_monitor::MonitorStepCursor;
 use super::qso::queued_call_ttl_partition_for_test;
 use crate::clock_skew::ClockSkewMonitorCore;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot::{current_slot_start_with_period, next_phase_with_period};
 use pancetta_core::slot_clock::{ClockEvent, ClockStamp, ManualClock};
 use pancetta_core::slot_timer::{Reanchor, SlotTimer};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::{QsoManager, QsoManagerConfig};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -31,12 +32,12 @@ const FT2_NS: i64 = 3_200_000_000;
 const POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 2026-01-01 00:00:00 UTC, a boundary for FT8, FT4 and FT2.
-fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+fn base() -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap()
 }
 
-fn ms(ms: i64) -> Duration {
-    Duration::milliseconds(ms)
+fn ms(ms: i64) -> SignedDuration {
+    SignedDuration::from_millis(ms)
 }
 
 /// What each consumer did after the step.
@@ -45,7 +46,7 @@ struct Observed {
     /// Every event a consumer reported, tagged by consumer.
     events: Vec<(&'static str, ClockEvent)>,
     /// `reading.now` of every autonomous fire after the step.
-    autonomous_fires_after: Vec<DateTime<Utc>>,
+    autonomous_fires_after: Vec<UtcTimestamp>,
     /// Whether the first post-step autonomous poll fired.
     autonomous_fired_on_first_post_step_poll: bool,
     /// Autonomous re-anchors after the step.
@@ -64,13 +65,13 @@ struct Observed {
 
 /// Run the four consumers on one clock: pre-step polls from `p` seconds
 /// into the slot at 00:00:00, then `step`, then two periods of polls.
-async fn run_scenario(slot_ns: i64, p_ms: i64, step: Duration) -> (Observed, DateTime<Utc>) {
+async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observed, UtcTimestamp) {
     let start = base() + ms(p_ms);
     let manual = ManualClock::new(start);
     let clock = manual.slot_clock(Arc::new(AtomicI64::new(slot_ns)));
 
     // Autonomous slot tick.
-    let mut timer = SlotTimer::new(&clock.read(), Duration::zero(), slot_ns);
+    let mut timer = SlotTimer::new(&clock.read(), SignedDuration::ZERO, slot_ns);
 
     // QSO watchdog with one active QSO.
     let mut manager = QsoManager::new(QsoManagerConfig {
@@ -88,7 +89,7 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: Duration) -> (Observed, Dat
     // Queued-call TTL: one call queued 9 min 30 s ago, one queued now.
     let fresh = clock.stamp();
     let old = ClockStamp {
-        wall: fresh.wall - Duration::seconds(570),
+        wall: fresh.wall - SignedDuration::from_secs(570),
         mono: fresh.mono,
     };
     let queue = [("JA1OLD", old), ("JA1NEW", fresh)];
@@ -182,7 +183,7 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: Duration) -> (Observed, Dat
 }
 
 /// The assertions every resync case shares.
-async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: Duration) {
+async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: SignedDuration) {
     let label = format!("slot {slot_ns} ns, p {p_ms} ms, step {step}");
     let (obs, pre_step_now) = run_scenario(slot_ns, p_ms, step).await;
 
@@ -234,7 +235,7 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: Duration) {
         vec![Reanchor::ClockStep(first)],
         "{label}: autonomous re-anchors once, on the clock event"
     );
-    let first_boundary = next_phase_with_period(first.observed_at, Duration::zero(), slot_ns);
+    let first_boundary = next_phase_with_period(first.observed_at, SignedDuration::ZERO, slot_ns);
     let first_fire = *obs
         .autonomous_fires_after
         .first()
@@ -263,7 +264,7 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: Duration) {
 
     // Queued-call TTL (PAN-289): a forward step ages the older call past the
     // 10 min TTL on the first post-step pass; a backward step never ages it.
-    let expected_expired: Vec<String> = if step >= Duration::seconds(30) {
+    let expected_expired: Vec<String> = if step >= SignedDuration::from_secs(30) {
         vec!["JA1OLD".to_string()]
     } else {
         Vec::new()
@@ -289,18 +290,18 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: Duration) {
 
 #[tokio::test]
 async fn every_consumer_reanchors_in_the_same_slot_after_a_60_s_forward_step() {
-    assert_resync_case(FT8_NS, 5_000, Duration::seconds(60)).await;
+    assert_resync_case(FT8_NS, 5_000, SignedDuration::from_secs(60)).await;
 
     // The ticket's concrete numbers: FT8, 5 s into the 00:00:00 slot, +60 s.
-    let (obs, _) = run_scenario(FT8_NS, 5_000, Duration::seconds(60)).await;
+    let (obs, _) = run_scenario(FT8_NS, 5_000, SignedDuration::from_secs(60)).await;
     let event = obs.events[0].1;
     assert_eq!(
         event.slot_start(),
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap()
+        UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 1, 0).unwrap()
     );
     assert_eq!(
         obs.autonomous_fires_after[0],
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 15).unwrap(),
+        UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 1, 15).unwrap(),
         "the first autonomous fire is 00:01:15, never the pre-step 00:00:15"
     );
     assert_eq!(
@@ -312,13 +313,13 @@ async fn every_consumer_reanchors_in_the_same_slot_after_a_60_s_forward_step() {
 #[tokio::test]
 async fn every_consumer_reanchors_in_the_same_slot_for_each_mode_direction_and_slot_position() {
     for (slot_ns, p_ms, step) in [
-        (FT8_NS, 5_000, Duration::seconds(-60)),
+        (FT8_NS, 5_000, SignedDuration::from_secs(-60)),
         (FT8_NS, 5_000, ms(67_500)),
-        (FT4_NS, 2_000, Duration::seconds(60)),
-        (FT2_NS, 1_000, Duration::seconds(60)),
-        (FT8_NS, 1_000, Duration::seconds(20)),
-        (FT8_NS, 5_000, Duration::seconds(20)),
-        (FT8_NS, 14_000, Duration::seconds(20)),
+        (FT4_NS, 2_000, SignedDuration::from_secs(60)),
+        (FT2_NS, 1_000, SignedDuration::from_secs(60)),
+        (FT8_NS, 1_000, SignedDuration::from_secs(20)),
+        (FT8_NS, 5_000, SignedDuration::from_secs(20)),
+        (FT8_NS, 14_000, SignedDuration::from_secs(20)),
     ] {
         assert_resync_case(slot_ns, p_ms, step).await;
     }
@@ -339,7 +340,7 @@ async fn sub_second_step_changes_no_slot_consumer() {
     // 00:00:37.5).
     assert!(obs.autonomous_reanchors.is_empty());
     assert!(!obs.autonomous_cleared);
-    let boundaries: Vec<DateTime<Utc>> = obs
+    let boundaries: Vec<UtcTimestamp> = obs
         .autonomous_fires_after
         .iter()
         .map(|now| current_slot_start_with_period(*now, FT8_NS))
@@ -347,8 +348,8 @@ async fn sub_second_step_changes_no_slot_consumer() {
     assert_eq!(
         boundaries,
         vec![
-            base() + Duration::seconds(15),
-            base() + Duration::seconds(30),
+            base() + SignedDuration::from_secs(15),
+            base() + SignedDuration::from_secs(30),
         ]
     );
     for (fire, boundary) in obs.autonomous_fires_after.iter().zip(&boundaries) {

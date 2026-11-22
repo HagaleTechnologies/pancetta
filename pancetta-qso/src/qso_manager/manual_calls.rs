@@ -1492,7 +1492,6 @@ impl QsoManager {
         }
     }
 
-<<<<<<< HEAD
     /// One watchdog pass at a fresh slot-clock reading (PAN-296, PAN-358).
     ///
     /// When the clock reported an event (a wall-clock step of 250 ms or
@@ -1520,7 +1519,7 @@ impl QsoManager {
                 // at the event, including a pre-step start a backward step
                 // left in the future, so no budget ever runs from an instant
                 // later than this pass.
-                let anchor_for = |start: DateTime<Utc>| {
+                let anchor_for = |start: UtcTimestamp| {
                     if start >= at && start <= reading.now {
                         start
                     } else {
@@ -1541,48 +1540,13 @@ impl QsoManager {
                     );
                 }
                 warn!(
-                    skew_ms = event.skew.num_milliseconds(),
+                    skew_ms = event.skew.as_millis_i64(),
                     epoch = event.epoch,
                     "Wall-clock step: reset active QSO watchdog budgets"
                 );
             }
             self.watchdog_clock_epoch
                 .store(reading.epoch, std::sync::atomic::Ordering::Release);
-=======
-    pub(super) async fn watchdog_pass_at(
-        &self,
-        now: UtcTimestamp,
-        mono_now: std::time::Instant,
-        detector: &mut pancetta_core::slot_clock::ClockStepDetector,
-        last_mono: &mut std::time::Instant,
-    ) {
-        let step = detector.observe(now, mono_now.duration_since(*last_mono));
-        *last_mono = mono_now;
-        if let Some(skew) = step {
-            let qsos = self.qsos.write().await;
-            let mut anchors = self
-                .watchdog_anchors
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            anchors.clear();
-            for (&id, progress) in qsos.iter().filter(|(_, p)| p.state.is_active()) {
-                anchors.insert(
-                    id,
-                    WatchdogAnchors {
-                        state: watchdog_state_identity(&progress.state, now)
-                            .map(|identity| (identity, now)),
-                        first_call: progress
-                            .metadata
-                            .first_call_at
-                            .map(|original| (original, now)),
-                    },
-                );
-            }
-            warn!(
-                skew_ms = skew.as_millis_i64(),
-                "Wall-clock step: reset active QSO watchdog budgets"
-            );
->>>>>>> d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf
         }
         // Preserve rearm-before-retirement ordering and independent call caps.
         self.rearm_manual_calls_at(reading.now).await;

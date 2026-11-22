@@ -974,6 +974,12 @@ in the slot the step landed.
 - The autonomous tick reads the clock, clears `slot_messages` on a resync or lag in either
   direction, and passes the reading's `now` to the operator's decode feed, whose untracked-parity
   fallback now uses that `now`.
+- The DSP decode-window cutter reads the clock through its own `SlotTimer` at the decode phase
+  (replaces PAN-114 D4 and `reanchor_decode_window`). A resync in either direction, or a deadline
+  more than one slot late with no step, re-anchors the window without emitting, flushes the buffer,
+  bumps the overload capture epoch and invalidates sweep captures; the WARN on
+  `pancetta::slot_clock` says which. A sub-second step keeps buffer and deadline. The overload
+  measurement's slot index counts the active period, not 15 s.
 - The clock-skew monitor has no detector of its own. It reports the clock's events: steps of 1 s or
   more keep the "re-anchored to UTC" text, smaller ones read "under 1 s, slot timing kept".
 - `coordinator/slot_clock_driver.rs` reads the clock every 250 ms and publishes each new event on a
@@ -986,8 +992,9 @@ in the slot the step landed.
 - `pancetta/tests/slot_clock_invariant.rs` keeps the deleted per-site items out of the scanned crates
   and checks that each consumer above stays wired to the coordinator's clock.
 
-Still on their own PAN-114 checks until the follow-up lands: the DSP decode-window cutter (D4,
-`classify_deadline_jump`) and the TX worker's pre-PTT wait and Step 6 hold (D5, D6).
+Still on its own PAN-114 checks until the follow-up lands: the TX worker's pre-PTT wait and Step 6
+hold (D5, D6: `ptt_wait_step` and `ptt_hold_exceeds_bound`). `classify_deadline_jump` no longer has
+a production caller.
 
 ## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
 

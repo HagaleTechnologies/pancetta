@@ -3,8 +3,9 @@
 //! tick.
 
 use super::*;
-use chrono::TimeZone;
+use jiff::SignedDuration;
 use pancetta_core::slot_clock::ClockEvent;
+use pancetta_core::time::UtcTimestamp;
 
 fn queued(name: &str, queued_at: ClockStamp) -> PendingManualCall {
     PendingManualCall {
@@ -28,8 +29,8 @@ fn queued(name: &str, queued_at: ClockStamp) -> PendingManualCall {
 fn forward_event() -> ClockEvent {
     ClockEvent {
         epoch: 1,
-        skew: chrono::Duration::seconds(60),
-        observed_at: chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 5).unwrap(),
+        skew: SignedDuration::from_secs(60),
+        observed_at: UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 1, 5).unwrap(),
         slot_ns: pancetta_core::slot::SLOT_NS,
         resync: true,
     }
@@ -63,7 +64,7 @@ async fn ttl_task_runs_a_pass_on_a_clock_event() {
     let now = test_queue_clock().stamp();
     pending.lock().await[0].queued_at = ClockStamp {
         mono: now.mono,
-        wall: now.wall - chrono::Duration::seconds(630),
+        wall: now.wall - SignedDuration::from_secs(630),
     };
     events_tx.send_replace(Some(forward_event()));
 

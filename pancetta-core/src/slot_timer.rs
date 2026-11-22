@@ -20,7 +20,8 @@
 
 use crate::slot::{current_slot_start_with_period, next_phase_with_period};
 use crate::slot_clock::{ClockEvent, SlotReading};
-use chrono::{DateTime, Duration, Utc};
+use crate::time::UtcTimestamp;
+use jiff::SignedDuration;
 
 /// Why a poll re-anchored the deadline without firing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +32,9 @@ pub enum Reanchor {
     /// consumer, buffer starvation, or a suspend the monotonic clock counted).
     Lagged {
         /// How far `now` was past the deadline.
-        behind: Duration,
+        behind: SignedDuration,
         /// The slot `now` fell in.
-        slot_start: DateTime<Utc>,
+        slot_start: UtcTimestamp,
     },
 }
 
@@ -49,23 +50,23 @@ pub struct SlotPoll {
 /// A UTC-anchored slot deadline (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotTimer {
-    offset: Duration,
-    deadline: DateTime<Utc>,
+    offset: SignedDuration,
+    deadline: UtcTimestamp,
     deadline_slot_ns: i64,
     poll_slot_ns: i64,
-    last_poll_now: DateTime<Utc>,
-    last_fired: Option<DateTime<Utc>>,
+    last_poll_now: UtcTimestamp,
+    last_fired: Option<UtcTimestamp>,
     resync_epoch: u64,
 }
 
-fn phase_after(now: DateTime<Utc>, offset: Duration, slot_ns: i64) -> DateTime<Utc> {
+fn phase_after(now: UtcTimestamp, offset: SignedDuration, slot_ns: i64) -> UtcTimestamp {
     next_phase_with_period(now, offset, slot_ns)
 }
 
 impl SlotTimer {
     /// A timer whose first deadline is the first phase strictly after
     /// `reading.now`. `offset` must lie in `[0, slot_ns)`.
-    pub fn new(reading: &SlotReading, offset: Duration, slot_ns: i64) -> Self {
+    pub fn new(reading: &SlotReading, offset: SignedDuration, slot_ns: i64) -> Self {
         Self {
             offset,
             deadline: phase_after(reading.now, offset, slot_ns),
@@ -78,7 +79,7 @@ impl SlotTimer {
     }
 
     /// The tracked deadline.
-    pub fn deadline(&self) -> DateTime<Utc> {
+    pub fn deadline(&self) -> UtcTimestamp {
         self.deadline
     }
 
@@ -99,7 +100,7 @@ impl SlotTimer {
                 // returns to the UTC grid at once.
                 self.last_fired = self.last_fired.filter(|fired| {
                     *fired >= event.observed_at
-                        && *fired - event.observed_at <= Duration::nanoseconds(slot_ns)
+                        && *fired - event.observed_at <= SignedDuration::from_nanos(slot_ns)
                 });
                 let from = self.last_fired.unwrap_or(event.observed_at);
                 self.deadline = phase_after(from, self.offset, slot_ns);
@@ -114,7 +115,7 @@ impl SlotTimer {
 
         // (2) More than one period late with no step: re-anchor, no fire.
         let behind = now - self.deadline;
-        if behind > Duration::nanoseconds(self.deadline_slot_ns) {
+        if behind > SignedDuration::from_nanos(self.deadline_slot_ns) {
             self.deadline = phase_after(now, self.offset, slot_ns);
             self.deadline_slot_ns = slot_ns;
             self.last_poll_now = now;
@@ -145,7 +146,7 @@ impl SlotTimer {
             if slot_ns != self.deadline_slot_ns {
                 self.deadline = phase_after(now, self.offset, slot_ns);
                 self.deadline_slot_ns = slot_ns;
-            } else if self.deadline - now > Duration::nanoseconds(self.deadline_slot_ns) {
+            } else if self.deadline - now > SignedDuration::from_nanos(self.deadline_slot_ns) {
                 // The clock moved back with no resync: return to the UTC
                 // grid, never re-firing the last boundary.
                 let from = self.last_fired.map_or(now, |fired| fired.max(now));

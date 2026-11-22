@@ -1,12 +1,13 @@
 //! PAN-358: the driver publishes each slot-clock event once.
 
 use super::*;
-use chrono::TimeZone;
+use jiff::SignedDuration;
 use pancetta_core::slot_clock::ManualClock;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::AtomicI64;
 
 fn manual() -> (ManualClock, SlotClock) {
-    let m = ManualClock::new(chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 5).unwrap());
+    let m = ManualClock::new(UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 5).unwrap());
     let clock = m.slot_clock(Arc::new(AtomicI64::new(15_000_000_000)));
     (m, clock)
 }
@@ -27,12 +28,12 @@ async fn driver_publishes_each_new_event_once() {
     tick().await;
     assert!(!rx.has_changed().unwrap());
 
-    m.step_wall(chrono::Duration::seconds(60));
+    m.step_wall(SignedDuration::from_secs(60));
     tick().await;
     assert!(rx.has_changed().unwrap());
     let event = rx.borrow_and_update().expect("an event");
     assert_eq!(event.epoch, 1);
-    assert_eq!(event.skew, chrono::Duration::seconds(60));
+    assert_eq!(event.skew, SignedDuration::from_secs(60));
 
     for _ in 0..4 {
         m.advance(SLOT_CLOCK_DRIVER_PERIOD);
@@ -51,14 +52,14 @@ async fn driver_publishes_an_event_another_reader_observed() {
     let (tx, mut rx) = watch::channel(None);
     let handle = spawn_slot_clock_driver(clock.clone(), tx, Arc::new(AtomicBool::new(false)));
     tick().await;
-    m.step_wall(chrono::Duration::seconds(-30));
+    m.step_wall(SignedDuration::from_secs(-30));
     // Another consumer observes the step first.
     assert_eq!(clock.read().epoch, 1);
     tick().await;
     assert!(rx.has_changed().unwrap());
     let event = rx.borrow_and_update().expect("an event");
     assert_eq!(event.epoch, 1);
-    assert_eq!(event.skew, chrono::Duration::seconds(-30));
+    assert_eq!(event.skew, SignedDuration::from_secs(-30));
     handle.abort();
 }
 

@@ -4,31 +4,32 @@
 //! 250 ms, as the autonomous loop does, and records the instants it fires.
 
 use super::*;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot_clock::{ManualClock, SlotClock};
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 const FT8_NS: i64 = 15_000_000_000;
 
-fn base_plus(seconds: f64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
-        + chrono::Duration::nanoseconds((seconds * 1e9).round() as i64)
+fn base_plus(seconds: f64) -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap()
+        + SignedDuration::from_nanos((seconds * 1e9).round() as i64)
 }
 
-fn secs(s: f64) -> chrono::Duration {
-    chrono::Duration::nanoseconds((s * 1e9).round() as i64)
+fn secs(s: f64) -> SignedDuration {
+    SignedDuration::from_nanos((s * 1e9).round() as i64)
 }
 
 fn start(seconds: f64) -> (ManualClock, SlotClock, SlotTimer) {
     let manual = ManualClock::new(base_plus(seconds));
     let clock = manual.slot_clock(Arc::new(AtomicI64::new(FT8_NS)));
-    let timer = SlotTimer::new(&clock.read(), chrono::Duration::zero(), FT8_NS);
+    let timer = SlotTimer::new(&clock.read(), SignedDuration::ZERO, FT8_NS);
     (manual, clock, timer)
 }
 
 /// One loop iteration: poll, and on `due` advance as the loop does.
-fn tick(clock: &SlotClock, timer: &mut SlotTimer) -> (AutonomousSlotPoll, DateTime<Utc>) {
+fn tick(clock: &SlotClock, timer: &mut SlotTimer) -> (AutonomousSlotPoll, UtcTimestamp) {
     let reading = clock.read();
     let poll = autonomous_slot_poll(timer, &reading, FT8_NS);
     if poll.due {
@@ -44,7 +45,7 @@ fn run(
     clock: &SlotClock,
     timer: &mut SlotTimer,
     polls: usize,
-) -> (Vec<DateTime<Utc>>, Vec<AutonomousSlotPoll>) {
+) -> (Vec<UtcTimestamp>, Vec<AutonomousSlotPoll>) {
     let mut fired = Vec::new();
     let mut clears = Vec::new();
     for _ in 0..polls {
