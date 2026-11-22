@@ -238,10 +238,9 @@ impl ConfigLoader {
     fn get_default_search_paths() -> ConfigResult<Vec<PathBuf>> {
         let mut paths = Vec::new();
 
-        // Current directory
-        if let Ok(current_dir) = std::env::current_dir() {
-            paths.push(current_dir);
-        }
+        // PAN-360: never the current directory. A config file there is read
+        // only when named with `--config`, so the station behaves the same
+        // from every shell location.
 
         // User configuration directory
         if let Some(config_dir) = dirs::config_dir() {
@@ -551,7 +550,12 @@ impl ConfigLoader {
     fn load_source(&self, source: &ConfigSource) -> ConfigResult<Config> {
         match &source.source_type {
             SourceType::Toml => {
-                if source.path.exists() {
+                if source.name == "defaults" {
+                    // PAN-360: the built-in defaults are always the embedded
+                    // ones. Their `defaults.toml` path is relative, so
+                    // reading it from disk would read the current directory.
+                    self.load_embedded_defaults()
+                } else if source.path.exists() {
                     self.load_from_file(&source.path)
                 } else if source.path.file_name() == Some(std::ffi::OsStr::new("defaults.toml")) {
                     // Load embedded defaults

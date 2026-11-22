@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
 - PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
 
+### Upgrading
+
+- PAN-360: pancetta no longer reads `pancetta.toml`, `config.toml`, `pancetta.json` or `config.json` from the current directory, so it behaves the same from every shell location. A `defaults.toml` in the current directory, which replaced the built-in defaults, is ignored too. Without `--config` it searches the five directories listed in `docs/CONFIG.md`. If your station relied on a config file in the directory it started from (for example next to `pancetta.exe`, or in a service's working directory), move it to `~/.pancetta/pancetta.toml` (`%USERPROFILE%\.pancetta\pancetta.toml` on Windows) or pass `--config <path>`. Run `pancetta config --validate` after upgrading. It lists every file read, and a file it does not list is not used. With no config file the station runs on built-in defaults (callsign `N0CALL`) and will not transmit until a callsign is set. `--config ./pancetta.toml` still works.
+
 ### Added
 
 - PAN-377: `pancetta --version` (and `-V`) now prints the commit, build date and target; `pancetta info` and the startup log show the same values. The date honours `SOURCE_DATE_EPOCH`. `pancetta completions zsh` prints a script generated from the binary's command line. Release builds verify that the binary names the checked-out commit and target.
