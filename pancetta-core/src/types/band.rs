@@ -322,6 +322,64 @@ impl FromStr for Band {
     }
 }
 
+/// Dial slack (Hz) for "the same dial": absorbs rig readback rounding while
+/// staying far inside the 100 Hz relevance gate and under the QSO engine's
+/// 15 Hz first-contact frequency gate. Shared by the coordinator's spot-call
+/// "already there" check (PAN-287) and the TUI's WSJT-X decode refusal
+/// (PAN-443).
+pub const SAME_DIAL_SLACK_HZ: u64 = 10;
+
+/// `true` when `current_hz` is on `target_hz` (within [`SAME_DIAL_SLACK_HZ`]).
+/// A current dial of `0` is unknown and never counts as there.
+pub fn same_dial(current_hz: u64, target_hz: u64) -> bool {
+    current_hz != 0 && current_hz.abs_diff(target_hz) <= SAME_DIAL_SLACK_HZ
+}
+
+/// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
+/// "band change". Sized to ride over normal fine-tuning / passband nudges
+/// within an FT8 sub-band (a few kHz) while still catching a deliberate jump
+/// that lands the rig somewhere a QSO can no longer complete. 100 kHz.
+pub const BAND_CHANGE_HZ_THRESHOLD: u64 = 100_000;
+
+/// Decide whether a dial-frequency change (`old_hz` → `new_hz`) is a genuine
+/// **band change**, versus a tiny tune wobble. The coordinator's C9
+/// active-QSO teardown is one user; the TUI's WSJT-X rig-lag guard
+/// (PAN-443) is another.
+///
+/// Returns `true` when:
+///   - the two frequencies map to **different ham bands**
+///     ([`Band::from_frequency`]), or
+///   - one/both are outside any ham band but the dial moved more than
+///     [`BAND_CHANGE_HZ_THRESHOLD`].
+///
+/// Returns `false` when:
+///   - `old_hz == 0` (uninitialized / first frequency set at startup — there
+///     is nothing to tear down, and we must not fire on the initial dial read),
+///   - the frequencies are in the **same** ham band (intra-band fine-tuning),
+///     or
+///   - both are out-of-band and within the threshold (small wobble).
+pub fn is_band_change(old_hz: u64, new_hz: u64) -> bool {
+    // Nothing to compare against at startup / before the first real read.
+    if old_hz == 0 {
+        return false;
+    }
+    if old_hz == new_hz {
+        return false;
+    }
+    match (Band::from_frequency(old_hz), Band::from_frequency(new_hz)) {
+        // Both map to a known band: a change iff the band differs.
+        (Some(a), Some(b)) => a != b,
+        // One/both out-of-band: fall back to a magnitude threshold so a big
+        // jump still triggers teardown but a small nudge near a band edge does
+        // not.
+        _ => old_hz.abs_diff(new_hz) >= BAND_CHANGE_HZ_THRESHOLD,
+    }
+}
+
+#[cfg(test)]
+#[path = "band/tests/dial_tests.rs"]
+mod dial_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
