@@ -16,6 +16,7 @@
 
 use super::ActiveQsoFreq;
 use anyhow::Result;
+use pancetta_core::slot_clock::ClockStamp;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -197,6 +198,8 @@ struct CompletedTxGrace {
     /// PAN-274: shutdown ends a pending grace early; nothing is purged or
     /// promoted after it.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// PAN-358: the coordinator's slot clock; queued-call ages read it.
+    clock: pancetta_core::SlotClock,
 }
 
 impl CompletedTxGrace {
@@ -212,6 +215,7 @@ impl CompletedTxGrace {
         message_bus: MessageBus,
         limits: QsoCapacityLimits,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
+        clock: pancetta_core::SlotClock,
     ) -> Self {
         Self {
             active_tx_qsos,
@@ -226,6 +230,7 @@ impl CompletedTxGrace {
             message_bus,
             limits,
             shutdown,
+            clock,
         }
     }
 
@@ -254,6 +259,7 @@ impl CompletedTxGrace {
                 admission: Arc::new(tokio::sync::Mutex::new(())),
             },
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_queue_clock(),
         )
     }
 
@@ -314,6 +320,7 @@ impl CompletedTxGrace {
                     &this.message_bus,
                     &this.limits,
                     &this.shutdown,
+                    &this.clock,
                 )
                 .await;
             }
@@ -389,10 +396,10 @@ struct PendingManualCall {
     /// is always `Some`.
     dx_parity: Option<pancetta_core::slot::SlotParity>,
     /// When the call was parked in the queue, on both the monotonic and the
-    /// wall clock (PAN-289). Its age (see [`QueueStamp::age_at`]) drives the
+    /// wall clock (PAN-289). Its age (see [`ClockStamp::age_at`]) drives the
     /// TTL watchdog and the expiry check at promotion, which retire calls that
     /// have waited without a free window for too long, sleep included.
-    queued_at: QueueStamp,
+    queued_at: ClockStamp,
     /// Set when this entry was created by [`QsoMessage::EngageHound`].
     /// On promotion, the call is routed to `engage_hound` instead of
     /// `respond_to_cq_with` so the Hound metadata (partner_freq, low
@@ -442,35 +449,25 @@ struct PendingManualCall {
     their_report: Option<i8>,
 }
 
-/// PAN-289: when a manual call was queued, on both clocks.
-///
-/// `std::time::Instant` does not advance while the machine is suspended
-/// (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS), so a monotonic
-/// stamp alone lets a call queued just before a sleep fire right after wake.
-/// The wall clock counts the sleep; the monotonic clock keeps a backward wall
-/// step from extending a call's life.
-#[derive(Debug, Clone, Copy)]
-struct QueueStamp {
-    mono: std::time::Instant,
-    wall: chrono::DateTime<chrono::Utc>,
-}
-
-impl QueueStamp {
-    fn now() -> Self {
-        Self {
-            mono: std::time::Instant::now(),
-            wall: chrono::Utc::now(),
-        }
-    }
-
-    /// Age at `now`: the larger of monotonic and wall-clock elapsed time.
-    /// Wall time counts a suspend; monotonic time survives a backward step.
-    /// A negative wall elapsed (the wall clock stepped back) counts as zero.
-    fn age_at(&self, now: QueueStamp) -> std::time::Duration {
-        let mono = now.mono.saturating_duration_since(self.mono);
-        let wall = (now.wall - self.wall).to_std().unwrap_or_default();
-        mono.max(wall)
-    }
+/// One slot clock for every test in this module, so `ClockStamp`s taken by
+/// different tests and helpers share one monotonic origin.
+#[cfg(test)]
+fn test_queue_clock() -> pancetta_core::SlotClock {
+    static CLOCK: std::sync::OnceLock<pancetta_core::SlotClock> = std::sync::OnceLock::new();
+    CLOCK
+        .get_or_init(|| {
+            // A day of monotonic headroom, so a test can stamp a call hours
+            // in the past without underflowing.
+            let origin = std::time::Instant::now();
+            pancetta_core::SlotClock::new(
+                Arc::new(chrono::Utc::now),
+                Arc::new(move || origin.elapsed() + std::time::Duration::from_secs(86_400)),
+                Arc::new(std::sync::atomic::AtomicI64::new(
+                    pancetta_core::slot::SLOT_NS,
+                )),
+            )
+        })
+        .clone()
 }
 
 impl PendingManualCall {
@@ -812,6 +809,7 @@ async fn promote_pending_manual_calls(
     message_bus: &MessageBus,
     limits: &QsoCapacityLimits,
     shutdown: &std::sync::atomic::AtomicBool,
+    clock: &pancetta_core::SlotClock,
 ) {
     // Capacity and parity are checked and the calls started under the
     // admission lock (see `QsoCapacityLimits::admission`).
@@ -847,7 +845,7 @@ async fn promote_pending_manual_calls(
             // PAN-289: drop expired calls before partitioning, so an expired
             // head can neither start nor pick the parity an idle station
             // adopts. Promotion can run on wake before the 15 s watchdog does.
-            let (queue, expired) = partition_expired(queue, QueueStamp::now(), QUEUED_CALL_TTL);
+            let (queue, expired) = partition_expired(queue, clock.stamp(), QUEUED_CALL_TTL);
             info!(
                 target: "qso",
                 "promote_pending_manual_calls: current_side={:?}, queue_depth={}, expired={}",
@@ -1010,12 +1008,12 @@ async fn promote_pending_manual_calls(
 
 /// Pure TTL partition: split the queue into entries that have NOT yet exceeded
 /// the TTL (retained) and entries that have expired (returned as a `Vec` of
-/// callsigns to report). An entry's age is [`QueueStamp::age_at`], so time the
+/// callsigns to report). An entry's age is [`ClockStamp::age_at`], so time the
 /// machine spent asleep counts (PAN-289). `now` and `ttl` are injected so this
 /// is deterministically unit-testable without sleeping.
 fn partition_expired(
     queue: std::collections::VecDeque<PendingManualCall>,
-    now: QueueStamp,
+    now: ClockStamp,
     ttl: std::time::Duration,
 ) -> (std::collections::VecDeque<PendingManualCall>, Vec<String>) {
     let mut kept = std::collections::VecDeque::new();
@@ -1030,18 +1028,56 @@ fn partition_expired(
     (kept, expired)
 }
 
+/// The queued-call TTL task: an expiry pass every 15 s and on every event
+/// the slot-clock driver publishes (PAN-358), so a call queued before a
+/// sleep or a forward clock step expires as soon as the step is observed.
+/// Exits on the first wake after `shutdown` is set.
+fn spawn_queued_call_ttl(
+    pending: PendingManualCalls,
+    bus: MessageBus,
+    clock: pancetta_core::SlotClock,
+    mut events: tokio::sync::watch::Receiver<Option<pancetta_core::slot_clock::ClockEvent>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                changed = events.changed(), if events_open => {
+                    if changed.is_err() {
+                        // The coordinator dropped the sender: keep the tick.
+                        events_open = false;
+                        continue;
+                    }
+                }
+            }
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            expire_stale_queued_calls(&pending, &bus, &clock).await;
+        }
+    })
+}
+
 /// TTL watchdog: remove entries from the cross-parity queue that have waited
 /// longer than [`QUEUED_CALL_TTL`] without getting a free window to start.
 /// Emits an operator status line + warn-level log for each retired call.
 /// Called from a dedicated interval task (every 15 s).
-async fn expire_stale_queued_calls(pending: &PendingManualCalls, message_bus: &MessageBus) {
+async fn expire_stale_queued_calls(
+    pending: &PendingManualCalls,
+    message_bus: &MessageBus,
+    clock: &pancetta_core::SlotClock,
+) {
     let expired = {
         let mut q = pending.lock().await;
         if q.is_empty() {
             return;
         }
         let queue = std::mem::take(&mut *q);
-        let (kept, expired) = partition_expired(queue, QueueStamp::now(), QUEUED_CALL_TTL);
+        let (kept, expired) = partition_expired(queue, clock.stamp(), QUEUED_CALL_TTL);
         *q = kept;
         expired
     };
@@ -1389,6 +1425,10 @@ fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
         && !metadata.hound
         && !metadata.fox
 }
+
+#[cfg(test)]
+#[path = "qso/tests/queued_call_ttl_clock_tests.rs"]
+mod queued_call_ttl_clock_tests;
 
 #[cfg(test)]
 #[path = "qso/tests/fox_slot_tests.rs"]
@@ -4135,6 +4175,11 @@ impl super::ApplicationCoordinator {
 
             let autonomous_cq_attempts = self.autonomous_cq_attempts.clone();
             let autonomous_config_enabled = self.autonomous_config_enabled.clone();
+            // PAN-358: the queued-call TTL task wakes on slot-clock events.
+            let ttl_clock_events = self.slot_clock_events();
+            // PAN-358: queued manual calls are stamped and aged on the
+            // coordinator's slot clock (PAN-289 age rule, `ClockStamp`).
+            let queue_clock = self.slot_clock();
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -4304,22 +4349,16 @@ impl super::ApplicationCoordinator {
                 // fires even when no QSO events are flowing (the main loop is
                 // event-driven and would never drain the queue on its own if
                 // the operator's active QSOs stay alive indefinitely).
-                {
-                    let ttl_pending = pending_manual_calls.clone();
-                    let ttl_bus = message_bus.clone();
-                    let ttl_shutdown = shutdown.clone();
-                    tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
-                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        loop {
-                            tick.tick().await;
-                            if ttl_shutdown.load(Ordering::Acquire) {
-                                break;
-                            }
-                            expire_stale_queued_calls(&ttl_pending, &ttl_bus).await;
-                        }
-                    });
-                }
+                // PAN-358: it also runs a pass as soon as the slot-clock
+                // driver publishes a clock event, so a call queued before a
+                // sleep or a forward step expires on wake, not up to 15 s later.
+                spawn_queued_call_ttl(
+                    pending_manual_calls.clone(),
+                    message_bus.clone(),
+                    queue_clock.clone(),
+                    ttl_clock_events,
+                    shutdown.clone(),
+                );
 
                 // PAN-78: the manual open handlers (message loop below) relay
                 // capacity refusals to remote clients through the same gate;
@@ -4353,6 +4392,7 @@ impl super::ApplicationCoordinator {
                 let snapshot_bus = tx_bus.clone();
                 let completions_for_events = recent_manual_completions.clone();
                 let pending_for_events = pending_manual_calls.clone();
+                let events_queue_clock = queue_clock.clone();
                 let dx_activity_for_events = dx_activity.clone();
                 let display_feed_enabled = display_feed_enabled.clone();
                 let pending_qso_offset_requests = pending_qso_offset_requests.clone();
@@ -4382,6 +4422,7 @@ impl super::ApplicationCoordinator {
                     snapshot_bus.clone(),
                     capacity_for_events.clone(),
                     tx_shutdown.clone(),
+                    queue_clock.clone(),
                 );
                 let tx_grace_for_events = completed_tx_grace.clone();
                 tokio::spawn(async move {
@@ -4522,6 +4563,7 @@ impl super::ApplicationCoordinator {
                                                 &snapshot_bus,
                                                 &capacity_for_events,
                                                 &tx_shutdown,
+                                                &events_queue_clock,
                                             )
                                             .await;
                                         }
@@ -4632,6 +4674,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                     &display_feed_enabled,
                                     &snapshot_bus,
+                                    &events_queue_clock,
                                 )
                                 .await;
 
@@ -4879,6 +4922,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                     &display_feed_enabled,
                                     &snapshot_bus,
+                                    &events_queue_clock,
                                 )
                                 .await;
                                 if let Some(ref their_call) = metadata.their_callsign {
@@ -5034,6 +5078,7 @@ impl super::ApplicationCoordinator {
                                         &snapshot_bus,
                                         &capacity_for_events,
                                         &tx_shutdown,
+                                        &events_queue_clock,
                                     )
                                     .await;
                                 }
@@ -5056,6 +5101,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                     &display_feed_enabled,
                                     &snapshot_bus,
+                                    &events_queue_clock,
                                 )
                                 .await;
                                 // observability-diagnostics-plan.md Layer 2: surface
@@ -5244,6 +5290,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                     &display_feed_enabled,
                                     &snapshot_bus,
+                                    &events_queue_clock,
                                 )
                                 .await;
                             }
@@ -5618,7 +5665,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: QueueStamp::now(),
+                                                            queued_at: queue_clock.stamp(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -5639,7 +5686,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: QueueStamp::now(),
+                                                            queued_at: queue_clock.stamp(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -6140,7 +6187,7 @@ impl super::ApplicationCoordinator {
                                                     // replacing its entry. Otherwise a
                                                     // re-engage after wake would keep the
                                                     // pre-sleep stamp and be expired.
-                                                    q[pos].queued_at = QueueStamp::now();
+                                                    q[pos].queued_at = queue_clock.stamp();
                                                 } else {
                                                     if q.len() >= MAX_PENDING_MANUAL_CALLS {
                                                         q.pop_front();
@@ -6149,7 +6196,7 @@ impl super::ApplicationCoordinator {
                                                         callsign: callsign.clone(),
                                                         frequency_hz: fox_freq as f64,
                                                         dx_parity,
-                                                        queued_at: QueueStamp::now(),
+                                                        queued_at: queue_clock.stamp(),
                                                         hound: true,
                                                         fox_freq_hz: Some(fox_freq as f64),
                                                         fox_grid: fox_grid.clone(),
@@ -6359,7 +6406,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: QueueStamp::now(),
+                                                            queued_at: queue_clock.stamp(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -6380,7 +6427,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: QueueStamp::now(),
+                                                            queued_at: queue_clock.stamp(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -6706,6 +6753,7 @@ impl super::ApplicationCoordinator {
                                                     &pending_manual_calls,
                                                     &display_feed_for_admission,
                                                     &message_bus,
+                                                    &queue_clock,
                                                 ).await;
                                             }
                                         }
@@ -7398,9 +7446,10 @@ async fn push_active_qso_snapshot(
     pending_manual_calls: &PendingManualCalls,
     display_feed_enabled: &std::sync::atomic::AtomicBool,
     message_bus: &MessageBus,
+    clock: &pancetta_core::SlotClock,
 ) {
     let (snapshot, pending_snap) =
-        build_active_qso_snapshot(qso_manager, dx_activity, pending_manual_calls).await;
+        build_active_qso_snapshot(qso_manager, dx_activity, pending_manual_calls, clock).await;
     // Additive: clone for the read-only gateway BEFORE the snapshot is moved
     // into the ->Tui send, and only when the gateway is enabled.
     let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
@@ -7443,6 +7492,7 @@ async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
     dx_activity: &DxActivityMap,
     pending_manual_calls: &PendingManualCalls,
+    clock: &pancetta_core::SlotClock,
 ) -> (
     Vec<crate::message_bus::ActiveQsoSnapshotItem>,
     Vec<crate::message_bus::PendingCallSnapshotItem>,
@@ -7514,7 +7564,7 @@ async fn build_active_qso_snapshot(
     // release — never hold across await points.
     let pending: Vec<crate::message_bus::PendingCallSnapshotItem> = {
         // PAN-289: the displayed wait uses the same age rule as expiry.
-        let stamp_now = QueueStamp::now();
+        let stamp_now = clock.stamp();
         let guard = pending_manual_calls.lock().await;
         guard
             .iter()
@@ -7663,7 +7713,7 @@ fn snapshot_item_from_progress(
 mod pending_manual_tests {
     use super::{
         compute_manual_tx_offset, compute_spot_call_tx_offset, drain_parked_calls_on_band_change,
-        partition_pending_calls, PendingManualCall, QueueStamp,
+        partition_pending_calls, ClockStamp, PendingManualCall,
     };
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
@@ -7675,7 +7725,7 @@ mod pending_manual_tests {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: QueueStamp::now(),
+            queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7792,7 +7842,7 @@ mod pending_manual_tests {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: QueueStamp::now(),
+            queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7939,12 +7989,12 @@ mod pending_manual_tests {
 
     /// Build a call whose `queued_at` is `age` in the past on both clocks.
     fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingManualCall {
-        let now = QueueStamp::now();
+        let now = crate::coordinator::qso::test_queue_clock().stamp();
         PendingManualCall {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: QueueStamp {
+            queued_at: ClockStamp {
                 mono: now
                     .mono
                     .checked_sub(age)
@@ -7968,7 +8018,7 @@ mod pending_manual_tests {
     fn fresh_calls_are_kept() {
         let ttl = std::time::Duration::from_secs(600);
         let q: VecDeque<_> = [call("A", SlotParity::Even), call("B", SlotParity::Odd)].into();
-        let now = QueueStamp::now();
+        let now = crate::coordinator::qso::test_queue_clock().stamp();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert_eq!(kept.len(), 2);
         assert!(expired.is_empty());
@@ -7986,7 +8036,7 @@ mod pending_manual_tests {
             aged_call("C", SlotParity::Even, std::time::Duration::from_secs(720)),
         ]
         .into();
-        let now = QueueStamp::now();
+        let now = crate::coordinator::qso::test_queue_clock().stamp();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].callsign, "B");
@@ -7998,7 +8048,7 @@ mod pending_manual_tests {
         // A call that is exactly TTL old should be retired (>=, not >).
         let ttl = std::time::Duration::from_secs(600);
         let q: VecDeque<_> = [aged_call("X", SlotParity::Even, ttl)].into();
-        let now = QueueStamp::now();
+        let now = crate::coordinator::qso::test_queue_clock().stamp();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert!(kept.is_empty());
         assert_eq!(expired, vec!["X"]);
@@ -8008,7 +8058,7 @@ mod pending_manual_tests {
     fn empty_queue_partition_expired_is_noop() {
         let (kept, expired) = partition_expired(
             VecDeque::new(),
-            QueueStamp::now(),
+            crate::coordinator::qso::test_queue_clock().stamp(),
             std::time::Duration::from_secs(600),
         );
         assert!(kept.is_empty());
@@ -8021,11 +8071,11 @@ mod pending_manual_tests {
     /// may be negative) after `s`. Only adds to `s`, so a freshly booted CI
     /// host cannot underflow an `Instant`.
     fn stamp_after(
-        s: QueueStamp,
+        s: ClockStamp,
         mono_elapsed: std::time::Duration,
         wall_elapsed: chrono::Duration,
-    ) -> QueueStamp {
-        QueueStamp {
+    ) -> ClockStamp {
+        ClockStamp {
             mono: s.mono + mono_elapsed,
             wall: s.wall + wall_elapsed,
         }
@@ -8103,7 +8153,7 @@ mod pending_manual_tests {
             callsign: "DX1ABC".to_string(),
             frequency_hz: 900.0, // DX decoded at 900 Hz
             dx_parity: Some(SlotParity::Even),
-            queued_at: QueueStamp::now(),
+            queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -8134,7 +8184,7 @@ mod pending_manual_tests {
             callsign: "DX2XYZ".to_string(),
             frequency_hz: 1200.0, // DX decoded at 1200 Hz
             dx_parity: Some(SlotParity::Odd),
-            queued_at: QueueStamp::now(),
+            queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -8173,7 +8223,7 @@ mod pending_manual_tests {
             callsign: "DX3WWW".to_string(),
             frequency_hz: 1750.0,
             dx_parity: Some(SlotParity::Even),
-            queued_at: QueueStamp::now(),
+            queued_at: crate::coordinator::qso::test_queue_clock().stamp(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -8253,8 +8303,8 @@ mod pending_manual_tests {
         let mgr = test_manager("K5ARH").await;
         let bus = MessageBus::new(1000).expect("bus");
         let mut stale = call("JA1AAA", SlotParity::Odd);
-        stale.queued_at = QueueStamp {
-            mono: std::time::Instant::now(),
+        stale.queued_at = ClockStamp {
+            mono: crate::coordinator::qso::test_queue_clock().stamp().mono,
             wall: chrono::Utc::now() - chrono::Duration::minutes(11),
         };
         let fresh = even_dx_call_at("JA2BBB", 1500.0);
@@ -8266,6 +8316,7 @@ mod pending_manual_tests {
             &bus,
             &limits(1),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
@@ -8296,7 +8347,15 @@ mod pending_manual_tests {
         let mut events = mgr.subscribe();
         let shutdown = std::sync::atomic::AtomicBool::new(true);
 
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &shutdown,
+            &crate::coordinator::qso::test_queue_clock(),
+        )
+        .await;
 
         assert_eq!(mgr.active_qso_count().await, 0, "no QSO was started");
         assert!(
@@ -8308,7 +8367,15 @@ mod pending_manual_tests {
 
         // Control: with the flag clear the same call starts.
         shutdown.store(false, std::sync::atomic::Ordering::Release);
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &shutdown,
+            &crate::coordinator::qso::test_queue_clock(),
+        )
+        .await;
         assert!(mgr.has_active_qso_with("JA2BBB").await);
     }
 
@@ -8347,6 +8414,7 @@ mod pending_manual_tests {
             &bus,
             &limits(1),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
@@ -8381,6 +8449,7 @@ mod pending_manual_tests {
                     &bus,
                     &lim,
                     &std::sync::atomic::AtomicBool::new(false),
+                    &crate::coordinator::qso::test_queue_clock(),
                 )
                 .await;
             })
@@ -8442,6 +8511,7 @@ mod pending_manual_tests {
             &bus,
             &limits(1),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
@@ -8479,6 +8549,7 @@ mod pending_manual_tests {
             &bus,
             &limits(2),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
@@ -8511,6 +8582,7 @@ mod pending_manual_tests {
             &bus,
             &limits(1),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
@@ -8552,6 +8624,7 @@ mod pending_manual_tests {
             &bus,
             &limits(1),
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::coordinator::qso::test_queue_clock(),
         )
         .await;
 
