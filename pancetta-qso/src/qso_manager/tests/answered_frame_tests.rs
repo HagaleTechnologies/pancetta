@@ -4,22 +4,23 @@
 //! fixed, slot-aligned timestamps (2026-10-24 12:00:00 UTC is a slot
 //! boundary on both the FT8 15 s and the FT4 7.5 s grid).
 use super::*;
-use chrono::TimeZone;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 const SLOT_NS: i64 = 15_000_000_000;
 
-fn slot_aligned_reply_slot() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap()
+fn slot_aligned_reply_slot() -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 10, 24, 12, 0, 0).unwrap()
 }
 
-fn aired(offset_hz: f64, aired_at: DateTime<Utc>) -> Option<AiredFrame> {
+fn aired(offset_hz: f64, aired_at: UtcTimestamp) -> Option<AiredFrame> {
     Some(AiredFrame {
         offset_hz,
         aired_at,
     })
 }
 
-fn reply_parity(reply_slot: DateTime<Utc>, slot_ns: i64) -> pancetta_core::slot::SlotParity {
+fn reply_parity(reply_slot: UtcTimestamp, slot_ns: i64) -> pancetta_core::slot::SlotParity {
     pancetta_core::slot::SlotParity::of_with_period(reply_slot, slot_ns)
 }
 
@@ -28,8 +29,8 @@ fn answered_frame_is_the_one_aired_in_the_slot_before_the_reply() {
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(2)),
-            reply_slot + Duration::seconds(13),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(2)),
+            reply_slot + SignedDuration::from_secs(13),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -44,8 +45,8 @@ fn answered_frame_survives_the_decode_being_processed_after_the_reply_slot_ends(
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(2)),
-            reply_slot + Duration::seconds(17),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(2)),
+            reply_slot + SignedDuration::from_secs(17),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -60,8 +61,8 @@ fn a_late_started_frame_that_finishes_inside_the_reply_slot_still_counts() {
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot + Duration::seconds(1)),
-            reply_slot + Duration::seconds(16),
+            aired(1500.0, reply_slot + SignedDuration::from_secs(1)),
+            reply_slot + SignedDuration::from_secs(16),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -77,8 +78,8 @@ fn a_frame_from_an_earlier_own_slot_does_not_count() {
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(17)),
-            reply_slot + Duration::seconds(13),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(17)),
+            reply_slot + SignedDuration::from_secs(13),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -93,8 +94,8 @@ fn our_next_frame_after_the_reply_does_not_count() {
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot + Duration::seconds(28)),
-            reply_slot + Duration::seconds(29),
+            aired(1500.0, reply_slot + SignedDuration::from_secs(28)),
+            reply_slot + SignedDuration::from_secs(29),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -109,8 +110,8 @@ fn no_slot_parity_means_no_answer() {
     let reply_slot = slot_aligned_reply_slot();
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(2)),
-            reply_slot + Duration::seconds(13),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(2)),
+            reply_slot + SignedDuration::from_secs(13),
             None,
             SLOT_NS
         ),
@@ -126,7 +127,7 @@ fn no_aired_record_means_no_answer() {
     assert_eq!(
         answered_frame_offset_hz(
             None,
-            reply_slot + Duration::seconds(13),
+            reply_slot + SignedDuration::from_secs(13),
             Some(reply_parity(reply_slot, SLOT_NS)),
             SLOT_NS
         ),
@@ -143,8 +144,8 @@ fn the_window_scales_with_the_active_slot_length() {
     let parity = reply_parity(reply_slot, FT4_SLOT_NS);
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(1)),
-            reply_slot + Duration::seconds(6),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(1)),
+            reply_slot + SignedDuration::from_secs(6),
             Some(parity),
             FT4_SLOT_NS
         ),
@@ -153,8 +154,8 @@ fn the_window_scales_with_the_active_slot_length() {
     );
     assert_eq!(
         answered_frame_offset_hz(
-            aired(1500.0, reply_slot - Duration::seconds(8)),
-            reply_slot + Duration::seconds(6),
+            aired(1500.0, reply_slot - SignedDuration::from_secs(8)),
+            reply_slot + SignedDuration::from_secs(6),
             Some(parity),
             FT4_SLOT_NS
         ),

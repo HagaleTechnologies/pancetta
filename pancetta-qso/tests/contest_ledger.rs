@@ -1,4 +1,6 @@
 //! Durable PAN-50 contest evidence, including ADIF-only cold recovery.
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::adif::AdifProcessor;
 
 fn app_record(version: u32) -> String {
@@ -120,8 +122,8 @@ async fn strict_ledger_exceeds_search_page_and_rejects_identity_conflicts() {
         1100
     );
     let mut changed = context();
-    changed.periods[0].start += chrono::Duration::days(365);
-    changed.periods[0].end += chrono::Duration::days(365);
+    changed.periods[0].start += SignedDuration::from_hours(24 * 365);
+    changed.periods[0].end += SignedDuration::from_hours(24 * 365);
     assert!(db
         .contest_ledger(&changed, "K5ARH")
         .await
@@ -223,8 +225,8 @@ async fn configured_manual_attempts_enroll_but_autonomous_and_outside_attempts_d
     use pancetta_qso::contest::{ledger::*, scoring::*};
     use pancetta_qso::{QsoManager, QsoManagerConfig};
     let mut active = context();
-    active.periods[0].start = chrono::Utc::now() - chrono::Duration::minutes(1);
-    active.periods[0].end = chrono::Utc::now() + chrono::Duration::minutes(10);
+    active.periods[0].start = UtcTimestamp::now() - SignedDuration::from_mins(1);
+    active.periods[0].end = UtcTimestamp::now() + SignedDuration::from_mins(10);
     let manager = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".into(),
         contest_scoring: Some(active.clone()),
@@ -255,8 +257,8 @@ async fn configured_manual_attempts_enroll_but_autonomous_and_outside_attempts_d
         .metadata
         .contest_info
         .is_none());
-    active.periods[0].start += chrono::Duration::days(1);
-    active.periods[0].end += chrono::Duration::days(1);
+    active.periods[0].start += SignedDuration::from_hours(24);
+    active.periods[0].end += SignedDuration::from_hours(24);
     let outside = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".into(),
         contest_scoring: Some(active),
@@ -276,8 +278,8 @@ async fn configured_manual_attempts_enroll_but_autonomous_and_outside_attempts_d
     // SC has identity for scoring, but must not engage the grid matcher.
     let mut sc = context();
     sc.rules_id = SCQP_DIGITAL_FIXED_2026.into();
-    sc.periods[0].start = chrono::Utc::now() - chrono::Duration::minutes(1);
-    sc.periods[0].end = chrono::Utc::now() + chrono::Duration::minutes(10);
+    sc.periods[0].start = UtcTimestamp::now() - SignedDuration::from_mins(1);
+    sc.periods[0].end = UtcTimestamp::now() + SignedDuration::from_mins(10);
     let sc_manager = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".into(),
         contest_scoring: Some(sc),

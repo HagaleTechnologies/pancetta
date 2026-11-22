@@ -20,7 +20,8 @@
 //! `pancetta_qso::contest::scoring::ContestScoringContext`.
 
 use crate::{ConfigError, ConfigResult, ConfigSection};
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 
 /// Exact validation message for malformed periods (PAN-50 design).
@@ -33,9 +34,9 @@ pub const CONTEST_PERIODS_MESSAGE: &str =
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContestPeriodConfig {
     /// Interval start (UTC, inclusive).
-    pub start: DateTime<Utc>,
+    pub start: UtcTimestamp,
     /// Interval end (UTC, exclusive).
-    pub end: DateTime<Utc>,
+    pub end: UtcTimestamp,
 }
 
 /// Contest scoring: an explicit operator opt-in for manual contest contacts.
@@ -147,12 +148,8 @@ mod tests {
             rules_id: Some("ksqp-ft-2026".to_string()),
             operator_region: Some("TX".to_string()),
             periods: vec![ContestPeriodConfig {
-                start: DateTime::parse_from_rfc3339("2026-08-29T14:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                end: DateTime::parse_from_rfc3339("2026-08-30T02:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
+                start: str::parse::<UtcTimestamp>("2026-08-29T14:00:00Z").unwrap(),
+                end: str::parse::<UtcTimestamp>("2026-08-30T02:00:00Z").unwrap(),
             }],
         }
     }
@@ -205,17 +202,17 @@ mod tests {
         let (s0, e0) = (p0.start, p0.end);
         // Gap: second interval starts after the first ends — valid.
         section.periods.push(ContestPeriodConfig {
-            start: e0 + chrono::Duration::hours(12),
-            end: e0 + chrono::Duration::hours(18),
+            start: e0 + SignedDuration::from_hours(12),
+            end: e0 + SignedDuration::from_hours(18),
         });
         assert!(section.validate_section().is_ok());
         // Overlap: second interval starts before the first ends — invalid.
-        section.periods[1].start = e0 - chrono::Duration::minutes(1);
+        section.periods[1].start = e0 - SignedDuration::from_mins(1);
         let err = section.validate_section().unwrap_err().to_string();
         assert!(err.contains(CONTEST_PERIODS_MESSAGE), "got: {err}");
         // Unordered is equally invalid.
-        section.periods[1].start = s0 - chrono::Duration::hours(2);
-        section.periods[1].end = s0 - chrono::Duration::hours(1);
+        section.periods[1].start = s0 - SignedDuration::from_hours(2);
+        section.periods[1].end = s0 - SignedDuration::from_hours(1);
         assert!(section.validate_section().is_err());
     }
 

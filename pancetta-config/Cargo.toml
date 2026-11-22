@@ -43,7 +43,7 @@ tempfile = "3.27"
 # Canonical browser origins for the local gateway allow-list (PAN-99)
 url = { workspace = true }
 uuid = { version = "1.23", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { workspace = true }
 
 [features]
 default = ["cli"]

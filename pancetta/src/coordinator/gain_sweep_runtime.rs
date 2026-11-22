@@ -1,7 +1,9 @@
 //! Coordinator-owned receive-gain experiment. CAT operations never hold ptt_sync_gate.
 use super::{gain_sweep::*, pipeline::*, ApplicationCoordinator};
 use anyhow::{anyhow, Context, Result};
-use chrono::{TimeZone, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use std::{
     path::PathBuf,
     sync::{
@@ -107,17 +109,17 @@ impl ApplicationCoordinator {
                         || generation.load(Ordering::Acquire) != initial_generation {
                         failure = Some("Dial, mode or Hamlib generation changed".into()); break;
                     }
-                    let now = Utc::now();
-                    let slot_secs = (now.timestamp_millis() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
-                    let slot = Utc.timestamp_opt(slot_secs, 0).single().context("Invalid source slot")?;
-                    let boundary = slot - chrono::Duration::milliseconds((lead * 1000.0) as i64);
-                    let wait = (boundary - Utc::now()).to_std().unwrap_or_default();
+                    let now = UtcTimestamp::now();
+                    let slot_secs = (now.as_millisecond() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
+                    let slot = UtcTimestamp::from_parts(slot_secs, 0).context("Invalid source slot")?;
+                    let boundary = slot - SignedDuration::from_millis((lead * 1000.0) as i64);
+                    let wait = (boundary - UtcTimestamp::now()).to_std().unwrap_or_default();
                     let wake = Instant::now() + wait;
                     while Instant::now() < wake.min(end) && !shutdown.load(Ordering::Acquire) {
                         sleep_until((Instant::now() + Duration::from_millis(50)).min(wake).min(end)).await;
                     }
                     if Instant::now() >= end || shutdown.load(Ordering::Acquire) { continue; }
-                    let lateness = Utc::now().signed_duration_since(boundary).num_milliseconds();
+                    let lateness = UtcTimestamp::now().duration_since(boundary).as_millis_i64();
                     if !(0..=50).contains(&lateness) { skip(&mut report, slot_secs, "late boundary or clock discontinuity"); continue; }
                     // Configured TX parity is reserved even with no queued frame.
                     // Auto can choose either parity, so both remain unavailable.
@@ -146,7 +148,7 @@ impl ApplicationCoordinator {
                         bus.gain_tx_gate.store(0, Ordering::Release);
                         skip(&mut report, slot_secs, "parity balance quiet slot"); continue;
                     };
-                    let budget = (slot - chrono::Duration::milliseconds(250) - Utc::now()).to_std().unwrap_or_default();
+                    let budget = (slot - SignedDuration::from_millis(250) - UtcTimestamp::now()).to_std().unwrap_or_default();
                     let deadline = Instant::now() + budget;
                     let transaction = async {
                         anyhow::ensure!(rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off, "Rig is transmitting");
@@ -157,7 +159,7 @@ impl ApplicationCoordinator {
                         Ok(Ok(())) => {
                             current = pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db };
                             // Do not release TX exclusion until the 250 ms settling interval ends.
-                            let settle = (slot - Utc::now()).to_std().unwrap_or_default();
+                            let settle = (slot - UtcTimestamp::now()).to_std().unwrap_or_default();
                             sleep(settle).await;
                             epoch += 1;
                             let capture_admitted = capture.lock().unwrap_or_else(|e| e.into_inner()).admit(GainCaptureMetadata {
@@ -237,24 +239,23 @@ pub(super) async fn restore(
     let restored = tokio::time::timeout_at(end, async {
         loop {
             let _ = rig.connect().await;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let slot_secs =
-                (now.timestamp_millis() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
-            let slot = Utc
-                .timestamp_opt(slot_secs, 0)
-                .single()
-                .context("Invalid restoration boundary")?;
-            let boundary = slot - chrono::Duration::milliseconds((lead * 1000.0) as i64);
-            sleep((boundary - Utc::now()).to_std().unwrap_or_default()).await;
-            if Utc::now()
-                .signed_duration_since(boundary)
-                .num_milliseconds()
-                > 50
-            {
+                (now.as_millisecond() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
+            let slot =
+                UtcTimestamp::from_parts(slot_secs, 0).context("Invalid restoration boundary")?;
+            let boundary = slot - SignedDuration::from_millis((lead * 1000.0) as i64);
+            sleep(
+                (boundary - UtcTimestamp::now())
+                    .to_std()
+                    .unwrap_or_default(),
+            )
+            .await;
+            if UtcTimestamp::now().duration_since(boundary).as_millis_i64() > 50 {
                 continue;
             }
             let deadline = Instant::now()
-                + (slot - chrono::Duration::milliseconds(250) - Utc::now())
+                + (slot - SignedDuration::from_millis(250) - UtcTimestamp::now())
                     .to_std()
                     .unwrap_or_default();
             let attempt = tokio::time::timeout_at(deadline, async {
@@ -267,7 +268,7 @@ pub(super) async fn restore(
             })
             .await;
             if matches!(attempt, Ok(Ok(()))) {
-                sleep((slot - Utc::now()).to_std().unwrap_or_default()).await;
+                sleep((slot - UtcTimestamp::now()).to_std().unwrap_or_default()).await;
                 return anyhow::Ok(());
             }
             let _ = rig.disconnect().await;
@@ -296,15 +297,15 @@ fn drain(capture: &std::sync::Mutex<GainCaptureRegistry>, report: &mut Report) {
     for completion in completed {
         let meta = completion.metadata;
         if let Some(reason) = completion.invalid_reason {
-            skip(report, meta.source_slot.timestamp(), &reason);
+            skip(report, meta.source_slot.as_second(), &reason);
             continue;
         }
         let Some(noise) = completion.noise_dbfs_per_hz else {
-            skip(report, meta.source_slot.timestamp(), "missing noise");
+            skip(report, meta.source_slot.as_second(), "missing noise");
             continue;
         };
         report.observations.push(Observation {
-            slot: meta.source_slot.timestamp(),
+            slot: meta.source_slot.as_second(),
             generation: meta.generation,
             gain_epoch: meta.epoch,
             gain: meta.gain,
@@ -545,7 +546,7 @@ mod tests {
             generation: 0,
             epoch: 1,
             tx_epoch: 0,
-            source_slot: Utc.timestamp_opt(30, 0).single().unwrap(),
+            source_slot: UtcTimestamp::from_parts(30, 0).unwrap(),
             dial_hz: 14_074_000,
             gain: GainSetting {
                 preamp_db: 0,

@@ -27,6 +27,9 @@
 //! `coordinator/mod.rs`.
 
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, info, span, warn, Level};
@@ -274,13 +277,10 @@ fn destructive_capture_flush(
 /// the slice's time anchor (not the slot scheduler, which stays on real
 /// `now`) keeps the window's slot-relative coordinates aligned across both
 /// paths to within one output sample.
-fn effective_buffer_end(
-    now: chrono::DateTime<chrono::Utc>,
-    stage: &DecimationStage,
-) -> chrono::DateTime<chrono::Utc> {
+fn effective_buffer_end(now: UtcTimestamp, stage: &DecimationStage) -> UtcTimestamp {
     if stage.is_fir31() {
         // 15 / 48000 s = 312.5 µs = 312_500 ns, exactly representable.
-        now - chrono::Duration::nanoseconds(312_500)
+        now - SignedDuration::from_nanos(312_500)
     } else {
         now
     }
@@ -425,12 +425,12 @@ fn mode_flush_decision(cached_mode: u8, cur_mode: u8) -> bool {
 /// on a jump and `(next_window_time, None)` otherwise, so the no-jump emit
 /// path is untouched.
 fn reanchor_decode_window(
-    now: chrono::DateTime<chrono::Utc>,
-    next_window_time: chrono::DateTime<chrono::Utc>,
-    decode_phase: chrono::Duration,
+    now: UtcTimestamp,
+    next_window_time: UtcTimestamp,
+    decode_phase: SignedDuration,
     slot_ns: i64,
 ) -> (
-    chrono::DateTime<chrono::Utc>,
+    UtcTimestamp,
     Option<pancetta_core::slot_clock::WallClockJump>,
 ) {
     match pancetta_core::slot_clock::classify_deadline_jump(now, next_window_time, slot_ns) {
@@ -522,12 +522,7 @@ impl WavRecorder {
     /// (`ft8_<date>_<time>_<band>.wav`) so the corpus is band-stratifiable.
     /// `0`/unknown → no suffix (legacy `ft8_<date>_<time>.wav`, still parsed
     /// by all downstream tooling, which splits on `_` and ignores extras).
-    fn write_window(
-        &mut self,
-        samples: &[f32],
-        timestamp: &chrono::DateTime<chrono::Utc>,
-        dial_freq_hz: u64,
-    ) {
+    fn write_window(&mut self, samples: &[f32], timestamp: &UtcTimestamp, dial_freq_hz: u64) {
         // Skip dead-air windows (rig off/unplugged → digital silence).
         if is_dead_air(samples) {
             debug!(
@@ -566,8 +561,8 @@ impl WavRecorder {
         }
 
         let filename = match band_for_freq_hz(dial_freq_hz) {
-            Some(band) => format!("ft8_{}_{}.wav", timestamp.format("%Y%m%d_%H%M%S"), band),
-            None => format!("ft8_{}.wav", timestamp.format("%Y%m%d_%H%M%S")),
+            Some(band) => format!("ft8_{}_{}.wav", timestamp.strftime("%Y%m%d_%H%M%S"), band),
+            None => format!("ft8_{}.wav", timestamp.strftime("%Y%m%d_%H%M%S")),
         };
         let path = self.dir.join(&filename);
 
@@ -913,7 +908,7 @@ impl super::ApplicationCoordinator {
                 let window = super::raw_capture::capture_window(
                     &self.decode_handles()?.raw_capture_start,
                     minutes,
-                    chrono::Utc::now(),
+                    UtcTimestamp::now(),
                 );
                 Some((dir, minutes, window))
             }
@@ -976,7 +971,7 @@ impl super::ApplicationCoordinator {
             let mut ft8_buffer: Vec<f32> = Vec::with_capacity(ft8_window_samples * 2);
             let mut window_count: u64 = 0;
             let mut batch_count: u64 = 0;
-            let mut overload_valid_since = chrono::Utc::now().timestamp_millis();
+            let mut overload_valid_since = UtcTimestamp::now().as_millisecond();
             let mut overload_last_batch = std::time::Instant::now();
             let mut overload_last_dial = 0;
             let mut overload_last_mode = seed_mode_u8;
@@ -1026,7 +1021,7 @@ impl super::ApplicationCoordinator {
                     _input_channels,
                     window_lead_secs,
                     super::raw_capture::RAW_CAPTURE_MAX_BYTES,
-                    chrono::Utc::now(),
+                    UtcTimestamp::now(),
                 )
             });
 
@@ -1055,13 +1050,13 @@ impl super::ApplicationCoordinator {
             // 0.36s after the 12.64s message end; FT4 → 6.5s). Slots start at
             // the protocol's `slot_ns` cadence aligned to UTC.
             let mut next_window_time = pancetta_core::slot::next_phase_with_period(
-                chrono::Utc::now(),
+                UtcTimestamp::now(),
                 dsp_decode_phase,
                 dsp_slot_ns,
             );
             info!(
                 "DSP: first window at {}",
-                next_window_time.format("%H:%M:%S")
+                next_window_time.strftime("%H:%M:%S")
             );
 
             let _initialized =
@@ -1106,14 +1101,14 @@ impl super::ApplicationCoordinator {
                             if overload_capture_epoch.load(Ordering::Acquire)
                                 != overload_seen_capture_epoch
                             {
-                                overload_valid_since = chrono::Utc::now().timestamp_millis();
+                                overload_valid_since = UtcTimestamp::now().as_millisecond();
                             }
                             if overload_last_batch.elapsed() > std::time::Duration::from_millis(500)
                                 || dial != overload_last_dial
                                 || mode != overload_last_mode
                                 || connection != overload_last_connection
                             {
-                                overload_valid_since = chrono::Utc::now().timestamp_millis();
+                                overload_valid_since = UtcTimestamp::now().as_millisecond();
                                 overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
                             }
                             overload_last_dial = dial;
@@ -1254,7 +1249,7 @@ impl super::ApplicationCoordinator {
                             );
                             bin_history.clear();
                             next_window_time = pancetta_core::slot::next_phase_with_period(
-                                chrono::Utc::now(),
+                                UtcTimestamp::now(),
                                 dsp_decode_phase,
                                 dsp_slot_ns,
                             );
@@ -1270,7 +1265,7 @@ impl super::ApplicationCoordinator {
                             let cached_mode =
                                 pancetta_config::OperatingMode::from_u8(cached_mode_u8);
                             let ctx = super::raw_capture::BatchContext {
-                                end: chrono::Utc::now(),
+                                end: UtcTimestamp::now(),
                                 dial_hz: last_known_dial_hz,
                                 ft8_active: cached_mode == pancetta_config::OperatingMode::Ft8,
                                 mode_label: super::mode_str(cached_mode),
@@ -1400,7 +1395,7 @@ impl super::ApplicationCoordinator {
                         // Overlap retained between windows = one full cycle
                         // (FT8 → 180_000 = 15s×12kHz; FT4 → 90_000 = 7.5s×12kHz).
                         let ideal_samples = dsp_overlap_samples;
-                        let now = chrono::Utc::now();
+                        let now = UtcTimestamp::now();
                         let (reanchored, jump) = reanchor_decode_window(
                             now,
                             next_window_time,
@@ -1409,7 +1404,7 @@ impl super::ApplicationCoordinator {
                         );
                         if let Some(jump) = jump {
                             if overload_enabled {
-                                overload_valid_since = now.timestamp_millis();
+                                overload_valid_since = now.as_millisecond();
                                 overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
                             }
                             if let Ok(mut registry) = sweep_capture.lock() {
@@ -1459,12 +1454,11 @@ impl super::ApplicationCoordinator {
                                 use super::receive_overload::{
                                     Identity, Measurement, WindowValidity,
                                 };
-                                let capture_start = slot_boundary.timestamp_millis()
+                                let capture_start = slot_boundary.as_millisecond()
                                     - (window_lead_secs * 1000.0) as i64;
-                                let full_len = ((now.timestamp_millis() - capture_start) as f64
-                                    * 12.0)
-                                    .round()
-                                    as usize;
+                                let full_len =
+                                    ((now.as_millisecond() - capture_start) as f64 * 12.0).round()
+                                        as usize;
                                 let valid = cached_mode_u8
                                     == pancetta_config::OperatingMode::Ft8.as_u8()
                                     && cur_dial_hz != 0
@@ -1473,11 +1467,10 @@ impl super::ApplicationCoordinator {
                                 let validity = if !valid {
                                     WindowValidity::Invalid
                                 } else {
-                                    gain_safety
-                                        .window_validity(capture_start, now.timestamp_millis())
+                                    gain_safety.window_validity(capture_start, now.as_millisecond())
                                 };
                                 let measurement = Measurement {
-                                    slot: slot_boundary.timestamp().div_euclid(15),
+                                    slot: slot_boundary.as_second().div_euclid(15),
                                     identity: Identity {
                                         dial_hz: cur_dial_hz,
                                         connection_generation: overload_connection
@@ -1515,7 +1508,7 @@ impl super::ApplicationCoordinator {
                                 "DSP: FT8 window #{} (RMS={:.4}) at {}",
                                 window_count,
                                 rms,
-                                now.format("%H:%M:%S.%3f")
+                                now.strftime("%H:%M:%S.%3f")
                             );
 
                             if super::hamlib::gain_capture_changed(
@@ -1600,7 +1593,7 @@ impl super::ApplicationCoordinator {
                             // Schedule next decode at `decode_phase` into the
                             // next slot (FT8 → 13s; FT4 → 6.5s).
                             next_window_time = pancetta_core::slot::next_phase_with_period(
-                                chrono::Utc::now(),
+                                UtcTimestamp::now(),
                                 dsp_decode_phase,
                                 dsp_slot_ns,
                             );
@@ -1610,7 +1603,7 @@ impl super::ApplicationCoordinator {
                         if overload_enabled
                             && overload_last_batch.elapsed() > std::time::Duration::from_millis(500)
                         {
-                            overload_valid_since = chrono::Utc::now().timestamp_millis();
+                            overload_valid_since = UtcTimestamp::now().as_millisecond();
                             overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
                         }
                     }
@@ -1671,15 +1664,15 @@ impl super::ApplicationCoordinator {
 /// offset.
 fn boundary_anchored_slice(
     buffer_len: usize,
-    emit_now: chrono::DateTime<chrono::Utc>,
-    slot_boundary: chrono::DateTime<chrono::Utc>,
+    emit_now: UtcTimestamp,
+    slot_boundary: UtcTimestamp,
     sample_rate: usize,
     min_len: usize,
     lead_secs: f64,
 ) -> (usize, usize) {
     // Seconds from the desired window start (slot_boundary − lead) to emit_now.
     let secs_from_start = (emit_now - slot_boundary)
-        .num_nanoseconds()
+        .as_nanos_i64()
         .map(|ns| ns as f64 / 1_000_000_000.0)
         .unwrap_or(0.0)
         + lead_secs;
@@ -2011,9 +2004,9 @@ mod dial_change_signal_tests {
     /// and before the 13 s decode deadline.
     const RETUNE_AT_SAMPLE: usize = 14 * SR + 8 * BATCH;
 
-    fn utc(secs: f64) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
-            + chrono::Duration::nanoseconds((secs * 1_000_000_000.0).round() as i64)
+    fn utc(secs: f64) -> pancetta_core::time::UtcTimestamp {
+        pancetta_core::time::UtcTimestamp::UNIX_EPOCH
+            + jiff::SignedDuration::from_nanos((secs * 1_000_000_000.0).round() as i64)
     }
 
     /// `text` modulated at 2000 Hz audio (+500 Hz over the 1500 Hz base).
@@ -2057,7 +2050,7 @@ mod dial_change_signal_tests {
         ft8_buffer: Vec<f32>,
         last_live_wf_samples: usize,
         bin_history: Vec<std::collections::VecDeque<f32>>,
-        next_window_time: chrono::DateTime<chrono::Utc>,
+        next_window_time: pancetta_core::time::UtcTimestamp,
         decoder: Ft8Decoder,
     }
 
@@ -2281,9 +2274,9 @@ mod anchored_slice_tests {
     // FT8 message span in samples (12.64 s) — the slice floor.
     const MSG_SAMPLES: usize = (SR as f64 * 12.64) as usize; // 151_680
 
-    fn utc(secs: f64) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
-            + chrono::Duration::nanoseconds((secs * 1_000_000_000.0) as i64)
+    fn utc(secs: f64) -> pancetta_core::time::UtcTimestamp {
+        pancetta_core::time::UtcTimestamp::UNIX_EPOCH
+            + jiff::SignedDuration::from_nanos((secs * 1_000_000_000.0) as i64)
     }
 
     /// With a generously long buffer and a nominal emit at boundary+13 s, the
@@ -2292,8 +2285,8 @@ mod anchored_slice_tests {
     #[test]
     fn sample_zero_lands_at_boundary_minus_lead() {
         let boundary = utc(100.0);
-        let emit_now = boundary + chrono::Duration::milliseconds(13_000); // exactly :13
-                                                                          // Buffer holds 20 s of audio, newest sample == emit_now.
+        let emit_now = boundary + jiff::SignedDuration::from_millis(13_000); // exactly :13
+                                                                             // Buffer holds 20 s of audio, newest sample == emit_now.
         let buffer_len = SR * 20;
         let (start, len) = boundary_anchored_slice(
             buffer_len,
@@ -2343,7 +2336,7 @@ mod anchored_slice_tests {
 
         let (_, len_on_time) = boundary_anchored_slice(
             buffer_len,
-            boundary + chrono::Duration::milliseconds(13_000),
+            boundary + jiff::SignedDuration::from_millis(13_000),
             boundary,
             SR,
             MSG_SAMPLES,
@@ -2351,7 +2344,7 @@ mod anchored_slice_tests {
         );
         let (_, len_late) = boundary_anchored_slice(
             buffer_len,
-            boundary + chrono::Duration::milliseconds(13_400), // 0.4 s late
+            boundary + jiff::SignedDuration::from_millis(13_400), // 0.4 s late
             boundary,
             SR,
             MSG_SAMPLES,
@@ -2374,7 +2367,7 @@ mod anchored_slice_tests {
     #[test]
     fn short_buffer_clamps_in_bounds() {
         let boundary = utc(100.0);
-        let emit_now = boundary + chrono::Duration::milliseconds(13_000);
+        let emit_now = boundary + jiff::SignedDuration::from_millis(13_000);
         let buffer_len = MSG_SAMPLES + 100; // only just enough for a message
         let (start, len) = boundary_anchored_slice(
             buffer_len,
@@ -2410,7 +2403,7 @@ mod anchored_slice_tests {
         // begins 2 s into the buffer. Reproduce that layout exactly.
         let buffer_len = SR * 15;
         let boundary = utc(100.0);
-        let emit_now = boundary + chrono::Duration::milliseconds(13_000); // :13 emit
+        let emit_now = boundary + jiff::SignedDuration::from_millis(13_000); // :13 emit
         let pre_boundary_secs = 2.0_f64; // buffer sample 0 = boundary − 2 s
         let msg_start = (pre_boundary_secs * SR as f64) as usize;
 
@@ -2819,15 +2812,15 @@ mod reanchor_decode_window_tests {
 
     const FT8_SLOT_NS: i64 = 15_000_000_000;
 
-    fn decode_phase() -> chrono::Duration {
-        chrono::Duration::seconds(13)
+    fn decode_phase() -> jiff::SignedDuration {
+        jiff::SignedDuration::from_secs(13)
     }
 
-    fn utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::seconds(secs)
+    fn utc(secs: i64) -> pancetta_core::time::UtcTimestamp {
+        pancetta_core::time::UtcTimestamp::UNIX_EPOCH + jiff::SignedDuration::from_secs(secs)
     }
 
-    fn window_after(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    fn window_after(t: pancetta_core::time::UtcTimestamp) -> pancetta_core::time::UtcTimestamp {
         pancetta_core::slot::next_phase_with_period(t, decode_phase(), FT8_SLOT_NS)
     }
 
@@ -2835,30 +2828,30 @@ mod reanchor_decode_window_tests {
     fn decode_window_reanchors_after_backward_step() {
         let t = utc(1_000_000_005);
         let next_window_time = window_after(t);
-        let now = t - chrono::Duration::seconds(600);
+        let now = t - jiff::SignedDuration::from_secs(600);
         let (reanchored, jump) =
             reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
         assert_eq!(reanchored, window_after(now));
         assert!(reanchored > now);
-        assert!(reanchored - now <= chrono::Duration::seconds(15));
+        assert!(reanchored - now <= jiff::SignedDuration::from_secs(15));
         assert!(matches!(jump, Some(WallClockJump::Backward(_))));
     }
 
     #[test]
     fn decode_window_reports_forward_jump_for_flush() {
         let next_window_time = window_after(utc(1_000_000_005));
-        let now = next_window_time + chrono::Duration::seconds(3600);
+        let now = next_window_time + jiff::SignedDuration::from_secs(3600);
         let (reanchored, jump) =
             reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
         assert!(matches!(jump, Some(WallClockJump::Forward(_))));
         assert!(reanchored > now);
-        assert!(reanchored - now <= chrono::Duration::seconds(15));
+        assert!(reanchored - now <= jiff::SignedDuration::from_secs(15));
     }
 
     #[test]
     fn decode_window_unchanged_without_jump() {
         let next_window_time = window_after(utc(1_000_000_005));
-        let now = next_window_time + chrono::Duration::milliseconds(40);
+        let now = next_window_time + jiff::SignedDuration::from_millis(40);
         assert_eq!(
             reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS),
             (next_window_time, None)
@@ -2893,8 +2886,8 @@ mod wav_recorder_tests {
         (0..1200).map(|i| (i as f32 * 0.3).sin() * 0.5).collect()
     }
 
-    fn ts() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap()
+    fn ts() -> UtcTimestamp {
+        UtcTimestamp::from_parts(1_790_000_000, 0).unwrap()
     }
 
     /// sophon 2026-10-15: the NAS offload moved files out from under the
@@ -3057,7 +3050,7 @@ mod wav_recorder_tests {
 
     /// Name `write_window` gives the window recorded at [`ts`] with no band.
     fn new_wav() -> String {
-        format!("ft8_{}.wav", ts().format("%Y%m%d_%H%M%S"))
+        format!("ft8_{}.wav", ts().strftime("%Y%m%d_%H%M%S"))
     }
 
     fn sorted(names: &[&str]) -> Vec<String> {
@@ -3437,7 +3430,6 @@ mod recording_data_dir_tests;
 #[cfg(test)]
 mod decimation_stage_tests {
     use super::*;
-    use chrono::TimeZone;
 
     /// AC3: `false` preserves the original samples and indices at every
     /// supported integer input-rate multiple; `true` selects the FIR only
@@ -3648,8 +3640,8 @@ mod decimation_stage_tests {
         let subsample = DecimationStage::new(48_000, false);
         let fir = DecimationStage::new(48_000, true);
 
-        let slot = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let now = slot + chrono::Duration::seconds(13);
+        let slot = UtcTimestamp::from_parts(1_700_000_000, 0).unwrap();
+        let now = slot + SignedDuration::from_secs(13);
 
         // Subsample: no compensation.
         assert_eq!(effective_buffer_end(now, &subsample), now);
@@ -3657,7 +3649,7 @@ mod decimation_stage_tests {
         let fir_end = effective_buffer_end(now, &fir);
         assert_eq!(
             now - fir_end,
-            chrono::Duration::nanoseconds(312_500),
+            SignedDuration::from_nanos(312_500),
             "15 input samples of group delay = 312.5 µs"
         );
 

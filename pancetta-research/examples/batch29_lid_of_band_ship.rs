@@ -17,6 +17,7 @@
 //!   cargo run --release -p pancetta-research --example batch29_lid_of_band_ship
 
 use anyhow::{Context, Result};
+use pancetta_core::time::UtcTimestamp;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -174,7 +175,7 @@ fn main() -> Result<()> {
     let manifest = Manifest {
         schema_version: 1,
         label: "lid_of_band",
-        generated_at: chrono::Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         snr_threshold_db: threshold,
         sources: vec!["curated-hard-200", "wild-100"],
         entries: all_entries,

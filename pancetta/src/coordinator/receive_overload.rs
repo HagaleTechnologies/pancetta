@@ -1,5 +1,6 @@
 //! Pure receive-window policy, shared PTT admission and bounded CAT transaction.
 
+use pancetta_core::time::UtcTimestamp;
 /// Identity of a capture. The capture epoch changes on retunes (including an
 /// away-and-back retune), mode/clock changes and audio discontinuities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,7 +447,7 @@ pub async fn execute_step(
     authorize: impl Fn() -> bool,
 ) -> anyhow::Result<StepOutcome> {
     use pancetta_hamlib::{PttState, Vfo};
-    let now_ms = || chrono::Utc::now().timestamp_millis();
+    let now_ms = || UtcTimestamp::now().as_millisecond();
     if !safety.gain_reserved() {
         return Ok(StepOutcome::Deferred);
     }

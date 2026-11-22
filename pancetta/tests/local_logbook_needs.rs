@@ -2,6 +2,7 @@
 //! local logbook (qsos.adi, through the index) while cqdx.io has not answered.
 //! Each Gherkin scenario runs from an ADIF file through the index, the
 //! lookup, the scorer and the rendered TUI.
+use pancetta_core::time::UtcTimestamp;
 use pancetta_lib::priority_evaluator::CachedStationLookup;
 use pancetta_qso::async_database::QsoDatabase;
 use pancetta_qso::priority::{PriorityScorer, PriorityWeights, WorkedStationLookup};
@@ -56,7 +57,7 @@ async fn decode(app: &mut App, lookup: &CachedStationLookup, call: &str, mhz: f6
     let explained = scorer.score_tiered_explained(call, None, -10, hz);
     let (needed, atno) = lookup.needed_atno_shown(call);
     app.add_decoded_message(DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: mhz,
         mode: mode.into(),
         snr: -10,
@@ -417,8 +418,8 @@ fn cqdx_spot(
         reporter_count: 3,
         best_snr: Some(-12),
         confidence: 0.9,
-        first_seen: chrono::Utc::now().timestamp(),
-        last_seen: chrono::Utc::now().timestamp(),
+        first_seen: UtcTimestamp::now().as_second(),
+        last_seen: UtcTimestamp::now().as_second(),
         is_notable: false,
         notable_type: None,
         entity_name: entity_name.into(),

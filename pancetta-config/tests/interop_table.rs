@@ -30,7 +30,7 @@ impl Row {
     fn is_dated(&self) -> bool {
         self.verified.len() >= 10
             && self.verified.is_char_boundary(10)
-            && chrono::NaiveDate::parse_from_str(&self.verified[..10], "%Y-%m-%d").is_ok()
+            && jiff::civil::Date::strptime("%Y-%m-%d", &self.verified[..10]).is_ok()
     }
 }
 

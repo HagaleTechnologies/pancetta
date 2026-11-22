@@ -36,7 +36,7 @@
 //! ```
 
 use anyhow::Context;
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::curated::{CuratedEntry, CuratedManifest, ScoreBreakdown};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use serde::Deserialize;
@@ -274,7 +274,7 @@ fn main() -> anyhow::Result<()> {
     let manifest = CuratedManifest {
         schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
         label: "hard_jt9_rich_200".to_string(),
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         scoring_decoder: "pancetta-ft8@default (jt9-novel-density curation, hb-150)".to_string(),
         entries,
     };

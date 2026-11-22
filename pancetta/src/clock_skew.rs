@@ -7,8 +7,10 @@
 //! reading or clock step produces. The monitor task only runs the schedule
 //! and the blocking UDP probe around it.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
 use pancetta_core::slot_clock::ClockStepDetector;
+use pancetta_core::time::SignedDurationExt as _;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::DiagnosticLevel;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -287,11 +289,11 @@ pub struct ClockSkewMonitorCore {
 
 impl ClockSkewMonitorCore {
     /// Production schedule ([`ClockSkewTiming::default`]).
-    pub fn new(wall_now: DateTime<Utc>) -> Self {
+    pub fn new(wall_now: UtcTimestamp) -> Self {
         Self::with_timing(wall_now, ClockSkewTiming::default())
     }
 
-    pub fn with_timing(wall_now: DateTime<Utc>, timing: ClockSkewTiming) -> Self {
+    pub fn with_timing(wall_now: UtcTimestamp, timing: ClockSkewTiming) -> Self {
         Self {
             timing,
             detector: ClockStepDetector::new(wall_now),
@@ -314,7 +316,7 @@ impl ClockSkewMonitorCore {
     pub fn on_tick(
         &mut self,
         mono_since_start: Duration,
-        wall_now: DateTime<Utc>,
+        wall_now: UtcTimestamp,
         mono_since_last: Duration,
     ) -> TickOutcome {
         let mut step_diag = None;
@@ -334,9 +336,9 @@ impl ClockSkewMonitorCore {
             });
             if diag_allowed {
                 self.last_step_diag_at = Some(mono_since_start);
-                let secs = match skew.num_nanoseconds() {
+                let secs = match skew.as_nanos_i64() {
                     Some(ns) => ns as f64 / 1e9,
-                    None => skew.num_milliseconds() as f64 / 1e3,
+                    None => skew.as_millis_i64() as f64 / 1e3,
                 };
                 step_diag = Some(SkewDiag {
                     target: "clock.step",
@@ -437,7 +439,6 @@ impl ClockSkewMonitorCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
@@ -447,14 +448,14 @@ mod tests {
     /// moves only the wall clock.
     struct Sim {
         core: ClockSkewMonitorCore,
-        base: DateTime<Utc>,
+        base: UtcTimestamp,
         mono_ms: i64,
         wall_offset_ms: i64,
     }
 
     impl Sim {
         fn new() -> Self {
-            let base = Utc.with_ymd_and_hms(2026, 10, 10, 19, 0, 0).unwrap();
+            let base = UtcTimestamp::from_ymd_hms(2026, 10, 10, 19, 0, 0).unwrap();
             Self {
                 core: ClockSkewMonitorCore::new(base),
                 base,
@@ -467,7 +468,7 @@ mod tests {
             let target_ms = (mono_s * 1000) as i64;
             let since_last = Duration::from_millis((target_ms - self.mono_ms) as u64);
             self.mono_ms = target_ms;
-            let wall = self.base + chrono::Duration::milliseconds(target_ms + self.wall_offset_ms);
+            let wall = self.base + SignedDuration::from_millis(target_ms + self.wall_offset_ms);
             self.core.on_tick(secs(mono_s), wall, since_last)
         }
 

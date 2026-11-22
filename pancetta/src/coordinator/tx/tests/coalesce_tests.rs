@@ -1,4 +1,5 @@
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::HashSet;
 
 fn audit_tmp() -> crate::coordinator::audit_test_util::TempPath {
@@ -159,7 +160,7 @@ async fn consent_deferred_request_stays_ahead_of_the_stop_message() {
     use std::sync::{Arc, Mutex, RwLock};
 
     let bus = MessageBus::new(16).unwrap();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut state = ArmState::new();
     state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
     state.set_channel_consent(ConsentChannel::WsjtxUdp, true, now_ms);
@@ -810,7 +811,7 @@ async fn backlog_preserves_consent_channels_until_key_time() {
             .await
             .unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = UtcTimestamp::now().as_millisecond();
         let mut state = ArmState::new();
         state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
         state.set_channel_consent(ConsentChannel::WsjtxUdp, true, now_ms);
@@ -918,7 +919,7 @@ async fn backlog_bundle_items_carry_their_own_binding() {
         .await
         .unwrap();
     let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     let mut state = ArmState::new();
     state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
     state.arm(
@@ -1028,7 +1029,7 @@ async fn backlog_into_drops_entries_bound_to_a_different_client_than_the_one_arm
 
     // client-a is armed; client-b is not.
     let mut st = pancetta_agent::arm::ArmState::new();
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = UtcTimestamp::now().as_millisecond();
     st.set_channel_consent(
         pancetta_agent::arm::ConsentChannel::StationAgent,
         true,

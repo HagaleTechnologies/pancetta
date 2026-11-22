@@ -1,7 +1,9 @@
 //! PAN-280: a completion that queues a closing frame emits `QsoCompleted`
 //! only when that frame airs; a frame that never airs reverts it.
 use super::*;
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::ResponseStep;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 
@@ -64,7 +66,7 @@ fn payload() -> UnsentAttemptPayload {
 
 async fn air(manager: &QsoManager, id: QsoId, attempt: TxAttemptId) -> CompletionAired {
     manager
-        .confirm_completion_aired(id, Some(attempt), "", &payload(), Utc::now())
+        .confirm_completion_aired(id, Some(attempt), "", &payload(), UtcTimestamp::now())
         .await
 }
 
@@ -102,7 +104,7 @@ async fn dropped_remote_ladder_73_is_not_logged_and_reopens() {
     permitted.store(false, SeqCst);
     assert_eq!(
         manager
-            .resolve_unsent_completion_at(id, Some(attempt), Utc::now())
+            .resolve_unsent_completion_at(id, Some(attempt), UtcTimestamp::now())
             .await,
         UnsentCompletion::Reverted(RevertedTo::Reopened)
     );
@@ -149,7 +151,7 @@ async fn reverted_qso_is_exempt_from_timeouts_for_one_rework_grace() {
         QsoState::WaitingForConfirmation { .. }
     ));
     let (_, advanced) = reply(&manager, ResponseStep::SeventyThree, None).await;
-    let t0 = Utc::now();
+    let t0 = UtcTimestamp::now();
     assert_eq!(
         manager
             .resolve_unsent_completion_at(id, advanced.attempt_id(), t0)
@@ -157,12 +159,16 @@ async fn reverted_qso_is_exempt_from_timeouts_for_one_rework_grace() {
         UnsentCompletion::Reverted(RevertedTo::Reopened)
     );
     // confirmation_timeout is 30 s: without the exemption this retires.
-    manager.check_timeouts_at(t0 + Duration::seconds(44)).await;
+    manager
+        .check_timeouts_at(t0 + SignedDuration::from_secs(44))
+        .await;
     assert!(matches!(
         manager.get_qso(id).await.map(|p| p.state),
         Ok(QsoState::WaitingForConfirmation { .. })
     ));
-    manager.check_timeouts_at(t0 + Duration::seconds(46)).await;
+    manager
+        .check_timeouts_at(t0 + SignedDuration::from_secs(46))
+        .await;
     assert!(!matches!(
         manager.get_qso(id).await.map(|p| p.state),
         Ok(QsoState::WaitingForConfirmation { .. })
@@ -287,7 +293,7 @@ async fn dx_rr73_reply_73_dropped_reopens_and_a_repeat_rr73_completes_again() {
     let (attempt, _) = last_send(&drain(&mut rx)).unwrap();
     assert_eq!(
         manager
-            .resolve_unsent_completion_at(id, Some(attempt), Utc::now())
+            .resolve_unsent_completion_at(id, Some(attempt), UtcTimestamp::now())
             .await,
         UnsentCompletion::Reverted(RevertedTo::Reopened)
     );
@@ -386,7 +392,7 @@ async fn dropped_open_at_close_is_retired_close_not_aired() {
     permitted.store(false, SeqCst);
     assert_eq!(
         manager
-            .resolve_unsent_completion_at(id, opened.attempt_id(), Utc::now())
+            .resolve_unsent_completion_at(id, opened.attempt_id(), UtcTimestamp::now())
             .await,
         UnsentCompletion::Reverted(RevertedTo::Retired)
     );
@@ -432,7 +438,7 @@ async fn fix_b_rekey_while_pending_joins_the_pending_set() {
         let b = rekey.attempt_id().unwrap();
         assert_eq!(
             manager
-                .resolve_unsent_completion_at(id, Some(a), Utc::now())
+                .resolve_unsent_completion_at(id, Some(a), UtcTimestamp::now())
                 .await,
             UnsentCompletion::StillPending
         );
@@ -442,7 +448,7 @@ async fn fix_b_rekey_while_pending_joins_the_pending_set() {
         } else {
             assert_eq!(
                 manager
-                    .resolve_unsent_completion_at(id, Some(b), Utc::now())
+                    .resolve_unsent_completion_at(id, Some(b), UtcTimestamp::now())
                     .await,
                 UnsentCompletion::Reverted(RevertedTo::Retired)
             );
@@ -458,7 +464,7 @@ async fn id_less_not_sent_never_reverts() {
     let (id, opened) = reply(&manager, ResponseStep::SeventyThree, None).await;
     assert_eq!(
         manager
-            .resolve_unsent_completion_at(id, None, Utc::now())
+            .resolve_unsent_completion_at(id, None, UtcTimestamp::now())
             .await,
         UnsentCompletion::NotPending
     );
@@ -473,10 +479,10 @@ async fn id_less_not_sent_never_reverts() {
 async fn aired_report_without_id_commits_on_content_match_only_after_queue() {
     let manager = manager(Arc::new(AtomicBool::new(true)));
     let mut rx = manager.subscribe();
-    let before_queue = Utc::now() - Duration::seconds(5);
+    let before_queue = UtcTimestamp::now() - SignedDuration::from_secs(5);
     let (id, _) = reply(&manager, ResponseStep::SeventyThree, None).await;
     let text = format!("{DX} {OUR} 73");
-    let confirm = |text: String, at: DateTime<Utc>| {
+    let confirm = |text: String, at: UtcTimestamp| {
         let manager = &manager;
         async move {
             manager
@@ -485,14 +491,17 @@ async fn aired_report_without_id_commits_on_content_match_only_after_queue() {
         }
     };
     assert_eq!(
-        confirm("K9ZZ K5ARH RR73".into(), Utc::now()).await,
+        confirm("K9ZZ K5ARH RR73".into(), UtcTimestamp::now()).await,
         CompletionAired::NotPending
     );
     assert_eq!(
         confirm(text.clone(), before_queue).await,
         CompletionAired::NotPending
     );
-    assert_eq!(confirm(text, Utc::now()).await, CompletionAired::Committed);
+    assert_eq!(
+        confirm(text, UtcTimestamp::now()).await,
+        CompletionAired::Committed
+    );
     assert_eq!(completions(&drain(&mut rx)), 1);
 }
 
@@ -506,18 +515,18 @@ async fn pending_completion_expires_as_not_aired_per_mode() {
         let mut manager = manager(Arc::new(AtomicBool::new(true)));
         manager.set_active_slot_ns_source(Arc::new(AtomicI64::new(slot_ns)));
         let mut rx = manager.subscribe();
-        let t0 = Utc::now();
+        let t0 = UtcTimestamp::now();
         let (id, _) = reply(&manager, ResponseStep::SeventyThree, None).await;
         assert_eq!(
             manager
-                .expire_pending_completions_at(t0 + Duration::seconds(expiry_s - 1))
+                .expire_pending_completions_at(t0 + SignedDuration::from_secs(expiry_s - 1))
                 .await,
             0,
             "slot {slot_ns}"
         );
         assert_eq!(
             manager
-                .expire_pending_completions_at(t0 + Duration::seconds(expiry_s + 1))
+                .expire_pending_completions_at(t0 + SignedDuration::from_secs(expiry_s + 1))
                 .await,
             1,
             "slot {slot_ns}"

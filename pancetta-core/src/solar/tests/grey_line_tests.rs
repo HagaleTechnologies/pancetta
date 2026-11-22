@@ -1,22 +1,21 @@
 use super::*;
 use crate::gridsquare::grid_to_coordinates;
-use chrono::TimeZone;
+use crate::time::UtcTimestamp;
+use jiff::civil;
 
 const TOLERANCE_SECS: i64 = 120;
 
-fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).expect("valid test date")
+fn date(y: i32, m: u32, d: u32) -> civil::Date {
+    civil::Date::new(y as i16, m as i8, d as i8).expect("valid test date")
 }
 
-fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
-        .single()
-        .expect("valid test instant")
+fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(y, mo, d, h, mi, 0).expect("valid test instant")
 }
 
-fn assert_near(label: &str, got: Option<DateTime<Utc>>, want: DateTime<Utc>) {
+fn assert_near(label: &str, got: Option<UtcTimestamp>, want: UtcTimestamp) {
     let got = got.unwrap_or_else(|| panic!("{label}: expected {want}, got None"));
-    let diff = (got - want).num_seconds().abs();
+    let diff = (got - want).as_secs().abs();
     assert!(
         diff <= TOLERANCE_SECS,
         "{label}: got {got}, want {want} (off by {diff} s)"

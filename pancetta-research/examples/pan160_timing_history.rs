@@ -1,5 +1,6 @@
 //! PAN-160 paired timing-history experiment. All arms run serially.
 use anyhow::Context;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{
     ap::{ApContext, MyCallAp, RecentCallAp},
     Ft8Config, InMemoryDtHistory,
@@ -368,15 +369,9 @@ fn original(args: &[String]) -> anyhow::Result<()> {
                 let cache: pancetta_research::BaselineCache = serde_json::from_slice(
                     &std::fs::read(Path::new(&args[1]).join(format!("{}.json", entry.wav_sha256)))?,
                 )?;
-                d.set_slot_time(
-                    chrono::DateTime::parse_from_rfc3339(&entry.wav_timestamp)?
-                        .with_timezone(&chrono::Utc)
-                        .into(),
-                );
+                d.set_slot_time(str::parse::<UtcTimestamp>(&entry.wav_timestamp)?.into());
                 let replay_at: SystemTime =
-                    chrono::DateTime::parse_from_rfc3339(&entry.wav_timestamp)?
-                        .with_timezone(&chrono::Utc)
-                        .into();
+                    str::parse::<UtcTimestamp>(&entry.wav_timestamp)?.into();
                 let eligible = d.eligible_timing_calls(&d.chrono_replay_snapshot(), replay_at);
                 let start = Instant::now();
                 let mut decoded = d.decode_wav(&entry.wav_path)?;
@@ -433,9 +428,7 @@ fn supplemental(out: &Path) -> anyhow::Result<()> {
             ));
             let bytes = std::fs::read(&path)?;
             let time: SystemTime =
-                chrono::DateTime::parse_from_rfc3339(&format!("2017-09-23T08:20:{suffix}Z"))?
-                    .with_timezone(&chrono::Utc)
-                    .into();
+                str::parse::<UtcTimestamp>(&format!("2017-09-23T08:20:{suffix}Z"))?.into();
             d.set_slot_time(time);
             let eligible = d.eligible_timing_calls(&d.chrono_replay_snapshot(), time);
             let start = Instant::now();

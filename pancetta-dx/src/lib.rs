@@ -68,7 +68,7 @@ pub use qso_upload::{
     QrzInsertOutcome, QrzLogbookClient, QsoUploadOutcome, UploadFailureClass,
 };
 
-use chrono::{DateTime, Utc};
+use pancetta_core::time::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -248,7 +248,7 @@ pub struct DxSpot {
     /// Spotter callsign
     pub spotter: String,
     /// Spot time
-    pub time: DateTime<Utc>,
+    pub time: UtcTimestamp,
     /// Comment/notes
     pub comment: Option<String>,
     /// DXCC entity information
@@ -271,7 +271,7 @@ pub struct DxQso {
     /// Contacted callsign
     pub callsign: String,
     /// QSO date and time
-    pub datetime: DateTime<Utc>,
+    pub datetime: UtcTimestamp,
     /// Frequency in Hz
     pub frequency: u64,
     /// Band
@@ -293,7 +293,7 @@ pub struct DxQso {
     /// Confirmation status
     pub confirmation_status: ConfirmationStatus,
     /// Confirmation date
-    pub confirmation_date: Option<DateTime<Utc>>,
+    pub confirmation_date: Option<UtcTimestamp>,
     /// DXCC entity
     pub dxcc_entity: u16,
     /// Contest/activity identifier

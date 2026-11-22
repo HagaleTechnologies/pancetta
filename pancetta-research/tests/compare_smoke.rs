@@ -3,6 +3,7 @@
 
 #![cfg(feature = "research-eval")]
 
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::scorecard::{
     BuildInfo, CompositeInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags, Scorecard,
     TierResult,
@@ -37,7 +38,7 @@ fn make_scorecard(score: f64, pass_rate: f64, snr50: f64) -> Scorecard {
     weights.insert("snr_50pct_synth_clean".to_string(), 0.30);
     Scorecard {
         schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
-        generated_at: chrono::Utc::now(),
+        generated_at: UtcTimestamp::now(),
         mode: Mode::Ft8,
         git: GitInfo {
             branch: "test".into(),

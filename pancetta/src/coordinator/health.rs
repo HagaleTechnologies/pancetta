@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ pub(crate) fn start_audit_maintenance(
     }
     let audit = audit.clone();
     *job = Some(tokio::task::spawn_blocking(move || {
-        if let Err(e) = audit.maintain(chrono::Utc::now().timestamp_millis()) {
+        if let Err(e) = audit.maintain(UtcTimestamp::now().as_millisecond()) {
             debug!(target: "agent.audit", error = %e, "audit maintenance pass failed");
         }
     }));

@@ -19,6 +19,7 @@ use crate::app::{ActivePanel, App};
 use crate::config::Config;
 use crossbeam_channel::unbounded;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use pancetta_core::time::UtcTimestamp;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -328,7 +329,7 @@ fn banner(call: &str, qso_id: &str) -> crate::app::ActiveQsoBanner {
     crate::app::ActiveQsoBanner {
         their_callsign: call.to_string(),
         state: "wait rpt".to_string(),
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         frequency_hz: 1500.0,
         tx_parity: None,
         last_tx_text: None,
@@ -363,7 +364,7 @@ fn cq_dx_station() -> crate::app::DxStation {
         frequency: 14.074,
         band: None,
         mode: "FT8".to_string(),
-        last_seen: chrono::Utc::now(),
+        last_seen: UtcTimestamp::now(),
         snr: -10,
         distance: None,
         bearing: None,
@@ -408,7 +409,7 @@ fn placement_fixture() -> crate::app::PlacementView {
         openness: vec![3; 96],
         bin_hz: 25.0,
         range: (200.0, 2600.0),
-        received_at: chrono::Utc::now(),
+        received_at: UtcTimestamp::now(),
     }
 }
 
@@ -426,7 +427,7 @@ fn rich_fixture(app: &mut App) {
     ];
     app.diagnostic_events
         .push_back(crate::app::DiagnosticEventRecord {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "Fixture diagnostic".into(),
@@ -435,7 +436,7 @@ fn rich_fixture(app: &mut App) {
         });
     app.diagnostic_events
         .push_back(crate::app::DiagnosticEventRecord {
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             target: "qso",
             level: pancetta_core::DiagnosticLevel::Info,
             text: "Second diagnostic".into(),
@@ -449,7 +450,7 @@ fn rich_fixture(app: &mut App) {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".into(),
             freq_hz: 14_074_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec![],
         });
     }
@@ -457,7 +458,7 @@ fn rich_fixture(app: &mut App) {
     app.apply_active_qsos(vec![banner("W1AW", "qso-1")], vec![]);
     app.decoded_messages
         .push_back(crate::app::DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14_074_000.0,
             mode: "FT8".to_string(),
             snr: -8,

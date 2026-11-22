@@ -2,6 +2,7 @@
 
 use super::tests::{cfg, mount, TOKEN};
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::priority::WorkedStationLookup;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -159,7 +160,7 @@ async fn opportunity_server(spots_status: u16, spots_expect: Option<u64>) -> Moc
         serde_json::json!({"grids": []}),
     )
     .await;
-    let now = chrono::Utc::now().timestamp() - 30;
+    let now = UtcTimestamp::now().as_second() - 30;
     let body = serde_json::json!({"groups": [
         spot_json(CALLS_17M[0], "17m", "FT8", 1, now),
         spot_json(CALLS_17M[1], "17m", "FT4", 2, now),
@@ -221,7 +222,7 @@ async fn wait_for_snapshot(bridge: &CqdxBridge) -> OpportunitySnapshot {
 async fn opportunity_poller_builds_a_snapshot_from_all_band_spots() {
     let server = opportunity_server(200, None).await;
     let (bridge, _lookup) = started_bridge(&server, 10).await;
-    let before = chrono::Utc::now();
+    let before = UtcTimestamp::now();
     let handle = spawn_for(&bridge);
     let snapshot = wait_for_snapshot(&bridge).await;
     handle.abort();

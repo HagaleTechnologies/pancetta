@@ -4,7 +4,7 @@
 //! path="contracts/rig/rig-api.v1.schema.json", ref="869efaa") copied verbatim
 //! to tests/fixtures/rig-api.v1.schema.json; local and upstream bytes compared.
 use boon::{Compiler, Schemas};
-use chrono::{TimeZone, Utc};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::{slot::SlotParity, ResponseStep, TxPolicy};
 use pancetta_protocol::{
     ClientCommand as C, ClientFrame, DecodedView, DxRow, Hello, PendingCall, Placement,
@@ -18,8 +18,8 @@ const RAW: &str = include_str!("fixtures/rig-api.v1.schema.json");
 fn schema() -> Value {
     serde_json::from_str(RAW).unwrap()
 }
-fn stamp() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap()
+fn stamp() -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 11, 7, 12, 0, 0).unwrap()
 }
 fn decoded(slot_parity: Option<SlotParity>) -> DecodedView {
     let full = slot_parity.is_some();

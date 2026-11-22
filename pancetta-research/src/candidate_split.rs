@@ -5,6 +5,7 @@ use crate::{
     scorecard::CorpusProvenance,
     synth::{SynthEntry, SynthManifest},
 };
+use pancetta_core::time::UtcTimestamp;
 
 use anyhow::{ensure, Context, Result};
 use pancetta_ft8::{Ft8Config, SyncCandidateRecord};
@@ -446,7 +447,7 @@ impl CandidateSplitScorecard {
         let mut s = Self {
             schema_version: 1,
             ticket: "PAN-154".into(),
-            generated_at: chrono::Utc::now().to_rfc3339(),
+            generated_at: UtcTimestamp::now().to_rfc3339(),
             decoder,
             truth,
             corpus,
