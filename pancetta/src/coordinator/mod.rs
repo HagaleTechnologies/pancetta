@@ -37,6 +37,8 @@ mod health;
 mod n1mm_udp;
 mod pipeline;
 mod psk_reporter;
+mod ptt_line;
+pub use ptt_line::{open_serial_rts_port, resolves_to_cat_port};
 mod qrz_lookup;
 mod qso;
 mod service_notify;
@@ -989,10 +991,19 @@ pub struct ApplicationCoordinator {
     /// Managed rigctld child process (killed on shutdown)
     rigctld_process: Option<std::process::Child>,
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-357: the serial PTT line, opened once and held for the session.
+    /// `start_hamlib_component` reconciles it with `rig.ptt` and wraps the rig
+    /// in `ptt_line::LineKeyedRig` when it has a target; shutdown lowers and
+    /// latches it alongside the Hamlib drain.
+    pub(crate) ptt_line: Arc<ptt_line::PttLine>,
     /// PAN-251 test seam: when set, `start_hamlib_component` uses this rig
     /// instead of `MockRig::default()` on the rig-control-disabled path.
     #[cfg(test)]
     pub(crate) test_mock_rig: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-357 test seam: when set, `start_hamlib_component` keys this serial
+    /// PTT device on either rig path, whatever `rig.ptt` says.
+    #[cfg(test)]
+    pub(crate) test_ptt_line_device: Option<String>,
     /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
     /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
     /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
@@ -2589,8 +2600,11 @@ impl ApplicationCoordinator {
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             rigctld_process: None,
             rig_handle: None,
+            ptt_line: Arc::new(ptt_line::PttLine::serial()),
             #[cfg(test)]
             test_mock_rig: None,
+            #[cfg(test)]
+            test_ptt_line_device: None,
             rig_handle_is_real: false,
             hamlib_children: None,
             hamlib_orphans: Vec::new(),

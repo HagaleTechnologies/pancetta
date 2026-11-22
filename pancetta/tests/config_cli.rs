@@ -876,3 +876,44 @@ fn terminal_validate_syntax_error_never_offers_repair() {
     assert!(!all.contains("Re-run first-time setup"), "{all}");
     assert!(!all.contains("First-Run Setup"), "{all}");
 }
+
+/// PAN-357: a rig-control config whose PTT method has no keying path.
+const VOX_PTT_CONFIG: &str = "[rig]\nmodel = \"Generic\"\n\n[rig.interface]\nenabled = true\n\
+port = \"/dev/ttyUSB0\"\nbaud_rate = 38400\n\n[rig.ptt]\nmethod = \"vox\"\n";
+
+const VOX_REFUSAL: &str = "rig.ptt.method = \"vox\" is not implemented. Use \"cat\" or \"none\" \
+to key through rigctld, or \"serial_rts\" with rig.ptt.device to key the RTS line of a separate \
+serial port.";
+
+/// PAN-357 scenario 2: `config --validate` tells the operator the method is
+/// not implemented instead of passing a config that would key through CAT.
+#[test]
+fn validate_refuses_an_unimplemented_ptt_method() {
+    let s = Scratch::new();
+    let path = s.write_file("vox.toml", VOX_PTT_CONFIG);
+    let out = s.validate(Some(&path));
+    let so = stdout(&out);
+    let all = format!("{so}{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(so.contains("Configuration validation: FAIL"), "{all}");
+    assert!(!so.contains("PASS"), "{all}");
+    assert!(
+        all.contains(&format!("Validation error: {VOX_REFUSAL}")),
+        "{all}"
+    );
+}
+
+/// PAN-357 scenario 2: the station refuses to start on that config, before
+/// Hamlib ever connects to rigctld.
+#[test]
+fn headless_startup_refuses_an_unimplemented_ptt_method() {
+    let s = Scratch::new();
+    let path = s.write_file("vox.toml", VOX_PTT_CONFIG);
+    let out = s.command().arg("--config").arg(&path).output().unwrap();
+    let all = format!("{}{}", stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(all.contains("Configuration validation failed"), "{all}");
+    assert!(all.contains(VOX_REFUSAL), "{all}");
+    assert!(!all.contains("Connecting to rigctld"), "{all}");
+    assert!(!all.contains("Starting Hamlib component"), "{all}");
+}
