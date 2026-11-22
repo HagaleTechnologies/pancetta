@@ -5726,6 +5726,7 @@ mod key_tests {
             (SoundCard, "sound card"),
             (Vox, "VOX"),
             (Network, "network"),
+            (SerialRts, "serial RTS"),
         ] {
             state.selected_ptt_idx = usize::MAX;
             state.live_ptt_method = method.clone();
@@ -9982,7 +9983,7 @@ mod pan_59_command_tests {
             model: "IC-7300".to_string(),
             port: "/dev/ttyUSB1".to_string(),
             baud_rate: 38400,
-            ptt_method: pancetta_config::rig::PttMethod::Cat,
+            ptt_method: pancetta_config::rig::PttMethod::SerialRts,
         };
         match cmd {
             TuiCommand::SelectRig {
@@ -9994,7 +9995,7 @@ mod pan_59_command_tests {
                 assert_eq!(model, "IC-7300");
                 assert_eq!(port, "/dev/ttyUSB1");
                 assert_eq!(baud_rate, 38400);
-                assert!(matches!(ptt_method, pancetta_config::rig::PttMethod::Cat));
+                assert_eq!(ptt_method, pancetta_config::rig::PttMethod::SerialRts);
             }
             _ => panic!("expected SelectRig"),
         }
@@ -10007,7 +10008,7 @@ mod pan_59_command_tests {
             current_model: "FTdx10".to_string(),
             current_port: "/dev/ttyUSB0".to_string(),
             current_baud_rate: 38400,
-            current_ptt_method: pancetta_config::rig::PttMethod::Serial,
+            current_ptt_method: pancetta_config::rig::PttMethod::SerialRts,
             bookmarks: vec![],
             select_seq: 0,
         };
@@ -10015,10 +10016,15 @@ mod pan_59_command_tests {
             TuiMessage::RigConfigUpdate {
                 available_ports,
                 current_model,
+                current_ptt_method,
                 ..
             } => {
                 assert_eq!(available_ports.len(), 2);
                 assert_eq!(current_model, "FTdx10");
+                assert_eq!(
+                    current_ptt_method,
+                    pancetta_config::rig::PttMethod::SerialRts
+                );
             }
             _ => panic!("expected RigConfigUpdate"),
         }

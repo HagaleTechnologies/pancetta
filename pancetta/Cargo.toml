@@ -77,6 +77,8 @@ anyhow = "1.0"
 
 # System utilities
 serialport = "4.9"
+# PAN-357: `LineKeyedRig` implements `pancetta_hamlib::RigControl`.
+async-trait = "0.1"
 same-file = "1.0"
 libc = "0.2"
 signal-hook = { workspace = true }
@@ -109,7 +111,6 @@ tokio = { version = "1.50", features = ["test-util"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
-async-trait = "0.1"
 ratatui = "0.30"
 tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }

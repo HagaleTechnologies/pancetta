@@ -1264,6 +1264,77 @@ Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
 
+Superseded for runtime keying by PAN-357 below.
+
+## The PTT method selects the keying path (PAN-357, 2026-11-22)
+
+Before this change `[rig.ptt].method` never chose how a transmission keyed (PAN-121 above). Every
+key-down ended at `RigctldClient::set_ptt` (`T 1`/`T 0`), and validation accepted every value, so
+`vox` or `serial` keyed through CAT without saying so. Now validation refuses every method with no
+keying path (`PttConfig::refusal`, `pancetta-config/src/rig.rs`), and `serial_rts` keys the RTS
+line of a separate serial port (`pancetta/src/coordinator/ptt_line.rs`). `pancetta test-rig --ptt`
+opens `rig.ptt.device` for `serial_rts` and refuses `serial` as untestable.
+
+- **Refuse only while rig control is on.** With `[rig.interface] enabled = false`, PTT goes to the
+  mock rig and keys nothing, so no method keys silently there. Refusing would reject decode-only
+  stations.
+- **`none` still keys through rigctld.** It is the default and keyed by CAT before. Making it
+  "never key" would stop TX on working stations, so only its labels and docs changed.
+- **`SerialRts` is `serial_rts`, with the alias `serial-rts`.** The schema is snake_case. The alias
+  makes the ticket's spelling parse, and a save writes `serial_rts`.
+- **The refused variants stay in the enum.** They must parse so validation can name the value.
+  Removing them would turn the refusal back into serde's `unknown variant`.
+- **`serial_rts` needs a separate `rig.ptt.device`, with no fallback to the CAT port.** rigctld
+  owns that port, pancetta's exclusive open would block a managed rigctld respawn, and two
+  programs would drive one line. Validation compares trimmed strings. `PttLine::configure` also
+  refuses a device that canonicalizes to the CAT port, which catches `/dev/serial/by-id` symlinks.
+  There is no path-shape check, because by-id paths are the recommended Linux form.
+- **`polarity = "negative"` is refused for `serial_rts`.** Linux lowers RTS when the port closes
+  (HUPCL) or the process exits, so an inverted line would key the rig whenever pancetta is not
+  running.
+- **Under `serial_rts` only the line keys, never `T 1`/`T 0`.** No scenario asks for both, sending
+  both could double-key, and a failed `T 0` would make a confirmed line drop look like a failed
+  unkey.
+- **The wrapper sits below `RigControl`.** `start_hamlib_component` wraps the rig it built in
+  `ptt_line::LineKeyedRig`, so all six Hamlib `set_ptt` sites and every producer (TX worker,
+  bundles, tune, manual PTT, SWR halt, autonomous halt) drive the line. `PttGuard`,
+  `send_ptt_command`, the `SetPtt` arm, the PAN-322 abort golden and the PAN-272/273/277/278
+  invariants are unchanged. `get_ptt` reports On while the line may be asserted, and every other
+  `RigControl` method forwards to the inner rig. Hamlib's `-P RTS` was rejected: it cannot cover
+  an external rigctld, and pancetta cannot test it without a fake daemon that records argv.
+- **One `PttLine` per coordinator, opened once and held for the session.** Reopening per frame
+  would pulse RTS on Linux at every open, and a per-generation handle would hit `EBUSY` on restart
+  while the old `Arc` is alive. `configure` reconciles it at each Hamlib start: it reuses an open
+  handle for the same device, and lowers and closes the old one when the target changes or goes
+  away. Shutdown lowers and latches it directly, concurrently with the Hamlib drain and
+  independent of the Hamlib loop.
+- **Blocking serial calls run on `spawn_blocking`.** USB-serial modem-line ioctls can block, and
+  `block_in_place` panics on the current_thread runtimes the Hamlib tests use.
+- **A poisoned line lock refuses key-down and lets unkey proceed** with the recovered state. TX
+  fails closed and an unkey is never blocked.
+- **No new TX hard-mute cause for an unopened line.** A refused key-down already plays audio
+  unkeyed for CAT (the `SetPtt` arm only logs it), and a mute cause would touch the PAN-89 parity
+  test, the readiness strip and every `tx_hard_mute_reason` caller. A failed open is reported at
+  Hamlib start as a rig error (`Serial PTT: cannot open serial PTT port …`), and each key-down
+  retries it.
+- **CM108, DTR and RTS on the CAT port are refused, tracked in PAN-476.** CM108 needs a HID path,
+  DTR glitches at open on Linux, and both fit rigctld's `-P` better.
+- **The picker and the wizard offer None, CAT and Serial RTS.** The relay checks the candidate PTT
+  settings before writing, so `serial_rts` without a device is refused with `Rig not applied:
+  <reason>`, and an operator with a device set can switch live. The wizard prompts for the device
+  and keeps the previous method when a choice breaks a rule.
+- **One PR.** With validation alone, `serial_rts` would validate but still key by CAT, so the
+  schema and the keying path ship together.
+
+Line level at open. Linux raises DTR and RTS when a tty opens with a nonzero baud rate, even with
+`dtr_on_open(false)`, so `open_serial_rts_port` writes RTS low immediately after the open. That
+can still leave a brief pulse at open, which is one reason the port is opened once per session.
+On Windows, `FlowControl::None` sets `RtsControl::Disable`, so the port opens with RTS low. On
+Linux, HUPCL lowers RTS when the port closes or the process exits, including after `kill -9`.
+These statements come from reading serialport 4.10.1 and Linux tty behavior, not from a device. A
+pty has no modem lines, so tests drive a fake line through `PttLine::with_opener`. Hardware
+qualification is pending.
+
 ## Shutdown unkeys through the Hamlib loop (PAN-277, 2026-11-10)
 
 The signal handler sets the shutdown flag before coordinator cleanup runs. The
