@@ -21,6 +21,7 @@ fn manager() -> QsoManager {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: "FT8".to_string(),
+        activation: crate::sig_reference::ActivationReference::default(),
     };
     QsoManager::new(config)
 }
