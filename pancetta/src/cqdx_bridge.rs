@@ -7,10 +7,10 @@ use crate::coordinator::upload_outbox::clip;
 use crate::priority_evaluator::{CachedStationLookup, NeedListAvailability};
 use pancetta_core::Band;
 use pancetta_cqdx::{
-    frequency_to_band, rank_to_rarity, CqdxCache, CqdxClient, CqdxError, NeededEntity, QsoRecord,
-    SpotGroup, SpotReport,
+    frequency_to_band, rank_to_rarity, Activation, CqdxCache, CqdxClient, CqdxError, NeededEntity,
+    QsoRecord, SpotGroup, SpotReport,
 };
-use pancetta_qso::{BandOpportunity, OpportunitySnapshot};
+use pancetta_qso::{BandOpportunity, OpportunitySnapshot, WorkedReference, WorkedReferenceBook};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,6 +81,136 @@ fn need_retry_due(last: Option<Instant>, now: Instant) -> bool {
 /// activity on its band, and how often the per-band needed sets refresh.
 const OPPORTUNITY_WINDOW_SECS: i64 = 600;
 const OPPORTUNITY_NEEDED_REFRESH: Duration = Duration::from_secs(600);
+
+/// PAN-359 (D10): the activation feed is fetched at most this often, inside
+/// the live-spot poller. cqdx.io refreshes it every 2 minutes.
+const ACTIVATION_REFRESH: Duration = Duration::from_secs(120);
+
+/// PAN-359: is an activation-feed fetch due? The first eligible tick
+/// fetches; later ones wait [`ACTIVATION_REFRESH`] after the last start.
+fn activation_refresh_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= ACTIVATION_REFRESH)
+}
+
+/// PAN-359 (D8): a feed callsign is trimmed, upper-cased and kept only when
+/// it is 3 to 20 characters of `A-Z0-9/`.
+fn feed_callsign(raw: &str) -> Option<String> {
+    let call = raw.trim().to_ascii_uppercase();
+    ((3..=20).contains(&call.len())
+        && call
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'/'))
+    .then_some(call)
+}
+
+/// PAN-359 (D8): a feed reference is trimmed, upper-cased and kept only
+/// when it is 3 to 32 characters of `A-Z0-9/-`.
+fn feed_reference(raw: &str) -> Option<String> {
+    let reference = raw.trim().to_ascii_uppercase();
+    ((3..=32).contains(&reference.len())
+        && reference
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'/' || b == b'-'))
+    .then_some(reference)
+}
+
+/// PAN-359 (D6, D7, D8): convert cqdx.io activation rows into worked-station
+/// references, one per callsign.
+///
+/// `type` `pota` maps to `SIG=POTA` and `sota` to `SIG=SOTA` (ASCII
+/// case-insensitive); other programmes and rows whose callsign or reference
+/// fails [`feed_callsign`] / [`feed_reference`] are skipped. When a callsign
+/// has several rows the newest RFC 3339 `spotTime` wins; a missing or
+/// unparseable time ranks oldest, and a tie keeps the first row. Output
+/// keeps the order in which each callsign first appeared.
+pub(crate) fn worked_references_from_activations(
+    rows: &[Activation],
+) -> Vec<(String, WorkedReference)> {
+    type Ranked = (
+        Option<chrono::DateTime<chrono::FixedOffset>>,
+        WorkedReference,
+    );
+    let mut order: Vec<String> = Vec::new();
+    let mut best: HashMap<String, Ranked> = HashMap::new();
+    for row in rows {
+        let sig = match row.program.trim().to_ascii_lowercase().as_str() {
+            "pota" => "POTA",
+            "sota" => "SOTA",
+            _ => continue,
+        };
+        let (Some(call), Some(reference)) =
+            (feed_callsign(&row.callsign), feed_reference(&row.reference))
+        else {
+            continue;
+        };
+        let spotted = row
+            .spot_time
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok());
+        let candidate = WorkedReference {
+            sig: sig.to_string(),
+            sig_info: reference,
+        };
+        match best.get_mut(&call) {
+            Some(current) => {
+                if spotted > current.0 {
+                    *current = (spotted, candidate);
+                }
+            }
+            None => {
+                order.push(call.clone());
+                best.insert(call, (spotted, candidate));
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|call| best.remove(&call).map(|(_, r)| (call, r)))
+        .collect()
+}
+
+/// Clears the activation fetch's in-flight flag however the fetch task ends.
+struct ActivationFetchInFlight(Arc<AtomicBool>);
+
+impl Drop for ActivationFetchInFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// PAN-359 (D10): one activation-feed fetch into `book`. A 404 is logged at
+/// info once per session (`not_offered_logged`), later 404s and every other
+/// failure at debug; a failure keeps the book's last entries, which age out
+/// on their own.
+async fn refresh_worked_references(
+    client: CqdxClient,
+    book: WorkedReferenceBook,
+    in_flight: ActivationFetchInFlight,
+    not_offered_logged: Arc<AtomicBool>,
+) {
+    let _in_flight = in_flight;
+    match client.fetch_activations().await {
+        Ok(Some(rows)) => {
+            let entries = worked_references_from_activations(&rows);
+            debug!(
+                "cqdx.io activations: {} rows, {} POTA/SOTA references recorded",
+                rows.len(),
+                entries.len()
+            );
+            book.record_feed(entries, chrono::Utc::now());
+        }
+        Ok(None) => {
+            if !not_offered_logged.swap(true, Ordering::Relaxed) {
+                info!("cqdx.io activation feed not offered (404); worked stations get no SIG/SIG_INFO");
+            } else {
+                debug!("cqdx.io activation feed still not offered (404)");
+            }
+        }
+        Err(e) => {
+            debug!("cqdx.io activation feed fetch failed ({e}); keeping the last activations")
+        }
+    }
+}
 
 /// PAN-385 (decision 11): count, per candidate band, the distinct needed DXCC
 /// entities cqdx spots show there. A group counts when its mode is FT8 or FT4
@@ -192,6 +322,10 @@ pub struct CqdxBridge {
     /// PAN-385: the latest all-band needed-activity snapshot written by the
     /// opportunity poller (`None` until its first successful spots fetch).
     opportunities: Arc<RwLock<Option<OpportunitySnapshot>>>,
+    /// PAN-359: the worked-station activation book the spot poller fills
+    /// from cqdx.io's activation feed, shared with the `QsoManager`. `None`
+    /// fetches no activations.
+    worked_references: Option<WorkedReferenceBook>,
 }
 
 impl CqdxBridge {
@@ -236,6 +370,7 @@ impl CqdxBridge {
             operating_frequency_hz: None,
             pending: std::sync::Mutex::new(PendingLoads::default()),
             opportunities: Arc::new(RwLock::new(None)),
+            worked_references: None,
         })
     }
 
@@ -248,6 +383,14 @@ impl CqdxBridge {
     /// poller can track the operating band and re-fetch per-band needs.
     pub fn with_operating_frequency(mut self, freq: Arc<AtomicU64>) -> Self {
         self.operating_frequency_hz = Some(freq);
+        self
+    }
+
+    /// PAN-359: attach the coordinator's worked-station activation book (the
+    /// one the `QsoManager` reads at completion). The spot poller then
+    /// refreshes it from `GET /api/v1/pota` at most every 120 s.
+    pub fn with_worked_references(mut self, book: WorkedReferenceBook) -> Self {
+        self.worked_references = Some(book);
         self
     }
 
@@ -461,6 +604,9 @@ impl CqdxBridge {
         let current_band_ref = self.current_band.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let watchdog_timeout = std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
+        let worked_references = self.worked_references.clone();
+        let activation_in_flight = Arc::new(AtomicBool::new(false));
+        let activation_not_offered_logged = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -477,6 +623,8 @@ impl CqdxBridge {
             // value are suppressed.
             let mut sent_states: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            // PAN-359: when the activation feed was last fetched.
+            let mut last_activation_fetch: Option<Instant> = None;
 
             loop {
                 timer.tick().await;
@@ -581,6 +729,26 @@ impl CqdxBridge {
                     }
                     info!("cqdx.io polling: retrying after backoff");
                     last_backoff_attempt = std::time::Instant::now();
+                }
+
+                // PAN-359 (D10): refresh the worked-station activation book,
+                // past the same gates as the spot poll, at most every
+                // ACTIVATION_REFRESH. The fetch runs on its own task, so a
+                // slow or failing feed never delays, stops or counts against
+                // the spot poll below.
+                if let Some(book) = worked_references.as_ref() {
+                    let now = Instant::now();
+                    if activation_refresh_due(last_activation_fetch, now)
+                        && !activation_in_flight.swap(true, Ordering::AcqRel)
+                    {
+                        last_activation_fetch = Some(now);
+                        tokio::spawn(refresh_worked_references(
+                            client.clone(),
+                            book.clone(),
+                            ActivationFetchInFlight(activation_in_flight.clone()),
+                            activation_not_offered_logged.clone(),
+                        ));
+                    }
                 }
 
                 let current_band = current_band_ref.read().await.clone();
@@ -929,6 +1097,10 @@ impl CqdxBridge {
 #[cfg(test)]
 #[path = "cqdx_bridge/tests/opportunity_tests.rs"]
 mod opportunity_tests;
+
+#[cfg(test)]
+#[path = "cqdx_bridge/tests/activation_feed_tests.rs"]
+mod activation_feed_tests;
 
 #[cfg(test)]
 mod tests {

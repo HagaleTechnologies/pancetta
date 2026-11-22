@@ -569,6 +569,31 @@ fn station_agent_public_plaintext_fails_validation() {
     }
 }
 
+/// PAN-359: an invalid `[station] my_sig_info` stops `config --validate`
+/// with the documented message and exit status 1.
+#[test]
+fn validate_rejects_invalid_station_my_sig_info() {
+    let scratch = Scratch::new();
+    let path = scratch.write_file(
+        "my_sig.toml",
+        "[station]\ncallsign = \"K5ARH\"\nmy_sig = \"POTA\"\nmy_sig_info = \"K-12<34\"\n",
+    );
+    let output = scratch.validate(Some(&path));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Configuration validation: FAIL"),
+        "{}",
+        stdout(&output)
+    );
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains(
+            "station.my_sig_info must be at most 64 printable ASCII characters other than < and >, got \"K-12<34\""
+        ),
+        "{text}"
+    );
+}
+
 #[test]
 fn pair_override_rejects_plaintext_before_identity() {
     let scratch = Scratch::new();

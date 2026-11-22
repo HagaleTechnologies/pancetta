@@ -25,6 +25,7 @@ fn manager() -> QsoManager {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: "FT8".to_string(),
+        activation: pancetta_qso::ActivationReference::default(),
     });
     manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
         14_074_000,
