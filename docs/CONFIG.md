@@ -1947,6 +1947,11 @@ min_tier = "atno"
 enabled = false
 url = ""
 min_tier = "atno"
+# Accept plain http://, loopback, private, link-local, CGNAT and unspecified
+# addresses, and localhost/.local/.home.arpa/.internal/single-label names.
+allow_private_targets = false
+# Webhook POSTs allowed in any 60 s, summaries included (1 to 600).
+max_per_minute = 10
 ```
 
 `ttl_secs` governs automatically remembered near-miss stations; operator pins
@@ -1956,10 +1961,25 @@ or focused callsign. Pins are saved in `~/.pancetta/pancetta.toml`.
 Alerts trigger on CQs meeting the channel's tier, or on any decode of a pinned
 callsign. `dedupe_secs` suppresses repeats per channel, callsign and band.
 Both duration fields must be at least 1. Enabled ntfy requires a non-empty
-topic and an HTTP(S) server; enabled webhook requires an HTTP(S) URL.
+topic and an HTTP(S) server. An enabled webhook must be an `https://` URL on
+a public host: plain `http://`, loopback, private, link-local, CGNAT,
+unspecified and broadcast addresses (including IPv4 inside IPv6), and
+`localhost`, `.localhost`, `.local`, `.home.arpa`, `.internal` and
+single-label names fail validation unless `allow_private_targets = true`.
+Validation does not resolve names. Instead, the webhook client checks every
+address a name resolves to when it posts and connects only to public unicast
+addresses, so a public name that resolves, or is rebound, to a private address
+is refused at delivery and counts as a failed delivery. Without the opt-in the
+webhook client also ignores `HTTP_PROXY`/`HTTPS_PROXY`, because a proxy would
+resolve the name itself. URL errors never print the URL.
 Bell emits terminal BEL in TUI mode. Every raised alert produces an INFO
 line naming the call, entity, band and audio offset. The webhook receives
-one JSON POST per alert; ntfy receives a JSON notification. Failed requests
+one JSON POST per alert, at most `max_per_minute` (1 to 600, default 10) in
+any 60 s. Alerts over the cap are held and sent as one `decode_alert_summary`
+POST (`count`, `window_secs`, `max_per_minute`, and the rarest 20 alerts)
+when the window has room, or as a plain `decode_alert` when only one was
+held; the summary counts toward the cap, and a paused target delays it.
+Ntfy receives a JSON notification. Failed requests
 are logged without retry; three consecutive failures pause that target for
 five minutes. Tier alerts suppress uncertain cqdx fallback evidence during
 need-list outages, while locally established band needs and pins remain usable.
