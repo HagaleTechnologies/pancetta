@@ -26,7 +26,7 @@
 //!   cargo run --release -p pancetta-research --example merge_corpus_refresh
 
 use anyhow::Context;
-use chrono::Utc;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_research::curated::{CuratedEntry, CuratedManifest, ScoreBreakdown};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     let new_hard_200 = CuratedManifest {
         schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
         label: "hard_200".to_string(),
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         scoring_decoder: existing_manifest.scoring_decoder.clone(),
         entries: merged,
     };
@@ -274,7 +274,7 @@ fn main() -> anyhow::Result<()> {
     let wild_manifest = CuratedManifest {
         schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
         label: "wild_100".to_string(),
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: UtcTimestamp::now().to_rfc3339(),
         scoring_decoder: existing_manifest.scoring_decoder.clone(),
         entries: wild_entries,
     };

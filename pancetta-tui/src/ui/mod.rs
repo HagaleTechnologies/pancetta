@@ -1,4 +1,6 @@
 use anyhow::Result;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -690,10 +692,7 @@ mod title_rank {
 /// Every title-bar chip as a [`BarSegment`], in display order. Chip text and
 /// styles are composed by [`title_bar_left_line`]. Returns the segments plus the index of the
 /// grid segment (where #171's own-entity span attaches).
-fn title_bar_segments(
-    app: &App,
-    now: chrono::DateTime<chrono::Utc>,
-) -> (Vec<BarSegment<'_>>, usize) {
+fn title_bar_segments(app: &App, now: UtcTimestamp) -> (Vec<BarSegment<'_>>, usize) {
     let accent_bold = app.theme.title.add_modifier(Modifier::BOLD);
 
     let mut segs = vec![
@@ -933,7 +932,7 @@ fn title_bar_segments(
 
 /// The title bar's left side (everything but the clock), priority-fitted to
 /// `width` columns. Pinned chips (callsign, TX policy) are always present.
-fn title_bar_left_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) -> Line<'_> {
+fn title_bar_left_line(app: &App, width: u16, now: UtcTimestamp) -> Line<'_> {
     let width = width as usize;
     let (mut segs, grid_idx) = title_bar_segments(app, now);
     let mut forms = bar_fit::fit_bar(&segs, width);
@@ -968,8 +967,8 @@ fn title_bar_left_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>
 /// it off screen; the chips priority-fit into whatever is left (see
 /// `title_rank` for the drop order).
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let now = chrono::Utc::now();
-    let utc_clock = now.format("%H:%M:%S UTC").to_string();
+    let now = UtcTimestamp::now();
+    let utc_clock = now.strftime("%H:%M:%S UTC").to_string();
     let clock_width = Span::raw(utc_clock.as_str()).width() as u16;
     let [left_area, clock_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).areas(area);
@@ -1203,7 +1202,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             // PAN-344: the typed completion toast outranks ordinary status
             // text (which stays stored and reappears on expiry) but never
             // compose input. Rendered in place — no layout change.
-            None => match app.active_toast_text(chrono::Utc::now()) {
+            None => match app.active_toast_text(UtcTimestamp::now()) {
                 Some(toast) => Span::styled(toast, app.theme.info.add_modifier(Modifier::BOLD)),
                 // PAN-351: leveled transient status colors by severity.
                 None => Span::styled(
@@ -1257,7 +1256,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Collect recent decoded signal frequencies
-    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(30);
     let signal_freqs: Vec<f64> = app
         .decoded_messages
         .iter()
@@ -1268,12 +1267,8 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Build (freq, parity, timestamp) tuples for the occupancy strip from
     // recent decodes. Filter to last 60s; the widget further trims per-column
     // (±37.5 Hz of column center, and re-checks the 60s cutoff defensively).
-    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
-    let decoded_for_occupancy: Vec<(
-        f64,
-        pancetta_core::slot::SlotParity,
-        chrono::DateTime<chrono::Utc>,
-    )> = app
+    let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(60);
+    let decoded_for_occupancy: Vec<(f64, pancetta_core::slot::SlotParity, UtcTimestamp)> = app
         .decoded_messages
         .iter()
         .filter(|m| m.timestamp >= cutoff)
@@ -1518,7 +1513,7 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or_default();
             let line = format!(
                 "{} {:<14} {}{}",
-                ev.ts.format("%H:%M:%S"),
+                ev.ts.strftime("%H:%M:%S"),
                 ev.target,
                 ev.text,
                 who
@@ -1542,7 +1537,7 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
 mod diagnostics_overlay_tests {
     use super::*;
     use crate::app::DiagnosticEventRecord;
-    use chrono::{TimeZone, Utc};
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_core::DiagnosticLevel;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
     use std::collections::VecDeque;
@@ -1562,7 +1557,7 @@ mod diagnostics_overlay_tests {
         callsign: Option<&str>,
     ) -> DiagnosticEventRecord {
         DiagnosticEventRecord {
-            ts: Utc.with_ymd_and_hms(2026, 7, 31, 12, 34, 56).unwrap(),
+            ts: UtcTimestamp::from_ymd_hms(2026, 7, 31, 12, 34, 56).unwrap(),
             target,
             level,
             text: text.to_string(),
@@ -1825,7 +1820,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             let line = if upload_cells.is_empty() {
                 format!(
                     "{} {:<10} {}  ({} Hz)",
-                    qso.ts.format("%H:%M:%S"),
+                    qso.ts.strftime("%H:%M:%S"),
                     qso.callsign,
                     summary,
                     qso.freq_hz
@@ -1833,7 +1828,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             } else if inner.width >= 60 {
                 format!(
                     "{} {:<10} {}  {}  ({} Hz)",
-                    qso.ts.format("%H:%M:%S"),
+                    qso.ts.strftime("%H:%M:%S"),
                     qso.callsign,
                     summary,
                     upload_cells,
@@ -1844,7 +1839,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
                 // glyph ahead of the RF and outcome summary (PAN-344).
                 format!(
                     "{} {:<10} {} {} ({} Hz)",
-                    qso.ts.format("%H:%M"),
+                    qso.ts.strftime("%H:%M"),
                     qso.callsign,
                     upload_cells,
                     summary,
@@ -1922,7 +1917,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         let title = format!(
             " Station: {} \u{b7} {} UTC \u{b7} {} Hz ",
             qso.callsign,
-            qso.ts.format("%H:%M:%S"),
+            qso.ts.strftime("%H:%M:%S"),
             qso.freq_hz
         );
         let block = Block::default()
@@ -2126,7 +2121,7 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
     {
         use crate::presentation::TxMeterRow;
         let capability = app.tx_meter_capability;
-        let row = if let Some(reading) = app.tx_meter_live_at(chrono::Utc::now()) {
+        let row = if let Some(reading) = app.tx_meter_live_at(UtcTimestamp::now()) {
             TxMeterRow::Live {
                 reading,
                 alc_limit: capability.and_then(|c| c.alc_limit),
@@ -2265,18 +2260,18 @@ pub fn format_bearing(bearing: Option<f64>) -> String {
 }
 
 /// Helper function to format time ago
-pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
-    let duration = now.signed_duration_since(timestamp);
+pub fn format_time_ago(timestamp: UtcTimestamp) -> String {
+    let now = UtcTimestamp::now();
+    let duration = now.duration_since(timestamp);
 
-    if duration.num_seconds() < 60 {
-        format!("{}s", duration.num_seconds())
-    } else if duration.num_minutes() < 60 {
-        format!("{}m", duration.num_minutes())
-    } else if duration.num_hours() < 24 {
-        format!("{}h", duration.num_hours())
+    if duration.as_secs() < 60 {
+        format!("{}s", duration.as_secs())
+    } else if duration.as_mins() < 60 {
+        format!("{}m", duration.as_mins())
+    } else if duration.as_hours() < 24 {
+        format!("{}h", duration.as_hours())
     } else {
-        format!("{}d", duration.num_days())
+        format!("{}d", duration.as_hours() / 24)
     }
 }
 
@@ -2330,7 +2325,7 @@ mod view_render_tests {
             if populated {
                 app.decoded_messages
                     .push_back(crate::app::DecodedMessageView {
-                        timestamp: chrono::Utc::now(),
+                        timestamp: UtcTimestamp::now(),
                         frequency: 14_074_000.0,
                         mode: "FT8".into(),
                         snr: -7,
@@ -2955,7 +2950,7 @@ mod view_render_tests {
             Some(BOTH_METERS),
         )
         .await;
-        app.tx_meter_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3));
+        app.tx_meter_at = Some(UtcTimestamp::now() - SignedDuration::from_secs(3));
         let buf = render_health(&app).await;
         assert!(tx_meter_row(&buf).contains("TX meter: drive pending, shown while transmitting"));
         assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
@@ -3281,7 +3276,7 @@ mod view_render_tests {
         crate::app::ActiveQsoBanner {
             their_callsign: call.into(),
             state: "wait rpt".into(),
-            started_at: chrono::Utc::now(),
+            started_at: UtcTimestamp::now(),
             frequency_hz: 1234.0,
             tx_parity: None,
             last_tx_text: None,
@@ -3334,7 +3329,7 @@ mod view_render_tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: chrono::Utc::now(),
+            received_at: UtcTimestamp::now(),
         }
     }
 
@@ -3357,7 +3352,7 @@ mod view_render_tests {
             openness: vec![3; 96],
             bin_hz: 25.0,
             range: (200.0, 2600.0),
-            received_at: chrono::Utc::now(),
+            received_at: UtcTimestamp::now(),
         }
     }
 
@@ -3598,7 +3593,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec![
                 "K1ABC started at 00:00:00".to_string(),
                 "Completed".to_string(),
@@ -3610,7 +3605,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
             last_state: "Failed".to_string(),
             freq_hz: 1832,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec![
                 "KJ5NJF started at 00:00:05".to_string(),
                 "Failed: watchdog timeout".to_string(),
@@ -3624,7 +3619,7 @@ mod view_render_tests {
             ),
             last_state: "Failed".to_string(),
             freq_hz: 2100,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Failed: invalid callsign".to_string()],
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
@@ -3633,7 +3628,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::UserCancelled),
             last_state: "Failed".to_string(),
             freq_hz: 800,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Failed: cancelled by operator".to_string()],
         });
         app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
@@ -3703,7 +3698,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 14_075_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Completed".to_string()],
         });
         app.recent_qsos_scroll = 0;
@@ -3724,7 +3719,7 @@ mod view_render_tests {
                     ),
                 ],
             }],
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         );
 
         let backend = TestBackend::new(80, 24);
@@ -3749,7 +3744,7 @@ mod view_render_tests {
         ));
         let mut second = app.recent_qsos[0].clone();
         second.qso_uuid = "u-2".into();
-        second.ts += chrono::Duration::seconds(15);
+        second.ts += SignedDuration::from_secs(15);
         app.push_recent_qso_outcome(second);
         app.apply_qso_upload_statuses(
             vec![crate::upload_status::QsoUploadStatus {
@@ -3764,7 +3759,7 @@ mod view_render_tests {
                     ),
                 )],
             }],
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         );
         app.recent_qsos_scroll = 1;
         term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
@@ -3804,7 +3799,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 14_075_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Completed".to_string()],
         });
 
@@ -3829,7 +3824,7 @@ mod view_render_tests {
 
         // After expiry the stored status text reappears.
         if let Some(toast) = app.completion_toast.as_mut() {
-            toast.since = chrono::Utc::now() - chrono::Duration::seconds(60);
+            toast.since = UtcTimestamp::now() - SignedDuration::from_secs(60);
         }
         let buf = draw(&app);
         assert!(buffer_contains(&buf, "Pancetta TUI Ready"));
@@ -3851,7 +3846,7 @@ mod view_render_tests {
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 14_075_000,
-            ts: chrono::Utc::now(),
+            ts: UtcTimestamp::now(),
             brief_timeline: vec!["Completed".to_string()],
         });
         app.recent_qsos_scroll = 0;
@@ -3868,7 +3863,7 @@ mod view_render_tests {
                     (Lotw, TargetUploadStatus::pending("queued")),
                 ],
             }],
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         );
 
         for (w, h, legend) in [
@@ -4090,7 +4085,7 @@ mod view_render_tests {
             && tail[8..].iter().collect::<String>() == " UTC"
     }
 
-    fn slot_test_now() -> chrono::DateTime<chrono::Utc> {
+    fn slot_test_now() -> UtcTimestamp {
         "2026-01-01T00:00:06Z".parse().unwrap()
     }
 
@@ -4190,7 +4185,7 @@ mod view_render_tests {
             &ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
                 .unwrap(),
             &[],
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         app.contest_score = Some(ContestScoreUpdate {
@@ -4390,7 +4385,7 @@ mod view_render_tests {
             frequency: 14.074,
             band: None,
             mode: "FT8".to_string(),
-            last_seen: chrono::Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr: -12,
             distance: Some(14_000.0),
             bearing: None,
@@ -4421,7 +4416,7 @@ mod view_render_tests {
 
     fn fixture_caller(app: &App, call: &str) -> crate::app::DecodedMessageView {
         crate::app::DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".to_string(),
             snr: -7,
@@ -5136,7 +5131,7 @@ mod hit_test_tests {
             &ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
                 .unwrap(),
             &[],
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         let update = ContestScoreUpdate {

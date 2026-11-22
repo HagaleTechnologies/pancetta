@@ -4,6 +4,7 @@
 //! fail at parse time instead of being silently ignored.
 
 use assert_cmd::Command;
+use pancetta_core::time::UtcTimestamp;
 use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -607,8 +608,8 @@ fn version_fields(scratch: &Scratch) -> (String, String, String, String) {
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
     );
-    let date = chrono::NaiveDate::parse_from_str(parts[1], "%Y-%m-%d").unwrap();
-    assert!(date <= chrono::Utc::now().date_naive());
+    let date = jiff::civil::Date::strptime("%Y-%m-%d", parts[1]).unwrap();
+    assert!(date <= UtcTimestamp::now().to_civil().date());
     assert!(parts[2].starts_with(&format!("{}-", std::env::consts::ARCH)));
     let os_fragment = match std::env::consts::OS {
         "macos" => "apple-darwin",

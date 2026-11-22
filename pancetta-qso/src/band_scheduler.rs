@@ -12,7 +12,8 @@
 //! Every hop carries a [`BandHopReason`] whose [`BandHopReason::why_text`] is
 //! the one-line Diagnostics overlay record.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::utc_window::UtcWindow;
 use pancetta_core::Band;
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ pub struct BandOpportunity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpportunitySnapshot {
     /// When the underlying spots were fetched.
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     /// One entry per candidate band whose needed set has loaded (zero
     /// counts included); a band with no entry has unknown counts.
     pub bands: Vec<BandOpportunity>,
@@ -71,8 +72,8 @@ impl OpportunitySnapshot {
     }
 
     /// True when the snapshot is no older than [`OPPORTUNITY_MAX_AGE_SECS`].
-    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
-        (now - self.as_of).num_seconds() <= OPPORTUNITY_MAX_AGE_SECS
+    pub fn is_fresh(&self, now: UtcTimestamp) -> bool {
+        (now - self.as_of).as_secs() <= OPPORTUNITY_MAX_AGE_SECS
     }
 }
 
@@ -231,7 +232,7 @@ pub fn is_low_band(band: Band) -> bool {
 struct InFlightHop {
     target: Band,
     needed: bool,
-    emitted_at: DateTime<Utc>,
+    emitted_at: UtcTimestamp,
 }
 
 /// PAN-385: the band scheduler's decision state, owned by
@@ -254,11 +255,11 @@ pub struct BandScheduler {
     /// Destination of the last hop emitted while the live dial was unknown.
     assumed_band: Option<Band>,
     /// When the current band was first observed (or first evaluated).
-    arrived_at: Option<DateTime<Utc>>,
+    arrived_at: Option<UtcTimestamp>,
     /// Last decoded CQ tiered `PerBandDxccNew` or higher.
-    last_needed_heard: Option<DateTime<Utc>>,
+    last_needed_heard: Option<UtcTimestamp>,
     /// Start of the needed-activity dwell (last carried-out needed hop).
-    last_needed_hop: Option<DateTime<Utc>>,
+    last_needed_hop: Option<UtcTimestamp>,
     /// A hop awaiting confirmation by the live dial.
     in_flight: Option<InFlightHop>,
     /// Latest cqdx needed-activity snapshot.
@@ -276,8 +277,8 @@ pub struct BandScheduler {
 #[derive(Debug, Clone, Copy)]
 struct HopMarks {
     assumed_band: Option<Band>,
-    arrived_at: Option<DateTime<Utc>>,
-    last_needed_hop: Option<DateTime<Utc>>,
+    arrived_at: Option<UtcTimestamp>,
+    last_needed_hop: Option<UtcTimestamp>,
     in_flight: Option<InFlightHop>,
 }
 
@@ -291,7 +292,7 @@ impl BandScheduler {
     /// the idle clock; a dial on an in-flight hop's target confirms it and
     /// starts the needed-activity dwell. An in-flight hop the dial does not
     /// show was not carried out and is dropped, so the triggers re-evaluate.
-    pub fn observe_band(&mut self, band: Band, now: DateTime<Utc>) {
+    pub fn observe_band(&mut self, band: Band, now: UtcTimestamp) {
         if self.live_band != Some(band) {
             self.live_band = Some(band);
             self.arrived_at = Some(now);
@@ -305,7 +306,7 @@ impl BandScheduler {
     }
 
     /// A decoded CQ tiered `PerBandDxccNew` or higher was heard.
-    pub fn note_needed_heard(&mut self, now: DateTime<Utc>) {
+    pub fn note_needed_heard(&mut self, now: UtcTimestamp) {
         self.last_needed_heard = Some(now);
     }
 
@@ -346,7 +347,7 @@ impl BandScheduler {
     }
 
     /// Grey-line phase label at the station now, when enabled and known.
-    pub fn grey_line(&self, enabled: bool, now: DateTime<Utc>) -> Option<&'static str> {
+    pub fn grey_line(&self, enabled: bool, now: UtcTimestamp) -> Option<&'static str> {
         if !enabled {
             return None;
         }
@@ -361,7 +362,7 @@ impl BandScheduler {
     }
 
     /// Start the idle clock at the first evaluation when no dial was seen.
-    pub fn ensure_arrival(&mut self, now: DateTime<Utc>) {
+    pub fn ensure_arrival(&mut self, now: UtcTimestamp) {
         if self.arrived_at.is_none() {
             self.arrived_at = Some(now);
         }
@@ -381,10 +382,10 @@ impl BandScheduler {
     pub fn update_plan(
         &mut self,
         plan: &[BandPlanEntry],
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         current: Option<Band>,
     ) -> (Option<usize>, Option<usize>) {
-        let time = now.time();
+        let time = now.to_civil().time();
         let active = plan.iter().position(|e| e.window.contains(time));
         let in_window = |i: usize| current.is_some_and(|b| plan[i].bands.contains(&b));
         if self.last_window != Some(active) {
@@ -410,24 +411,24 @@ impl BandScheduler {
 
     /// Seconds since the later of arrival on this band and the last needed
     /// caller.
-    pub fn idle_secs(&self, now: DateTime<Utc>) -> i64 {
+    pub fn idle_secs(&self, now: UtcTimestamp) -> i64 {
         let start = match (self.arrived_at, self.last_needed_heard) {
             (Some(a), Some(h)) => a.max(h),
             (Some(a), None) => a,
             (None, Some(h)) => h,
             (None, None) => now,
         };
-        (now - start).num_seconds()
+        (now - start).as_secs()
     }
 
     /// Whether one hop interval has passed since the last needed hop.
-    pub fn needed_dwell_passed(&self, now: DateTime<Utc>, hop_interval: chrono::Duration) -> bool {
+    pub fn needed_dwell_passed(&self, now: UtcTimestamp, hop_interval: SignedDuration) -> bool {
         self.last_needed_hop.is_none_or(|t| now - t >= hop_interval)
     }
 
     /// Record an emitted hop. With a known live dial the hop waits for the
     /// dial to confirm it; with an unknown dial it is assumed carried out.
-    pub fn note_hop(&mut self, to: Option<Band>, needed: bool, now: DateTime<Utc>) {
+    pub fn note_hop(&mut self, to: Option<Band>, needed: bool, now: UtcTimestamp) {
         self.before_hop = Some(HopMarks {
             assumed_band: self.assumed_band,
             arrived_at: self.arrived_at,

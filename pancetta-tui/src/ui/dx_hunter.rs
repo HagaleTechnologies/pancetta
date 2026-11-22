@@ -1,5 +1,6 @@
 use super::need_display::{atno_style, band_marker, need_marker, needed_style};
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
@@ -177,7 +178,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // the DXCC "Entity" is what the operator scans for. PAN-88: narrow panels
     // show fewer, whole columns (see `visible_columns`).
     let columns = visible_columns(area.width);
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let header_cells = columns
         .iter()
         .map(|c| Cell::from(c.header()).style(app.theme.title.add_modifier(Modifier::BOLD)));
@@ -305,7 +306,7 @@ fn create_dx_row<'a>(
     station: &'a DxStation,
     app: &App,
     columns: &[DxHunterColumn],
-    now: chrono::DateTime<chrono::Utc>,
+    now: UtcTimestamp,
 ) -> Row<'a> {
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
     // this row's callsign is the operator's current focus, flag it here too
@@ -346,7 +347,7 @@ fn create_dx_row<'a>(
         station
             .last_seen_network
             .map(|ts| {
-                let age = now.timestamp() - ts;
+                let age = now.as_second() - ts;
                 age > 600 // >10 minutes
             })
             .unwrap_or(false)
@@ -810,7 +811,7 @@ mod tests {
         let mut row = make_test_station("JA1STL");
         row.band = Some(pancetta_core::Band::Band20m);
         row.source = SpotSource::Network;
-        row.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        row.last_seen_network = Some(UtcTimestamp::now().as_second() - 601);
         app.dx_stations.clear();
         app.dx_stations.insert(row.call_sign.clone(), row);
         for selected in [false, true] {
@@ -914,7 +915,7 @@ mod tests {
         let mut app = needed_app().await;
         let station = app.dx_stations.get_mut("W5ABC").unwrap();
         station.source = SpotSource::Network;
-        station.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        station.last_seen_network = Some(UtcTimestamp::now().as_second() - 601);
         for selected in [false, true] {
             app.active_panel = if selected {
                 ActivePanel::DxHunter
@@ -1029,7 +1030,7 @@ mod tests {
         let mut app = super::super::station_card::tests::ranked_app("W5XYZ/P", false, true).await;
         let station = app.dx_stations.get_mut("W5XYZ/P").unwrap();
         station.source = SpotSource::Both;
-        station.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        station.last_seen_network = Some(UtcTimestamp::now().as_second() - 601);
         let buf = render_buffer(&app, 200, 8);
         for text in [
             "no award need",
@@ -1197,7 +1198,7 @@ mod tests {
     async fn atno_marker_follows_the_displayed_score_after_a_spot_refresh() {
         let mut app = App::new(crate::Config::default(), None).await.unwrap();
         let view = crate::DecodedMessageView {
-            timestamp: chrono::Utc::now(),
+            timestamp: UtcTimestamp::now(),
             frequency: 14.074,
             mode: "FT8".to_string(),
             snr: -10,
@@ -1231,8 +1232,8 @@ mod tests {
             reporter_count: 3,
             best_snr: Some(-10),
             confidence: 0.9,
-            first_seen: chrono::Utc::now().timestamp(),
-            last_seen: chrono::Utc::now().timestamp(),
+            first_seen: UtcTimestamp::now().as_second(),
+            last_seen: UtcTimestamp::now().as_second(),
             is_notable: false,
             notable_type: None,
             entity_name: "New Zealand".to_string(),
@@ -1519,7 +1520,7 @@ mod tests {
             frequency: 14.074,
             band: None,
             mode: "FT8".to_string(),
-            last_seen: chrono::Utc::now(),
+            last_seen: UtcTimestamp::now(),
             snr: -10,
             distance: None,
             bearing: None,

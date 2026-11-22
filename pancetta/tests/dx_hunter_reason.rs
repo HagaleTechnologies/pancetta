@@ -1,4 +1,5 @@
 //! PAN-94: the shared lookup's decision inputs reach the operator's screen.
+use pancetta_core::time::UtcTimestamp;
 use pancetta_lib::priority_evaluator::CachedStationLookup;
 use pancetta_qso::priority::{PriorityScorer, PriorityWeights, WorkedStationLookup};
 use pancetta_tui::{
@@ -11,7 +12,7 @@ async fn decode(app: &mut App, lookup: &CachedStationLookup, call: &str) {
     let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup.clone()));
     let explained = scorer.score_tiered_explained(call, None, -3, 14_074_000.0);
     app.add_decoded_message(DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: 14.074,
         mode: "FT8".into(),
         snr: -3,

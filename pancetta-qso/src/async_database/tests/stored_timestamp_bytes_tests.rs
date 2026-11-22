@@ -4,6 +4,7 @@
 //! literal, never re-blessed.
 
 use super::*;
+use pancetta_core::time::UtcTimestamp;
 
 const FIXTURE_ROWS: &str = include_str!("../../../tests/fixtures/pan441/qso_rows.sql");
 
@@ -28,15 +29,15 @@ const CREATED_AT_TEXT: [&str; 4] = [
 
 const UPDATED_AT_TEXT: &str = "2026-11-21T21:44:57.519597210+00:00";
 
-fn instant(nanos: u32) -> DateTime<Utc> {
-    DateTime::from_timestamp(BASE_SECS, nanos).expect("in range")
+fn instant(nanos: u32) -> UtcTimestamp {
+    UtcTimestamp::from_parts(BASE_SECS, nanos).expect("in range")
 }
 
 fn qso_id(raw: u128) -> QsoId {
     Uuid::from_u128(raw)
 }
 
-fn fixture_progress(callsign: &str, id: u128, at: DateTime<Utc>) -> QsoProgress {
+fn fixture_progress(callsign: &str, id: u128, at: UtcTimestamp) -> QsoProgress {
     let frequency = 14_074_000.0;
     QsoProgress {
         state: QsoState::Completed {
@@ -270,7 +271,7 @@ async fn sqlite_check_duplicate_matches_fixture_fraction() {
     let window_hours = 1;
     let one_hour = 3_600;
     let now_for_cutoff =
-        |nanos: u32| DateTime::from_timestamp(BASE_SECS + one_hour, nanos).expect("in range");
+        |nanos: u32| UtcTimestamp::from_parts(BASE_SECS + one_hour, nanos).expect("in range");
 
     // Cutoff 2026-11-04T14:30:00.123456779Z: the stored .123456780 start is inside.
     let found = db

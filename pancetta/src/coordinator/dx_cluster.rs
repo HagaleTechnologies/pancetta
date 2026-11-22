@@ -8,6 +8,7 @@
 //! No-op when `[network.dx_cluster].enabled = false` (the default).
 
 use anyhow::Result;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::{Band, Mode};
 use pancetta_dx::cluster::{ClusterConfig, ClusterFilter, DxClusterClient};
 use pancetta_dx::DxSpot;
@@ -263,7 +264,7 @@ mod tests {
             frequency: 14_074_000,
             mode,
             spotter: "W1ABC".to_string(),
-            time: chrono::Utc::now(),
+            time: UtcTimestamp::now(),
             comment: Some(comment.to_string()),
             dxcc_entity: None,
             grid_square: None,
@@ -334,7 +335,7 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let time = chrono::Utc::now().format("%H%MZ");
+            let time = UtcTimestamp::now().strftime("%H%MZ");
             let lines = format!(
                 "Welcome\r\n\
                  DX de W1ABC:     14074.0  JA1XYZ       CW 25 WPM          {time}\r\n\

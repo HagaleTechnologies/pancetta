@@ -3,7 +3,8 @@
 //! Bridges `pancetta_qso::PriorityScorer` with the QSO database for
 //! duplicate checking and DXCC need lookups.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::priority::{NeedSource, WorkedStationLookup};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -54,13 +55,13 @@ pub enum NeedListAvailability {
     NotOffered,
     /// cqdx.io answered. `band` is the per-band scope, `None` for all bands.
     Loaded {
-        fetched_at: DateTime<Utc>,
+        fetched_at: UtcTimestamp,
         band: Option<String>,
     },
     /// No answer this session. `retrying` is false when only a config fix
     /// and restart can help.
     Unavailable {
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         error: String,
         retrying: bool,
     },
@@ -85,7 +86,7 @@ impl<T> NeedList<T> {
         let since = match &self.availability {
             NeedListAvailability::Loaded { .. } => return,
             NeedListAvailability::Unavailable { since, .. } => *since,
-            _ => Utc::now(),
+            _ => UtcTimestamp::now(),
         };
         self.availability = NeedListAvailability::Unavailable {
             since,
@@ -149,7 +150,7 @@ impl EntitySet {
 pub struct CachedStationLookup {
     /// Callsigns worked per band.  Key = uppercase band name (e.g. "20M"),
     /// value = latest contact start date per resolved uppercase callsign.
-    worked_on_band: Arc<RwLock<HashMap<String, HashMap<String, DateTime<Utc>>>>>,
+    worked_on_band: Arc<RwLock<HashMap<String, HashMap<String, UtcTimestamp>>>>,
     /// DXCC entities worked per band, derived locally from `worked_on_band`
     /// via the offline prefix→entity resolver (`pancetta_core::dxcc`) — no
     /// cqdx dependency. Key = uppercase band name, value = set of resolved
@@ -292,13 +293,13 @@ impl CachedStationLookup {
         self.seed_dated_worked(
             callsigns
                 .into_iter()
-                .map(|c| (band.to_string(), c, Utc::now()))
+                .map(|c| (band.to_string(), c, UtcTimestamp::now()))
                 .collect(),
         );
     }
 
     /// Merge dated history for all bands. Dates never expire the worked-before display.
-    pub fn seed_dated_worked(&self, rows: Vec<(String, String, DateTime<Utc>)>) {
+    pub fn seed_dated_worked(&self, rows: Vec<(String, String, UtcTimestamp)>) {
         for (band, call, date) in rows {
             let _ = self.record_worked_at(&call, &band, date);
         }
@@ -508,7 +509,7 @@ impl CachedStationLookup {
 
     /// Install an all-bands cqdx needed-entity answer fetched now.
     pub fn update_needed_dxcc(&self, patterns: HashSet<String>) {
-        self.update_needed_dxcc_for_band(patterns, None, Utc::now());
+        self.update_needed_dxcc_for_band(patterns, None, UtcTimestamp::now());
     }
 
     /// PAN-93: install a cqdx needed-entity answer and mark the list
@@ -518,7 +519,7 @@ impl CachedStationLookup {
         &self,
         patterns: HashSet<String>,
         band: Option<String>,
-        fetched_at: DateTime<Utc>,
+        fetched_at: UtcTimestamp,
     ) {
         let mut list = self.needed_dxcc.write();
         list.entries = EntitySet::from_prefixes(patterns);
@@ -538,7 +539,7 @@ impl CachedStationLookup {
         let mut list = self.needed_grids.write();
         list.entries = grids;
         list.availability = NeedListAvailability::Loaded {
-            fetched_at: Utc::now(),
+            fetched_at: UtcTimestamp::now(),
             band: None,
         };
     }
@@ -716,7 +717,7 @@ impl CachedStationLookup {
         &self,
         rows: &[pancetta_cqdx::NeededEntity],
         band: Option<String>,
-        fetched_at: DateTime<Utc>,
+        fetched_at: UtcTimestamp,
     ) -> (usize, usize) {
         let mut needed = EntitySet::default();
         let mut atno = EntitySet::default();
@@ -818,7 +819,7 @@ impl CachedStationLookup {
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
-        let _ = self.record_worked_at(callsign, band, Utc::now());
+        let _ = self.record_worked_at(callsign, band, UtcTimestamp::now());
     }
 
     /// PAN-347: one logged contact: the band maps plus the local log's
@@ -829,7 +830,7 @@ impl CachedStationLookup {
         band: &str,
         mode: &str,
         confirmed: bool,
-        date: DateTime<Utc>,
+        date: UtcTimestamp,
     ) {
         if let Some(entity) = self.record_worked_at(callsign, band, date) {
             let mut log = self.local_log.write();
@@ -845,7 +846,7 @@ impl CachedStationLookup {
         &self,
         callsign: &str,
         band: &str,
-        date: DateTime<Utc>,
+        date: UtcTimestamp,
     ) -> Option<&'static str> {
         // PAN-58 round 1 (Codex P1): canonicalize on write, matching
         // `is_duplicate`'s resolved-form read — otherwise a QSO completed
@@ -1171,7 +1172,7 @@ mod tests {
         };
         for atno in [true, false] {
             row.atno = atno;
-            l.update_needed_entities(&[row.clone()], None, Utc::now());
+            l.update_needed_entities(&[row.clone()], None, UtcTimestamp::now());
             for call in ["JA1ABC", "7K1ABC", "JR1ABC", "JH1ABC", "8N1ABC", "JE1ABC"] {
                 assert_eq!(l.needed_dxcc_status(call), NeedStatus::Needed, "{call}");
                 assert_eq!(l.display_needed_atno(call), (true, atno));
@@ -1210,7 +1211,7 @@ mod tests {
                     atno: true,
                 }],
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
             );
             for call in included {
                 assert_eq!(l.display_needed_atno(call), (true, true), "{call}");
@@ -1398,7 +1399,7 @@ mod tests {
             .dxcc_list,
             None
         );
-        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let at = UtcTimestamp::from_parts(1_800_000_000, 0).unwrap();
         l.update_needed_dxcc_for_band(HashSet::from(["JA".into()]), Some("20M".into()), at);
         let s = l.lookup_need(
             "JA1ABC",
@@ -2019,7 +2020,7 @@ mod tests {
     #[test]
     fn loaded_lists_report_needed_and_not_needed_with_scope() {
         let lookup = CachedStationLookup::new();
-        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let at = UtcTimestamp::from_parts(1_800_000_000, 0).unwrap();
         lookup.update_needed_dxcc_for_band(HashSet::from(["JA".into()]), Some("20M".into()), at);
         assert_eq!(lookup.needed_dxcc_status("JA1ABC"), NeedStatus::Needed);
         assert_eq!(lookup.needed_dxcc_status("<JA1ABC>"), NeedStatus::Needed);
@@ -2515,8 +2516,8 @@ mod pan260 {
     #[tokio::test]
     async fn dated_all_band_history_preserves_latest_and_survives_failed_refresh() {
         let l = CachedStationLookup::new();
-        let now = Utc::now();
-        let old = now - chrono::Duration::days(90);
+        let now = UtcTimestamp::now();
+        let old = now - SignedDuration::from_hours(24 * 90);
         l.seed_dated_worked(vec![
             ("40m".into(), "ja1xyz".into(), old),
             ("20m".into(), "k1abc".into(), now),
@@ -2540,7 +2541,7 @@ mod pan260 {
         metadata.start_time = old;
         l.record_completed_contact(&metadata);
         assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], now);
-        metadata.start_time = now + chrono::Duration::seconds(1);
+        metadata.start_time = now + SignedDuration::from_secs(1);
         l.record_completed_contact(&metadata);
         assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], metadata.start_time);
         let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
@@ -2913,7 +2914,7 @@ mod pan348 {
         l.set_needed_means(NeededMeans::Unconfirmed);
         assert_eq!(l.needed_atno_shown("TA2ABC"), (true, false));
         assert!(!l.is_atno("TA2ABC"));
-        l.record_logged_contact("TA2ABC", "20M", "FT8", true, Utc::now());
+        l.record_logged_contact("TA2ABC", "20M", "FT8", true, UtcTimestamp::now());
         for call in ["TA1ABC", "TA2ABC"] {
             assert_eq!(l.needed_atno_shown(call), (false, false));
             assert!(!l.is_needed_dxcc(call));
@@ -2929,17 +2930,17 @@ mod pan348 {
         l.set_needed_means(NeededMeans::Unconfirmed);
         assert!(l.is_needed_dxcc("DL1XYZ"));
         assert!(l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
-        l.record_logged_contact("DL2ABC", "40m", "FT4", true, Utc::now());
+        l.record_logged_contact("DL2ABC", "40m", "FT4", true, UtcTimestamp::now());
         assert!(!l.is_needed_dxcc("DL1XYZ"));
         assert!(l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
         assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 7_074_000.0));
-        l.record_logged_contact("DA1ABC", "20m", "FT4", true, Utc::now());
+        l.record_logged_contact("DA1ABC", "20m", "FT4", true, UtcTimestamp::now());
         assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
         assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 0.0));
         assert!(!l.is_dxcc_needed_on_band("DL1XYZ", f64::NAN));
         assert!(!l.is_dxcc_needed_on_band("Q1ABC", 14_074_000.0));
         assert!(!l.is_needed_dxcc("K1ABC"));
-        l.record_logged_contact("DL3ABC", "20M", "FT8", false, Utc::now());
+        l.record_logged_contact("DL3ABC", "20M", "FT8", false, UtcTimestamp::now());
         assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
     }
 

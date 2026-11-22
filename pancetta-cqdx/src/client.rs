@@ -889,7 +889,7 @@ mod tests {
             frequency: 14074000,
             mode: "FT8".to_string(),
             snr: -12,
-            timestamp: chrono::Utc::now(),
+            timestamp: pancetta_core::time::UtcTimestamp::now(),
             reporter: "K2DEF".to_string(),
             reporter_grid: Some("FN31".to_string()),
         }];
@@ -906,8 +906,8 @@ mod tests {
             mode: "FT8".to_string(),
             rst_sent: Some("-10".to_string()),
             rst_received: Some("-14".to_string()),
-            start_time: chrono::Utc::now(),
-            end_time: chrono::Utc::now(),
+            start_time: pancetta_core::time::UtcTimestamp::now(),
+            end_time: pancetta_core::time::UtcTimestamp::now(),
         }
     }
 

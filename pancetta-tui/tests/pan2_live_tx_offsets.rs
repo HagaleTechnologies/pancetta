@@ -7,6 +7,7 @@
 //! rather than a guarantee, it says so explicitly and asserts the CURRENT
 //! behavior so the finding is reproducible without a red suite.
 
+use pancetta_core::time::UtcTimestamp;
 use pancetta_tui::app::{
     ActivePanel, ActiveQsoBanner, App, PlacementSlice, PlacementView, TxQueueItem,
 };
@@ -17,7 +18,7 @@ fn banner_at(call: &str, hz: f64, qso_id: &str) -> ActiveQsoBanner {
     ActiveQsoBanner {
         their_callsign: call.into(),
         state: "wait rpt".into(),
-        started_at: chrono::Utc::now(),
+        started_at: UtcTimestamp::now(),
         frequency_hz: hz,
         tx_parity: None,
         last_tx_text: None,
@@ -60,7 +61,7 @@ fn placement_view(offsets: &[(f64, f64)]) -> PlacementView {
         openness: vec![3u8; 96],
         bin_hz: 25.0,
         range: (200.0, 2600.0),
-        received_at: chrono::Utc::now(),
+        received_at: UtcTimestamp::now(),
     }
 }
 

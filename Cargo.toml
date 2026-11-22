@@ -79,7 +79,7 @@ anyhow = "1.0"
 
 # System utilities
 uuid = { version = "1.23", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 dirs = "6"
 num_cpus = "1.0"
 

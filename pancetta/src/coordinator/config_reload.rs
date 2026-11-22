@@ -36,6 +36,7 @@
 //!   running state at all — it is restart-required — so no reload can clobber
 //!   an in-progress QSO.
 
+use pancetta_core::time::UtcTimestamp;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -951,7 +952,7 @@ impl super::ApplicationCoordinator {
         diff: &SecurityConfigDiff,
     ) -> Vec<(DiagnosticLevel, String)> {
         let mut lines = Vec::new();
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = UtcTimestamp::now().as_millisecond();
 
         // 1. Consent turned OFF (audited `LocalConsentChanged`). The TX
         //    worker's key-time and playback re-checks read this bit live.
@@ -1066,7 +1067,7 @@ impl super::ApplicationCoordinator {
             };
             st.disarm_with_reason(
                 pancetta_agent::arm::DisarmReason::OperatorDisarm,
-                chrono::Utc::now().timestamp_millis(),
+                UtcTimestamp::now().as_millisecond(),
             )
         };
         let audit = self.audit_log();

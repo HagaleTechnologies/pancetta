@@ -1,5 +1,7 @@
 // PAN-260. Formerly the inline module `pan260`.
 use super::*;
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 
 #[tokio::test]
 async fn standalone_memory_only_admission_does_not_require_a_rig_band() {
@@ -33,9 +35,7 @@ async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
     });
     let dial = Arc::new(AtomicU64::new(14_074_000));
     m.set_dial_frequency_source(dial.clone());
-    let now = DateTime::parse_from_rfc3339("2026-11-04T14:30:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = str::parse::<UtcTimestamp>("2026-11-04T14:30:00Z").unwrap();
     let id = m.start_cq(1200.0, None, false, None).await.unwrap();
     m.qsos
         .write()
@@ -43,7 +43,7 @@ async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
         .get_mut(&id)
         .unwrap()
         .metadata
-        .start_time = now - Duration::minutes(30);
+        .start_time = now - SignedDuration::from_mins(30);
     for (message, raw) in [
         (
             MessageType::CqResponse {
@@ -79,10 +79,13 @@ async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
     assert!(m.check_duplicate_at("k1abc", 1800.0, now).await.unwrap());
 
     for (date, expected) in [
-        (now - Duration::hours(24), false),
-        (now - Duration::hours(24) + Duration::nanoseconds(1), true),
+        (now - SignedDuration::from_hours(24), false),
+        (
+            now - SignedDuration::from_hours(24) + SignedDuration::from_nanos(1),
+            true,
+        ),
         (now, true),
-        (now + Duration::nanoseconds(1), false),
+        (now + SignedDuration::from_nanos(1), false),
     ] {
         m.qsos
             .write()
@@ -123,7 +126,7 @@ async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
     if let QsoState::Completed { completed_at, .. } =
         &mut m.qsos.write().await.get_mut(&id).unwrap().state
     {
-        *completed_at = Utc::now() - Duration::hours(2);
+        *completed_at = UtcTimestamp::now() - SignedDuration::from_hours(2);
     }
     m.cleanup_completed_qsos().await;
     assert!(m.qsos.read().await.is_empty());
@@ -137,7 +140,7 @@ async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
         .await
         .unwrap());
     assert!(!fresh
-        .check_duplicate_at("K1ABC", 1800.0, now + Duration::hours(24))
+        .check_duplicate_at("K1ABC", 1800.0, now + SignedDuration::from_hours(24))
         .await
         .unwrap());
     dial.store(0, Ordering::Relaxed);

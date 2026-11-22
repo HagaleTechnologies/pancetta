@@ -4,11 +4,12 @@
 //!
 //! Fixtures use fixed times and hand-computed expected totals, per the plan.
 
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::contest::scoring::*;
 
-fn t(minutes: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 29, 14, 0, 0).unwrap() + chrono::Duration::minutes(minutes)
+fn t(minutes: i64) -> UtcTimestamp {
+    UtcTimestamp::from_ymd_hms(2026, 8, 29, 14, 0, 0).unwrap() + SignedDuration::from_mins(minutes)
 }
 
 fn kansas_tx_entrant() -> ContestScoringContext {

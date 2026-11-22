@@ -1,6 +1,8 @@
 //! Scrollable explanation for the station selected in any panel.
 use crate::app::App;
 use crate::dx_reason::{self, FocusedReason};
+use jiff::SignedDuration;
+use pancetta_core::time::UtcTimestamp;
 use ratatui::{
     layout::Rect,
     text::{Line, Span},
@@ -13,7 +15,7 @@ pub fn render_why_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let modal = Rect::new(area.x + 2, area.y + 2, area.width - 4, area.height - 4);
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let (title, lines) = match dx_reason::focused(app, now) {
         FocusedReason::NoFocus => (
             " Why? — Esc/w close ".to_owned(),
@@ -120,7 +122,7 @@ mod tests {
         assert!(render(&mut app, 100, 30).contains("No station focused. Tab to a list"));
         assert!(render(&mut app, 19, 5).trim().is_empty());
         let mut app = super::super::station_card::tests::ranked_app("JA1ABC", true, false).await;
-        app.dx_stations.get_mut("JA1ABC").unwrap().last_seen -= chrono::Duration::minutes(4);
+        app.dx_stations.get_mut("JA1ABC").unwrap().last_seen -= SignedDuration::from_mins(4);
         assert!(render(&mut app, 132, 40)
             .contains("JA1ABC is not ranked now: not heard or spotted in the last 3 min."));
         let removed = app.dx_stations.remove("JA1ABC").unwrap();
@@ -128,7 +130,7 @@ mod tests {
             .contains("JA1ABC is not ranked now: not heard or spotted in the last 3 min."));
         app.dx_stations.insert("JA1ABC".into(), removed);
         let station = app.dx_stations.get_mut("JA1ABC").unwrap();
-        station.last_seen = chrono::Utc::now();
+        station.last_seen = UtcTimestamp::now();
         station.local_rank = None;
         station.network_rank = None;
         assert!(render(&mut app, 132, 40).contains("JA1ABC has not been scored yet: it came from the DX cluster with no decode or cqdx data."));

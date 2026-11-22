@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use pancetta_config::Config;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_qso::logbook_lock::{LogbookGuard, LogbookLock};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -305,7 +306,7 @@ struct ExportArgs {
 
     /// Only QSOs on or after this UTC date (QSO_DATE)
     #[arg(long, value_name = "YYYY-MM-DD", value_parser = parse_export_date)]
-    since: Option<chrono::NaiveDate>,
+    since: Option<jiff::civil::Date>,
 
     /// Only QSOs on this band, e.g. 20m (BAND, else the band FREQ falls in)
     #[arg(long, value_parser = parse_export_band)]
@@ -320,9 +321,9 @@ struct ExportArgs {
     callsign: Option<String>,
 }
 
-fn parse_export_date(value: &str) -> std::result::Result<chrono::NaiveDate, String> {
-    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|e| e.to_string())?;
-    if date.format("%Y-%m-%d").to_string() != value {
+fn parse_export_date(value: &str) -> std::result::Result<jiff::civil::Date, String> {
+    let date = jiff::civil::Date::strptime("%Y-%m-%d", value).map_err(|e| e.to_string())?;
+    if date.strftime("%Y-%m-%d").to_string() != value {
         return Err("use YYYY-MM-DD".into());
     }
     Ok(date)
@@ -1460,7 +1461,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         version: RECEIPT_VERSION,
         logbook: adif.clone(),
         import_file: std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()),
-        imported_at: chrono::Utc::now(),
+        imported_at: UtcTimestamp::now(),
         contacts: plan.to_add.len(),
         backup,
         offset: block.offset,
@@ -1604,7 +1605,7 @@ fn write_import_receipt(
 ) -> Result<PathBuf> {
     use std::io::Write;
     std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    let stem = format!("import-{}", receipt.imported_at.format("%Y%m%d-%H%M%S"));
+    let stem = format!("import-{}", receipt.imported_at.strftime("%Y%m%d-%H%M%S"));
     let json = receipt.to_json();
     for n in 1..=100 {
         let path = if n == 1 {
@@ -1684,7 +1685,7 @@ fn rewrite_import_receipt(
 /// Why `pancetta import --undo` left the logbook alone (PAN-214).
 enum UndoRefusal<'a> {
     /// The receipt is marked undone, at this time.
-    AlreadyUndone(chrono::DateTime<chrono::Utc>),
+    AlreadyUndone(UtcTimestamp),
     /// The receipt names `receipt`, not this Pancetta's logbook `logbook`.
     OtherLogbook {
         receipt: &'a Path,
@@ -1701,7 +1702,7 @@ impl std::fmt::Display for UndoRefusal<'_> {
             UndoRefusal::AlreadyUndone(at) => write!(
                 f,
                 "This import was already undone at {}; your logbook was not changed.",
-                at.format("%Y-%m-%d %H:%M UTC")
+                at.strftime("%Y-%m-%d %H:%M UTC")
             ),
             UndoRefusal::OtherLogbook { receipt, logbook } => write!(
                 f,
@@ -1816,7 +1817,7 @@ async fn undo_import_command(receipt_path: PathBuf) -> Result<()> {
         .parse_bytes(&current[at + len..])
         .records
         .len();
-    receipt.undone_at = Some(chrono::Utc::now());
+    receipt.undone_at = Some(UtcTimestamp::now());
     let marked = rewrite_import_receipt(&receipt_path, &receipt);
     print!("{}", format_undo_report(&receipt, &adif, &bak, kept));
     if let Err(e) = marked {
@@ -1847,7 +1848,7 @@ fn format_undo_report(
                 "{} ({}, added {})",
                 receipt.import_file.display(),
                 count_of(receipt.contacts, "contact", "contacts"),
-                receipt.imported_at.format("%Y-%m-%d %H:%M UTC")
+                receipt.imported_at.strftime("%Y-%m-%d %H:%M UTC")
             )
         )
     );
@@ -4429,14 +4430,11 @@ mod tests {
     /// The receipt the `undo_*` tests read back: two contacts from LoTW,
     /// imported at the time the Design for review shows.
     fn design_receipt() -> pancetta_qso::adif_import::ImportReceipt {
-        use chrono::TimeZone;
         pancetta_qso::adif_import::ImportReceipt {
             version: pancetta_qso::adif_import::RECEIPT_VERSION,
             logbook: PathBuf::from(LOGBOOK),
             import_file: PathBuf::from("/home/op/lotw.adi"),
-            imported_at: chrono::Utc
-                .with_ymd_and_hms(2026, 10, 26, 10, 15, 0)
-                .unwrap(),
+            imported_at: UtcTimestamp::from_ymd_hms(2026, 10, 26, 10, 15, 0).unwrap(),
             contacts: 2,
             backup: Some(PathBuf::from(BACKUP)),
             offset: 153,
@@ -4472,10 +4470,7 @@ mod tests {
 
     #[test]
     fn undo_errors_match_the_design() {
-        use chrono::TimeZone;
-        let undone = chrono::Utc
-            .with_ymd_and_hms(2026, 10, 26, 10, 20, 0)
-            .unwrap();
+        let undone = UtcTimestamp::from_ymd_hms(2026, 10, 26, 10, 20, 0).unwrap();
         assert_eq!(
             UndoRefusal::AlreadyUndone(undone).to_string(),
             "This import was already undone at 2026-10-26 10:20 UTC; your logbook was not changed."

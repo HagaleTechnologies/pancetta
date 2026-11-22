@@ -1,14 +1,14 @@
 use super::*;
 use crate::states::{GridSquares, SignalReports};
-use chrono::Utc;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
 // ── QsoMetadata default field values ────────────────────────────────────
 
 fn make_metadata() -> QsoMetadata {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     QsoMetadata {
         qso_id: Uuid::new_v4(),
         our_callsign: "K5ARH".into(),

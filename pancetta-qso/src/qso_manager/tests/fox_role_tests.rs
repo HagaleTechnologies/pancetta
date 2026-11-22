@@ -2,7 +2,9 @@
 //! mode) are marked after creation, split out of the active offsets for
 //! slot selection, pinned to their slot, and never drift-relatched.
 use super::*;
+use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
+use pancetta_core::time::UtcTimestamp;
 use pancetta_core::ResponseStep;
 
 const FOX: &str = "KH7Z";
@@ -121,7 +123,7 @@ async fn completed_fox_stream_is_not_rekeyable() {
             our_report: -8,
             frequency: 360.0,
             grid_square: None,
-            completed_at: Utc::now(),
+            completed_at: UtcTimestamp::now(),
             duration_seconds: 30,
         };
     }
@@ -247,14 +249,14 @@ async fn fox_r_report_completes_when_rr73_airs() {
     };
     assert_eq!(
         manager
-            .confirm_completion_aired(id, Some(attempt), "", &payload, Utc::now())
+            .confirm_completion_aired(id, Some(attempt), "", &payload, UtcTimestamp::now())
             .await,
         CompletionAired::Committed
     );
     assert_eq!(completions(&drain(&mut rx)), 1);
     assert_eq!(
         manager
-            .confirm_completion_aired(id, Some(attempt), "", &payload, Utc::now())
+            .confirm_completion_aired(id, Some(attempt), "", &payload, UtcTimestamp::now())
             .await,
         CompletionAired::NotPending
     );
@@ -299,7 +301,7 @@ async fn fox_logs_the_hounds_r_report_as_received() {
     };
     assert_eq!(
         manager
-            .confirm_completion_aired(id, attempt, "", &payload, Utc::now())
+            .confirm_completion_aired(id, attempt, "", &payload, UtcTimestamp::now())
             .await,
         CompletionAired::Committed
     );
@@ -337,7 +339,7 @@ async fn fox_rr73_not_aired_reopens_the_qso() {
     let (attempt, _) = last_send(&drain(&mut rx)).unwrap();
     assert!(matches!(
         manager
-            .resolve_unsent_completion_at(id, attempt, Utc::now())
+            .resolve_unsent_completion_at(id, attempt, UtcTimestamp::now())
             .await,
         UnsentCompletion::Reverted(_)
     ));
@@ -399,7 +401,7 @@ async fn fox_stream_skips_drift_relatch() {
             .maybe_confirm_frequency_drift_at(&frame, 700.0, t0)
             .await;
         manager
-            .maybe_confirm_frequency_drift_at(&frame, 700.0, t0 + chrono::Duration::seconds(6))
+            .maybe_confirm_frequency_drift_at(&frame, 700.0, t0 + SignedDuration::from_secs(6))
             .await;
         let after = manager.get_qso(id).await.unwrap();
         if fox_role {

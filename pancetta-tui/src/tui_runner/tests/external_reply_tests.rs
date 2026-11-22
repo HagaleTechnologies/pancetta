@@ -5,12 +5,13 @@
 use super::key_tests::{key, make_runner};
 use super::*;
 use crate::app::{ActivePanel, DecodedMessageView};
+use pancetta_core::time::UtcTimestamp;
 
 /// A decode a same-host WSJT-X sent, as the relay builds it: dial in MHz and
 /// the mode WSJT-X named.
 fn ext_decode(text: &str, dial_mhz: f64, mode: &str, directed: bool) -> DecodedMessageView {
     DecodedMessageView {
-        timestamp: chrono::Utc::now(),
+        timestamp: UtcTimestamp::now(),
         frequency: dial_mhz,
         mode: mode.to_string(),
         snr: -8,

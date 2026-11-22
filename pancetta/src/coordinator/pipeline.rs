@@ -2,6 +2,7 @@ use super::audio::TxAudioCommand;
 use anyhow::Result;
 use geographiclib_rs::InverseGeodesic;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
+use pancetta_core::time::UtcTimestamp;
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ pub(crate) struct GainCaptureMetadata {
     pub(crate) generation: u64,
     pub(crate) epoch: u64,
     pub(crate) tx_epoch: u64,
-    pub(crate) source_slot: chrono::DateTime<chrono::Utc>,
+    pub(crate) source_slot: UtcTimestamp,
     pub(crate) dial_hz: u64,
     pub(crate) gain: super::gain_sweep::GainSetting,
 }
@@ -120,7 +121,7 @@ pub(crate) struct GainCaptureRegistry {
 
 impl GainCaptureRegistry {
     pub(crate) fn admit(&mut self, metadata: GainCaptureMetadata) -> bool {
-        let key = metadata.source_slot.timestamp_millis();
+        let key = metadata.source_slot.as_millisecond();
         if self.pending.len() + self.completed.len() >= 240 || self.pending.contains_key(&key) {
             return false;
         }
@@ -130,12 +131,12 @@ impl GainCaptureRegistry {
 
     pub(crate) fn claim(
         &mut self,
-        slot: chrono::DateTime<chrono::Utc>,
+        slot: UtcTimestamp,
         dial_hz: u64,
         lead: f64,
         tx_epoch: u64,
     ) -> Option<GainCapturedWindow> {
-        let (metadata, claimed) = self.pending.get_mut(&slot.timestamp_millis())?;
+        let (metadata, claimed) = self.pending.get_mut(&slot.as_millisecond())?;
         if *claimed {
             return None;
         }
@@ -156,7 +157,7 @@ impl GainCaptureRegistry {
     }
 
     pub(crate) fn complete(&mut self, mut completion: GainCaptureCompletion) {
-        let key = completion.metadata.source_slot.timestamp_millis();
+        let key = completion.metadata.source_slot.as_millisecond();
         if !self
             .pending
             .get(&key)
@@ -263,7 +264,7 @@ pub(crate) struct DecodePipelineHandles {
     /// PAN-393: when the timed raw 48 kHz capture started. Set by the first
     /// DSP start with capture enabled and reused by every DSP supervisor
     /// restart, so a restart neither extends nor restarts the capture.
-    pub(crate) raw_capture_start: Arc<std::sync::OnceLock<chrono::DateTime<chrono::Utc>>>,
+    pub(crate) raw_capture_start: Arc<std::sync::OnceLock<UtcTimestamp>>,
 }
 
 impl DecodePipelineHandles {
@@ -640,14 +641,13 @@ mod tests {
 #[cfg(test)]
 mod gain_sweep_capture_tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn metadata(slot: i64, epoch: u64) -> GainCaptureMetadata {
         GainCaptureMetadata {
             generation: 1,
             epoch,
             tx_epoch: 0,
-            source_slot: chrono::Utc.timestamp_opt(slot, 0).unwrap(),
+            source_slot: UtcTimestamp::from_parts(slot, 0).unwrap(),
             dial_hz: 14_074_000,
             gain: super::super::gain_sweep::GainSetting {
                 preamp_db: 10,
@@ -754,11 +754,10 @@ mod gain_sweep_capture_tests {
 #[cfg(test)]
 mod gain_sweep_tx_overlap_tests {
     use super::*;
-    use chrono::TimeZone;
     #[test]
     fn decode_window_transmission_after_gain_admission_invalidates_measurement() {
         let mut registry = GainCaptureRegistry::default();
-        let slot = chrono::Utc.timestamp_opt(30, 0).unwrap();
+        let slot = UtcTimestamp::from_parts(30, 0).unwrap();
         assert!(registry.admit(GainCaptureMetadata {
             generation: 1,
             epoch: 1,
