@@ -3,10 +3,11 @@ use jiff::SignedDuration;
 use pancetta_core::time::SignedDurationExt as _;
 use pancetta_core::time::UtcTimestamp;
 
-/// PAN-114 (lane5 H-16): one evaluation of the pre-PTT wait, re-derived
-/// from a fresh wall-clock read each chunk. The old single monotonic sleep
-/// keyed a frame 4.5 s into its waveform after a 5 s forward jump, and held
-/// PTT 600 s after a 600 s backward step.
+/// One evaluation of the pre-PTT wait, from one read of the shared slot
+/// clock (PAN-358, PAN-484). PAN-114 (lane5 H-16) measured why the wait
+/// re-reads the clock each chunk: the old single monotonic sleep keyed a
+/// frame 4.5 s into its waveform after a 5 s forward jump, and held PTT
+/// 600 s after a 600 s backward step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PttWaitStep {
     Sleep(Duration),
@@ -14,37 +15,43 @@ pub(super) enum PttWaitStep {
     ClockJumped(pancetta_core::slot_clock::WallClockJump),
 }
 
-/// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame only if
-/// (a) the PTT instant is now more than two periods away (a backward step:
-/// `schedule_tx` never targets further ahead than that), or (b) the wait
-/// started before the PTT instant and `now` is more than `late_max_ms` past
-/// `target_slot` (a forward jump past the late-start policy). A request that
-/// was already late when the wait began keeps today's path exactly.
+/// The step that moved the shared clock's resync epoch since the read that
+/// decided the frame's schedule (`scheduled_resync_epoch`), or `None` while
+/// it has not moved. A resync is a wall-clock step of 1 s or more
+/// (`pancetta_core::slot_clock::SLOT_RESYNC_THRESHOLD_MS`); the jump carries
+/// the latest step's real size. A frame scheduled under an older resync
+/// epoch is never keyed: its slot was chosen on timing the step invalidated.
+pub(super) fn resync_since(
+    reading: &pancetta_core::slot_clock::SlotReading,
+    scheduled_resync_epoch: u64,
+) -> Option<pancetta_core::slot_clock::WallClockJump> {
+    reading
+        .last_resync
+        .filter(|_| reading.resync_epoch != scheduled_resync_epoch)
+        .map(|event| event.jump())
+}
+
+/// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame when the
+/// shared clock reported a resync since the frame was scheduled
+/// ([`resync_since`]), in either direction and even while its slot is still
+/// ahead; otherwise sleeps in chunks of at most 50 ms until `ptt_target`.
+/// A step under 1 s keeps the frame; the PAN-117 key-time cap at Step 4d
+/// still drops it if it would key too late.
 pub(super) fn ptt_wait_step(
-    now: UtcTimestamp,
+    reading: &pancetta_core::slot_clock::SlotReading,
     ptt_target: UtcTimestamp,
-    target_slot: UtcTimestamp,
-    waited_from_before_target: bool,
-    late_max_ms: u64,
-    slot_ns: i64,
+    scheduled_resync_epoch: u64,
 ) -> PttWaitStep {
-    use pancetta_core::slot_clock::WallClockJump;
-    let remaining = ptt_target - now;
-    // schedule_tx never targets more than two slots ahead.
-    if remaining > SignedDuration::from_nanos(2 * slot_ns) {
-        return PttWaitStep::ClockJumped(WallClockJump::Backward(remaining));
+    if let Some(jump) = resync_since(reading, scheduled_resync_epoch) {
+        return PttWaitStep::ClockJumped(jump);
     }
+    let remaining = ptt_target - reading.now;
     if remaining > SignedDuration::ZERO {
         let chunk = remaining
             .to_std()
             .unwrap_or(Duration::ZERO)
             .min(Duration::from_millis(50));
         return PttWaitStep::Sleep(chunk);
-    }
-    if waited_from_before_target
-        && now - target_slot > SignedDuration::from_millis(late_max_ms as i64)
-    {
-        return PttWaitStep::ClockJumped(WallClockJump::Forward(now - ptt_target));
     }
     PttWaitStep::Reached
 }
@@ -59,8 +66,8 @@ pub(super) fn ptt_wait_step(
 /// (`elapsed == cap` keys), mirroring `schedule_tx`'s
 /// `mstr <= tx_late_max_ms`; a deferred target (target_slot in the
 /// future) makes `now - target_slot` negative, so this only bites
-/// current-slot late starts. Mid-wait clock jumps stay covered by
-/// PAN-114's `ptt_wait_step` above.
+/// current-slot late starts. Clock steps of 1 s or more are covered by
+/// [`resync_since`] above.
 pub(super) fn key_time_too_late(
     now: UtcTimestamp,
     target_slot: UtcTimestamp,
@@ -72,40 +79,36 @@ pub(super) fn key_time_too_late(
 /// Outcome of [`wait_for_ptt_instant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PttWait {
-    /// The wall clock reached the PTT instant (or the frame ships as a
-    /// policy late start).
+    /// The wall clock reached the PTT instant.
     Reached,
     /// Shutdown or F8 abort flipped; same caller handling as
     /// `interruptible_sleep` returning `true`.
     Interrupted,
-    /// A wall-clock jump moved the PTT instant out of reach; drop the frame.
+    /// The shared clock resynced after the frame was scheduled; drop it.
     ClockJumped(pancetta_core::slot_clock::WallClockJump),
 }
 
-/// PAN-114: wait for the PTT engage instant on the WALL clock (re-read via
-/// `wall_now` every <= 50 ms chunk) instead of one monotonic sleep computed
-/// up front. Checks `shutdown`/`abort` before each evaluation, exactly like
-/// [`interruptible_sleep`], so wake latency stays ~50 ms. With no clock
-/// jump this returns `Reached` at the same wall instant the old monotonic
-/// sleep ended.
+/// Wait for the PTT engage instant on the coordinator's shared slot clock
+/// (PAN-358, PAN-484), re-read every <= 50 ms chunk instead of one monotonic
+/// sleep computed up front. Checks `shutdown`/`abort` before each read,
+/// exactly like [`interruptible_sleep`], so wake latency stays ~50 ms. With
+/// no clock step this returns `Reached` at the same wall instant the old
+/// monotonic sleep ended; a resync since `scheduled_resync_epoch` returns
+/// `ClockJumped` with the step's real size.
 pub(super) async fn wait_for_ptt_instant(
     ptt_target: UtcTimestamp,
-    target_slot: UtcTimestamp,
-    late_max_ms: u64,
-    slot_ns: i64,
+    scheduled_resync_epoch: u64,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    wall_now: impl Fn() -> UtcTimestamp,
+    clock: &pancetta_core::SlotClock,
 ) -> PttWait {
     use std::sync::atomic::Ordering;
-    let mut waited_from_before_target: Option<bool> = None;
     loop {
         if shutdown.load(Ordering::Acquire) || abort.load(Ordering::Acquire) {
             return PttWait::Interrupted;
         }
-        let now = wall_now();
-        let waited = *waited_from_before_target.get_or_insert(ptt_target > now);
-        match ptt_wait_step(now, ptt_target, target_slot, waited, late_max_ms, slot_ns) {
+        let reading = clock.read();
+        match ptt_wait_step(&reading, ptt_target, scheduled_resync_epoch) {
             PttWaitStep::Sleep(chunk) => sleep(chunk).await,
             PttWaitStep::Reached => return PttWait::Reached,
             PttWaitStep::ClockJumped(jump) => return PttWait::ClockJumped(jump),

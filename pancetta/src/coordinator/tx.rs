@@ -159,7 +159,11 @@ impl SlotTimingContext {
             sample_rate,
             slot_ns,
             request_received_at,
-            utc_clock: pancetta_core::time::system_utc_clock(),
+            request_resync_epoch: 0,
+            slot_clock: pancetta_core::SlotClock::without_step_detection(
+                pancetta_core::time::system_utc_clock(),
+                std::sync::Arc::new(std::sync::atomic::AtomicI64::new(slot_ns)),
+            ),
         }
     }
 }
@@ -192,6 +196,10 @@ mod disarm_interrupt_signal_tests;
 #[cfg(test)]
 #[path = "tx/tests/supersede_rekey_tests.rs"]
 mod supersede_rekey_tests;
+
+#[cfg(test)]
+#[path = "tx/tests/slot_clock_resync_tests.rs"]
+mod slot_clock_resync_tests;
 #[cfg(test)]
 #[path = "tx/tests/tx_frame_logged_tests.rs"]
 mod tx_frame_logged_tests;

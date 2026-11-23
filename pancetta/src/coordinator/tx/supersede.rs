@@ -447,6 +447,8 @@ pub(super) struct WorkingFrame<'a> {
     pub(super) message_text: &'a mut String,
     pub(super) frequency_offset: &'a mut f64,
     pub(super) schedule: &'a mut TxSchedule,
+    /// Resync epoch of the clock read that decided `schedule` (PAN-484).
+    pub(super) resync_epoch: &'a mut u64,
 }
 
 /// Worker state a supersede handler sends through.
@@ -491,6 +493,7 @@ pub(super) async fn supersede_and_rekey_or_bundle(
         message_text,
         frequency_offset,
         schedule,
+        resync_epoch,
     }: WorkingFrame<'_>,
     ptt_guard: &mut PttGuard,
     timing: &SlotTimingContext,
@@ -554,7 +557,10 @@ pub(super) async fn supersede_and_rekey_or_bundle(
         }
     };
 
-    let now = (timing.utc_clock)();
+    // PAN-484: one read decides the re-key's schedule and the resync epoch
+    // it is checked against, so a re-key decided after a step keys.
+    let reading = timing.slot_clock.read();
+    let now = reading.now;
     let required_parity =
         resolve_required_parity(new_tx_parity, timing.tx_self_parity, now, timing.slot_ns);
     let new_schedule = schedule_tx(
@@ -597,6 +603,7 @@ pub(super) async fn supersede_and_rekey_or_bundle(
     *message_text = new_text.clone();
     *frequency_offset = new_freq;
     *schedule = new_schedule;
+    *resync_epoch = reading.resync_epoch;
 
     // Prefer folding the new request into a multi-TX bundle alongside the
     // in-flight content when the station runs concurrent QSOs. The actual
@@ -952,8 +959,9 @@ pub(super) async fn supersede_multi_reenqueue(
     // to recover the new item on the `Replace` edge case.
     let mut scratch_text = String::new();
     let mut scratch_freq = 0.0f64;
+    let mut scratch_resync_epoch = timing.request_resync_epoch;
     let mut scratch_schedule = TxSchedule {
-        target_slot: (timing.utc_clock)(),
+        target_slot: timing.slot_clock.now(),
         silent_pad_samples: 0,
         cursor_offset_samples: 0,
         deferred: false,
@@ -964,6 +972,7 @@ pub(super) async fn supersede_multi_reenqueue(
             message_text: &mut scratch_text,
             frequency_offset: &mut scratch_freq,
             schedule: &mut scratch_schedule,
+            resync_epoch: &mut scratch_resync_epoch,
         },
         ptt_guard,
         timing,
