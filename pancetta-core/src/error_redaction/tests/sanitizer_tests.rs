@@ -28,7 +28,6 @@ fn secret_overlapping_the_marker_cannot_rewrite_inserted_markers() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn later_secret_overlapping_an_earlier_match_redacts_fully() {
     // A secret that starts inside another secret's match and ends after it
     // used to be skipped, leaving its tail after the marker.
@@ -139,7 +138,9 @@ fn no_covered_byte_survives_redaction() {
             "case {case}: body {body:?} secrets {refs:?} gave {out:?}"
         );
     }
-=======
+}
+
+#[test]
 fn edge_padding_does_not_spend_the_display_budget() {
     // Whitespace at the edges of a server response used to count against the
     // 200-character clip, so 200 leading spaces left the operator a bare `…`.
@@ -183,5 +184,4 @@ fn edge_whitespace_secret_still_redacts_in_padded_body() {
         sanitize_error_body(&format!("denied: pw {pad}"), &[" pw "]),
         "denied:<redacted>"
     );
->>>>>>> fac54f725731eff5f8650524d5d5702e47cd40f2
 }

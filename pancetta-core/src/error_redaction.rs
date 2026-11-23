@@ -3,15 +3,11 @@
 /// Marker substituted for every known secret value.
 const MARKER: &str = "<redacted>";
 
-<<<<<<< HEAD
 /// Marker substituted for every cqdx personal access token run (`pat_…`).
 const TOKEN_MARKER: &str = "pat_***REDACTED***";
 
-/// Redact known secret values and cqdx personal access tokens, then clip to 200 characters.
-=======
 /// Redact known secret values and cqdx personal access tokens, trim edge whitespace from the
 /// result, then clip it to 200 characters.
->>>>>>> fac54f725731eff5f8650524d5d5702e47cd40f2
 /// Empty values are ignored so ordinary text is preserved.
 ///
 /// Finds every occurrence of every secret and every token run on the original
@@ -39,13 +35,10 @@ pub fn sanitize_error_body(body: &str, secrets: &[&str]) -> String {
         redacted.push_str(if is_token { TOKEN_MARKER } else { MARKER });
         copied = end;
     }
-<<<<<<< HEAD
     redacted.push_str(&body[copied..]);
-=======
     // Trim after matching, so a secret's own edge whitespace still matches,
     // and before the clip, so padding does not spend the display budget.
     let redacted = redacted.trim();
->>>>>>> fac54f725731eff5f8650524d5d5702e47cd40f2
     if redacted.chars().count() > 200 {
         let mut clipped: String = redacted.chars().take(200).collect();
         clipped.push('…');
