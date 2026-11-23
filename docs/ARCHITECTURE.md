@@ -140,6 +140,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `ptt_line.rs` | Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357). |
 | `ptt_line/` | Serial RTS PTT line and the `LineKeyedRig` wrapper that keys it (PAN-357). |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
+| `qrz_lookup/` | Interactive, session-cached QRZ station lookups. |
 | `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso/` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso_filter.rs` | QSO partner band-collapse filtering (hb-229). |
