@@ -89,8 +89,15 @@ impl WorkerHarness {
         let qso = Arc::new(bus.durable_inbox(ComponentId::Qso).await.unwrap());
         let autonomous = Arc::new(bus.durable_inbox(ComponentId::Autonomous).await.unwrap());
         let tui = bus.get_or_create_channel(ComponentId::Tui).await.unwrap().1;
+        // PAN-484: the worker reads the coordinator's slot clock; a harness
+        // clock is wrapped without step detection so a virtual clock that
+        // jumps keeps its meaning.
+        coordinator.slot_clock = pancetta_core::SlotClock::without_step_detection(
+            utc_clock,
+            coordinator.active_slot_ns(),
+        );
         coordinator
-            .start_transmitter_component_with_clock(arm_clock, utc_clock)
+            .start_transmitter_component_with_clock(arm_clock)
             .await
             .unwrap();
         Self {

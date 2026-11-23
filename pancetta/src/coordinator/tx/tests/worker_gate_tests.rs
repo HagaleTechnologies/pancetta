@@ -147,6 +147,13 @@ async fn build_worker_harness_in_home(
             uuid::Uuid::new_v4()
         ))
     }));
+    // PAN-484: the worker reads the coordinator's slot clock. Wrap the
+    // harness clock without step detection, before `prepare`, so a test can
+    // install a stepping clock of its own there.
+    coordinator.slot_clock = pancetta_core::SlotClock::without_step_detection(
+        utc_clock.clone(),
+        coordinator.active_slot_ns(),
+    );
     prepare(&mut coordinator);
     // As in a live session once the Hamlib message loop is consuming.
     coordinator
@@ -171,7 +178,7 @@ async fn build_worker_harness_in_home(
     // fixture needs an Audio destination even though it uses no device.
     bus.get_or_create_channel(ComponentId::Audio).await.unwrap();
     coordinator
-        .start_transmitter_component_with_clock(arm_clock, utc_clock.clone())
+        .start_transmitter_component_with_clock(arm_clock)
         .await
         .expect("TX worker starts");
     Harness {

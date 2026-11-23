@@ -6,7 +6,12 @@ fn ctx(
     ptt_lead_ms: u64,
 ) -> SlotTimingContext {
     SlotTimingContext {
-        utc_clock: pancetta_core::time::system_utc_clock(),
+        slot_clock: pancetta_core::SlotClock::without_step_detection(
+            pancetta_core::time::system_utc_clock(),
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                pancetta_core::slot::SLOT_NS,
+            )),
+        ),
         active_protocol,
         tx_late_max_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(tx_late_max_ms)),
         tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
@@ -14,6 +19,7 @@ fn ctx(
         sample_rate: 12_000,
         slot_ns: pancetta_core::slot::SLOT_NS,
         request_received_at: pancetta_core::time::UtcTimestamp::now(),
+        request_resync_epoch: 0,
     }
 }
 
