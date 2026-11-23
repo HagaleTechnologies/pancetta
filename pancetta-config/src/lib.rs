@@ -2370,6 +2370,8 @@ mod merge_guard {
                 ),
                 ("operator_name", json!("Op Name")),
                 ("contest_category", json!("SINGLE-OP")),
+                ("my_sig", json!("POTA")),
+                ("my_sig_info", json!("K-1234")),
                 ("tx_self_parity", json!("even")),
             ],
             |a, b| a.merge_with(b),

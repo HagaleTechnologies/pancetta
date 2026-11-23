@@ -126,6 +126,7 @@ fn hound_test_config() -> QsoManagerConfig {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: "FT8".to_string(),
+        activation: crate::sig_reference::ActivationReference::default(),
     }
 }
 
