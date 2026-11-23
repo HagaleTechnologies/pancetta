@@ -857,6 +857,13 @@ pub struct QsoManagerConfig {
     /// byte-identical.
     #[serde(default = "default_active_mode")]
     pub active_mode: String,
+
+    /// PAN-359: the operator's own special-activity reference
+    /// (`[station] my_sig` / `my_sig_info`), stamped as ADIF `MY_SIG` /
+    /// `MY_SIG_INFO` on every `QsoCompleted` this manager emits. Default
+    /// empty: nothing is stamped.
+    #[serde(default)]
+    pub activation: crate::sig_reference::ActivationReference,
 }
 
 /// Default value for [`QsoManagerConfig::active_mode`]: `"FT8"`.
@@ -1254,6 +1261,7 @@ impl Default for QsoManagerConfig {
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
             active_mode: default_active_mode(),
+            activation: crate::sig_reference::ActivationReference::default(),
         }
     }
 }
@@ -1748,7 +1756,13 @@ fn watchdog_state_identity(state: &QsoState, now: UtcTimestamp) -> Option<Watchd
 
 /// QSO manager implementation
 pub struct QsoManager {
-    utc_clock: pancetta_core::time::UtcClock,
+    /// PAN-358: the one UTC slot clock. `now_utc` reads it, and the watchdog
+    /// takes its clock steps from it instead of a detector of its own. The
+    /// coordinator shares its clock through [`QsoManager::set_slot_clock`].
+    slot_clock: pancetta_core::SlotClock,
+    /// PAN-358: the latest slot-clock event epoch the watchdog has applied
+    /// (PAN-296 budget reset). Shared with the production loop's clone.
+    watchdog_clock_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Configuration
     config: QsoManagerConfig,
 
@@ -1975,6 +1989,13 @@ pub struct QsoManager {
 
     /// Shared late-start limit: worker and timeout clones observe reloads together.
     tx_late_max_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// PAN-359: worked-station activations (callsign to programme and
+    /// reference) the coordinator's cqdx bridge fills from cqdx.io's
+    /// activation feed, read when a `QsoCompleted` is emitted. Injected via
+    /// [`QsoManager::set_worked_reference_source`]; defaults to a private
+    /// empty book, so no SIG/SIG_INFO is written without a source.
+    worked_references: crate::sig_reference::WorkedReferenceBook,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -2212,17 +2233,40 @@ impl QsoManager {
     }
 
     fn now_utc(&self) -> UtcTimestamp {
-        (self.utc_clock)()
+        self.slot_clock.now()
     }
 
+    /// A manager on a virtual clock that never reports a step
+    /// (`SlotClock::without_step_detection` over `clock`).
     #[cfg(test)]
     pub fn with_clock_for_test(
         config: QsoManagerConfig,
         clock: pancetta_core::time::UtcClock,
     ) -> Self {
         let mut manager = Self::new(config);
-        manager.utc_clock = clock;
+        let slot_ns = manager.active_slot_ns.clone();
+        manager.set_slot_clock(pancetta_core::SlotClock::without_step_detection(
+            clock, slot_ns,
+        ));
         manager
+    }
+
+    /// PAN-358: read time from `clock` (the coordinator's one slot clock)
+    /// and take the watchdog's clock steps from its events. Also shares the
+    /// clock's slot-period source, like [`Self::set_active_slot_ns_source`].
+    /// Events the clock reported before this call are not applied. Must be
+    /// called before [`Self::start`].
+    pub fn set_slot_clock(&mut self, clock: pancetta_core::SlotClock) {
+        self.active_slot_ns = clock.slot_ns_source();
+        self.watchdog_clock_epoch
+            .store(clock.read().epoch, std::sync::atomic::Ordering::Release);
+        self.slot_clock = clock;
+    }
+
+    /// PAN-358: the latest slot-clock event epoch the watchdog applied.
+    pub fn applied_clock_epoch(&self) -> u64 {
+        self.watchdog_clock_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Create a new QSO manager using the system UTC clock.
@@ -2234,8 +2278,10 @@ impl QsoManager {
             .map(|c| c.starting_serial)
             .unwrap_or(1);
 
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS));
         Self {
-            utc_clock: pancetta_core::time::system_utc_clock(),
+            slot_clock: pancetta_core::SlotClock::system(active_slot_ns.clone()),
+            watchdog_clock_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
             watchdog_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2280,10 +2326,13 @@ impl QsoManager {
             hamlib_hard_muted: Arc::new(|| false),
             // Default FT8 slot: with no injected source the rearm/stall
             // cadence is the historical 15 s (see the field's doc comment).
-            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
+            active_slot_ns,
             // Default late-start window: the documented operator default
             // (see the field's doc comment).
             tx_late_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_TX_LATE_MAX_MS)),
+            // Default empty: with no injected source no worked station's
+            // SIG/SIG_INFO is ever written (see the field's doc comment).
+            worked_references: crate::sig_reference::WorkedReferenceBook::default(),
         }
     }
 
@@ -2301,6 +2350,15 @@ impl QsoManager {
     /// keeps its private `0` (RX==TX).
     pub fn set_split_tx_frequency_source(&mut self, source: Arc<AtomicU64>) {
         self.split_tx_frequency_hz = source;
+    }
+
+    /// PAN-359: share the coordinator's worked-station activation book (the
+    /// one the cqdx bridge fills from cqdx.io's activation feed) so a logged
+    /// QSO with a station the feed lists as activating carries ADIF `SIG` /
+    /// `SIG_INFO`. If never called, the manager keeps a private empty book
+    /// and writes neither field.
+    pub fn set_worked_reference_source(&mut self, book: crate::sig_reference::WorkedReferenceBook) {
+        self.worked_references = book;
     }
 
     /// Share the coordinator's TX-frequency-mode atomic so the silence-driven
@@ -4728,7 +4786,33 @@ impl QsoManager {
         }
     }
 
-    async fn emit_event(&self, event: QsoEvent) {
+    /// PAN-359: add the activation references to a completion's metadata,
+    /// never replacing a tag already there: the operator's own `MY_SIG` /
+    /// `MY_SIG_INFO`, and the partner's `SIG` / `SIG_INFO` when the worked
+    /// reference book lists the partner as activating at most
+    /// `WORKED_REFERENCE_MAX_AGE` before the QSO's end time.
+    fn stamp_logged_references(&self, metadata: &mut QsoMetadata) {
+        self.config.activation.stamp(&mut metadata.tags);
+        if let Some(call) = metadata.their_callsign.as_deref() {
+            let at = metadata.end_time.unwrap_or_else(|| self.now_utc());
+            if let Some(worked) = self.worked_references.lookup(call, at) {
+                worked.stamp(&mut metadata.tags);
+            }
+        }
+    }
+
+    async fn emit_event(&self, mut event: QsoEvent) {
+        // PAN-359: the one stamp point for activation references. Both
+        // `QsoCompleted` producers (the immediate emit and the held emit in
+        // `confirm_completion_aired`) come through here, so every consumer
+        // (ADIF writer, index, uploads, WSJT-X relay, N1MM) sees the same
+        // record.
+        if let QsoEvent::QsoCompleted {
+            ref mut metadata, ..
+        } = event
+        {
+            self.stamp_logged_references(metadata);
+        }
         // 2026-07-18 operator finding: PTT keyed twice for the same QSO's
         // final 73 (confirmed via YO6BHN and UT7UJ — real rig set_ptt ON
         // events, one FT8 slot [~15s] apart, for the identical message and
@@ -4803,18 +4887,10 @@ impl QsoManager {
     }
 
     async fn timeout_check_loop(&self) {
-        let mut detector = pancetta_core::slot_clock::ClockStepDetector::new(self.now_utc());
-        let mut last_mono = std::time::Instant::now();
         let mut interval_timer = interval(TokioDuration::from_secs(5));
         loop {
             interval_timer.tick().await;
-            self.watchdog_pass_at(
-                self.now_utc(),
-                std::time::Instant::now(),
-                &mut detector,
-                &mut last_mono,
-            )
-            .await;
+            self.watchdog_pass().await;
         }
     }
 
@@ -4859,7 +4935,8 @@ impl QsoManager {
 impl Clone for QsoManager {
     fn clone(&self) -> Self {
         Self {
-            utc_clock: self.utc_clock.clone(),
+            slot_clock: self.slot_clock.clone(),
+            watchdog_clock_epoch: Arc::clone(&self.watchdog_clock_epoch),
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
             watchdog_anchors: Arc::clone(&self.watchdog_anchors),
@@ -4888,6 +4965,7 @@ impl Clone for QsoManager {
             active_slot_ns: Arc::clone(&self.active_slot_ns),
             // Reload publication also reaches the background timeout clone.
             tx_late_max_ms: self.tx_late_max_ms.clone(),
+            worked_references: self.worked_references.clone(),
         }
     }
 }

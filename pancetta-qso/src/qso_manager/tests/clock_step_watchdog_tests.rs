@@ -1,12 +1,13 @@
 // PAN-296. Formerly the inline module `pan296_watchdog_tests`.
+// PAN-358: the watchdog takes its steps from the manager's `SlotClock`; these
+// tests drive a `ManualClock` through the same (wall, monotonic) tables.
 use super::*;
 use jiff::SignedDuration;
-use pancetta_core::slot_clock::ClockStepDetector;
+use pancetta_core::slot_clock::ManualClock;
 use pancetta_core::time::UtcTimestamp;
-use std::time::{Duration as StdDuration, Instant};
 
-fn manager() -> QsoManager {
-    QsoManager::new(QsoManagerConfig {
+fn config() -> QsoManagerConfig {
+    QsoManagerConfig {
         our_callsign: "W1ABC".into(),
         our_grid: Some("FN42".into()),
         timeouts: TimeoutConfig::default(),
@@ -16,7 +17,51 @@ fn manager() -> QsoManager {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: default_active_mode(),
-    })
+        activation: crate::sig_reference::ActivationReference::default(),
+    }
+}
+
+fn manager() -> QsoManager {
+    QsoManager::new(config())
+}
+
+/// A manager on a `ManualClock`-backed slot clock starting at `base`.
+fn manager_on(base: UtcTimestamp) -> (QsoManager, ManualClock) {
+    let clock = ManualClock::new(base);
+    let mut manager = QsoManager::new(config());
+    let slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS));
+    manager.set_slot_clock(clock.slot_clock(slot_ns));
+    (manager, clock)
+}
+
+/// Move `clock` so wall time is `base + wall_secs` and monotonic time is
+/// `mono_secs` since `base`: both advance by the monotonic delta and the
+/// wall alone takes the difference (a step).
+fn move_to(
+    clock: &ManualClock,
+    base: UtcTimestamp,
+    wall_secs: i64,
+    mono_secs: u64,
+    mono: &mut u64,
+) {
+    let delta = mono_secs - *mono;
+    *mono = mono_secs;
+    clock.advance(std::time::Duration::from_secs(delta));
+    let want = base + SignedDuration::from_secs(wall_secs);
+    clock.step_wall(want - clock.now());
+}
+
+/// One watchdog pass with the clock at `(base + wall_secs, mono_secs)`.
+async fn pass_at(
+    manager: &QsoManager,
+    clock: &ManualClock,
+    base: UtcTimestamp,
+    wall_secs: i64,
+    mono_secs: u64,
+    mono: &mut u64,
+) {
+    move_to(clock, base, wall_secs, mono_secs, mono);
+    manager.watchdog_pass().await;
 }
 
 async fn open(manager: &QsoManager, call: &str, at: UtcTimestamp) -> QsoId {
@@ -46,38 +91,22 @@ fn failures(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoFailureReason> {
 
 #[tokio::test]
 async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
-    let manager = manager();
-    let mut rx = manager.subscribe();
     let base = UtcTimestamp::now();
-    let mono = Instant::now();
-    let mut last = mono;
-    let mut detector = ClockStepDetector::new(base);
+    let (manager, clock) = manager_on(base);
+    let mut rx = manager.subscribe();
+    let mut mono = 0;
     let mut ids = Vec::new();
     for call in ["K1DEF", "K2DEF", "K3DEF"] {
         ids.push(open(&manager, call, base).await);
     }
     for (wall, elapsed) in [(20, 20), (80, 20), (85, 25), (110, 50)] {
-        manager
-            .watchdog_pass_at(
-                base + SignedDuration::from_secs(wall),
-                mono + StdDuration::from_secs(elapsed),
-                &mut detector,
-                &mut last,
-            )
-            .await;
+        pass_at(&manager, &clock, base, wall, elapsed, &mut mono).await;
         for id in &ids {
             assert!(manager.get_qso(*id).await.is_ok(), "retired at {wall}");
         }
         assert!(failures(&mut rx).is_empty());
     }
-    manager
-        .watchdog_pass_at(
-            base + SignedDuration::from_secs(111),
-            mono + StdDuration::from_secs(51),
-            &mut detector,
-            &mut last,
-        )
-        .await;
+    pass_at(&manager, &clock, base, 111, 51, &mut mono).await;
     for id in ids {
         assert!(manager.get_qso(id).await.is_err());
     }
@@ -91,45 +120,27 @@ async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
 
 #[tokio::test]
 async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
-    let manager = manager();
     let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
     let id = open(&manager, "K1DEF", base).await;
-    let mono = Instant::now();
-    let mut last = mono;
-    let mut detector = ClockStepDetector::new(base);
+    let mut mono = 0;
     for (wall, elapsed) in [(20, 20), (-40, 20), (-10, 50), (90, 50), (120, 80)] {
-        manager
-            .watchdog_pass_at(
-                base + SignedDuration::from_secs(wall),
-                mono + StdDuration::from_secs(elapsed),
-                &mut detector,
-                &mut last,
-            )
-            .await;
+        pass_at(&manager, &clock, base, wall, elapsed, &mut mono).await;
         assert!(manager.get_qso(id).await.is_ok());
     }
-    manager
-        .watchdog_pass_at(
-            base + SignedDuration::from_secs(160),
-            mono + StdDuration::from_secs(120),
-            &mut detector,
-            &mut last,
-        )
-        .await;
+    pass_at(&manager, &clock, base, 160, 120, &mut mono).await;
     assert!(manager.get_qso(id).await.is_err());
 }
+
+/// The PAN-296 recovery pass: a +60 s step observed by a pass at base + 80 s
+/// (monotonic 20 s), on a fresh slot clock installed on `manager`.
 async fn recover(manager: &QsoManager, base: UtcTimestamp) {
-    let mono = Instant::now();
-    let mut last = mono;
-    let mut detector = ClockStepDetector::new(base);
-    manager
-        .watchdog_pass_at(
-            base + SignedDuration::from_secs(80),
-            mono + StdDuration::from_secs(20),
-            &mut detector,
-            &mut last,
-        )
-        .await;
+    let clock = ManualClock::new(base);
+    let mut stepped = manager.clone();
+    let slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS));
+    stepped.set_slot_clock(clock.slot_clock(slot_ns));
+    let mut mono = 0;
+    pass_at(&stepped, &clock, base, 80, 20, &mut mono).await;
 }
 
 #[tokio::test]
@@ -325,28 +336,12 @@ async fn state_variant_and_first_call_identity_changes_discard_grace() {
 
 #[tokio::test]
 async fn contacts_created_between_observations_receive_grace_and_same_state_restart_expires() {
-    let manager = manager();
     let base = UtcTimestamp::now();
-    let mono = Instant::now();
-    let mut last = mono;
-    let mut detector = ClockStepDetector::new(base);
-    manager
-        .watchdog_pass_at(
-            base + SignedDuration::from_secs(20),
-            mono + StdDuration::from_secs(20),
-            &mut detector,
-            &mut last,
-        )
-        .await;
+    let (manager, clock) = manager_on(base);
+    let mut mono = 0;
+    pass_at(&manager, &clock, base, 20, 20, &mut mono).await;
     let id = open(&manager, "K1DEF", base + SignedDuration::from_secs(25)).await;
-    manager
-        .watchdog_pass_at(
-            base + SignedDuration::from_secs(85),
-            mono + StdDuration::from_secs(25),
-            &mut detector,
-            &mut last,
-        )
-        .await;
+    pass_at(&manager, &clock, base, 85, 25, &mut mono).await;
     assert!(manager.get_qso(id).await.is_ok());
     assert_eq!(
         manager
@@ -368,5 +363,148 @@ async fn contacts_created_between_observations_receive_grace_and_same_state_rest
     assert!(
         manager.get_qso(id).await.is_err(),
         "a changed start invalidates grace even in the same state variant"
+    );
+}
+
+/// A RespondingToCq QSO opened at `base` on a manager over `clock`.
+async fn open_on(manager: &QsoManager, call: &str, base: UtcTimestamp) -> QsoId {
+    open(manager, call, base).await
+}
+
+#[tokio::test]
+async fn watchdog_anchors_budgets_at_the_clock_event_instant() {
+    let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
+    let id = open_on(&manager, "K1DEF", base).await;
+    clock.advance(std::time::Duration::from_secs(20));
+    manager.watchdog_pass().await;
+    // Another reader observes a +60 s step at T = base + 80 s.
+    clock.step_wall(SignedDuration::from_secs(60));
+    let t = clock.now();
+    let seen = manager.slot_clock.read();
+    assert_eq!(seen.epoch, 1);
+    assert_eq!(seen.last_event.unwrap().observed_at, t);
+    // The watchdog pass runs 4 s later and still anchors at T.
+    clock.advance(std::time::Duration::from_secs(4));
+    manager.watchdog_pass().await;
+    assert_eq!(manager.applied_clock_epoch(), 1);
+    assert!(manager.get_qso(id).await.is_ok());
+    // RespondingToCq keeps its 30 s budget from T, not from T + 4 s.
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(30))
+        .await;
+    assert!(manager.get_qso(id).await.is_ok());
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(31))
+        .await;
+    assert!(
+        manager.get_qso(id).await.is_err(),
+        "the budget restarts at the event instant, not at the later pass"
+    );
+}
+
+#[tokio::test]
+async fn two_steps_between_passes_anchor_at_the_latest_event() {
+    let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
+    let id = open_on(&manager, "K1DEF", base).await;
+    clock.advance(std::time::Duration::from_secs(10));
+    manager.watchdog_pass().await;
+    clock.step_wall(SignedDuration::from_secs(60));
+    let _ = manager.slot_clock.read();
+    clock.advance(std::time::Duration::from_secs(1));
+    clock.step_wall(SignedDuration::from_secs(30));
+    let latest = clock.now();
+    assert_eq!(manager.slot_clock.read().epoch, 2);
+    clock.advance(std::time::Duration::from_secs(4));
+    manager.watchdog_pass().await;
+    assert_eq!(manager.applied_clock_epoch(), 2);
+    manager
+        .check_timeouts_at(latest + SignedDuration::from_secs(30))
+        .await;
+    assert!(manager.get_qso(id).await.is_ok());
+    manager
+        .check_timeouts_at(latest + SignedDuration::from_secs(31))
+        .await;
+    assert!(manager.get_qso(id).await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_watchdog_loop_applies_a_step_seen_by_another_reader() {
+    let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
+    manager.start().await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(manager.applied_clock_epoch(), 0);
+    clock.step_wall(SignedDuration::from_secs(60));
+    assert_eq!(manager.slot_clock.read().epoch, 1);
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    for _ in 0..100 {
+        if manager.applied_clock_epoch() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(manager.applied_clock_epoch(), 1);
+}
+
+#[tokio::test]
+async fn a_qso_opened_after_the_event_keeps_its_own_start() {
+    let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
+    clock.advance(std::time::Duration::from_secs(10));
+    manager.watchdog_pass().await;
+    // Another reader observes a +60 s step at T.
+    clock.step_wall(SignedDuration::from_secs(60));
+    let t = clock.now();
+    assert_eq!(manager.slot_clock.read().epoch, 1);
+    // A QSO opens 4 s after the step, before the watchdog's next pass.
+    clock.advance(std::time::Duration::from_secs(4));
+    let opened = clock.now();
+    let id = open_on(&manager, "K1DEF", opened).await;
+    clock.advance(std::time::Duration::from_secs(1));
+    manager.watchdog_pass().await;
+    assert_eq!(manager.applied_clock_epoch(), 1);
+    // RespondingToCq keeps its 30 s budget from its own start, never from
+    // the event instant T, 4 s before it existed.
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(31))
+        .await;
+    assert!(
+        manager.get_qso(id).await.is_ok(),
+        "a QSO opened after the step is not charged for time before it existed"
+    );
+    manager
+        .check_timeouts_at(opened + SignedDuration::from_secs(31))
+        .await;
+    assert!(manager.get_qso(id).await.is_err());
+}
+
+#[tokio::test]
+async fn backward_step_restarts_budgets_at_the_event_not_at_a_future_start() {
+    let base = UtcTimestamp::now();
+    let (manager, clock) = manager_on(base);
+    let id = open_on(&manager, "K1DEF", base).await;
+    clock.advance(std::time::Duration::from_secs(20));
+    manager.watchdog_pass().await;
+    // The clock steps back an hour: the QSO's start now lies in the future.
+    clock.step_wall(SignedDuration::from_secs(-3600));
+    let t = clock.now();
+    assert_eq!(manager.slot_clock.read().epoch, 1);
+    clock.advance(std::time::Duration::from_secs(4));
+    manager.watchdog_pass().await;
+    assert_eq!(manager.applied_clock_epoch(), 1);
+    // RespondingToCq gets a fresh 30 s budget from the step, not an extra
+    // hour until the wall clock catches up with its pre-step start.
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(30))
+        .await;
+    assert!(manager.get_qso(id).await.is_ok());
+    manager
+        .check_timeouts_at(t + SignedDuration::from_secs(31))
+        .await;
+    assert!(
+        manager.get_qso(id).await.is_err(),
+        "a backward step restarts the budget at the event instant"
     );
 }

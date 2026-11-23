@@ -185,3 +185,101 @@ fn test_degraded_mode_defaults() {
     assert!((cache.rarity("K1ABC") - 0.5).abs() < f64::EPSILON);
     assert!(cache.spot_groups().is_empty());
 }
+
+/// PAN-359 AC10: the served `/api/v1/pota` body parses. The first row is
+/// the CQD-630 example verbatim; `byCallsign`, `updatedAt`, `name`, `mode`
+/// and unknown fields are ignored, `frequency` may be a string, a number or
+/// null, a read field of the wrong JSON type reads as empty, and a row
+/// that is not a JSON object is skipped without emptying the feed.
+#[tokio::test]
+async fn fetch_activations_parses_served_feed() {
+    let server = MockServer::start().await;
+    let body = r#"{"activations":[{"callsign":"7N1ICA/1","type":"sota","reference":"JA/YN-036","name":"Onigatake","frequency":"7.005","mode":"CW","spotTime":"2026-11-06T02:48:13.285492Z"},{"callsign":"DL1ABC","type":"pota","reference":"DA-0123","name":"Some Park","frequency":"14074","mode":"FT8","spotTime":"2026-11-22T09:01:00Z","extra":{"nested":true}},{"callsign":"K1XYZ","type":"pota","reference":"K-0001","name":"Another Park","frequency":7.09,"mode":"FT8","spotTime":"2026-11-22T09:02:00Z"},{"callsign":"W2ABC","type":"sota","reference":"W2/WE-003","name":null,"frequency":null,"mode":null},{"callsign":"N0NUM","type":"pota","reference":123,"spotTime":1793934000},null,"junk",42,[]],"byCallsign":{"7N1ICA/1":[{"callsign":"7N1ICA/1","type":"sota","reference":"JA/YN-036","name":"Onigatake","frequency":"7.005","mode":"CW","spotTime":"2026-11-06T02:48:13.285492Z"}]},"updatedAt":1793934000}"#;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pota"))
+        .and(header("Authorization", "Bearer pat_test_token_long_enough"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
+    let rows = client
+        .fetch_activations()
+        .await
+        .expect("parses")
+        .expect("offered");
+    assert_eq!(
+        rows,
+        vec![
+            Activation {
+                callsign: "7N1ICA/1".into(),
+                program: "sota".into(),
+                reference: "JA/YN-036".into(),
+                spot_time: Some("2026-11-06T02:48:13.285492Z".into()),
+            },
+            Activation {
+                callsign: "DL1ABC".into(),
+                program: "pota".into(),
+                reference: "DA-0123".into(),
+                spot_time: Some("2026-11-22T09:01:00Z".into()),
+            },
+            Activation {
+                callsign: "K1XYZ".into(),
+                program: "pota".into(),
+                reference: "K-0001".into(),
+                spot_time: Some("2026-11-22T09:02:00Z".into()),
+            },
+            Activation {
+                callsign: "W2ABC".into(),
+                program: "sota".into(),
+                reference: "W2/WE-003".into(),
+                spot_time: None,
+            },
+            // A field of another JSON type reads as empty, never failing
+            // the whole feed.
+            Activation {
+                callsign: "N0NUM".into(),
+                program: "pota".into(),
+                reference: String::new(),
+                spot_time: None,
+            },
+        ]
+    );
+
+    // The documented empty response.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pota"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"activations":[],"byCallsign":{},"updatedAt":null}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
+    assert_eq!(client.fetch_activations().await.unwrap(), Some(vec![]));
+}
+
+/// PAN-359 AC10: a 404 means the feed is not offered (`Ok(None)`); other
+/// failures are errors.
+#[tokio::test]
+async fn fetch_activations_404_is_not_offered() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pota"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
+    assert_eq!(client.fetch_activations().await.unwrap(), None);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pota"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
+    assert!(client.fetch_activations().await.is_err());
+}
