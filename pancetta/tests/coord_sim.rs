@@ -2471,6 +2471,70 @@ async fn key_time_late_cap_preserves_drop_and_offset() {
     }
 }
 
+/// PAN-483: a resync landing between Step 4b and Step 4d drops the frame
+/// before PTT-on. The frame is 2.5 s into its slot, under the 3000 ms late
+/// cap, so only the resync check can drop it.
+#[tokio::test]
+async fn final_gate_drops_a_frame_after_a_resync_without_keying() {
+    let manual = pancetta_core::slot_clock::ManualClock::new(UtcTimestamp::now());
+    let slot_clock = manual.slot_clock(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        15_000_000_000,
+    )));
+    let mut sim = CoordSim::new_with_slot_clock("K5ARH", slot_clock).await;
+    sim.set_rx_dial(14_074_000);
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            2317.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("start QSO");
+    let pending = sim.pump_qso_events();
+    assert_eq!(pending.len(), 1);
+    let required_parity = pending[0].tx_parity.expect("latched parity");
+    let target = pancetta_core::slot::next_slot_with_parity_with_period(
+        manual.now() + SignedDuration::from_secs(15),
+        required_parity,
+        15_000_000_000,
+    );
+    // Move both clocks (no step) to 500 ms past the target slot.
+    let lead = target + SignedDuration::from_millis(500) - manual.now();
+    manual.advance(lead.try_into().expect("target is ahead"));
+    let attempt_id = pending[0].attempt_id.expect("attempt identity");
+    let gate = sim.ptt_sync_gate();
+    let held = gate.lock().await;
+    let before = sim.before_ptt_gate();
+    sim.submit(&pending).await;
+    if tokio::time::timeout(Duration::from_secs(8), before.notified())
+        .await
+        .is_err()
+    {
+        panic!("Step 4b timeout: {:?}", sim.observations.lock().unwrap());
+    }
+    manual.step_wall(SignedDuration::from_secs(2));
+    drop(held);
+    sim.drive_submitted_slot(pending).await;
+    assert!(sim
+        .observations
+        .lock()
+        .unwrap()
+        .settlements
+        .iter()
+        .any(|(_, id, aired)| *id == Some(attempt_id) && !*aired));
+    sim.timeline.assert_not_keyed_for_qso(&qso_id.to_string());
+    sim.timeline.assert_silent();
+    assert!(sim.observations.lock().unwrap().ptt.is_empty());
+    assert_eq!(sim.observations.lock().unwrap().audio, 0);
+    assert_worker_diagnostic(&sim, "dropping stale TX after a +2.0 s clock jump").await;
+    sim.shutdown().await;
+}
+
 /// A fresh same-grid sighting at the last gate holds only colliding parity.
 #[tokio::test]
 async fn final_dx_parity_gate_preserves_drop_and_offset() {

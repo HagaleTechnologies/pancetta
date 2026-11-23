@@ -86,7 +86,28 @@ pub(super) async fn build_worker_harness(
     utc_clock: pancetta_core::time::UtcClock,
     register_rig: bool,
 ) -> Harness {
-    build_worker_harness_in_home(cfg, prepare, arm_clock, utc_clock, register_rig, None).await
+    build_worker_harness_in_home(cfg, prepare, arm_clock, utc_clock, register_rig, None, None).await
+}
+
+/// PAN-483: [`worker_harness`] whose worker reads `slot_clock`, so a
+/// detecting clock can land a resync on it.
+pub(super) async fn worker_harness_with_slot_clock(
+    slot_clock: pancetta_core::SlotClock,
+) -> Harness {
+    let utc_clock: pancetta_core::time::UtcClock = {
+        let clock = slot_clock.clone();
+        Arc::new(move || clock.now())
+    };
+    build_worker_harness_in_home(
+        Config::default(),
+        |_| {},
+        Arc::new(pancetta_agent::arm::ArmTime::now),
+        utc_clock,
+        true,
+        None,
+        Some(slot_clock),
+    )
+    .await
 }
 
 /// PAN-439: [`worker_harness_with`] whose coordinator starts from the
@@ -103,6 +124,7 @@ pub(crate) async fn worker_harness_in_home(
         pancetta_core::time::system_utc_clock(),
         true,
         Some(home),
+        None,
     )
     .await
 }
@@ -114,6 +136,7 @@ async fn build_worker_harness_in_home(
     utc_clock: pancetta_core::time::UtcClock,
     register_rig: bool,
     home: Option<std::path::PathBuf>,
+    slot_clock: Option<pancetta_core::SlotClock>,
 ) -> Harness {
     // This TX-only fixture historically sends CQ requests as Autonomous.
     // Grant their config permission so each test reaches the gate it targets;
@@ -171,7 +194,15 @@ async fn build_worker_harness_in_home(
     // fixture needs an Audio destination even though it uses no device.
     bus.get_or_create_channel(ComponentId::Audio).await.unwrap();
     coordinator
-        .start_transmitter_component_with_clock(arm_clock, utc_clock.clone())
+        .start_transmitter_component_with_clock(
+            arm_clock,
+            slot_clock.unwrap_or_else(|| {
+                pancetta_core::SlotClock::without_step_detection(
+                    utc_clock.clone(),
+                    coordinator.active_slot_ns(),
+                )
+            }),
+        )
         .await
         .expect("TX worker starts");
     Harness {

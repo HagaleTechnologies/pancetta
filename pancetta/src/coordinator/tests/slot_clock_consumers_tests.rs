@@ -1,29 +1,29 @@
 //! PAN-358 ticket scenario: a clock step is observed by every consumer at
 //! once.
 //!
-//! One `ManualClock` and one `SlotClock` feed the five consumers this test
+//! One `ManualClock` and one `SlotClock` feed the six consumers this test
 //! drives: the autonomous slot tick (`autonomous_slot_poll` on a
 //! `SlotTimer`), the DSP decode-window cutter (`decode_window_clock_step` on
 //! a `SlotTimer` at the mode's production decode phase), the QSO watchdog
 //! (`QsoManager::watchdog_pass` with one active QSO), the queued-call TTL
-//! (the production partition over two queued calls) and the clock-skew
-//! monitor (`MonitorStepCursor` feeding `ClockSkewMonitorCore`). The test
-//! polls all five every 250 ms of virtual time, four times before the step
-//! and for two slots after it.
-//!
-//! The TX worker is the one slot consumer this test does not drive yet. Its
-//! pre-PTT wait still detects steps with its own deadline rule
-//! (`tx/ptt.rs`), which has no resync epoch and reports how far the deadline
-//! moved rather than this event, so it joins the scenario when it moves onto
-//! the clock (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock").
+//! (the production partition over two queued calls), the clock-skew monitor
+//! (`MonitorStepCursor` feeding `ClockSkewMonitorCore`) and the TX worker's
+//! pre-PTT wait (`ptt_wait_step` on a frame `schedule_tx` placed at the first
+//! reading, PAN-483). The test polls all six every 250 ms of virtual time,
+//! four times before the step and for two slots after it; the TX wait stops
+//! polling once it reaches its PTT instant or drops the frame, as the
+//! worker's wait does.
 
 use super::autonomous::autonomous_slot_poll;
 use super::clock_monitor::MonitorStepCursor;
 use super::dsp::decode_window_clock_step;
 use super::qso::queued_call_ttl_partition_for_test;
+use super::tx::{ptt_wait_step, schedule_tx, PttWaitStep};
 use crate::clock_skew::ClockSkewMonitorCore;
 use jiff::SignedDuration;
-use pancetta_core::slot::{current_slot_start_with_period, next_phase_with_period};
+use pancetta_core::slot::{
+    current_slot_start_with_period, next_phase_with_period, next_slot_start_with_period, SlotParity,
+};
 use pancetta_core::slot_clock::{ClockEvent, ClockStamp, ManualClock};
 use pancetta_core::slot_timer::{Reanchor, SlotTimer};
 use pancetta_core::time::UtcTimestamp;
@@ -36,6 +36,8 @@ const FT8_NS: i64 = 15_000_000_000;
 const FT4_NS: i64 = 7_500_000_000;
 const FT2_NS: i64 = 3_200_000_000;
 const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Default `station.ptt_lead_ms`.
+const PTT_LEAD: SignedDuration = SignedDuration::from_millis(80);
 
 /// 2026-01-01 00:00:00 UTC, a boundary for FT8, FT4 and FT2.
 fn base() -> UtcTimestamp {
@@ -103,9 +105,14 @@ struct Observed {
     ttl_expired_on_first_pass: Vec<String>,
     /// Monitor `clock.step` lines after the step.
     monitor_lines: Vec<String>,
+    /// The TX frame's PTT engage instant (`target_slot - ptt_lead_ms`).
+    tx_ptt_target: Option<UtcTimestamp>,
+    /// The post-step poll index and `reading.now` at which the TX wait
+    /// ended, and how.
+    tx_wait_end: Option<(i64, UtcTimestamp, PttWaitStep)>,
 }
 
-/// Run the five consumers on one clock: pre-step polls from `p` seconds
+/// Run the six consumers on one clock: pre-step polls from `p` seconds
 /// into the slot at 00:00:00, then `step`, then two periods of polls.
 async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observed, UtcTimestamp) {
     let start = base() + ms(p_ms);
@@ -148,7 +155,23 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
     let mut monitor = ClockSkewMonitorCore::new();
     let mut mono_since_start = std::time::Duration::ZERO;
 
-    let mut obs = Observed::default();
+    // TX worker: a frame scheduled at the first reading, as the worker's
+    // dequeue does, for the first boundary after the last pre-step poll plus
+    // the PTT lead, so every case's PTT instant lies after the step.
+    let tx_reading = clock.read();
+    let last_pre_step_poll = start + SignedDuration::try_from(POLL * 4).unwrap();
+    let tx_boundary =
+        next_slot_start_with_period(last_pre_step_poll + PTT_LEAD, SignedDuration::ZERO, slot_ns);
+    let tx_parity = SlotParity::of_with_period(tx_boundary, slot_ns);
+    let tx_schedule = schedule_tx(tx_reading.now, tx_parity, 3000, 12_000, slot_ns);
+    assert_eq!(tx_schedule.target_slot, tx_boundary, "TX frame target slot");
+    let tx_ptt_target = tx_schedule.target_slot - PTT_LEAD;
+    let tx_scheduled_epoch = tx_reading.resync_epoch;
+
+    let mut obs = Observed {
+        tx_ptt_target: Some(tx_ptt_target),
+        ..Observed::default()
+    };
 
     // Four pre-step polls: nothing re-anchors, nothing flushes, nothing
     // expires.
@@ -169,6 +192,13 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
         if window.due {
             dsp_timer.advance(&reading);
         }
+        assert!(
+            matches!(
+                ptt_wait_step(&reading, tx_ptt_target, tx_scheduled_epoch),
+                PttWaitStep::Sleep(_)
+            ),
+            "the TX frame waits before the step"
+        );
         manager.watchdog_pass().await;
         let (_, expired) = queued_call_ttl_partition_for_test(&queue, clock.stamp());
         assert!(expired.is_empty(), "nothing expires before the step");
@@ -220,6 +250,13 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
             }
             obs.dsp_due_after.push(reading.now);
             dsp_timer.advance(&reading);
+        }
+
+        if obs.tx_wait_end.is_none() {
+            let step = ptt_wait_step(&reading, tx_ptt_target, tx_scheduled_epoch);
+            if !matches!(step, PttWaitStep::Sleep(_)) {
+                obs.tx_wait_end = Some((i, reading.now, step));
+            }
         }
 
         manager.watchdog_pass().await;
@@ -396,6 +433,17 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: SignedDuration) {
         "{label}: {}",
         obs.monitor_lines[0]
     );
+
+    // TX worker: the frame scheduled before the step is dropped on the first
+    // post-step poll with the same event's real step size, never keyed.
+    let (tx_poll, _, tx_end) = obs
+        .tx_wait_end
+        .unwrap_or_else(|| panic!("{label}: the TX wait ends after the step"));
+    assert_eq!(
+        (tx_poll, tx_end),
+        (0, PttWaitStep::ClockJumped(first.jump())),
+        "{label}: the TX wait drops the frame on the first post-step poll with the shared event"
+    );
 }
 
 #[tokio::test]
@@ -490,6 +538,20 @@ async fn sub_second_step_changes_no_slot_consumer() {
             "emitted late: {due}"
         );
     }
+
+    // TX worker: the frame keeps its slot and reaches its PTT instant on the
+    // first poll at or after it (00:00:14.92 for the 00:00:15 slot).
+    let ptt_target = obs.tx_ptt_target.expect("TX frame scheduled");
+    assert_eq!(
+        ptt_target,
+        base() + SignedDuration::from_secs(15) - PTT_LEAD
+    );
+    let (_, reached_at, tx_end) = obs.tx_wait_end.expect("the TX wait ends");
+    assert_eq!(tx_end, PttWaitStep::Reached);
+    assert!(
+        reached_at >= ptt_target && reached_at - ptt_target < ms(250),
+        "reached at {reached_at}, PTT instant {ptt_target}"
+    );
 
     // The watchdog still applies the event (PAN-296), and the QSO stays.
     assert_eq!(obs.watchdog_epoch_after_first_pass, 1);

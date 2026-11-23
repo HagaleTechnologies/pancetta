@@ -460,19 +460,6 @@ pub(super) async fn on_ptt_wait(
     }
 }
 
-/// PAN-114 (D6): slack over `ptt_lead_ms` allowed between PTT-on (Step 5)
-/// and the slot boundary (Step 6) before the hold is treated as a clock step.
-pub(super) const PTT_HOLD_SLACK_MS: u64 = 1000;
-
-/// `true` when Step 6 would hold PTT keyed (for `hold`, the Step 6
-/// `to_slot`) longer than `ptt_lead_ms` + [`PTT_HOLD_SLACK_MS`]. Nothing
-/// between Step 4 and Step 6 reassigns the schedule, so after a normal
-/// Step 4 the hold is <= `ptt_lead_ms`; anything past the bound means the
-/// wall clock stepped back in between.
-pub(super) fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
-    hold > Duration::from_millis(ptt_lead_ms + PTT_HOLD_SLACK_MS)
-}
-
 /// PAN-114 (D7): drop frame(s) a wall-clock jump made unsendable. Mirrors
 /// the neighbouring stale-TX drops: one `tx.policy` tracing line and Warn
 /// diagnostic per frame (text starts "dropping stale TX" so it counts in the
@@ -1323,7 +1310,11 @@ pub(super) fn encode_and_modulate(
 /// arm, where `slot_ns` is loaded, so a single-frame re-key pass rebuilds it.
 #[derive(Clone)]
 pub(super) struct SlotTimingContext {
-    pub(super) utc_clock: pancetta_core::time::UtcClock,
+    /// The coordinator's shared slot clock (PAN-483).
+    pub(super) slot_clock: pancetta_core::SlotClock,
+    /// The clock's resync epoch when this frame's schedule was computed
+    /// (PAN-483, D5): a later epoch means the schedule is on pre-step time.
+    pub(super) scheduled_resync_epoch: u64,
     pub(super) active_protocol: pancetta_ft8::Protocol,
     /// Raw `station.tx_late_max_ms`; [`Self::late_cap_ms`] scales it per mode.
     pub(super) tx_late_max_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1338,9 +1329,10 @@ pub(super) struct SlotTimingContext {
 impl super::super::ApplicationCoordinator {
     /// Start FT8 transmitter component
     pub(crate) async fn start_transmitter_component(&mut self) -> Result<()> {
+        let slot_clock = self.slot_clock();
         self.start_transmitter_component_with_clock(
             std::sync::Arc::new(pancetta_agent::arm::ArmTime::now),
-            pancetta_core::time::system_utc_clock(),
+            slot_clock,
         )
         .await
     }
@@ -1350,8 +1342,14 @@ impl super::super::ApplicationCoordinator {
     pub(crate) async fn start_transmitter_component_with_clock(
         &mut self,
         arm_clock: std::sync::Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
-        utc_clock: pancetta_core::time::UtcClock,
+        slot_clock: pancetta_core::SlotClock,
     ) -> Result<()> {
+        // PAN-483: every worker clock read goes through the shared slot
+        // clock, so it observes (and is ordered with) every step.
+        let utc_clock: pancetta_core::time::UtcClock = {
+            let clock = slot_clock.clone();
+            std::sync::Arc::new(move || clock.now())
+        };
         let span = span!(Level::INFO, "start_transmitter");
         let _enter = span.enter();
 
@@ -1702,7 +1700,11 @@ impl super::super::ApplicationCoordinator {
                             // tx_late_max_ms) past the late-cap purely by the
                             // scheduling decision being made ~800ms later than the
                             // request actually arrived — an unforced ~30s defer.
-                            let request_received_at = utc_clock();
+                            // PAN-483 (D5): the schedule's time and its resync
+                            // epoch come from one read.
+                            let dequeue_reading = slot_clock.read();
+                            let request_received_at = dequeue_reading.now;
+                            let request_resync_epoch = dequeue_reading.resync_epoch;
                             // PAN-117 (PR #450 review round 2): only a
                             // `TransmitRequest` head takes the base coalesce wait
                             // below. Captured before coalescing can fold it into a
@@ -2153,6 +2155,9 @@ impl super::super::ApplicationCoordinator {
                                     // flush-stale-audio flag. Both stay inert (None/false)
                                     // on the normal first pass, keeping it byte-identical.
                                     let mut rekey_schedule: Option<TxSchedule> = None;
+                                    // PAN-483: the resync epoch read before the
+                                    // supersede that produced `rekey_schedule`.
+                                    let mut rekey_resync_epoch: Option<u64> = None;
                                     let mut is_rekey = false;
 
                                     // 'key_and_send wraps Steps 1-10 so a mid-TX supersede
@@ -2267,7 +2272,9 @@ impl super::super::ApplicationCoordinator {
                                             )
                                         };
                                         let timing = SlotTimingContext {
-                                            utc_clock: utc_clock.clone(),
+                                            slot_clock: slot_clock.clone(),
+                                            scheduled_resync_epoch: rekey_resync_epoch
+                                                .unwrap_or(request_resync_epoch),
                                             active_protocol,
                                             tx_late_max_ms: live_late_cap.clone(),
                                             tx_self_parity,
@@ -2408,12 +2415,10 @@ impl super::super::ApplicationCoordinator {
                                             timing.ptt_target(schedule.target_slot);
                                         let ptt_wait = wait_for_ptt_instant(
                                             ptt_target_utc,
-                                            schedule.target_slot,
-                                            timing.late_cap_ms(),
-                                            slot_ns,
+                                            timing.scheduled_resync_epoch,
                                             &shutdown,
                                             &abort_current_tx,
-                                            || utc_clock(),
+                                            &timing.slot_clock,
                                         )
                                         .await;
                                         match on_ptt_wait(
@@ -3266,15 +3271,55 @@ impl super::super::ApplicationCoordinator {
                                         // half of Step 4d, run LAST among the pre-send
                                         // gates — after the liveness/DX-parity gate, the
                                         // hard mute and the band-plan gate above — so
-                                        // `utc_clock()` here is the last clock read
+                                        // `key_time_reading` is the last clock read
                                         // before the PTT-on send. A frame more than
                                         // `tx_late_max_ms` into its target slot is dropped
                                         // here instead of keyed (no receiver could decode
                                         // the surviving fragment). SYNCHRONOUS through the
                                         // key-down enqueue below: `send_ptt_command` takes
-                                        // no lock and no await (PAN-202).
+                                        // no lock and no await (PAN-202); `SlotClock::read`
+                                        // takes a std mutex and never awaits.
+                                        let key_time_reading = timing.slot_clock.read();
+                                        // PAN-483: a resync since this frame was
+                                        // scheduled drops it before PTT-on, unwound
+                                        // like the key-time denial below.
+                                        if let Some(jump) = resync_since(
+                                            &key_time_reading,
+                                            timing.scheduled_resync_epoch,
+                                        ) {
+                                            last_ptt_off_ms.store(
+                                                super::super::now_epoch_ms(),
+                                                Ordering::Release,
+                                            );
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &[(
+                                                    message_text.clone(),
+                                                    qso_id.clone(),
+                                                    attempt_id,
+                                                )],
+                                                jump,
+                                                &mut qso_id
+                                                    .as_deref()
+                                                    .zip(pivot_replaced)
+                                                    .map(|(id, r)| {
+                                                        (super::super::active_tx_qso_key(id), r)
+                                                    })
+                                                    .into_iter()
+                                                    .collect(),
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
                                         if let Some(denial) = key_time_gate_denial(
-                                            utc_clock(),
+                                            key_time_reading.now,
                                             schedule.target_slot,
                                             timing.late_cap_ms(),
                                         ) {
@@ -3465,16 +3510,20 @@ impl super::super::ApplicationCoordinator {
                                         // --- Step 6: Sleep precisely until target slot start ---
                                         // (audio_out itself includes any silent_pad needed past
                                         // the slot boundary; we send it at the boundary.)
+                                        let hold_reading = timing.slot_clock.read();
                                         let to_slot = pancetta_core::slot::duration_until(
                                             schedule.target_slot,
-                                            utc_clock(),
+                                            hold_reading.now,
                                         );
-                                        // PAN-114 (D6): a backward clock step between Step 4
-                                        // and here would hold PTT keyed for the size of the
-                                        // step (measured: 600 s). Never hold it past
-                                        // `ptt_lead_ms` + PTT_HOLD_SLACK_MS; release PTT
+                                        // PAN-114 (D6), PAN-483: a resync since this frame
+                                        // was scheduled (a backward step would otherwise
+                                        // hold PTT keyed for the size of the step; measured:
+                                        // 600 s) drops it before the hold; release PTT
                                         // FIRST, exactly like `SleepOutcome::AbortedByDisarm`.
-                                        if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                        if let Some(jump) = resync_since(
+                                            &hold_reading,
+                                            timing.scheduled_resync_epoch,
+                                        ) {
                                             ptt_guard.release("Clock-step PTT hold guard").await;
                                             // Pre-slot abort: nothing reached the air, so a
                                             // Step 4c pivot tombstone must go too (same as
@@ -3491,10 +3540,7 @@ impl super::super::ApplicationCoordinator {
                                                     qso_id.clone(),
                                                     attempt_id,
                                                 )],
-                                                pancetta_core::slot_clock::WallClockJump::Backward(
-                                                    SignedDuration::try_from(to_slot)
-                                                        .unwrap_or(SignedDuration::MAX),
-                                                ),
+                                                jump,
                                                 &mut qso_id
                                                     .as_deref()
                                                     .zip(pivot_replaced)
@@ -3561,7 +3607,48 @@ impl super::super::ApplicationCoordinator {
                                         )
                                         .await
                                         {
-                                            SleepFlow::Continue(()) => {}
+                                            SleepFlow::Continue(()) => {
+                                                // PAN-483: a resync during the hold
+                                                // drops the frame before any audio,
+                                                // releasing PTT first.
+                                                if let Some(jump) = resync_since(
+                                                    &timing.slot_clock.read(),
+                                                    timing.scheduled_resync_epoch,
+                                                ) {
+                                                    ptt_guard
+                                                        .release("Clock-step PTT hold guard")
+                                                        .await;
+                                                    let pivot_replaced =
+                                                        pivoted_this_key.take().and_then(|key| {
+                                                            pivoted_once.remove(&key);
+                                                            pivoted_from.remove(&key)
+                                                        });
+                                                    drop_frames_for_clock_jump(
+                                                        &message_bus,
+                                                        &[(
+                                                            message_text.clone(),
+                                                            qso_id.clone(),
+                                                            attempt_id,
+                                                        )],
+                                                        jump,
+                                                        &mut qso_id
+                                                            .as_deref()
+                                                            .zip(pivot_replaced)
+                                                            .map(|(id, r)| {
+                                                                (
+                                                                    super::super::active_tx_qso_key(
+                                                                        id,
+                                                                    ),
+                                                                    r,
+                                                                )
+                                                            })
+                                                            .into_iter()
+                                                            .collect(),
+                                                    )
+                                                    .await;
+                                                    continue 'worker;
+                                                }
+                                            }
                                             SleepFlow::Break(SleepBreak::Exit(
                                                 TxExit::StopWorker,
                                             )) => {
@@ -3574,6 +3661,12 @@ impl super::super::ApplicationCoordinator {
                                             }
                                             SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
                                                 let new_request = *boxed;
+                                                // PAN-483 (D5): read before the supersede
+                                                // computes the re-key's schedule, so a step
+                                                // landing in between drops the re-key
+                                                // instead of keying it on pre-step time.
+                                                let supersede_resync_epoch =
+                                                    timing.slot_clock.read().resync_epoch;
                                                 // The current in-flight single item — passed to the
                                                 // helper so a bundle-add (max_concurrent_qsos > 1)
                                                 // can fold the new request alongside it.
@@ -3681,6 +3774,8 @@ impl super::super::ApplicationCoordinator {
                                                         qso_id = new_qso_id;
                                                         attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
+                                                        rekey_resync_epoch =
+                                                            Some(supersede_resync_epoch);
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
@@ -3785,6 +3880,8 @@ impl super::super::ApplicationCoordinator {
                                                             .and_then(|item| item.qso_id.clone());
                                                         attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
+                                                        rekey_resync_epoch =
+                                                            Some(supersede_resync_epoch);
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
@@ -4009,6 +4106,12 @@ impl super::super::ApplicationCoordinator {
                                             }
                                             SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
                                                 let new_request = *boxed;
+                                                // PAN-483 (D5): read before the supersede
+                                                // computes the re-key's schedule, so a step
+                                                // landing in between drops the re-key
+                                                // instead of keying it on pre-step time.
+                                                let supersede_resync_epoch =
+                                                    timing.slot_clock.read().resync_epoch;
                                                 // Same bundle-add-or-replace decision as Step 6.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
@@ -4100,6 +4203,8 @@ impl super::super::ApplicationCoordinator {
                                                         qso_id = new_qso_id;
                                                         attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
+                                                        rekey_resync_epoch =
+                                                            Some(supersede_resync_epoch);
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
@@ -4182,6 +4287,8 @@ impl super::super::ApplicationCoordinator {
                                                             .and_then(|item| item.qso_id.clone());
                                                         attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
+                                                        rekey_resync_epoch =
+                                                            Some(supersede_resync_epoch);
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
@@ -4783,7 +4890,8 @@ impl super::super::ApplicationCoordinator {
                                         )
                                     };
                                     let timing = SlotTimingContext {
-                                        utc_clock: utc_clock.clone(),
+                                        slot_clock: slot_clock.clone(),
+                                        scheduled_resync_epoch: request_resync_epoch,
                                         active_protocol,
                                         tx_late_max_ms: live_late_cap.clone(),
                                         tx_self_parity,
@@ -5080,12 +5188,10 @@ impl super::super::ApplicationCoordinator {
                                     let ptt_target_utc = timing.ptt_target(schedule.target_slot);
                                     let ptt_wait = wait_for_ptt_instant(
                                         ptt_target_utc,
-                                        schedule.target_slot,
-                                        timing.late_cap_ms(),
-                                        slot_ns,
+                                        timing.scheduled_resync_epoch,
                                         &shutdown,
                                         &abort_current_tx,
-                                        || utc_clock(),
+                                        &timing.slot_clock,
                                     )
                                     .await;
                                     match on_ptt_wait(
@@ -6288,7 +6394,43 @@ impl super::super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
-                                    let key_time_now = utc_clock();
+                                    // PAN-483: one read for the resync check and the
+                                    // key-time gate; a resync since the bundle was
+                                    // scheduled drops every item before PTT-on.
+                                    let key_time_reading = timing.slot_clock.read();
+                                    if let Some(jump) = resync_since(
+                                        &key_time_reading,
+                                        timing.scheduled_resync_epoch,
+                                    ) {
+                                        last_ptt_off_ms
+                                            .store(super::super::now_epoch_ms(), Ordering::Release);
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        let frames: Vec<_> = items
+                                            .iter()
+                                            .map(|item| {
+                                                (
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    item.attempt_id,
+                                                )
+                                            })
+                                            .collect();
+                                        drop_frames_for_clock_jump(
+                                            &message_bus,
+                                            &frames,
+                                            jump,
+                                            &mut bundle_replaced,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    let key_time_now = key_time_reading.now;
                                     let key_time_late_max_ms = timing.late_cap_ms();
                                     if key_time_too_late(
                                         key_time_now,
@@ -6495,13 +6637,16 @@ impl super::super::ApplicationCoordinator {
                                     // A qualifying request arriving here supersedes the in-flight
                                     // bundle: prefer folding it in (bundle-add), else re-enqueue
                                     // a single-item replace — see `supersede_multi_reenqueue`.
+                                    let hold_reading = timing.slot_clock.read();
                                     let to_slot = pancetta_core::slot::duration_until(
                                         schedule.target_slot,
-                                        utc_clock(),
+                                        hold_reading.now,
                                     );
-                                    // PAN-114 (D6): never hold PTT through a backward clock
-                                    // step — see the single-TX arm's identical guard.
-                                    if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                    // PAN-114 (D6), PAN-483: never hold PTT through a
+                                    // resync — see the single-TX arm's identical guard.
+                                    if let Some(jump) =
+                                        resync_since(&hold_reading, timing.scheduled_resync_epoch)
+                                    {
                                         ptt_guard.release("Clock-step PTT hold guard").await;
                                         // Pre-slot abort: nothing reached the air yet.
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -6522,10 +6667,7 @@ impl super::super::ApplicationCoordinator {
                                         drop_frames_for_clock_jump(
                                             &message_bus,
                                             &frames,
-                                            pancetta_core::slot_clock::WallClockJump::Backward(
-                                                SignedDuration::try_from(to_slot)
-                                                    .unwrap_or(SignedDuration::MAX),
-                                            ),
+                                            jump,
                                             &mut bundle_replaced,
                                         )
                                         .await;
@@ -6571,7 +6713,42 @@ impl super::super::ApplicationCoordinator {
                                     )
                                     .await
                                     {
-                                        SleepFlow::Continue(()) => {}
+                                        SleepFlow::Continue(()) => {
+                                            // PAN-483: a resync during the hold drops
+                                            // the bundle before any audio, releasing
+                                            // PTT first.
+                                            if let Some(jump) = resync_since(
+                                                &timing.slot_clock.read(),
+                                                timing.scheduled_resync_epoch,
+                                            ) {
+                                                ptt_guard
+                                                    .release("Clock-step PTT hold guard")
+                                                    .await;
+                                                let mut bundle_replaced = unwind_bundle_pivots(
+                                                    &pivoted_this_bundle_keys,
+                                                    &mut pivoted_once,
+                                                    &mut pivoted_from,
+                                                );
+                                                let frames: Vec<_> = items
+                                                    .iter()
+                                                    .map(|item| {
+                                                        (
+                                                            item.message_text.clone(),
+                                                            item.qso_id.clone(),
+                                                            item.attempt_id,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                drop_frames_for_clock_jump(
+                                                    &message_bus,
+                                                    &frames,
+                                                    jump,
+                                                    &mut bundle_replaced,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                        }
                                         SleepFlow::Break(SleepBreak::Exit(TxExit::StopWorker)) => {
                                             break;
                                         }
