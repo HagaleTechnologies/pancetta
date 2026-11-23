@@ -9,9 +9,10 @@
 //! count: a deleted item named in a comment is stale documentation. Needles
 //! are built at runtime so this file never matches itself.
 //!
-//! The TX worker moved onto the clock in PAN-484: its PAN-114 wait band and
+//! The TX worker moved onto the clock in PAN-483: its PAN-114 wait band and
 //! PTT-hold bound are gone, and a frame scheduled before a resync is dropped
-//! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock").
+//! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"). PAN-484 added
+//! its former checks and its wiring to this scan.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +52,13 @@ fn scanned_files() -> Vec<PathBuf> {
     );
     files
 }
+
+/// The TX worker's slot-timing files.
+const TX_TIMING_FILES: [&str; 3] = [
+    "pancetta/src/coordinator/tx/worker.rs",
+    "pancetta/src/coordinator/tx/ptt.rs",
+    "pancetta/src/coordinator/tx/supersede.rs",
+];
 
 fn read(rel: &str) -> String {
     let path = workspace_root().join(rel);
@@ -165,13 +173,9 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
     let tx_worker = read("pancetta/src/coordinator/tx/worker.rs");
     assert!(
         tx_worker.contains(&needle("self.slot", "_clock()")),
-        "the TX worker must capture the coordinator's slot clock (PAN-484)"
+        "the TX worker must capture the coordinator's slot clock (PAN-483)"
     );
-    for rel in [
-        "pancetta/src/coordinator/tx/worker.rs",
-        "pancetta/src/coordinator/tx/ptt.rs",
-        "pancetta/src/coordinator/tx/supersede.rs",
-    ] {
+    for rel in TX_TIMING_FILES {
         let text = read(rel);
         for banned in [needle("Utc", "Clock"), needle("utc", "_clock")] {
             assert!(
@@ -188,11 +192,7 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
     // exactly one line, so a second or a stale exemption fails.
     let wall_reads = [needle("Timestamp", "::now"), needle("SystemTime", "::now")];
     let mut admission_stamps = 0;
-    for rel in [
-        "pancetta/src/coordinator/tx/worker.rs",
-        "pancetta/src/coordinator/tx/ptt.rs",
-        "pancetta/src/coordinator/tx/supersede.rs",
-    ] {
+    for rel in TX_TIMING_FILES {
         for (i, line) in read(rel).lines().enumerate() {
             let Some(wall) = wall_reads.iter().find(|w| line.contains(w.as_str())) else {
                 continue;

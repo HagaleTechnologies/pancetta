@@ -227,18 +227,52 @@ impl CoordSim {
         our_callsign: &str,
         utc_clock: pancetta_core::time::UtcClock,
     ) -> Self {
+        Self::build(our_callsign, utc_clock, None).await
+    }
+
+    /// PAN-483: a sim whose TX worker reads `slot_clock`, so a detecting
+    /// clock can land a resync on it.
+    pub async fn new_with_slot_clock(
+        our_callsign: &str,
+        slot_clock: pancetta_core::SlotClock,
+    ) -> Self {
+        let utc_clock: pancetta_core::time::UtcClock = {
+            let clock = slot_clock.clone();
+            Arc::new(move || clock.now())
+        };
+        Self::build(our_callsign, utc_clock, Some(slot_clock)).await
+    }
+
+    async fn build(
+        our_callsign: &str,
+        utc_clock: pancetta_core::time::UtcClock,
+        slot_clock: Option<pancetta_core::SlotClock>,
+    ) -> Self {
         let mut config = pancetta_config::Config::default();
         config.station.callsign = our_callsign.to_string();
         config.autonomous.max_concurrent_qsos = 8;
         let home = tempfile::tempdir().expect("temporary station home");
         let arm_now = pancetta_agent::arm::ArmTime::now();
-        let worker = pancetta_lib::coordinator::testing::WorkerHarness::new_with_utc_clock(
-            config,
-            home.path().to_owned(),
-            Arc::new(move || arm_now),
-            utc_clock.clone(),
-        )
-        .await;
+        let worker = match slot_clock {
+            Some(slot_clock) => {
+                pancetta_lib::coordinator::testing::WorkerHarness::new_with_slot_clock(
+                    config,
+                    home.path().to_owned(),
+                    Arc::new(move || arm_now),
+                    slot_clock,
+                )
+                .await
+            }
+            None => {
+                pancetta_lib::coordinator::testing::WorkerHarness::new_with_utc_clock(
+                    config,
+                    home.path().to_owned(),
+                    Arc::new(move || arm_now),
+                    utc_clock.clone(),
+                )
+                .await
+            }
+        };
         let mut manager = QsoManager::new(QsoManagerConfig {
             our_callsign: our_callsign.to_string(),
             our_grid: Some("EM10".into()),

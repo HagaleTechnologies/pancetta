@@ -934,15 +934,14 @@ used by the clock-skew monitor.
   a flush can never be misread as a jump; an audio start-up delay of more than (slot − window) can
   cost one extra flush of a window whose boundary is already more than a slot stale.
 - **TX worker pre-PTT wait** (`coordinator/tx.rs::wait_for_ptt_instant` / `ptt_wait_step`, both
-  arms' Step 4; the band rule below was replaced by the PAN-358/PAN-484 resync rule, see "One UTC
-  slot clock"): re-reads the wall clock every ≤ 50 ms chunk (D5). It drops the frame only if the
+  arms' Step 4; replaced by PAN-483's resync rule, see "One UTC slot clock"): re-reads the wall clock every ≤ 50 ms chunk (D5). It drops the frame only if the
   PTT instant is now more than two periods away (backward step; `schedule_tx` never targets
   further), or if the wait started before the PTT instant and finished more than
   `tx_late_max_ms_effective` past `target_slot` (forward jump). A request that was already a late
   start when the wait began keeps the old path exactly; a forward jump that lands inside the
   late-start policy ships as a policy late start.
-- **PTT hold bound** (`ptt_hold_exceeds_bound`, both arms' Step 6, D6; replaced by the
-  PAN-358/PAN-484 resync check, see "One UTC slot clock"): if `to_slot` exceeds
+- **PTT hold bound** (`ptt_hold_exceeds_bound`, both arms' Step 6, D6; replaced by PAN-483's
+  resync rule): if `to_slot` exceeds
   `ptt_lead_ms` + `PTT_HOLD_SLACK_MS` (1000 ms) with PTT keyed, PTT is released first (the
   `AbortedByDisarm` pattern, including the pivot-tombstone cleanup) and the frame is dropped.
   Nothing reassigns `schedule` between Step 4 and Step 6, so the bound only trips on a step.
@@ -994,21 +993,20 @@ in the slot the step landed.
 - `pancetta/tests/slot_clock_invariant.rs` keeps the deleted per-site items out of the scanned crates
   and checks that each consumer above stays wired to the coordinator's clock.
 
-- The TX worker (PAN-484, 2026-11-23) reads the clock through `SlotTimingContext.slot_clock` and
-  has no step check of its own. A frame whose scheduling read had an older `resync_epoch` than the
-  current read is never keyed (replaces PAN-114 D5 and D6): the pre-PTT wait, the Step 4d final
-  gate (unwound like the key-time denial) and the Step 6 hold (PTT released first through
-  `PttGuard::release("Clock-step PTT hold guard")`) all drop it, in both directions and even while
-  its slot is still ahead. A step under 1 s keeps it; the PAN-117 key-time cap still applies. The
-  dequeue read gives `request_received_at` and `request_resync_epoch` together, and a re-key takes
-  both from its own read in `supersede_and_rekey_or_bundle`, so a re-key decided after a step keys.
-  There is no re-check after the Step 6 hold: a resync before the Step 6 read is caught there, and
-  the hold then lasts at most `ptt_lead_ms` plus a sub-second step. `drop_frames_for_clock_jump`
-  keeps its text and now carries the latest resync's real step size (`ClockEvent::jump`); after two
-  resyncs it shows the second one, not their sum.
-  `ptt_hold_exceeds_bound`, `PTT_HOLD_SLACK_MS` and `classify_deadline_jump` are deleted. Harness
-  clocks are wrapped with `SlotClock::without_step_detection`, so virtual-clock jumps keep their
-  meaning. Automated coverage only.
+- The TX worker reads the coordinator's clock (PAN-483; replaces PAN-114 D5 and D6). At dequeue,
+  `request_received_at` and the frame's scheduled resync epoch come from one read; a mid-TX re-key
+  takes the epoch read just before its supersede. `resync_since` (`tx/ptt.rs`) reports the latest
+  resync event's real step once a reading's resync epoch differs from the scheduled one. The
+  pre-PTT wait (`ptt_wait_step`) drops such a frame even when its PTT instant is still ahead; Step
+  4d drops it before PTT-on from the same read as the key-time gate; Step 6 checks before and after
+  the hold and releases PTT first ("Clock-step PTT hold guard"). A step under 1 s never drops a
+  frame, and a frame whose audio is playing finishes. The two-period band, the late-forward rule,
+  `PTT_HOLD_SLACK_MS` and `ptt_hold_exceeds_bound` are gone. The cost is one retry cycle for a
+  frame whose slot was still ahead.
+  PAN-484 deleted `classify_deadline_jump` (no caller left) and added the TX worker's former
+  checks, its wiring and a ban on direct `SystemTime::now`/`Timestamp::now` reads in
+  `tx/worker.rs`, `tx/ptt.rs` and `tx/supersede.rs` (one PTT-admission stamp exempt) to
+  `pancetta/tests/slot_clock_invariant.rs`.
 
 ## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
 

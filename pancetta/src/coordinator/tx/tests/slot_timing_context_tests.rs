@@ -12,6 +12,7 @@ fn ctx(
                 pancetta_core::slot::SLOT_NS,
             )),
         ),
+        scheduled_resync_epoch: 0,
         active_protocol,
         tx_late_max_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(tx_late_max_ms)),
         tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
@@ -19,7 +20,6 @@ fn ctx(
         sample_rate: 12_000,
         slot_ns: pancetta_core::slot::SLOT_NS,
         request_received_at: pancetta_core::time::UtcTimestamp::now(),
-        request_resync_epoch: 0,
     }
 }
 

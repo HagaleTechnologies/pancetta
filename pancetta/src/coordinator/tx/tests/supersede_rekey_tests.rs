@@ -109,7 +109,6 @@ async fn supersede_into_a_full_hamlib_channel_keeps_the_guard_armed() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &timing,
@@ -195,7 +194,6 @@ async fn supersede_retries_ptt_off_until_hamlib_frees_room() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &timing,
@@ -265,7 +263,6 @@ async fn supersede_and_rekey_updates_state_when_viable() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -388,7 +385,6 @@ async fn supersede_rekeys_audio_to_new_message_not_stale() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -540,7 +536,6 @@ async fn supersede_returns_bundle_when_concurrent() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -638,7 +633,6 @@ async fn supersede_refuses_to_bundle_across_consent_channels() {
                 message_text: &mut message_text,
                 frequency_offset: &mut frequency_offset,
                 schedule: &mut schedule,
-                resync_epoch: &mut 0,
             },
             &mut guard,
             &super::SlotTimingContext::ft8_for_test(
@@ -735,7 +729,6 @@ async fn supersede_bundle_gives_the_new_item_the_new_requests_binding() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -834,7 +827,6 @@ async fn supersede_refuses_to_bundle_mismatched_remote_clients() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -964,7 +956,6 @@ async fn supersede_bundle_replaces_matching_qso_item_on_frequency_hop() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -1083,7 +1074,6 @@ async fn supersede_falls_back_to_replace_when_bundle_would_exceed_cap() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -1198,7 +1188,6 @@ async fn supersede_bundle_cap_does_not_count_manual_items() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -1299,7 +1288,6 @@ async fn supersede_replace_carries_superseding_requests_origin() {
                 message_text: &mut message_text,
                 frequency_offset: &mut frequency_offset,
                 schedule: &mut schedule,
-                resync_epoch: &mut 0,
             },
             &mut guard,
             &super::SlotTimingContext::ft8_for_test(
@@ -1438,7 +1426,6 @@ async fn supersede_bundle_folds_origin_failsafe() {
                 message_text: &mut message_text,
                 frequency_offset: &mut frequency_offset,
                 schedule: &mut schedule,
-                resync_epoch: &mut 0,
             },
             &mut guard,
             &super::SlotTimingContext::ft8_for_test(
@@ -1514,7 +1501,6 @@ async fn supersede_declines_multi_transmit_request() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -2346,7 +2332,6 @@ async fn pan279_notviable_returns_the_deferred_superseder_intact() {
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(
@@ -2623,7 +2608,6 @@ async fn pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two() {
                     message_text: &mut message_text,
                     frequency_offset: &mut frequency_offset,
                     schedule: &mut schedule,
-                    resync_epoch: &mut 0,
                 },
                 &mut guard,
                 &super::SlotTimingContext::ft8_for_test(
@@ -2727,7 +2711,6 @@ async fn pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream
             message_text: &mut message_text,
             frequency_offset: &mut frequency_offset,
             schedule: &mut schedule,
-            resync_epoch: &mut 0,
         },
         &mut guard,
         &super::SlotTimingContext::ft8_for_test(

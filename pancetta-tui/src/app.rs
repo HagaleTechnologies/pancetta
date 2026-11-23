@@ -2160,6 +2160,9 @@ impl App {
             parked_since: None,
             park_coverage_last: None,
         };
+        // PAN-419: focus starts on Band Activity, which a saved Run view
+        // does not draw.
+        app.focus_a_drawn_panel();
 
         // Initialize audio monitoring if device specified
         if let Some(device) = app.audio_device.clone() {
@@ -2344,6 +2347,10 @@ impl App {
         // no-op, harmless call for the common case where the list didn't
         // shrink).
         self.clamp_band_activity_selection();
+        // PAN-419: the new view may not draw the focused panel (Monitor
+        // draws neither QSO Status nor Callers, and Waterfall is Monitor's
+        // alone); move focus onto one it does.
+        self.focus_a_drawn_panel();
         self.persist_tui_state();
         self.statuses.push(
             crate::presentation::view_message(self.active_view).to_string(),
@@ -4335,6 +4342,21 @@ impl App {
         if self.waterfall_data.len() > MAX_WATERFALL_ROWS {
             let excess = self.waterfall_data.len() - MAX_WATERFALL_ROWS;
             self.waterfall_data.drain(..excess);
+        }
+    }
+
+    /// PAN-419: whether the screen shows `panel`. Zoomed, the focused panel fills
+    /// the screen in any view; otherwise the view draws exactly its `tab_order`
+    /// (pinned to `ui::view_rects` by `tab_order_matches_rendered_panels_per_view`).
+    pub fn panel_is_drawn(&self, panel: ActivePanel) -> bool {
+        self.zoomed || ActivePanel::tab_order(self.active_view).contains(&panel)
+    }
+
+    /// PAN-419: move focus to the view's first panel when the screen does not
+    /// show the focused one; a drawn focus is left alone.
+    pub fn focus_a_drawn_panel(&mut self) {
+        if !self.panel_is_drawn(self.active_panel) {
+            self.active_panel = ActivePanel::tab_order(self.active_view)[0];
         }
     }
 

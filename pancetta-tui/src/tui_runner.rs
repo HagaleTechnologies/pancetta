@@ -528,6 +528,21 @@ pub enum TuiMessage {
 const WATERFALL_FOCUS_HINT: &str =
     "Focus the waterfall (Monitor view, Tab) to change its gain or palette";
 
+/// PAN-419: a jump key (`1`-`5`) focuses its panel only when the screen
+/// shows it; otherwise focus stays put and the status line says why.
+fn focus_jump(app: &mut App, panel: crate::app::ActivePanel, name: &str) {
+    let text = if app.panel_is_drawn(panel) {
+        app.active_panel = panel;
+        format!("Panel: {name}")
+    } else {
+        format!(
+            "{name} is not shown in {}",
+            crate::presentation::view_message(app.active_view)
+        )
+    };
+    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+}
+
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     /// Add or remove an operator watchlist pin.
@@ -2114,6 +2129,9 @@ impl TuiRunner {
             // fires when nothing else claimed this Esc press above.
             Action::ClearZoom => {
                 app.zoomed = false;
+                // PAN-419: the panel zoom showed may be one this view does
+                // not draw.
+                app.focus_a_drawn_panel();
                 {
                     let text = "Zoom cleared".to_string();
                     app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
@@ -2285,41 +2303,30 @@ impl TuiRunner {
             // card + status-bar spans), which freed up a number key —
             // TxPlacement now gets one (`5`), unlike Task 11's original
             // "no number key" scoping. 1=Band, 2=QSO, 3=Callers, 4=DX,
-            // 5=Placement.
+            // 5=Placement. PAN-419: a panel the active view does not draw
+            // is refused (see `focus_jump`).
             Action::FocusBandActivity => {
-                app.active_panel = crate::app::ActivePanel::BandActivity;
-                {
-                    let text = "Panel: Band Activity".to_string();
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
+                focus_jump(
+                    &mut app,
+                    crate::app::ActivePanel::BandActivity,
+                    "Band Activity",
+                );
             }
             Action::FocusQsoStatus => {
-                app.active_panel = crate::app::ActivePanel::QsoStatus;
-                {
-                    let text = "Panel: QSO Status".to_string();
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
+                focus_jump(&mut app, crate::app::ActivePanel::QsoStatus, "QSO Status");
             }
             Action::FocusCallers => {
-                app.active_panel = crate::app::ActivePanel::Callers;
-                {
-                    let text = "Panel: Callers".to_string();
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
+                focus_jump(&mut app, crate::app::ActivePanel::Callers, "Callers");
             }
             Action::FocusDxHunter => {
-                app.active_panel = crate::app::ActivePanel::DxHunter;
-                {
-                    let text = "Panel: DX Hunter".to_string();
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
+                focus_jump(&mut app, crate::app::ActivePanel::DxHunter, "DX Hunter");
             }
             Action::FocusTxPlacement => {
-                app.active_panel = crate::app::ActivePanel::TxPlacement;
-                {
-                    let text = "Panel: TX Placement".to_string();
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
+                focus_jump(
+                    &mut app,
+                    crate::app::ActivePanel::TxPlacement,
+                    "TX Placement",
+                );
             }
 
             // === Quit (with confirm modal) ===
@@ -2713,11 +2720,13 @@ impl TuiRunner {
             Action::CycleDecodeEffort => {
                 self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
             }
-            // PAN-389: focus can be left on the waterfall after a view switch
-            // (`active_panel` is not reset). Unzoomed, the waterfall is drawn
-            // only in the Monitor view; zoomed (`z`), the focused panel is
-            // drawn in every view. Off screen, the keys explain themselves and
-            // never change or persist an invisible gain or palette.
+            // PAN-389: unzoomed, the waterfall is drawn only in the Monitor
+            // view; zoomed (`z`), the focused panel is drawn in every view.
+            // Since PAN-419 no key leaves the waterfall focused off screen
+            // (a view switch or cleared zoom moves focus onto a drawn panel).
+            // This guard stays as a backstop, so a future writer of
+            // `active_panel` cannot change or persist a gain or palette the
+            // operator cannot see; off screen, the keys explain themselves.
             Action::WaterfallGainDown
             | Action::WaterfallGainUp
             | Action::CycleWaterfallPaletteForward
@@ -2783,6 +2792,9 @@ impl TuiRunner {
             // back off (Esc also clears it; see the guarded Esc arm above).
             Action::ToggleZoom => {
                 app.zoomed = !app.zoomed;
+                // PAN-419: unzoomed, move an undrawn focus onto the view;
+                // zooming in is a no-op (every panel counts as drawn).
+                app.focus_a_drawn_panel();
                 {
                     let text = if app.zoomed {
                         "Panel zoomed".to_string()
@@ -10388,3 +10400,7 @@ mod tx_drive_tests;
 #[cfg(test)]
 #[path = "tui_runner/tests/external_reply_tests.rs"]
 mod external_reply_tests;
+
+#[cfg(test)]
+#[path = "tui_runner/tests/drawn_focus_tests.rs"]
+mod drawn_focus_tests;

@@ -32,6 +32,12 @@ pub struct WorkerHarness {
     pub tui: crossbeam_channel::Receiver<ComponentMessage>,
 }
 
+/// The clock a [`WorkerHarness`] hands its worker.
+enum HarnessClock {
+    Utc(pancetta_core::time::UtcClock),
+    Slot(pancetta_core::SlotClock),
+}
+
 impl WorkerHarness {
     pub async fn new(
         config: pancetta_config::Config,
@@ -47,11 +53,33 @@ impl WorkerHarness {
         .await
     }
 
+    /// A worker on `utc_clock` with no step detection (PAN-483, D4): a
+    /// virtual clock that jumps keeps its pre-PAN-483 meaning.
     pub async fn new_with_utc_clock(
         config: pancetta_config::Config,
         home: std::path::PathBuf,
         arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
         utc_clock: pancetta_core::time::UtcClock,
+    ) -> Self {
+        Self::build(config, home, arm_clock, HarnessClock::Utc(utc_clock)).await
+    }
+
+    /// A worker on the given slot clock (PAN-483): a detecting clock lets a
+    /// test land a resync on the worker.
+    pub async fn new_with_slot_clock(
+        config: pancetta_config::Config,
+        home: std::path::PathBuf,
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+        slot_clock: pancetta_core::SlotClock,
+    ) -> Self {
+        Self::build(config, home, arm_clock, HarnessClock::Slot(slot_clock)).await
+    }
+
+    async fn build(
+        config: pancetta_config::Config,
+        home: std::path::PathBuf,
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+        clock: HarnessClock,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
@@ -89,15 +117,15 @@ impl WorkerHarness {
         let qso = Arc::new(bus.durable_inbox(ComponentId::Qso).await.unwrap());
         let autonomous = Arc::new(bus.durable_inbox(ComponentId::Autonomous).await.unwrap());
         let tui = bus.get_or_create_channel(ComponentId::Tui).await.unwrap().1;
-        // PAN-484: the worker reads the coordinator's slot clock; a harness
-        // clock is wrapped without step detection so a virtual clock that
-        // jumps keeps its meaning.
-        coordinator.slot_clock = pancetta_core::SlotClock::without_step_detection(
-            utc_clock,
-            coordinator.active_slot_ns(),
-        );
+        let slot_clock = match clock {
+            HarnessClock::Utc(utc_clock) => pancetta_core::SlotClock::without_step_detection(
+                utc_clock,
+                coordinator.active_slot_ns(),
+            ),
+            HarnessClock::Slot(slot_clock) => slot_clock,
+        };
         coordinator
-            .start_transmitter_component_with_clock(arm_clock)
+            .start_transmitter_component_with_clock(arm_clock, slot_clock)
             .await
             .unwrap();
         Self {

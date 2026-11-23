@@ -468,7 +468,9 @@ async fn qso_completed_after_the_shutdown_flag_still_has_its_uploads_queued() {
 
 /// PAN-274: a QSO that completes after the shutdown flag flips (the Qso
 /// task finishes the message it is handling) is in qsos.adi when shutdown
-/// returns, and the upload queue holds the same QSO.
+/// returns, and the upload queue holds the same QSO. It observes the
+/// queued upload before shutdown instead of relying on shutdown's 2 s
+/// upload backstop, which a busy runner can outlast (PAN-414).
 #[tokio::test]
 async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_and_the_upload_queue() {
     let tmp = tempfile::tempdir().unwrap();
@@ -484,7 +486,16 @@ async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_and_the_upload_q
         .store(true, std::sync::atomic::Ordering::Release);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     super::replay_local_log_tests::complete_one_qso(&manager).await;
+    let queued = wait_for_queued_upload(
+        &coordinator.upload_health,
+        pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+    )
+    .await;
     coordinator.shutdown().await.unwrap();
+    assert!(
+        queued,
+        "the QSO's ClubLog upload was not queued within {UPLOAD_QUEUED_WAIT:?} of completing"
+    );
 
     let adif_path = tmp.path().join(".pancetta").join("qsos.adi");
     let adif = std::fs::read_to_string(&adif_path).unwrap_or_default();
