@@ -180,6 +180,37 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
             );
         }
     }
+    // A direct `Timestamp::now`/`SystemTime::now` call skips the clock's step
+    // detection. This covers only these three files and only direct calls,
+    // not helpers such as `now_epoch_ms`. The one exempt line is the
+    // receive-overload PTT admission stamp in `tx/ptt.rs` (`.admit_ptt(`),
+    // which is not slot timing and stays on the wall clock; it must stay
+    // exactly one line, so a second or a stale exemption fails.
+    let wall_reads = [needle("Timestamp", "::now"), needle("SystemTime", "::now")];
+    let mut admission_stamps = 0;
+    for rel in [
+        "pancetta/src/coordinator/tx/worker.rs",
+        "pancetta/src/coordinator/tx/ptt.rs",
+        "pancetta/src/coordinator/tx/supersede.rs",
+    ] {
+        for (i, line) in read(rel).lines().enumerate() {
+            let Some(wall) = wall_reads.iter().find(|w| line.contains(w.as_str())) else {
+                continue;
+            };
+            let admission_stamp = rel.ends_with("/ptt.rs") && line.contains(".admit_ptt(");
+            assert!(
+                admission_stamp,
+                "{rel}:{}: read slot timing through the shared SlotClock, not {wall}",
+                i + 1
+            );
+            admission_stamps += 1;
+        }
+    }
+    assert_eq!(
+        admission_stamps, 1,
+        "tx/ptt.rs must hold exactly one wall-clock `.admit_ptt(` stamp; \
+         update this exemption if the admission stamp moved or a second appeared"
+    );
 
     let coordinator = read("pancetta/src/coordinator/mod.rs");
     assert!(
