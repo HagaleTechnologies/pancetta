@@ -627,6 +627,7 @@ impl CqdxBridge {
             // Last band we re-fetched per-band needs for. `None` until the
             // dial frequency is first observed.
             let mut last_needed_band: Option<String> = None;
+            let mut last_never_worked_attempt: Option<Instant> = None;
             // PAN-85: remember the last US state actually forwarded for each
             // callsign (uppercased key), so a state that is learned *or
             // corrected* later still reaches the TUI. Repeats of an unchanged
@@ -682,6 +683,24 @@ impl CqdxBridge {
                                 bridge.record_dxcc_failure(&e);
                             }
                         }
+                    }
+                }
+
+                // PAN-495: the never-worked set comes only from the
+                // all-bands list. A start with the dial already known never
+                // asks for it, and a failed fetch must not leave ATNO dead
+                // for the session, so fetch it here until it loads.
+                if !dxcc_blocked
+                    && !cached_lookup.never_worked_loaded()
+                    && need_retry_due(last_never_worked_attempt, Instant::now())
+                {
+                    last_never_worked_attempt = Some(Instant::now());
+                    match client.fetch_needed(None).await {
+                        Ok(rows) => {
+                            let n = cached_lookup.update_never_worked(&rows);
+                            info!("cqdx.io never-worked (all bands): {n} DXCC identities");
+                        }
+                        Err(e) => debug!("cqdx.io all-bands needed fetch failed ({e}); will retry"),
                     }
                 }
 
@@ -1217,7 +1236,7 @@ mod tests {
 
     use crate::priority_evaluator::NeedStatus;
     use std::collections::HashSet;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     pub(super) const TOKEN: &str = "pat_0123456789abcdef";
@@ -1506,6 +1525,53 @@ mod tests {
         assert!(need_retry_due(None, t));
         assert!(!need_retry_due(Some(t), t + Duration::from_secs(59)));
         assert!(need_retry_due(Some(t), t + Duration::from_secs(60)));
+    }
+
+    // PAN-495: with the dial known from the start, the poller only asks for
+    // per-band lists; the all-bands (never-worked) list must still load or
+    // no station can ever be ATNO this session.
+    #[tokio::test]
+    async fn poller_loads_the_all_bands_list_when_the_dial_is_known_from_the_start() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed"))
+            .and(query_param("band", "20M"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "needed": [{"entityId": 24, "name": "Bouvet", "prefix": "3Y/B", "atno": true}]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "needed": [{"entityId": 24, "name": "Bouvet", "prefix": "3Y/B", "atno": true}]
+            })))
+            .with_priority(2)
+            .expect(1..)
+            .mount(&server)
+            .await;
+        let lookup = Arc::new(CachedStationLookup::new());
+        let config = pancetta_config::network::CqdxConfig {
+            poll_interval_secs: 10,
+            ..cfg(&server.uri(), Some(TOKEN))
+        };
+        let bridge = Arc::new(
+            CqdxBridge::from_config(&config, lookup.clone())
+                .unwrap()
+                .with_operating_frequency(Arc::new(AtomicU64::new(14_074_000))),
+        );
+        let handle = bridge.spawn_spot_poller(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        handle.abort();
+        assert!(lookup.never_worked_loaded());
+        assert_eq!(lookup.display_needed_atno("3Y0J"), (true, true));
+        server.verify().await;
     }
 
     #[tokio::test]
