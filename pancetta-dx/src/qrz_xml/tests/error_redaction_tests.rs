@@ -77,3 +77,14 @@ async fn lookup_not_found_survives_display_clipping() {
         err
     );
 }
+
+#[test]
+fn padded_error_text_keeps_its_explanation() {
+    // Leading whitespace used to spend the 200-character display budget and
+    // leave only `…` of QRZ's error text.
+    let client = QrzXmlClient::new("user", "pw-secret", "agent");
+    assert_eq!(
+        client.sanitize(&format!("{}Invalid session key", " ".repeat(200)), &[]),
+        "Invalid session key"
+    );
+}

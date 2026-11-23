@@ -88,11 +88,10 @@ pub fn upload_failure_class_for_status(status: u16) -> UploadFailureClass {
 }
 
 fn sanitized(body: &str, secrets: &[&str]) -> String {
-    // Redact before trimming: trimming first would strip the edge whitespace
-    // of a credential echo that its spellings match on.
+    // Pass the body untrimmed: the sanitizer matches secrets first, so a
+    // credential echo keeps the edge whitespace its spellings match on, and
+    // trims before its clip, so padding does not spend the display budget.
     pancetta_core::error_redaction::sanitize_error_body(body, secrets)
-        .trim()
-        .to_string()
 }
 
 fn html_spelling(value: &str) -> String {
