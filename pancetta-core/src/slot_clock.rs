@@ -52,36 +52,14 @@ fn duration_secs_f64(d: SignedDuration) -> f64 {
     }
 }
 
-/// Classify `deadline` against `now` for a slot of `period_ns` nanoseconds.
-///
-/// Returns `None` while the deadline sits inside the healthy band
-/// (`now - period ..= now + period`); otherwise reports which way the wall
-/// clock jumped. The band edges themselves are healthy: a deadline exactly
-/// one period ahead is what `next_slot_start_with_period` returns at a
-/// boundary.
-pub fn classify_deadline_jump(
-    now: UtcTimestamp,
-    deadline: UtcTimestamp,
-    period_ns: i64,
-) -> Option<WallClockJump> {
-    let period = SignedDuration::from_nanos(period_ns);
-    let ahead = deadline - now;
-    if ahead > period {
-        Some(WallClockJump::Backward(ahead))
-    } else if -ahead > period {
-        Some(WallClockJump::Forward(-ahead))
-    } else {
-        None
-    }
-}
-
 /// Smallest wall-vs-monotonic divergence reported as a step. NTP slewing
 /// moves the wall clock at most 500 ppm (0.5 ms/s).
 pub const CLOCK_STEP_THRESHOLD_MS: i64 = 250;
 
 /// Smallest wall-vs-monotonic divergence that re-anchors slot timing (a
-/// resync). Equals the TX worker's PTT hold slack: a smaller step cannot
-/// move a UTC-anchored deadline off the grid in a way any consumer acts on.
+/// resync). A smaller step cannot move a UTC-anchored deadline off the grid
+/// in a way any consumer acts on; the TX worker drops a frame scheduled
+/// before a resync (PAN-484).
 pub const SLOT_RESYNC_THRESHOLD_MS: i64 = 1_000;
 
 /// Widest monotonic bracket around a wall read that [`SlotClock`] trusts for
@@ -471,76 +449,6 @@ mod clock_stamp_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const FT8_NS: i64 = 15_000_000_000;
-    const FT4_NS: i64 = 7_500_000_000;
-    const FT2_NS: i64 = 3_200_000_000;
-
-    /// Same helper as `slot.rs`: a UTC instant `seconds` past
-    /// 2026-01-01 00:00:00 UTC (a 15 s boundary).
-    fn at(seconds: f64) -> UtcTimestamp {
-        let base = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let ns = (seconds * 1_000_000_000.0) as i64;
-        base + SignedDuration::from_nanos(ns)
-    }
-
-    #[test]
-    fn deadline_within_one_period_ahead_is_not_a_jump() {
-        let now = at(100.0);
-        let deadline = now + SignedDuration::from_secs(15);
-        assert_eq!(classify_deadline_jump(now, deadline, FT8_NS), None);
-    }
-
-    #[test]
-    fn deadline_passed_by_less_than_one_period_is_not_a_jump() {
-        let deadline = at(105.0);
-        let now = deadline + SignedDuration::from_millis(250);
-        assert_eq!(classify_deadline_jump(now, deadline, FT8_NS), None);
-    }
-
-    #[test]
-    fn deadline_more_than_one_period_ahead_is_a_backward_jump() {
-        // Deadline 15 s ahead, then the clock steps back 600 s.
-        let deadline = at(1_000.0);
-        let now = deadline - SignedDuration::from_secs(15) - SignedDuration::from_secs(600);
-        assert_eq!(
-            classify_deadline_jump(now, deadline, FT8_NS),
-            Some(WallClockJump::Backward(SignedDuration::from_secs(615)))
-        );
-    }
-
-    #[test]
-    fn deadline_passed_by_more_than_one_period_is_a_forward_jump() {
-        let deadline = at(1_000.0);
-        let now = deadline + SignedDuration::from_millis(3_604_321);
-        assert_eq!(
-            classify_deadline_jump(now, deadline, FT8_NS),
-            Some(WallClockJump::Forward(SignedDuration::from_millis(
-                3_604_321
-            )))
-        );
-    }
-
-    #[test]
-    fn jump_band_scales_with_ft4_and_ft2_periods() {
-        let now = at(100.0);
-        let deadline = now + SignedDuration::from_secs(8);
-        assert_eq!(classify_deadline_jump(now, deadline, FT8_NS), None);
-        assert!(matches!(
-            classify_deadline_jump(now, deadline, FT4_NS),
-            Some(WallClockJump::Backward(_))
-        ));
-        assert!(matches!(
-            classify_deadline_jump(now, deadline, FT2_NS),
-            Some(WallClockJump::Backward(_))
-        ));
-        let deadline = now - SignedDuration::from_secs(4);
-        assert_eq!(classify_deadline_jump(now, deadline, FT4_NS), None);
-        assert!(matches!(
-            classify_deadline_jump(now, deadline, FT2_NS),
-            Some(WallClockJump::Forward(_))
-        ));
-    }
 
     #[test]
     fn signed_secs_is_positive_forward_negative_backward() {
