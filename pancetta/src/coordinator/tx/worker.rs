@@ -1345,11 +1345,8 @@ impl super::super::ApplicationCoordinator {
         slot_clock: pancetta_core::SlotClock,
     ) -> Result<()> {
         // PAN-483: every worker clock read goes through the shared slot
-        // clock, so it observes (and is ordered with) every step.
-        let utc_clock: pancetta_core::time::UtcClock = {
-            let clock = slot_clock.clone();
-            std::sync::Arc::new(move || clock.now())
-        };
+        // clock (`slot_clock.now()`/`read()`), so it observes (and is
+        // ordered with) every step.
         let span = span!(Level::INFO, "start_transmitter");
         let _enter = span.enter();
 
@@ -2102,7 +2099,7 @@ impl super::super::ApplicationCoordinator {
                                             "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
                                         );
                                         audit_log.record(&pancetta_agent::audit::AuditEvent {
-                                            ts_unix_ms: utc_clock().as_millisecond(),
+                                            ts_unix_ms: slot_clock.now().as_millisecond(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
                                                 &remote_tx_arm,
@@ -2731,7 +2728,7 @@ impl super::super::ApplicationCoordinator {
                                         pending_ptt_off.settle().await;
                                         let (fresh_pad_samples, fresh_cursor_samples) =
                                             pad_and_cursor_for_target(
-                                                utc_clock(),
+                                                slot_clock.now(),
                                                 schedule.target_slot,
                                                 sample_rate,
                                             );
@@ -3946,7 +3943,7 @@ impl super::super::ApplicationCoordinator {
                                                 // wait and enqueue-time fallback. Only authorized, enqueued
                                                 // frames are logged (PAN-134). The durable record precedes
                                                 // the TUI event and uses the same instant (PAN-122).
-                                                let enqueued_utc = utc_clock();
+                                                let enqueued_utc = slot_clock.now();
                                                 let tx_logged_at = frame_log_instant(
                                                     &mut playback_waiter,
                                                     enqueued_utc,
@@ -4657,7 +4654,7 @@ impl super::super::ApplicationCoordinator {
                                             items.len()
                                         );
                                         audit_log.record(&pancetta_agent::audit::AuditEvent {
-                                            ts_unix_ms: utc_clock().as_millisecond(),
+                                            ts_unix_ms: slot_clock.now().as_millisecond(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
                                                 &remote_tx_arm,
@@ -5984,7 +5981,7 @@ impl super::super::ApplicationCoordinator {
                                     pending_ptt_off.settle().await;
                                     let (fresh_pad_samples, fresh_cursor_samples) =
                                         pad_and_cursor_for_target(
-                                            utc_clock(),
+                                            slot_clock.now(),
                                             schedule.target_slot,
                                             sample_rate,
                                         );
@@ -6834,7 +6831,7 @@ impl super::super::ApplicationCoordinator {
                                             // wait and enqueue-time fallback. Only authorized, enqueued
                                             // frames are logged (PAN-134). The durable record precedes
                                             // the TUI event and uses the same instant (PAN-122).
-                                            let enqueued_utc = utc_clock();
+                                            let enqueued_utc = slot_clock.now();
                                             let bundle_text = items
                                                 .iter()
                                                 .map(|item| item.message_text.as_str())

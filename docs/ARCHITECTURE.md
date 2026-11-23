@@ -183,7 +183,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |
 <!-- coordinator-modules:end -->
 
-PAN-358: `pancetta_core::SlotClock` is the one time source for slot timing in the autonomous tick, the clock-skew monitor, the QSO watchdog and the queued-call TTL. The coordinator owns it over `active_slot_ns`, and `slot_clock_driver.rs` publishes its step events so the queued-call TTL task wakes on a step.
+PAN-358: `pancetta_core::SlotClock` is the one time source for slot timing in the autonomous tick, the DSP decode-window cutter, the clock-skew monitor, the QSO watchdog, the queued-call TTL and the TX worker (PAN-484). The coordinator owns it over `active_slot_ns`, and `slot_clock_driver.rs` publishes its step events so the queued-call TTL task wakes on a step.
 
 **Communication model**: crossbeam channels carry point-to-point data (audio samples,
 decoded messages, waterfall frames). A `MessageBus` handles broadcast control events
