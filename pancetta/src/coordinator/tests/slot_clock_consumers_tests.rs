@@ -116,7 +116,9 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
     let mut timer = SlotTimer::new(&clock.read(), SignedDuration::ZERO, slot_ns);
 
     // DSP decode-window cutter at the mode's production decode phase. The
-    // buffer always holds a full window, so a due poll emits and advances.
+    // scenario checks the window timer, not sample accounting: it treats the
+    // buffer as full, so a due poll stands for an emit and advances the
+    // timer. Production also waits for a full buffer after a flush.
     let decode_phase = dsp_decode_phase(slot_ns);
     let mut dsp_timer = SlotTimer::new(&clock.read(), decode_phase, slot_ns);
 
