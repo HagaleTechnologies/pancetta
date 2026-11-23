@@ -96,7 +96,7 @@ empty/qso | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 empty/qso | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
 empty/qso | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 empty/qso | Char('T') | none,shift | cmds=["ToggleTune"]
-empty/qso | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+empty/qso | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: QsoStatus -> Waterfall; active_view: Operate -> Monitor
 empty/qso | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 empty/qso | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 empty/qso | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -163,7 +163,7 @@ empty/callers | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmer
 empty/callers | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
 empty/callers | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 empty/callers | Char('T') | none,shift | cmds=["ToggleTune"]
-empty/callers | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+empty/callers | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: Callers -> Waterfall; active_view: Operate -> Monitor
 empty/callers | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 empty/callers | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 empty/callers | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -187,7 +187,7 @@ empty/callers | Char('r') | none,shift | status_message: "Pancetta TUI Ready" ->
 empty/callers | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 empty/callers | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(1500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 1500 Hz (clear, held)"; tx_offset_hold_hz: None -> Some(1500); parked_since: false -> true
 empty/callers | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-empty/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_view: Operate -> Hunt
+empty/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_panel: Callers -> TxPlacement; active_view: Operate -> Hunt
 empty/callers | Char('w') | none,shift | show_why: false -> true
 empty/callers | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/callers | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
@@ -230,7 +230,7 @@ empty/dx | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergency
 empty/dx | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
 empty/dx | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 empty/dx | Char('T') | none,shift | cmds=["ToggleTune"]
-empty/dx | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+empty/dx | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: DxHunter -> Waterfall; active_view: Operate -> Monitor
 empty/dx | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 empty/dx | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 empty/dx | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -297,7 +297,7 @@ empty/placement | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEm
 empty/placement | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
 empty/placement | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 empty/placement | Char('T') | none,shift | cmds=["ToggleTune"]
-empty/placement | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+empty/placement | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: TxPlacement -> Waterfall; active_view: Operate -> Monitor
 empty/placement | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 empty/placement | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 empty/placement | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -342,10 +342,10 @@ empty/waterfall | Char('-') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequen
 empty/waterfall | Char('.') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/waterfall | Char('/') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Compose TX message — type, Enter to send, Esc to cancel"; compose_mode: false -> true
 empty/waterfall | Char('1') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Band Activity"; active_panel: Waterfall -> BandActivity
-empty/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: QSO Status"; active_panel: Waterfall -> QsoStatus
-empty/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Callers"; active_panel: Waterfall -> Callers
-empty/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: DX Hunter"; active_panel: Waterfall -> DxHunter
-empty/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: TX Placement"; active_panel: Waterfall -> TxPlacement
+empty/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "QSO Status is not shown in Monitor view"
+empty/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Callers is not shown in Monitor view"
+empty/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "DX Hunter is not shown in Monitor view"
+empty/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX Placement is not shown in Monitor view"
 empty/waterfall | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
@@ -362,7 +362,7 @@ empty/waterfall | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEm
 empty/waterfall | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
 empty/waterfall | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 empty/waterfall | Char('T') | none,shift | cmds=["ToggleTune"]
-empty/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_view: Monitor -> Run
+empty/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_panel: Waterfall -> TxPlacement; active_view: Monitor -> Run
 empty/waterfall | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 empty/waterfall | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 empty/waterfall | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -386,7 +386,7 @@ empty/waterfall | Char('r') | none,shift | status_message: "Pancetta TUI Ready" 
 empty/waterfall | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 empty/waterfall | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(1500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 1500 Hz (clear, held)"; tx_offset_hold_hz: None -> Some(1500); parked_since: false -> true
 empty/waterfall | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-empty/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_view: Monitor -> Operate
+empty/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_panel: Waterfall -> TxPlacement; active_view: Monitor -> Operate
 empty/waterfall | Char('w') | none,shift | show_why: false -> true
 empty/waterfall | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/waterfall | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
@@ -498,7 +498,7 @@ rich/qso | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergency
 rich/qso | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/qso | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/qso | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/qso | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/qso | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: QsoStatus -> Waterfall; active_view: Operate -> Monitor
 rich/qso | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/qso | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/qso | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -566,7 +566,7 @@ rich/callers | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmerg
 rich/callers | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/callers | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/callers | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/callers | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/callers | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: Callers -> Waterfall; active_view: Operate -> Monitor
 rich/callers | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/callers | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/callers | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -590,7 +590,7 @@ rich/callers | Char('r') | none,shift | status_message: "Pancetta TUI Ready" -> 
 rich/callers | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 rich/callers | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 500 Hz (clear, held)"; tx_frequency_offset: 1500.0 -> 500.0; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
 rich/callers | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-rich/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_view: Operate -> Hunt
+rich/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_panel: Callers -> TxPlacement; active_view: Operate -> Hunt
 rich/callers | Char('w') | none,shift | show_why: false -> true
 rich/callers | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/callers | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
@@ -634,7 +634,7 @@ rich/dx | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyS
 rich/dx | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/dx | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/dx | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/dx | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/dx | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: DxHunter -> Waterfall; active_view: Operate -> Monitor
 rich/dx | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "VK9XX" }
 rich/dx | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/dx | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -702,7 +702,7 @@ rich/placement | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEme
 rich/placement | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/placement | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/placement | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/placement | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/placement | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: TxPlacement -> Waterfall; active_view: Operate -> Monitor
 rich/placement | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/placement | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/placement | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -748,10 +748,10 @@ rich/waterfall | Char('-') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequenc
 rich/waterfall | Char('.') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/waterfall | Char('/') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Compose TX message — type, Enter to send, Esc to cancel"; compose_mode: false -> true
 rich/waterfall | Char('1') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Band Activity"; active_panel: Waterfall -> BandActivity
-rich/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: QSO Status"; active_panel: Waterfall -> QsoStatus
-rich/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Callers"; active_panel: Waterfall -> Callers
-rich/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: DX Hunter"; active_panel: Waterfall -> DxHunter
-rich/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: TX Placement"; active_panel: Waterfall -> TxPlacement
+rich/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "QSO Status is not shown in Monitor view"
+rich/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Callers is not shown in Monitor view"
+rich/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "DX Hunter is not shown in Monitor view"
+rich/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX Placement is not shown in Monitor view"
 rich/waterfall | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
@@ -769,7 +769,7 @@ rich/waterfall | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEme
 rich/waterfall | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/waterfall | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/waterfall | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_view: Monitor -> Run
+rich/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_panel: Waterfall -> TxPlacement; active_view: Monitor -> Run
 rich/waterfall | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/waterfall | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/waterfall | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -793,7 +793,7 @@ rich/waterfall | Char('r') | none,shift | status_message: "Pancetta TUI Ready" -
 rich/waterfall | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 rich/waterfall | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 500 Hz (clear, held)"; tx_frequency_offset: 1500.0 -> 500.0; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
 rich/waterfall | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-rich/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_view: Monitor -> Operate
+rich/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_panel: Waterfall -> TxPlacement; active_view: Monitor -> Operate
 rich/waterfall | Char('w') | none,shift | show_why: false -> true
 rich/waterfall | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/waterfall | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
@@ -905,7 +905,7 @@ rich/callers/ext-off-band | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["
 rich/callers/ext-off-band | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/callers/ext-off-band | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/callers/ext-off-band | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/callers/ext-off-band | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/callers/ext-off-band | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: Callers -> Waterfall; active_view: Operate -> Monitor
 rich/callers/ext-off-band | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/callers/ext-off-band | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/callers/ext-off-band | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -929,7 +929,7 @@ rich/callers/ext-off-band | Char('r') | none,shift | status_message: "Pancetta T
 rich/callers/ext-off-band | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 rich/callers/ext-off-band | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 500 Hz (clear, held)"; tx_frequency_offset: 1500.0 -> 500.0; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
 rich/callers/ext-off-band | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-rich/callers/ext-off-band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_view: Operate -> Hunt
+rich/callers/ext-off-band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_panel: Callers -> TxPlacement; active_view: Operate -> Hunt
 rich/callers/ext-off-band | Char('w') | none,shift | show_why: false -> true
 rich/callers/ext-off-band | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/callers/ext-off-band | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
@@ -973,7 +973,7 @@ rich/callers/ext-on-band | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["O
 rich/callers/ext-on-band | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
 rich/callers/ext-on-band | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
 rich/callers/ext-on-band | Char('T') | none,shift | cmds=["ToggleTune"]
-rich/callers/ext-on-band | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_view: Operate -> Monitor
+rich/callers/ext-on-band | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Monitor view"; active_panel: Callers -> Waterfall; active_view: Operate -> Monitor
 rich/callers/ext-on-band | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
 rich/callers/ext-on-band | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
 rich/callers/ext-on-band | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -997,7 +997,7 @@ rich/callers/ext-on-band | Char('r') | none,shift | status_message: "Pancetta TU
 rich/callers/ext-on-band | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
 rich/callers/ext-on-band | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 500 Hz (clear, held)"; tx_frequency_offset: 1500.0 -> 500.0; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
 rich/callers/ext-on-band | Char('u') | none,shift | cmds=["NudgeTxOffset"]
-rich/callers/ext-on-band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_view: Operate -> Hunt
+rich/callers/ext-on-band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Hunt view"; active_panel: Callers -> TxPlacement; active_view: Operate -> Hunt
 rich/callers/ext-on-band | Char('w') | none,shift | show_why: false -> true
 rich/callers/ext-on-band | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/callers/ext-on-band | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true

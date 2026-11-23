@@ -533,7 +533,9 @@ async fn fixture(name: ThemeName) -> App {
     }];
 
     // Focus on the engaged W1AW from the QSO-status panel, so the other
-    // lists draw it with both the focus and the engaged highlight.
+    // lists draw it with both the focus and the engaged highlight. This
+    // holds in the views that draw QSO Status (Operate, Hunt and Run);
+    // Monitor moves focus onto its waterfall (PAN-419, see `render_with`).
     app.active_panel = ActivePanel::QsoStatus;
     app.qso_cursor = 0;
     app
@@ -719,6 +721,9 @@ fn render_with(app: &mut App, surface: Surface) -> Snapshot {
                 Surface::too_small => (60, 16),
                 _ => unreachable!(),
             };
+            // PAN-419: Monitor does not draw the fixture's QSO Status focus;
+            // record the focus a view switch leaves there.
+            app.focus_a_drawn_panel();
             let buf = draw_full(app, w, h);
             Snapshot::from_buffer(&buf, buf.area)
         }

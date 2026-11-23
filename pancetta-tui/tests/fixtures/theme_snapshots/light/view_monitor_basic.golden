@@ -7,36 +7,36 @@ r01 | ⚠ TX OPEN  ⚠ PTT MAY STILL BE KEYED — check radio  ⚠ TX AUDIO → 
 r01 s 0+11 Black/Yellow/BOLD 11+40 White/Red/BOLD 51+24 Black/Yellow/BOLD 75+18 DarkGray/White/- 93+6 Blue/White/BOLD 99+1 Black/White/-
 r02 |QSO: W#AW (wait rpt · #:## · ####Hz)                                                                |
 r02 s 0+5 Blue/White/BOLD 5+4 Blue/White/BOLD|UNDERLINED 9+91 Black/White/-
-r03 |┌ Waterfall: TX #### Hz (LIVE) · classic · gain # dB ──────────────────────────────────────────────┐|
-r03 s 0+1 DarkGray/White/- 1+52 Blue/White/- 53+47 DarkGray/White/-
+r03 |┌ Waterfall: TX #### Hz (LIVE) · classic · gain # dB · { } gain · b B palette ─────────────────────┐|
+r03 s 0+100 Magenta/White/BOLD
 r04 |│··················█▼█····█▼···█▼···▼█··█▼█······█▼TX ##▼# ✗··█▼····█▼█····························│|
-r04 s 0+1 DarkGray/White/- 1+18 DarkGray/Black/- 19+1 Red/Black/- 20+1 Yellow/Black/- 21+1 Red/Black/- 22+4 DarkGray/Black/- 26+2 Yellow/Black/- 28+3 DarkGray/Black/- 31+2 Yellow/Black/- 33+3 DarkGray/Black/- 36+1 Yellow/Black/- 37+1 Red/Black/- 38+2 DarkGray/Black/- 40+3 Yellow/Black/- 43+6 DarkGray/Black/- 49+1 Red/Black/- 50+1 Yellow/Black/- 51+5 Red/Black/- 56+1 Yellow/Black/- 57+3 Red/Black/- 60+2 DarkGray/Black/- 62+1 Red/Black/- 63+1 Yellow/Black/- 64+4 DarkGray/Black/- 68+3 Yellow/Black/- 71+28 DarkGray/Black/- 99+1 DarkGray/White/-
+r04 s 0+1 Magenta/White/BOLD 1+18 DarkGray/Black/- 19+1 Red/Black/- 20+1 Yellow/Black/- 21+1 Red/Black/- 22+4 DarkGray/Black/- 26+2 Yellow/Black/- 28+3 DarkGray/Black/- 31+2 Yellow/Black/- 33+3 DarkGray/Black/- 36+1 Yellow/Black/- 37+1 Red/Black/- 38+2 DarkGray/Black/- 40+3 Yellow/Black/- 43+6 DarkGray/Black/- 49+1 Red/Black/- 50+1 Yellow/Black/- 51+5 Red/Black/- 56+1 Yellow/Black/- 57+3 Red/Black/- 60+2 DarkGray/Black/- 62+1 Red/Black/- 63+1 Yellow/Black/- 64+4 DarkGray/Black/- 68+3 Yellow/Black/- 71+28 DarkGray/Black/- 99+1 Magenta/White/BOLD
 r05 |│███████████████████▼██████▼████▼███▼████▼████████▼█████▼██████▼█████▼█████████████████████████████│|
-r05 s 0+1 DarkGray/White/- 1+98 Yellow/Black/- 99+1 DarkGray/White/-
+r05 s 0+1 Magenta/White/BOLD 1+98 Yellow/Black/- 99+1 Magenta/White/BOLD
 r06 |│█████████████████████████████████████████████████│████████████████████████████████████████████████│|
-r06 s 0+1 DarkGray/White/- 1+49 Yellow/Black/- 50+1 Red/Black/- 51+48 Yellow/Black/- 99+1 DarkGray/White/-
+r06 s 0+1 Magenta/White/BOLD 1+49 Yellow/Black/- 50+1 Red/Black/- 51+48 Yellow/Black/- 99+1 Magenta/White/BOLD
 r07 |│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│|
-r07 s 0+1 DarkGray/White/- 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 DarkGray/White/-
+r07 s 0+1 Magenta/White/BOLD 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 Magenta/White/BOLD
 r08 |│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│|
-r08 s 0+1 DarkGray/White/- 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 DarkGray/White/-
+r08 s 0+1 Magenta/White/BOLD 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 Magenta/White/BOLD
 r09 |│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│|
-r09 s 0+1 DarkGray/White/- 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 DarkGray/White/-
+r09 s 0+1 Magenta/White/BOLD 1+49 White/Black/- 50+1 Red/Black/- 51+48 White/Black/- 99+1 Magenta/White/BOLD
 r10 |│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│|
-r10 s 0+1 DarkGray/White/- 1+49 Cyan/Black/- 50+1 Red/Black/- 51+48 Cyan/Black/- 99+1 DarkGray/White/-
+r10 s 0+1 Magenta/White/BOLD 1+49 Cyan/Black/- 50+1 Red/Black/- 51+48 Cyan/Black/- 99+1 Magenta/White/BOLD
 r11 |│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│|
-r11 s 0+1 DarkGray/White/- 1+49 Cyan/Black/- 50+1 Red/Black/- 51+48 Cyan/Black/- 99+1 DarkGray/White/-
+r11 s 0+1 Magenta/White/BOLD 1+49 Cyan/Black/- 50+1 Red/Black/- 51+48 Cyan/Black/- 99+1 Magenta/White/BOLD
 r12 |│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│|
-r12 s 0+1 DarkGray/White/- 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 DarkGray/White/-
+r12 s 0+1 Magenta/White/BOLD 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 Magenta/White/BOLD
 r13 |│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│|
-r13 s 0+1 DarkGray/White/- 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 DarkGray/White/-
+r13 s 0+1 Magenta/White/BOLD 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 Magenta/White/BOLD
 r14 |│                                                 │                                                │|
-r14 s 0+1 DarkGray/White/- 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 DarkGray/White/-
+r14 s 0+1 Magenta/White/BOLD 1+49 Gray/Black/- 50+1 Red/Black/- 51+48 Gray/Black/- 99+1 Magenta/White/BOLD
 r15 |│               ###            ####             ##│#            ####            ####               │|
-r15 s 0+1 DarkGray/White/- 1+15 Black/Black/- 16+3 DarkGray/Black/- 19+12 Black/Black/- 31+4 DarkGray/Black/- 35+13 Black/Black/- 48+2 DarkGray/Black/- 50+1 Red/Black/- 51+1 DarkGray/Black/- 52+12 Black/Black/- 64+4 DarkGray/Black/- 68+12 Black/Black/- 80+4 DarkGray/Black/- 84+15 Black/Black/- 99+1 DarkGray/White/-
+r15 s 0+1 Magenta/White/BOLD 1+15 Black/Black/- 16+3 DarkGray/Black/- 19+12 Black/Black/- 31+4 DarkGray/Black/- 35+13 Black/Black/- 48+2 DarkGray/Black/- 50+1 Red/Black/- 51+1 DarkGray/Black/- 52+12 Black/Black/- 64+4 DarkGray/Black/- 68+12 Black/Black/- 80+4 DarkGray/Black/- 84+15 Black/Black/- 99+1 Magenta/White/BOLD
 r16 |│────────────────┴───────────────┴────────────────│───────────────┴───────────────┴────────────────│|
-r16 s 0+1 DarkGray/White/- 1+49 DarkGray/Black/- 50+1 Red/Black/- 51+48 DarkGray/Black/- 99+1 DarkGray/White/-
+r16 s 0+1 Magenta/White/BOLD 1+49 DarkGray/Black/- 50+1 Red/Black/- 51+48 DarkGray/Black/- 99+1 Magenta/White/BOLD
 r17 |└──────────────────────────────────────────────────────────────────────────────────────────────────┘|
-r17 s 0+100 DarkGray/White/-
+r17 s 0+100 Magenta/White/BOLD
 r18 |┌Band Activity────────────────────────────────────────────────────────────────────────────────#/##─┐|
 r18 s 0+1 DarkGray/White/- 1+13 Blue/White/- 14+86 DarkGray/White/-
 r19 |│Time     SNR  DT    DF     Call         Grid  km     Msg                                          │|
@@ -59,5 +59,5 @@ r27 | * TX NOW  W#AW N#CALL -## @####Hz   ⋯ QUEUED: (none)                    
 r27 s 0+35 White/Red/BOLD 35+65 Black/White/-
 r28 |AUD DSP:## FT#:## | Level: #.#% | S:--- | Dev: Default | Msgs: ## | DX: # | Fixture status          |
 r28 s 0+3 Blue/White/BOLD 3+1 Black/White/- 4+6 Blue/White/- 10+1 Black/White/- 11+6 Blue/White/- 17+59 Black/White/- 76+14 Blue/White/- 90+10 Black/White/-
-r29 |Monitor view | Up/Down:Select | r:Resend | k:Abort | v:View | ?:Help | q:Quit                       |
-r29 s 0+12 Black/White/BOLD 12+3 DarkGray/White/- 15+7 Blue/White/BOLD 22+10 DarkGray/White/- 32+1 Blue/White/BOLD 33+10 DarkGray/White/- 43+1 Blue/White/BOLD 44+9 DarkGray/White/- 53+1 Blue/White/BOLD 54+8 DarkGray/White/- 62+1 Blue/White/BOLD 63+8 DarkGray/White/- 71+1 Blue/White/BOLD 72+28 DarkGray/White/-
+r29 |Monitor view | {/}:Gain | b/B:Palette | v:View | ?:Help | q:Quit                                    |
+r29 s 0+12 Black/White/BOLD 12+3 DarkGray/White/- 15+3 Blue/White/BOLD 18+8 DarkGray/White/- 26+3 Blue/White/BOLD 29+11 DarkGray/White/- 40+1 Blue/White/BOLD 41+8 DarkGray/White/- 49+1 Blue/White/BOLD 50+8 DarkGray/White/- 58+1 Blue/White/BOLD 59+41 DarkGray/White/-
