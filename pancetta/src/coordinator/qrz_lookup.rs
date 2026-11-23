@@ -202,7 +202,7 @@ mod tests {
         net::TcpListener,
     };
 
-    fn context(
+    pub(super) fn context(
         enabled: bool,
         url: Option<String>,
     ) -> (QrzLookupCtx, crossbeam_channel::Receiver<TuiMessage>) {
@@ -214,7 +214,7 @@ mod tests {
         (QrzLookupCtx::new(Arc::new(RwLock::new(cfg)), tx, url), rx)
     }
 
-    async fn next(rx: &crossbeam_channel::Receiver<TuiMessage>) -> TuiMessage {
+    pub(super) async fn next(rx: &crossbeam_channel::Receiver<TuiMessage>) -> TuiMessage {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Ok(m) = rx.try_recv() {
@@ -227,7 +227,7 @@ mod tests {
         .expect("QRZ reply deadline")
     }
 
-    async fn speaking_qrz_server(
+    pub(super) async fn speaking_qrz_server(
         body: &'static str,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -379,3 +379,7 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "qrz_lookup/tests/credential_echo_tests.rs"]
+mod credential_echo_tests;

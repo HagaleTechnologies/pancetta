@@ -237,6 +237,34 @@ impl CqdxClient {
         Ok(Some(body.grids))
     }
 
+    /// Fetch cqdx.io's current POTA and SOTA activations (PAN-359).
+    ///
+    /// GET `/api/v1/pota` → `{"activations": [{callsign, type, reference,
+    /// spotTime, ...}], "byCallsign": {...}, "updatedAt": ...}`. Only the
+    /// four named row fields are read.
+    ///
+    /// `Ok(None)` means the endpoint answered `404 Not Found` (not offered
+    /// by this server); other failures propagate as errors. The route is
+    /// outside dispensa's `cqdx-api.v1` set, so callers must treat any
+    /// failure as "no activation known", never as an error to surface.
+    pub async fn fetch_activations(&self) -> Result<Option<Vec<Activation>>> {
+        let url = format!("{}/api/v1/pota", self.base_url);
+        debug!("Fetching activations from {}", url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await?;
+        if resp.status().as_u16() == 404 {
+            debug!("activations endpoint not available (404); activations not offered");
+            return Ok(None);
+        }
+        let resp = self.check_status(resp).await?;
+        let body: ActivationsResponse = self.checked_json(resp).await?;
+        Ok(Some(body.activations))
+    }
+
     /// Fetch live spot groups from the cqdx.io Durable Object snapshot.
     /// Edge-cached with 10s TTL — safe to poll every 30s.
     pub async fn fetch_live_spots(
