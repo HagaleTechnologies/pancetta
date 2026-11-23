@@ -293,6 +293,9 @@ waits for it to finish.
 Select the Fox in the DX Hunter panel (`4`) and press **Shift+H**.
 Pancetta engages the WSJT-X Fox/Hound convention: calls above 1000 Hz,
 then obeys the Fox's QSY instruction after being called.
+On a row tagged `EXT` or `EX+N`, Shift+H works only when WSJT-X heard the
+Fox on pancetta's dial and mode; otherwise the status line explains why, as
+it does for Space.
 
 `Shift+X` toggles Fox mode itself (running your own pileup). In FT8 it
 runs a WSJT-X-style Fox (PAN-386, unreleased). The CQ and every answer
@@ -409,10 +412,11 @@ GridTracker stays off unless you turn it on.
 - **Nothing transmits on its own.** A WSJT-X decode never starts a QSO, an
   autonomous call, an alert or a PSKReporter report. Answering it is still
   your own key press.
-- **Only on pancetta's dial and mode.** Space and Callers Enter refuse an
-  `EXT` decode unless WSJT-X heard it within 10 Hz of pancetta's dial (the
-  dial the rig reports, or the band-key dial without CAT) and in pancetta's
-  mode. This works on any dial, including 4m, 630m, 2200m and custom dials,
+- **Only on pancetta's dial and mode.** Space, Callers Enter and Shift+H
+  (Hound) refuse an `EXT` decode, and Shift+H also an `EX+N` row, unless
+  WSJT-X heard it within 10 Hz of pancetta's dial (the dial the rig
+  reports, or the band-key dial without CAT) and in pancetta's mode. This
+  works on any dial, including 4m, 630m, 2200m and custom dials,
   though the band-plan gate still blocks TX outside the configured band plan
   unless `edge_warnings = false`, as it does for any call. The status line
   explains the mismatch, for example
