@@ -180,6 +180,27 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
             );
         }
     }
+    // A direct wall read skips the clock's step detection. The one exempt
+    // line is the receive-overload PTT admission stamp in `tx/ptt.rs`
+    // (`.admit_ptt(`), which is not slot timing and stays on the wall clock.
+    let wall_reads = [needle("Timestamp", "::now"), needle("SystemTime", "::now")];
+    for rel in [
+        "pancetta/src/coordinator/tx/worker.rs",
+        "pancetta/src/coordinator/tx/ptt.rs",
+        "pancetta/src/coordinator/tx/supersede.rs",
+    ] {
+        for (i, line) in read(rel).lines().enumerate() {
+            let Some(wall) = wall_reads.iter().find(|w| line.contains(w.as_str())) else {
+                continue;
+            };
+            let admission_stamp = rel.ends_with("/ptt.rs") && line.contains(".admit_ptt(");
+            assert!(
+                admission_stamp,
+                "{rel}:{}: read slot timing through the shared SlotClock, not {wall}",
+                i + 1
+            );
+        }
+    }
 
     let coordinator = read("pancetta/src/coordinator/mod.rs");
     assert!(
