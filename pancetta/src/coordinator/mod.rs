@@ -1506,6 +1506,13 @@ pub struct ApplicationCoordinator {
     /// to compute absolute RF frequency from audio offsets.
     operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
 
+    /// PAN-359: worked-station activations (callsign to POTA/SOTA reference).
+    /// One book, created here because `start_qso_component` runs before the
+    /// cqdx bridge is built: the bridge's spot poller fills it from cqdx.io's
+    /// activation feed and the `QsoManager` reads it when it logs a QSO
+    /// (ADIF `SIG` / `SIG_INFO`).
+    worked_references: pancetta_qso::WorkedReferenceBook,
+
     /// Rig split-TX dial in Hz (0 = simplex). Written by the TUI SetSplit relay,
     /// read by the QSO RF stamp (effective TX dial). RX dial stays
     /// `operating_frequency_hz`.
@@ -2571,6 +2578,8 @@ impl ApplicationCoordinator {
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // PAN-359: empty until the cqdx bridge's first activation fetch.
+            worked_references: pancetta_qso::WorkedReferenceBook::new(),
             // 0 = simplex; the TUI SetSplit relay writes the split TX dial when
             // the operator enables split mode on the rig.
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2808,8 +2817,10 @@ impl ApplicationCoordinator {
                 &config.network.cqdx,
                 self.cached_lookup.clone(),
             )
-            .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
-            {
+            .map(|b| {
+                b.with_operating_frequency(self.operating_frequency_hz.clone())
+                    .with_worked_references(self.worked_references.clone())
+            }) {
                 drop(config);
                 // PAN-93: the bridge registers and its poller runs whether or
                 // not this first attempt succeeds. Whatever did not load is
