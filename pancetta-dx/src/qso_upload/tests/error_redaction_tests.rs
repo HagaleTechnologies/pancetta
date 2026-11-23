@@ -162,3 +162,60 @@ async fn oversized_error_body_omits_partial_preview() {
     absent(&err, &["pw+secret", "api-secret"]);
     let _ = crate::test_support::served(served).await;
 }
+
+#[tokio::test]
+async fn padded_http_error_keeps_its_explanation() {
+    // Leading whitespace used to spend the 200-character display budget, so
+    // the operator saw only `…` after the status line.
+    let body = format!("{}login rejected: bad API key", " ".repeat(200));
+    let addr = respond("500 Internal Server Error", body);
+    let err = ClubLogClient::new("a@example.com", "pw-secret", "K1ABC", "api-secret")
+        .with_endpoint(format!("http://{addr}/"))
+        .upload_adif("<EOR>")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.upload_failure_text(),
+        "ClubLog upload failed: HTTP 500 Internal Server Error — login rejected: bad API key"
+    );
+}
+
+#[test]
+fn padded_application_errors_keep_their_explanation() {
+    let pad = " ".repeat(200);
+
+    let err = parse_eqsl_response_inner(&format!("{pad}Error: Bad password"), &[]).unwrap_err();
+    assert_eq!(
+        err.upload_failure_class(),
+        UploadFailureClass::LoginRejected
+    );
+    assert_eq!(
+        err.upload_failure_text(),
+        "eQSL upload rejected (authentication): Error: Bad password"
+    );
+
+    let err = parse_eqsl_response_inner(&format!("{pad}Something odd happened"), &[]).unwrap_err();
+    let text = err.upload_failure_text();
+    assert!(
+        text.ends_with("Unrecognised eQSL response: Something odd happened"),
+        "{text}"
+    );
+
+    let err = parse_qrz_response_inner(&format!("RESULT=FAIL&REASON={pad}bad logbook entry"), &[])
+        .unwrap_err();
+    assert_eq!(
+        err.upload_failure_class(),
+        UploadFailureClass::RecordRejected
+    );
+    assert_eq!(
+        err.upload_failure_text(),
+        "QRZ Logbook insert failed: bad logbook entry"
+    );
+
+    let err = parse_qrz_response_inner(&format!("{pad}Something odd happened"), &[]).unwrap_err();
+    let text = err.upload_failure_text();
+    assert!(
+        text.ends_with("Unrecognised QRZ Logbook response: Something odd happened"),
+        "{text}"
+    );
+}

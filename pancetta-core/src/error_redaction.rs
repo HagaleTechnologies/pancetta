@@ -3,7 +3,8 @@
 /// Marker substituted for every known secret value.
 const MARKER: &str = "<redacted>";
 
-/// Redact known secret values and cqdx personal access tokens, then clip to 200 characters.
+/// Redact known secret values and cqdx personal access tokens, trim edge whitespace from the
+/// result, then clip it to 200 characters.
 /// Empty values are ignored so ordinary text is preserved.
 ///
 /// Scans the original text in one pass so a secret that overlaps the marker
@@ -42,12 +43,15 @@ pub fn sanitize_error_body(body: &str, secrets: &[&str]) -> String {
         redacted.push(ch);
         i += ch.len_utf8();
     }
+    // Trim after matching, so a secret's own edge whitespace still matches,
+    // and before the clip, so padding does not spend the display budget.
+    let redacted = redacted.trim();
     if redacted.chars().count() > 200 {
         let mut clipped: String = redacted.chars().take(200).collect();
         clipped.push('…');
         clipped
     } else {
-        redacted
+        redacted.to_string()
     }
 }
 
