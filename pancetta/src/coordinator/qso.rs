@@ -1425,6 +1425,18 @@ fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
         && !metadata.fox
 }
 
+/// PAN-359: the operator's own activation reference from `[station]`
+/// (`my_sig` / `my_sig_info`), trimmed, with blank values dropped, for
+/// `QsoManagerConfig::activation`.
+pub(crate) fn activation_from_station(
+    station: &pancetta_config::StationConfig,
+) -> pancetta_qso::ActivationReference {
+    pancetta_qso::ActivationReference::new(
+        station.my_sig.as_deref(),
+        station.my_sig_info.as_deref(),
+    )
+}
+
 #[cfg(test)]
 #[path = "qso/tests/queued_call_ttl_clock_tests.rs"]
 mod queued_call_ttl_clock_tests;
@@ -1464,6 +1476,10 @@ pub(super) fn queued_call_ttl_partition_for_test(
 #[cfg(test)]
 #[path = "qso/tests/fox_slot_tests.rs"]
 mod fox_slot_tests;
+
+#[cfg(test)]
+#[path = "qso/tests/activation_from_station_tests.rs"]
+mod activation_from_station_tests;
 
 #[cfg(test)]
 #[path = "qso/tests/upload_subscriber_startup_tests.rs"]
@@ -3044,6 +3060,16 @@ impl super::ApplicationCoordinator {
         // Stamped into every rendered ADIF record's TX_PWR field (source-of-truth
         // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
         let station_power_watts = config.station.power_watts;
+        // PAN-359: the operator's own `[station] my_sig` / `my_sig_info`,
+        // stamped as ADIF MY_SIG / MY_SIG_INFO on every logged QSO.
+        let activation = activation_from_station(&config.station);
+        if !activation.is_empty() {
+            info!(
+                "PAN-359: logging MY_SIG={:?} MY_SIG_INFO={:?} on every QSO",
+                activation.my_sig.as_deref().unwrap_or(""),
+                activation.my_sig_info.as_deref().unwrap_or("")
+            );
+        }
         let attribution_comment = config.logging.attribution_comment;
         // PAN-382: snapshot `[logging]` for the N1MM contactinfo gate below.
         let logging_cfg = config.logging.clone();
@@ -3359,12 +3385,18 @@ impl super::ApplicationCoordinator {
                     qso_stall_switch_after,
                     ..Default::default()
                 },
+                activation,
                 ..Default::default()
             }
         };
 
         let mut qso_manager = pancetta_qso::QsoManager::new(qso_config);
         qso_manager.require_persistent_history();
+        // PAN-359: share the coordinator's worked-station activation book,
+        // which the cqdx bridge's spot poller fills from cqdx.io, so a QSO
+        // with a listed activator logs SIG / SIG_INFO. Set before the
+        // supervisor clone below so that handle reads the same book.
+        qso_manager.set_worked_reference_source(self.worked_references.clone());
         // PAN-358: the watchdog reads the coordinator's one slot clock (over
         // the same `active_slot_ns` atomic) and takes its PAN-296 budget
         // resets from that clock's events, not a detector of its own. Set
