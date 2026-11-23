@@ -84,7 +84,7 @@ dirs = "6"
 num_cpus = "1.0"
 
 # Signal handling
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 # HTTP client and networking
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "json", "stream", "multipart", "cookies", "query", "form"] }
