@@ -1,18 +1,17 @@
 //! PAN-358 invariant: one UTC slot clock.
 //!
 //! The autonomous slot tick, the DSP decode-window cutter, the QSO watchdog,
-//! the queued-call TTL and the clock-skew monitor read time through the
-//! coordinator's one
-//! `pancetta_core::SlotClock`, the only wall-clock step detector for them.
-//! This scan keeps the per-site detectors and slot math those consumers used
-//! to carry from coming back, and checks that each consumer stays wired to
-//! the coordinator's clock. Comments count: a deleted item named in a
-//! comment is stale documentation. Needles are built at runtime so this file
-//! never matches itself.
+//! the queued-call TTL, the clock-skew monitor and the TX worker read time
+//! through the coordinator's one `pancetta_core::SlotClock`, the only
+//! wall-clock step detector for them. This scan keeps the per-site detectors
+//! and slot math those consumers used to carry from coming back, and checks
+//! that each consumer stays wired to the coordinator's clock. Comments
+//! count: a deleted item named in a comment is stale documentation. Needles
+//! are built at runtime so this file never matches itself.
 //!
-//! The TX worker still carries its PAN-114 checks
-//! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"); its needles
-//! join this scan when it moves onto the clock.
+//! The TX worker moved onto the clock in PAN-484: its PAN-114 wait band and
+//! PTT-hold bound are gone, and a frame scheduled before a resync is dropped
+//! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock").
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +76,13 @@ fn no_per_site_slot_clock_code_remains() {
         needle("watchdog_pass", "_at"),
         // The DSP cutter's own deadline-band re-anchor.
         needle("reanchor_decode", "_window"),
+        // The shared deadline-band classifier the per-site checks used.
+        needle("classify_deadline", "_jump"),
+        // The TX worker's PAN-114 PTT-hold bound and its slack.
+        needle("ptt_hold_exceeds", "_bound"),
+        needle("PTT_HOLD_SLACK", "_MS"),
+        // The TX worker's PAN-114 late-forward wait rule.
+        needle("waited_from_before", "_target"),
     ];
     let root = workspace_root();
     let mut found = Vec::new();
@@ -89,6 +95,15 @@ fn no_per_site_slot_clock_code_remains() {
                     found.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
                 }
             }
+        }
+    }
+    // FT8-only slot math in the DSP cutter's file; other files keep theirs
+    // until the FT8-only follow-up moves them.
+    let dsp_rel = "pancetta/src/coordinator/dsp.rs";
+    let slot_math = needle("div_euclid(", "15)");
+    for (i, line) in read(dsp_rel).lines().enumerate() {
+        if line.contains(slot_math.as_str()) {
+            found.push(format!("{dsp_rel}:{}: {}", i + 1, line.trim()));
         }
     }
     assert!(
@@ -146,6 +161,25 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
         monitor.contains(&needle("clock: Slot", "Clock")),
         "the clock-skew monitor must read the shared SlotClock"
     );
+
+    let tx_worker = read("pancetta/src/coordinator/tx/worker.rs");
+    assert!(
+        tx_worker.contains(&needle("self.slot", "_clock()")),
+        "the TX worker must capture the coordinator's slot clock (PAN-484)"
+    );
+    for rel in [
+        "pancetta/src/coordinator/tx/worker.rs",
+        "pancetta/src/coordinator/tx/ptt.rs",
+        "pancetta/src/coordinator/tx/supersede.rs",
+    ] {
+        let text = read(rel);
+        for banned in [needle("Utc", "Clock"), needle("utc", "_clock")] {
+            assert!(
+                !text.contains(banned.as_str()),
+                "{rel} must read slot timing through the shared SlotClock, not {banned}"
+            );
+        }
+    }
 
     let coordinator = read("pancetta/src/coordinator/mod.rs");
     assert!(
