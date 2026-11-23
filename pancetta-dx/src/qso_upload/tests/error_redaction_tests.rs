@@ -164,6 +164,28 @@ async fn oversized_error_body_omits_partial_preview() {
 }
 
 #[tokio::test]
+async fn clublog_overlapping_credentials_leave_no_tail() {
+    // The API key starts inside the password's match: the tail "73" the old
+    // scan leaked contains neither full credential, so `absent` alone cannot
+    // catch it and the exact redacted text is asserted.
+    let addr = respond(
+        "500 Internal Server Error",
+        "login rejected for w1aw73 (see docs)".into(),
+    );
+    let err = ClubLogClient::new("a@example.com", "w1aw", "K1ABC", "aw73")
+        .with_endpoint(format!("http://{addr}/"))
+        .upload_adif("<EOR>")
+        .await
+        .unwrap_err();
+    let text = err.upload_failure_text();
+    assert!(
+        text.contains("login rejected for <redacted> (see docs)"),
+        "{text}"
+    );
+    absent(&err, &["w1aw", "aw73"]);
+}
+
+#[tokio::test]
 async fn padded_http_error_keeps_its_explanation() {
     // Leading whitespace used to spend the 200-character display budget, so
     // the operator saw only `…` after the status line.
