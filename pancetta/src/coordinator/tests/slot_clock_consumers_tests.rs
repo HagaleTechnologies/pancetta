@@ -1,20 +1,25 @@
 //! PAN-358 ticket scenario: a clock step is observed by every consumer at
 //! once.
 //!
-//! One `ManualClock` and one `SlotClock` feed the four consumers that read
-//! the shared clock: the autonomous slot tick (`autonomous_slot_poll` on a
-//! `SlotTimer`), the QSO watchdog (`QsoManager::watchdog_pass` with one
-//! active QSO), the queued-call TTL (the production partition over two
-//! queued calls) and the clock-skew monitor (`MonitorStepCursor` feeding
-//! `ClockSkewMonitorCore`). All four are polled every 250 ms, as the
-//! production loops poll, for two slots after the step.
+//! One `ManualClock` and one `SlotClock` feed the five consumers this test
+//! drives: the autonomous slot tick (`autonomous_slot_poll` on a
+//! `SlotTimer`), the DSP decode-window cutter (`decode_window_clock_step` on
+//! a `SlotTimer` at the mode's production decode phase), the QSO watchdog
+//! (`QsoManager::watchdog_pass` with one active QSO), the queued-call TTL
+//! (the production partition over two queued calls) and the clock-skew
+//! monitor (`MonitorStepCursor` feeding `ClockSkewMonitorCore`). The test
+//! polls all five every 250 ms of virtual time, four times before the step
+//! and for two slots after it.
 //!
-//! The DSP decode-window cutter and the TX worker keep their PAN-114 checks
-//! until they move onto the clock (`docs/DECISIONS/tx-scheduling.md`, "One
-//! UTC slot clock"), so they are not in this scenario yet.
+//! The TX worker is the one slot consumer this test does not drive yet. Its
+//! pre-PTT wait still detects steps with its own deadline rule
+//! (`tx/ptt.rs`), which has no resync epoch and reports how far the deadline
+//! moved rather than this event, so it joins the scenario when it moves onto
+//! the clock (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock").
 
 use super::autonomous::autonomous_slot_poll;
 use super::clock_monitor::MonitorStepCursor;
+use super::dsp::decode_window_clock_step;
 use super::qso::queued_call_ttl_partition_for_test;
 use crate::clock_skew::ClockSkewMonitorCore;
 use jiff::SignedDuration;
@@ -22,6 +27,7 @@ use pancetta_core::slot::{current_slot_start_with_period, next_phase_with_period
 use pancetta_core::slot_clock::{ClockEvent, ClockStamp, ManualClock};
 use pancetta_core::slot_timer::{Reanchor, SlotTimer};
 use pancetta_core::time::UtcTimestamp;
+use pancetta_ft8::ProtocolParams;
 use pancetta_qso::{QsoManager, QsoManagerConfig};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -40,6 +46,34 @@ fn ms(ms: i64) -> SignedDuration {
     SignedDuration::from_millis(ms)
 }
 
+/// The DSP cutter's production decode phase for a scenario slot length:
+/// `derive_dsp_timing` on that mode's protocol parameters, as the coordinator
+/// derives it at startup (FT8 13 s, FT4 6.5 s, FT2 2.2 s).
+fn dsp_decode_phase(slot_ns: i64) -> SignedDuration {
+    let params = match slot_ns {
+        FT8_NS => ProtocolParams::ft8(),
+        FT4_NS => ProtocolParams::ft4(),
+        #[cfg(feature = "ft2")]
+        FT2_NS => ProtocolParams::ft2(),
+        // Without the `ft2` feature there are no FT2 parameters. FT4's with
+        // FT2's 3.2 s cycle derive the same timing: every non-FT8 mode
+        // decodes 1 s before the next boundary.
+        #[cfg(not(feature = "ft2"))]
+        FT2_NS => {
+            let mut params = ProtocolParams::ft4();
+            params.cycle_duration = 3.2;
+            params
+        }
+        other => panic!("no scenario mode has a {other} ns slot"),
+    };
+    let timing = super::derive_dsp_timing(&params);
+    assert_eq!(
+        timing.slot_ns, slot_ns,
+        "decode timing for the scenario's slot"
+    );
+    timing.decode_phase
+}
+
 /// What each consumer did after the step.
 #[derive(Debug, Default)]
 struct Observed {
@@ -53,6 +87,14 @@ struct Observed {
     autonomous_reanchors: Vec<Reanchor>,
     /// Whether any poll asked to clear the stale decodes.
     autonomous_cleared: bool,
+    /// DSP cutter re-anchors after the step.
+    dsp_reanchors: Vec<Reanchor>,
+    /// DSP cutter polls after the step that asked to flush the buffer.
+    dsp_flushes: usize,
+    /// Whether the first post-step DSP poll was due.
+    dsp_due_on_first_post_step_poll: bool,
+    /// `reading.now` of every due DSP poll after the step.
+    dsp_due_after: Vec<UtcTimestamp>,
     /// The watchdog's applied epoch after its first post-step pass.
     watchdog_epoch_after_first_pass: u64,
     /// Active QSOs at the end of the run.
@@ -63,7 +105,7 @@ struct Observed {
     monitor_lines: Vec<String>,
 }
 
-/// Run the four consumers on one clock: pre-step polls from `p` seconds
+/// Run the five consumers on one clock: pre-step polls from `p` seconds
 /// into the slot at 00:00:00, then `step`, then two periods of polls.
 async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observed, UtcTimestamp) {
     let start = base() + ms(p_ms);
@@ -72,6 +114,11 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
 
     // Autonomous slot tick.
     let mut timer = SlotTimer::new(&clock.read(), SignedDuration::ZERO, slot_ns);
+
+    // DSP decode-window cutter at the mode's production decode phase. The
+    // buffer always holds a full window, so a due poll emits and advances.
+    let decode_phase = dsp_decode_phase(slot_ns);
+    let mut dsp_timer = SlotTimer::new(&clock.read(), decode_phase, slot_ns);
 
     // QSO watchdog with one active QSO.
     let mut manager = QsoManager::new(QsoManagerConfig {
@@ -101,7 +148,8 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
 
     let mut obs = Observed::default();
 
-    // Four pre-step polls: nothing re-anchors, nothing expires.
+    // Four pre-step polls: nothing re-anchors, nothing flushes, nothing
+    // expires.
     for _ in 0..4 {
         manual.advance(POLL);
         mono_since_start += POLL;
@@ -110,6 +158,14 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
         assert!(tick.reanchor.is_none(), "no re-anchor before the step");
         if tick.due {
             timer.advance(&reading);
+        }
+        let window = decode_window_clock_step(&mut dsp_timer, &reading, slot_ns);
+        assert!(
+            window.reanchor.is_none() && !window.flush,
+            "no DSP re-anchor or flush before the step"
+        );
+        if window.due {
+            dsp_timer.advance(&reading);
         }
         manager.watchdog_pass().await;
         let (_, expired) = queued_call_ttl_partition_for_test(&queue, clock.stamp());
@@ -144,6 +200,24 @@ async fn run_scenario(slot_ns: i64, p_ms: i64, step: SignedDuration) -> (Observe
             }
             obs.autonomous_fires_after.push(reading.now);
             timer.advance(&reading);
+        }
+
+        let window = decode_window_clock_step(&mut dsp_timer, &reading, slot_ns);
+        if window.flush {
+            obs.dsp_flushes += 1;
+        }
+        if let Some(reanchor) = window.reanchor {
+            if let Reanchor::ClockStep(event) = reanchor {
+                obs.events.push(("DSP cutter", event));
+            }
+            obs.dsp_reanchors.push(reanchor);
+        }
+        if window.due {
+            if i == 0 {
+                obs.dsp_due_on_first_post_step_poll = true;
+            }
+            obs.dsp_due_after.push(reading.now);
+            dsp_timer.advance(&reading);
         }
 
         manager.watchdog_pass().await;
@@ -196,6 +270,7 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: SignedDuration) {
     let consumers: Vec<&str> = obs.events.iter().map(|(c, _)| *c).collect();
     for consumer in [
         "autonomous",
+        "DSP cutter",
         "watchdog",
         "queued-call TTL",
         "clock-skew monitor",
@@ -249,6 +324,39 @@ async fn assert_resync_case(slot_ns: i64, p_ms: i64, step: SignedDuration) {
         assert!(
             pair[0] < slot,
             "{label}: one fire per boundary ({} then {})",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // DSP cutter: one re-anchor on the clock event and one flush of the
+    // buffer that spans the step; the pre-step deadline is never emitted, and
+    // the first emit is the first decode phase after the step.
+    assert_eq!(
+        obs.dsp_reanchors,
+        vec![Reanchor::ClockStep(first)],
+        "{label}: the DSP cutter re-anchors once, on the clock event"
+    );
+    assert_eq!(obs.dsp_flushes, 1, "{label}: the DSP cutter flushes once");
+    assert!(
+        !obs.dsp_due_on_first_post_step_poll,
+        "{label}: the DSP cutter must not emit a window computed before the step"
+    );
+    let decode_phase = dsp_decode_phase(slot_ns);
+    let first_decode = next_phase_with_period(first.observed_at, decode_phase, slot_ns);
+    let first_due = *obs
+        .dsp_due_after
+        .first()
+        .unwrap_or_else(|| panic!("{label}: the DSP cutter emits after the step"));
+    assert!(
+        first_due >= first_decode && first_due - first_decode < ms(250),
+        "{label}: first DSP emit {first_due} must be the first poll at or after {first_decode}"
+    );
+    for pair in obs.dsp_due_after.windows(2) {
+        let deadline = next_phase_with_period(pair[0], decode_phase, slot_ns);
+        assert!(
+            pair[1] >= deadline,
+            "{label}: one DSP emit per decode phase ({} then {})",
             pair[0],
             pair[1]
         );
@@ -354,6 +462,31 @@ async fn sub_second_step_changes_no_slot_consumer() {
     );
     for (fire, boundary) in obs.autonomous_fires_after.iter().zip(&boundaries) {
         assert!(*fire - *boundary < ms(250), "fired late: {fire}");
+    }
+
+    // DSP cutter: no re-anchor, no flush, one emit per decode phase exactly
+    // as without a step (00:00:13, 00:00:28), each within one poll of its
+    // deadline.
+    assert!(obs.dsp_reanchors.is_empty(), "{:?}", obs.dsp_reanchors);
+    assert_eq!(obs.dsp_flushes, 0);
+    let decode_phase = dsp_decode_phase(FT8_NS);
+    let deadlines: Vec<UtcTimestamp> = obs
+        .dsp_due_after
+        .iter()
+        .map(|now| current_slot_start_with_period(*now - decode_phase, FT8_NS) + decode_phase)
+        .collect();
+    assert_eq!(
+        deadlines,
+        vec![
+            base() + SignedDuration::from_secs(13),
+            base() + SignedDuration::from_secs(28),
+        ]
+    );
+    for (due, deadline) in obs.dsp_due_after.iter().zip(&deadlines) {
+        assert!(
+            *due >= *deadline && *due - *deadline < ms(250),
+            "emitted late: {due}"
+        );
     }
 
     // The watchdog still applies the event (PAN-296), and the QSO stays.
