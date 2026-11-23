@@ -180,6 +180,18 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
             );
         }
     }
+    // No direct wall read in the worker or the re-key path either; `ptt.rs`
+    // keeps its receive-overload admission stamp, which is not slot timing.
+    for rel in [
+        "pancetta/src/coordinator/tx/worker.rs",
+        "pancetta/src/coordinator/tx/supersede.rs",
+    ] {
+        let banned = needle("UtcTimestamp::", "now");
+        assert!(
+            !read(rel).contains(banned.as_str()),
+            "{rel} must read slot timing through the shared SlotClock, not {banned}"
+        );
+    }
 
     let coordinator = read("pancetta/src/coordinator/mod.rs");
     assert!(
