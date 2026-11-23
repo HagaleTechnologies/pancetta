@@ -1611,7 +1611,7 @@ fn adaptive_cap_zero_for_non_transmit_request() {
     assert_eq!(cap, 0);
 }
 
-// --- PAN-114: wall-clock pre-PTT wait and the Step 6 PTT-hold bound ---
+// --- PAN-114, PAN-483: the pre-PTT wait on the shared slot clock ---
 
 /// Default `ptt_lead_ms` (`pancetta-config/src/station.rs`).
 const PTT_LEAD_MS: i64 = 80;
@@ -1625,26 +1625,62 @@ fn ptt_and_slot(slot_s: f64) -> (UtcTimestamp, UtcTimestamp) {
     )
 }
 
+/// A reading at `now` on a clock that has seen no step.
+fn steady_reading(now: UtcTimestamp, slot_ns: i64) -> pancetta_core::slot_clock::SlotReading {
+    pancetta_core::slot_clock::SlotReading {
+        now,
+        slot_ns,
+        epoch: 0,
+        resync_epoch: 0,
+        last_event: None,
+        last_resync: None,
+    }
+}
+
+/// A reading at `now` just after one step of `skew` (epoch 1).
+fn stepped_reading(
+    now: UtcTimestamp,
+    slot_ns: i64,
+    skew: SignedDuration,
+) -> pancetta_core::slot_clock::SlotReading {
+    let resync = skew.as_millis_i64().abs() >= pancetta_core::slot_clock::SLOT_RESYNC_THRESHOLD_MS;
+    let event = pancetta_core::slot_clock::ClockEvent {
+        epoch: 1,
+        skew,
+        observed_at: now,
+        slot_ns,
+        resync,
+    };
+    pancetta_core::slot_clock::SlotReading {
+        now,
+        slot_ns,
+        epoch: 1,
+        resync_epoch: u64::from(resync),
+        last_event: Some(event),
+        last_resync: resync.then_some(event),
+    }
+}
+
 #[test]
 fn ptt_wait_sleeps_in_chunks_until_the_target() {
-    let (ptt_target, target_slot) = ptt_and_slot(30.0);
+    let (ptt_target, _) = ptt_and_slot(30.0);
     let far = ptt_target - SignedDuration::from_secs(20);
     assert_eq!(
-        ptt_wait_step(far, ptt_target, target_slot, true, 8000, SLOT_NS),
+        ptt_wait_step(&steady_reading(far, SLOT_NS), ptt_target, 0),
         PttWaitStep::Sleep(Duration::from_millis(50))
     );
     let near = ptt_target - SignedDuration::from_millis(30);
     assert_eq!(
-        ptt_wait_step(near, ptt_target, target_slot, true, 8000, SLOT_NS),
+        ptt_wait_step(&steady_reading(near, SLOT_NS), ptt_target, 0),
         PttWaitStep::Sleep(Duration::from_millis(30))
     );
 }
 
 #[test]
 fn ptt_wait_reaches_on_time() {
-    let (ptt_target, target_slot) = ptt_and_slot(30.0);
+    let (ptt_target, _) = ptt_and_slot(30.0);
     assert_eq!(
-        ptt_wait_step(ptt_target, ptt_target, target_slot, true, 8000, SLOT_NS),
+        ptt_wait_step(&steady_reading(ptt_target, SLOT_NS), ptt_target, 0),
         PttWaitStep::Reached
     );
 }
@@ -1652,11 +1688,12 @@ fn ptt_wait_reaches_on_time() {
 #[test]
 fn ptt_wait_already_late_request_keeps_todays_path() {
     // A request that was already a late start when the wait began keeps
-    // today's path, even past late_max: schedule_tx already decided it.
+    // today's path, even past late_max: schedule_tx already decided it, and
+    // with no step the wait never drops it.
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
     let now = target_slot + SignedDuration::from_secs(9);
     assert_eq!(
-        ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
+        ptt_wait_step(&steady_reading(now, SLOT_NS), ptt_target, 0),
         PttWaitStep::Reached
     );
 }
@@ -1816,81 +1853,95 @@ fn multi_tx_acceptance_reserves_the_base_wait_only_for_coalesced_bundles() {
 }
 
 #[test]
-fn ptt_wait_forward_jump_within_late_policy_ships_late() {
+fn ptt_wait_forward_resync_within_late_policy_is_dropped() {
+    // PAN-114 shipped a +5 s jump late; PAN-483 drops any frame scheduled
+    // before a resync, with the step's real size.
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
     let now = target_slot + SignedDuration::from_secs(5);
+    let reading = stepped_reading(now, SLOT_NS, SignedDuration::from_secs(10));
     assert_eq!(
-        ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
-        PttWaitStep::Reached
+        ptt_wait_step(&reading, ptt_target, 0),
+        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(
+            SignedDuration::from_secs(10)
+        ))
     );
 }
 
 #[test]
-fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
+fn ptt_wait_forward_resync_past_late_policy_is_dropped() {
     let (ptt_target, target_slot) = ptt_and_slot(30.0);
     let now = target_slot + SignedDuration::from_secs(3600);
-    match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
-        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
-            assert_eq!(d, now - ptt_target);
-        }
-        other => panic!("expected ClockJumped(Forward), got {other:?}"),
-    }
+    let reading = stepped_reading(now, SLOT_NS, SignedDuration::from_secs(3600));
+    assert_eq!(
+        ptt_wait_step(&reading, ptt_target, 0),
+        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(
+            SignedDuration::from_secs(3600)
+        ))
+    );
 }
 
 #[test]
-fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
-    let (ptt_target, target_slot) = ptt_and_slot(30.0);
+fn ptt_wait_backward_resync_is_dropped() {
+    let (ptt_target, _) = ptt_and_slot(30.0);
     let now = ptt_target - SignedDuration::from_secs(620);
-    match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
-        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-            assert_eq!(d, SignedDuration::from_secs(620));
-        }
-        other => panic!("expected ClockJumped(Backward), got {other:?}"),
-    }
+    let reading = stepped_reading(now, SLOT_NS, -SignedDuration::from_secs(600));
+    assert_eq!(
+        ptt_wait_step(&reading, ptt_target, 0),
+        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(
+            SignedDuration::from_secs(600)
+        ))
+    );
 }
 
 #[test]
 fn ptt_wait_small_backward_step_is_waited_out() {
-    // 25 s ahead is inside schedule_tx's two-slot horizon (30 s for FT8).
-    let (ptt_target, target_slot) = ptt_and_slot(30.0);
+    // A 0.5 s backward step is an event but not a resync: the frame waits.
+    let (ptt_target, _) = ptt_and_slot(30.0);
     let now = ptt_target - SignedDuration::from_secs(25);
+    let reading = stepped_reading(now, SLOT_NS, -SignedDuration::from_millis(500));
     assert_eq!(
-        ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+        ptt_wait_step(&reading, ptt_target, 0),
         PttWaitStep::Sleep(Duration::from_millis(50))
     );
 }
 
 #[test]
-fn ptt_wait_bounds_scale_with_ft4() {
-    // 16 s ahead: beyond FT4's 2 × 7.5 s horizon, inside FT8's 30 s.
-    let (ptt_target, target_slot) = ptt_and_slot(30.0);
+fn ptt_wait_resync_rule_is_the_same_in_ft4() {
+    // The rule reads the epoch, not the slot period: FT4 and FT8 agree.
+    let (ptt_target, _) = ptt_and_slot(30.0);
     let now = ptt_target - SignedDuration::from_secs(16);
-    assert!(matches!(
-        ptt_wait_step(now, ptt_target, target_slot, true, 8000, FT4_SLOT_NS),
-        PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(_))
-    ));
-    assert_eq!(
-        ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
-        PttWaitStep::Sleep(Duration::from_millis(50))
-    );
+    for slot_ns in [FT4_SLOT_NS, SLOT_NS] {
+        assert_eq!(
+            ptt_wait_step(
+                &stepped_reading(now, slot_ns, -SignedDuration::from_secs(2)),
+                ptt_target,
+                0
+            ),
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(
+                SignedDuration::from_secs(2)
+            )),
+            "slot_ns={slot_ns}"
+        );
+        assert_eq!(
+            ptt_wait_step(&steady_reading(now, slot_ns), ptt_target, 0),
+            PttWaitStep::Sleep(Duration::from_millis(50)),
+            "slot_ns={slot_ns}"
+        );
+    }
 }
 
-#[test]
-fn ptt_hold_bound_allows_normal_lead_and_rejects_a_step() {
-    assert!(!ptt_hold_exceeds_bound(Duration::from_millis(80), 80));
-    assert!(!ptt_hold_exceeds_bound(Duration::from_millis(1080), 80));
-    assert!(ptt_hold_exceeds_bound(Duration::from_millis(1081), 80));
-    assert!(ptt_hold_exceeds_bound(Duration::from_secs(600), 80));
-}
-
-/// Injectable wall clock for the `wait_for_ptt_instant` tests.
-fn test_wall_clock(start: UtcTimestamp) -> std::sync::Arc<std::sync::Mutex<UtcTimestamp>> {
-    std::sync::Arc::new(std::sync::Mutex::new(start))
-}
-
-fn shift_clock(clock: &std::sync::Arc<std::sync::Mutex<UtcTimestamp>>, by: SignedDuration) {
-    let mut now = clock.lock().unwrap();
-    *now += by;
+/// A detecting slot clock over a [`ManualClock`] at `start`.
+fn manual_slot_clock(
+    start: UtcTimestamp,
+) -> (
+    pancetta_core::slot_clock::ManualClock,
+    pancetta_core::SlotClock,
+) {
+    let manual = pancetta_core::slot_clock::ManualClock::new(start);
+    let clock = manual.slot_clock(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        SLOT_NS,
+    )));
+    (manual, clock)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1900,33 +1951,22 @@ async fn wait_for_ptt_instant_reaches_target_on_the_wall_clock() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let start_wall = at(10.0);
-    let clock = test_wall_clock(start_wall);
-    let ticker_clock = clock.clone();
+    let (manual, clock) = manual_slot_clock(start_wall);
+    let ticker_clock = manual.clone();
     let ticker = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            shift_clock(&ticker_clock, SignedDuration::from_millis(20));
+            ticker_clock.advance(Duration::from_millis(20));
         }
     });
     let ptt_target = start_wall + SignedDuration::from_millis(200);
-    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
-    let reader = clock.clone();
     let started = std::time::Instant::now();
-    let outcome = wait_for_ptt_instant(
-        ptt_target,
-        target_slot,
-        8000,
-        SLOT_NS,
-        &shutdown,
-        &abort,
-        move || *reader.lock().unwrap(),
-    )
-    .await;
+    let outcome = wait_for_ptt_instant(ptt_target, 0, &shutdown, &abort, &clock).await;
     let elapsed = started.elapsed();
     ticker.abort();
     assert_eq!(outcome, PttWait::Reached);
     assert!(
-        *clock.lock().unwrap() >= ptt_target,
+        manual.now() >= ptt_target,
         "must not report Reached before the wall clock reaches the PTT instant"
     );
     assert!(
@@ -1942,34 +1982,23 @@ async fn wait_for_ptt_instant_detects_a_backward_step_mid_wait() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let start_wall = at(10.0);
-    let clock = test_wall_clock(start_wall);
-    let stepper_clock = clock.clone();
+    let (manual, clock) = manual_slot_clock(start_wall);
     let stepper = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
-        shift_clock(&stepper_clock, -SignedDuration::from_secs(600));
+        manual.step_wall(-SignedDuration::from_secs(600));
     });
     let ptt_target = start_wall + SignedDuration::from_millis(200);
-    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
-    let reader = clock.clone();
     let started = std::time::Instant::now();
-    let outcome = wait_for_ptt_instant(
-        ptt_target,
-        target_slot,
-        8000,
-        SLOT_NS,
-        &shutdown,
-        &abort,
-        move || *reader.lock().unwrap(),
-    )
-    .await;
+    let outcome = wait_for_ptt_instant(ptt_target, 0, &shutdown, &abort, &clock).await;
     let elapsed = started.elapsed();
     let _ = stepper.await;
-    match outcome {
-        PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
-            assert!(d > SignedDuration::from_secs(600), "jump size {d:?}");
-        }
-        other => panic!("expected ClockJumped(Backward), got {other:?}"),
-    }
+    // PAN-483: the step's real size, not how far the deadline moved.
+    assert_eq!(
+        outcome,
+        PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(
+            SignedDuration::from_secs(600)
+        ))
+    );
     // Step at ~60 ms + at most one 50 ms chunk ≈ 110-150 ms; slack for jitter.
     assert!(
         elapsed < Duration::from_millis(250),
@@ -1984,34 +2013,24 @@ async fn wait_for_ptt_instant_detects_a_forward_jump_mid_wait() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let start_wall = at(10.0);
-    let clock = test_wall_clock(start_wall);
-    let jumper_clock = clock.clone();
+    let (manual, clock) = manual_slot_clock(start_wall);
     let jumper = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
-        shift_clock(&jumper_clock, SignedDuration::from_secs(3600));
+        manual.step_wall(SignedDuration::from_secs(3600));
     });
     let ptt_target = start_wall + SignedDuration::from_secs(10);
-    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
-    let reader = clock.clone();
     let started = std::time::Instant::now();
-    let outcome = wait_for_ptt_instant(
-        ptt_target,
-        target_slot,
-        8000,
-        SLOT_NS,
-        &shutdown,
-        &abort,
-        move || *reader.lock().unwrap(),
-    )
-    .await;
+    let outcome = wait_for_ptt_instant(ptt_target, 0, &shutdown, &abort, &clock).await;
     let elapsed = started.elapsed();
     let _ = jumper.await;
-    match outcome {
-        PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
-            assert_eq!(d, SignedDuration::from_secs(3590));
-        }
-        other => panic!("expected ClockJumped(Forward), got {other:?}"),
-    }
+    // PAN-483: the step's real size (PAN-114 reported 3590 s, the
+    // distance past the PTT instant).
+    assert_eq!(
+        outcome,
+        PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(
+            SignedDuration::from_secs(3600)
+        ))
+    );
     assert!(
         elapsed < Duration::from_millis(250),
         "forward jump must be seen within about one chunk (elapsed={elapsed:?})"
@@ -2026,7 +2045,6 @@ async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
     // the wait.
     let start_wall = at(10.0);
     let ptt_target = start_wall + SignedDuration::from_secs(10);
-    let target_slot = ptt_target + SignedDuration::from_millis(PTT_LEAD_MS);
 
     for flip_shutdown in [false, true] {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2036,21 +2054,13 @@ async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
         } else {
             abort.clone()
         };
+        let (_manual, clock) = manual_slot_clock(start_wall);
         let flipper = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             flag.store(true, Ordering::Release);
         });
         let started = std::time::Instant::now();
-        let outcome = wait_for_ptt_instant(
-            ptt_target,
-            target_slot,
-            8000,
-            SLOT_NS,
-            &shutdown,
-            &abort,
-            move || start_wall,
-        )
-        .await;
+        let outcome = wait_for_ptt_instant(ptt_target, 0, &shutdown, &abort, &clock).await;
         let elapsed = started.elapsed();
         let _ = flipper.await;
         assert_eq!(outcome, PttWait::Interrupted, "shutdown={flip_shutdown}");
@@ -2065,15 +2075,19 @@ async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
     // Already-set flags return without evaluating the clock at all.
     let shutdown = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(true));
-    let outcome = wait_for_ptt_instant(
-        ptt_target,
-        target_slot,
-        8000,
-        SLOT_NS,
-        &shutdown,
-        &abort,
-        || -> UtcTimestamp { panic!("clock read after abort") },
-    )
-    .await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let wall_armed = armed.clone();
+    let clock = pancetta_core::SlotClock::without_step_detection(
+        Arc::new(move || {
+            assert!(
+                !wall_armed.load(Ordering::Acquire),
+                "clock read after abort"
+            );
+            start_wall
+        }),
+        Arc::new(std::sync::atomic::AtomicI64::new(SLOT_NS)),
+    );
+    armed.store(true, Ordering::Release);
+    let outcome = wait_for_ptt_instant(ptt_target, 0, &shutdown, &abort, &clock).await;
     assert_eq!(outcome, PttWait::Interrupted);
 }

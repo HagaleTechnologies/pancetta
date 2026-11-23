@@ -554,7 +554,7 @@ pub(super) async fn supersede_and_rekey_or_bundle(
         }
     };
 
-    let now = (timing.utc_clock)();
+    let now = timing.slot_clock.now();
     let required_parity =
         resolve_required_parity(new_tx_parity, timing.tx_self_parity, now, timing.slot_ns);
     let new_schedule = schedule_tx(
@@ -953,7 +953,7 @@ pub(super) async fn supersede_multi_reenqueue(
     let mut scratch_text = String::new();
     let mut scratch_freq = 0.0f64;
     let mut scratch_schedule = TxSchedule {
-        target_slot: (timing.utc_clock)(),
+        target_slot: timing.slot_clock.now(),
         silent_pad_samples: 0,
         cursor_offset_samples: 0,
         deferred: false,

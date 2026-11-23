@@ -45,6 +45,8 @@ mod ptt;
 #[cfg(test)]
 pub(crate) use ptt::KeyDownProbe;
 use ptt::*;
+#[cfg(test)]
+pub(in crate::coordinator) use ptt::{ptt_wait_step, PttWaitStep};
 pub(crate) use ptt::{send_ptt_command, PendingPttOff, SAFETY_SEND_RETRY_DELAYS};
 mod bundle;
 use bundle::*;
@@ -159,7 +161,11 @@ impl SlotTimingContext {
             sample_rate,
             slot_ns,
             request_received_at,
-            utc_clock: pancetta_core::time::system_utc_clock(),
+            slot_clock: pancetta_core::SlotClock::without_step_detection(
+                pancetta_core::time::system_utc_clock(),
+                std::sync::Arc::new(std::sync::atomic::AtomicI64::new(slot_ns)),
+            ),
+            scheduled_resync_epoch: 0,
         }
     }
 }
@@ -171,6 +177,10 @@ mod slot_timing_context_tests;
 #[cfg(test)]
 #[path = "tx/tests/schedule_tx_tests.rs"]
 mod schedule_tx_tests;
+
+#[cfg(test)]
+#[path = "tx/tests/slot_clock_resync_tests.rs"]
+mod slot_clock_resync_tests;
 
 /// Regression coverage for the silent-TX-failure gap: an encode/modulate
 /// error used to only log a WARN and send a TransmitComplete no consumer

@@ -96,7 +96,12 @@ async fn supersede_into_a_full_hamlib_channel_keeps_the_guard_armed() {
         pancetta_config::station::TxSelfParity::Auto,
         now,
     );
-    timing.utc_clock = Arc::new(move || now);
+    timing.slot_clock = pancetta_core::SlotClock::without_step_detection(
+        Arc::new(move || now),
+        Arc::new(std::sync::atomic::AtomicI64::new(
+            pancetta_core::slot::SLOT_NS,
+        )),
+    );
 
     let outcome = super::supersede_and_rekey_or_bundle(
         new_request,
@@ -176,7 +181,12 @@ async fn supersede_retries_ptt_off_until_hamlib_frees_room() {
         pancetta_config::station::TxSelfParity::Auto,
         now,
     );
-    timing.utc_clock = Arc::new(move || now);
+    timing.slot_clock = pancetta_core::SlotClock::without_step_detection(
+        Arc::new(move || now),
+        Arc::new(std::sync::atomic::AtomicI64::new(
+            pancetta_core::slot::SLOT_NS,
+        )),
+    );
 
     let outcome = super::supersede_and_rekey_or_bundle(
         new_request,
