@@ -6618,6 +6618,7 @@ mod rolled_back_attempt_tombstone_tests {
 /// starve `tokio::time::advance()`'s requirement that the runtime go idle
 /// before jumping the clock.
 #[cfg(test)]
+#[path = "autonomous"]
 mod fq_f9_placement_feed_when_disabled_tests {
     use super::super::ApplicationCoordinator;
     use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
@@ -6670,6 +6671,59 @@ mod fq_f9_placement_feed_when_disabled_tests {
         )
         .await;
     }
+
+    /// PAN-414: a pounce test's CQ must reach Autonomous after the Odd tick
+    /// and before the Even TX tick. Sent earlier, the Odd tick feeds it,
+    /// decides `NotOurSlot`, and the next feed clears it. Sent inside the
+    /// Even slot, `pan302_wait_for_even_tx_slot` waits for the following
+    /// Even slot and the test fails. The window opens this long after the
+    /// Odd boundary, so the Odd tick (boundary, up to one 250 ms poll and
+    /// the slot body) has run on a loaded runner ...
+    const ODD_INJECTION_OPENS_AFTER: jiff::SignedDuration = jiff::SignedDuration::from_secs(2);
+    /// ... and closes this long before the Even boundary, so the decodes
+    /// are on the Autonomous channel before the Even tick drains it.
+    const ODD_INJECTION_CLOSES_BEFORE_EVEN: jiff::SignedDuration =
+        jiff::SignedDuration::from_secs(3);
+
+    /// How long to wait from `now` until the next instant inside the Odd
+    /// injection window; zero when `now` is already inside it. Past the
+    /// window's close it targets the next cycle's window, never a late
+    /// injection.
+    fn odd_injection_delay(now: pancetta_core::time::UtcTimestamp) -> Duration {
+        let slot = jiff::SignedDuration::from_secs(15);
+        let start = pancetta_core::slot::current_slot_start(now);
+        let odd_start = if SlotParity::of(now) == SlotParity::Odd {
+            start
+        } else {
+            start + slot
+        };
+        let open = odd_start + ODD_INJECTION_OPENS_AFTER;
+        let close = odd_start + slot - ODD_INJECTION_CLOSES_BEFORE_EVEN;
+        if now < open {
+            pancetta_core::slot::duration_until(open, now)
+        } else if now <= close {
+            Duration::ZERO
+        } else {
+            pancetta_core::slot::duration_until(open + slot + slot, now)
+        }
+    }
+
+    /// Sleeps until the wall clock is inside the Odd injection window. It
+    /// rechecks after every sleep, so a late wake-up past the window waits
+    /// for the next window instead of injecting late.
+    async fn wait_for_odd_injection_window() {
+        loop {
+            let delay = odd_injection_delay(pancetta_core::time::UtcTimestamp::now());
+            if delay.is_zero() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    #[cfg(test)]
+    #[path = "tests/odd_injection_tests.rs"]
+    mod odd_injection_tests;
 
     #[tokio::test]
     async fn pan302_file_disable_stops_new_calls_within_one_slot() {
@@ -6779,18 +6833,8 @@ mod fq_f9_placement_feed_when_disabled_tests {
 
     #[tokio::test]
     async fn pan302_reload_changes_next_pounce_decision() {
-        // Feed the CQ in the RX slot immediately before the chosen Even
-        // TX slot. An earlier Odd tick consumes its decode batch as usual.
-        let now = pancetta_core::time::UtcTimestamp::now();
-        let next = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
-        if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
-            == pancetta_qso::SlotParity::Odd
-        {
-            tokio::time::sleep(
-                pancetta_core::slot::duration_until(next, now) + Duration::from_millis(500),
-            )
-            .await;
-        }
+        // Build every fixture, then feed the CQs in the Odd RX slot before
+        // the Even TX slot (PAN-414).
         let mut fixtures = Vec::new();
         for (threshold, snr, expected) in [(0.5, -4.0, true), (0.8, -4.0, false), (0.8, 8.0, true)]
         {
@@ -6830,19 +6874,22 @@ mod fq_f9_placement_feed_when_disabled_tests {
             decoded.snr_db = snr;
             // Unknown parity leaves the existing fixed TX-slot policy in charge.
             decoded.slot_parity = None;
+            fixtures.push((c, qso, tui, decoded, expected, threshold, snr));
+        }
+        wait_for_odd_injection_window().await;
+        for (c, _, _, decoded, ..) in &fixtures {
             c.message_bus
                 .send_message(ComponentMessage::new(
                     ComponentId::Ft8Decoder,
                     ComponentId::Autonomous,
-                    MessageType::DecodedMessage(decoded),
+                    MessageType::DecodedMessage(decoded.clone()),
                     Instant::now(),
                 ))
                 .await
                 .unwrap();
-            fixtures.push((c, qso, tui, expected, threshold, snr));
         }
         pan302_wait_for_even_tx_slot().await;
-        for (c, qso, tui, expected, threshold, snr) in fixtures {
+        for (c, qso, tui, _, expected, threshold, snr) in fixtures {
             assert!(drain(&tui)
                 .iter()
                 .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))));
@@ -6859,16 +6906,6 @@ mod fq_f9_placement_feed_when_disabled_tests {
     /// called.
     #[tokio::test]
     async fn pan292_cq_modifier_gate_reaches_the_bus_and_the_diagnostics_overlay() {
-        let now = pancetta_core::time::UtcTimestamp::now();
-        let next = pancetta_core::slot::next_slot_start(now, jiff::SignedDuration::ZERO);
-        if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
-            == pancetta_qso::SlotParity::Odd
-        {
-            tokio::time::sleep(
-                pancetta_core::slot::duration_until(next, now) + Duration::from_millis(500),
-            )
-            .await;
-        }
         let mut fixtures = Vec::new();
         for (text, expected_call, expected_skip) in [
             (
@@ -6902,19 +6939,22 @@ mod fq_f9_placement_feed_when_disabled_tests {
             decoded.snr_db = -4.0;
             // Unknown parity leaves the existing fixed TX-slot policy in charge.
             decoded.slot_parity = None;
+            fixtures.push((c, qso, tui, decoded, text, expected_call, expected_skip));
+        }
+        wait_for_odd_injection_window().await;
+        for (c, _, _, decoded, ..) in &fixtures {
             c.message_bus
                 .send_message(ComponentMessage::new(
                     ComponentId::Ft8Decoder,
                     ComponentId::Autonomous,
-                    MessageType::DecodedMessage(decoded),
+                    MessageType::DecodedMessage(decoded.clone()),
                     Instant::now(),
                 ))
                 .await
                 .unwrap();
-            fixtures.push((c, qso, tui, text, expected_call, expected_skip));
         }
         pan302_wait_for_even_tx_slot().await;
-        for (c, qso, tui, text, expected_call, expected_skip) in fixtures {
+        for (c, qso, tui, _, text, expected_call, expected_skip) in fixtures {
             let starts = drain(&qso);
             assert_eq!(
                 starts.iter().any(|m| matches!(&m.message_type,
