@@ -429,10 +429,12 @@ pub enum MessageType {
     /// handler on every path (successful engage, refused engage, or disengage)
     /// so the TUI `fox_mode` flag is always authoritative.  Without this the
     /// TUI's optimistic Shift+X flip can desync when engage is refused under
-    /// RespondOnly/Disabled TX policy.  Observation only.
+    /// RespondOnly/Disabled TX policy.  Also sent (`on: false`) by the
+    /// `BandChanged` handler when a band change ends Fox mode (PAN-447), so
+    /// the chip never stays up with no Fox CQ on the air.  Observation only.
     FoxModeStatus {
-        /// `true` if Fox mode was actually engaged; `false` if refused or
-        /// disengaged.
+        /// `true` if Fox mode was actually engaged; `false` if refused,
+        /// disengaged, or ended by a band change.
         on: bool,
     },
 

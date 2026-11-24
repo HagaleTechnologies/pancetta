@@ -983,6 +983,82 @@ fn pan385_plan_hop_held_by_an_exchange_is_reported_as_waiting() {
 }
 
 #[test]
+fn pan447_no_hop_while_fox_mode_is_on() {
+    // Plan entry: no hop for as long as Fox mode is on.
+    let mut h = Harness::new(SCENARIO2_BANDS, scenario2_plan(), Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    let a = h.slot(utc(2026, 11, 16, 23, 59, 30), &two_cqs(), None);
+    assert!(hop_of(&a).is_none());
+    h.op.set_fox_mode(true);
+    let midnight = utc(2026, 11, 17, 0, 0, 0);
+    for k in 0..10 {
+        let a = h.slot(midnight + secs(15 * k), &two_cqs(), None);
+        assert!(hop_of(&a).is_none(), "no hop while Fox mode is on");
+    }
+    h.op.set_fox_mode(false);
+    let a = h.slot(midnight + secs(150), &two_cqs(), None);
+    assert_eq!(hop_of(&a).map(|(d, _)| d), Some(7_076_000));
+
+    // The AC1 needed-activity hop (due at t0 + 600 s) never fires while
+    // Fox mode is on, and fires on the first slot after it ends.
+    let mut h = Harness::new(AC1_BANDS, vec![], Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    h.op.set_fox_mode(true);
+    for k in 0..=60 {
+        let now = t0() + secs(15 * k);
+        let a = h.slot(now, &two_cqs(), Some(ac1_snapshot(now)));
+        assert!(
+            hop_of(&a).is_none(),
+            "no hop at t0 + {} s while Fox mode is on",
+            15 * k
+        );
+        assert!(
+            h.op.take_held_band_hop().is_none(),
+            "a needed-activity hop is not reported as held"
+        );
+    }
+    h.op.set_fox_mode(false);
+    let now = t0() + secs(15 * 61);
+    let a = h.slot(now, &two_cqs(), Some(ac1_snapshot(now)));
+    let (dial, reason) = hop_of(&a).expect("hop once Fox mode ends");
+    assert_eq!(dial, 18_100_000);
+    assert!(reason
+        .why_text()
+        .starts_with("Band hop 20m -> 17m: needed activity"));
+}
+
+#[test]
+fn pan447_plan_hop_held_by_fox_mode_runs_once_it_ends() {
+    let mut h = Harness::new(SCENARIO2_BANDS, scenario2_plan(), Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    let a = h.slot(utc(2026, 11, 16, 23, 59, 30), &two_cqs(), None);
+    assert!(hop_of(&a).is_none());
+    assert!(h.op.take_held_band_hop().is_none());
+    h.op.set_fox_mode(true);
+    let midnight = utc(2026, 11, 17, 0, 0, 0);
+    for k in 0..4 {
+        let a = h.slot(midnight + secs(15 * k), &two_cqs(), None);
+        assert!(hop_of(&a).is_none(), "no ChangeBand while Fox mode is on");
+        let held = h.op.take_held_band_hop().expect("the window move is held");
+        assert!(h.op.take_held_band_hop().is_none(), "taken once");
+        assert!(matches!(held, BandHopReason::PlanWindow { .. }), "{held:?}");
+        assert_eq!(held.to_band(), Some(Band::Band40m));
+        assert_eq!(
+            held.waiting_text("Fox mode is on"),
+            "Band hop 20m -> 40m waiting: Fox mode is on"
+        );
+    }
+    h.op.set_fox_mode(false);
+    let a = h.slot(midnight + secs(60), &two_cqs(), None);
+    assert_eq!(
+        hop_of(&a).map(|(d, _)| d),
+        Some(7_076_000),
+        "the held move runs on the first slot after Fox mode ends"
+    );
+    assert!(h.op.take_held_band_hop().is_none());
+}
+
+#[test]
 fn pan385_needed_hop_needs_a_known_current_band_count() {
     // 20m's needed set has not loaded, so the snapshot has no 20m entry: a
     // tie read as 0 on 20m must not become a hop.

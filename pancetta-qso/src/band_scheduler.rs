@@ -266,6 +266,8 @@ pub struct BandScheduler {
     snapshot: Option<OpportunitySnapshot>,
     /// A partner-answered exchange is in progress: no hop is emitted.
     exchange_in_progress: bool,
+    /// PAN-447: the coordinator's Fox mode is on: no hop is emitted.
+    fox_mode: bool,
     /// Station latitude/longitude (grid centre) for grey-line.
     station_location: Option<(f64, f64)>,
     /// What the last `note_hop` replaced, for `undo_hop`.
@@ -328,6 +330,23 @@ impl BandScheduler {
     /// Whether the exchange-in-progress gate is closed.
     pub fn exchange_in_progress(&self) -> bool {
         self.exchange_in_progress
+    }
+
+    /// PAN-447: set the Fox-mode gate. While Fox mode is on the station
+    /// stays on its band and calls, so no hop is emitted.
+    pub fn set_fox_mode(&mut self, on: bool) {
+        self.fox_mode = on;
+    }
+
+    /// PAN-447: whether the Fox-mode gate is closed.
+    pub fn fox_mode(&self) -> bool {
+        self.fox_mode
+    }
+
+    /// Whether any gate holds hops back: a partner-answered exchange in
+    /// progress (PAN-385) or Fox mode on (PAN-447).
+    pub fn hops_held(&self) -> bool {
+        self.exchange_in_progress() || self.fox_mode()
     }
 
     /// Set (or clear) the station location used for grey-line.

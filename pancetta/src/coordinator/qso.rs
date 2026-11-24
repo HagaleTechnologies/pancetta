@@ -604,6 +604,10 @@ pub fn compute_spot_call_tx_offset(
 /// PAN-287: a band change empties the cross-parity call queue. A call parked
 /// on the old band must never promote and transmit on the new one. Returns
 /// the dropped callsigns in queue order, so each can be reported.
+/// PAN-447: the status and Diagnostics line when a band change ends Fox
+/// mode.
+const FOX_MODE_ENDED_BY_BAND_CHANGE: &str = "Fox mode OFF — band changed";
+
 fn drain_parked_calls_on_band_change(
     queue: &mut std::collections::VecDeque<PendingManualCall>,
 ) -> Vec<String> {
@@ -2203,6 +2207,33 @@ fn record_fox_admitted(
     if let Ok(mut set) = fox_admitted_qsos.write() {
         set.insert(super::active_tx_qso_key(&qso_id.to_string()));
     }
+}
+
+/// PAN-76: drop a cancelled QSO from the Fox-admitted set at once, not
+/// when the event forwarder sees the cancel (it repeats this idempotently).
+/// Until then an immediate re-engage would read the cancelled CQ as a Hound
+/// in its completed grace and could start no CQ.
+fn forget_fox_admitted(
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    qso_id: &pancetta_qso::QsoId,
+) {
+    if let Ok(mut set) = fox_admitted_qsos.write() {
+        set.remove(&super::active_tx_qso_key(&qso_id.to_string()));
+    }
+}
+
+/// Echo the actual Fox mode state to the TUI, whose FOX chip follows
+/// `FoxModeStatus` only (engage, refused engage, disengage, and PAN-447's
+/// band change in Fox mode).
+async fn echo_fox_mode_status(message_bus: &MessageBus, on: bool) {
+    let _ = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Qso,
+            ComponentId::Tui,
+            MessageType::FoxModeStatus { on },
+            Instant::now(),
+        ))
+        .await;
 }
 
 /// PAN-76: completed Fox-admitted Hounds still inside their 45 s completed
@@ -6089,6 +6120,14 @@ impl super::ApplicationCoordinator {
                                             previous_hz,
                                             new_hz,
                                         } => {
+                                            // PAN-447: a band change ends Fox mode. The Fox CQ
+                                            // is cancelled below and is not restarted on a band
+                                            // nobody chose, so leaving `fox_mode` set would keep
+                                            // the FOX chip and the Fox admission cap with no Fox
+                                            // CQ on the air. Clear it first, as the Fox-off arm
+                                            // does, so the cap drops before the cancels.
+                                            let ended_fox = fox_mode
+                                                .swap(false, std::sync::atomic::Ordering::Relaxed);
                                             let active = qso_manager.get_active_qsos().await;
                                             let n = active.len();
                                             for (id, _) in active {
@@ -6097,6 +6136,8 @@ impl super::ApplicationCoordinator {
                                                         "BandChanged: cancel {} failed: {}",
                                                         id, e
                                                     );
+                                                } else if ended_fox {
+                                                    forget_fox_admitted(&fox_admitted_qsos, &id);
                                                 }
                                             }
                                             info!(
@@ -6112,6 +6153,30 @@ impl super::ApplicationCoordinator {
                                                         n
                                                     ), pancetta_core::DiagnosticLevel::Warn)
                                                 .await;
+                                            }
+                                            if ended_fox {
+                                                info!(
+                                                    target: "operator.override",
+                                                    "Band change {} Hz -> {} Hz: Fox mode ended",
+                                                    previous_hz, new_hz
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    FOX_MODE_ENDED_BY_BAND_CHANGE,
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                )
+                                                .await;
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    FOX_MODE_ENDED_BY_BAND_CHANGE.to_string(),
+                                                    None,
+                                                    None,
+                                                )
+                                                .await;
+                                                echo_fox_mode_status(&message_bus, false).await;
                                             }
                                             // PAN-287: a call parked in the cross-parity queue on
                                             // the old band must not promote and transmit on the
@@ -6327,16 +6392,7 @@ impl super::ApplicationCoordinator {
                                                     .await;
                                                     // Echo the ACTUAL state (still false — refused)
                                                     // so the TUI can correct its optimistic flip.
-                                                    let _ = message_bus
-                                                        .send_message(ComponentMessage::new(
-                                                            ComponentId::Qso,
-                                                            ComponentId::Tui,
-                                                            MessageType::FoxModeStatus {
-                                                                on: false,
-                                                            },
-                                                            Instant::now(),
-                                                        ))
-                                                        .await;
+                                                    echo_fox_mode_status(&message_bus, false).await;
                                                     continue;
                                                 }
 
@@ -6465,14 +6521,7 @@ impl super::ApplicationCoordinator {
                                                     }
                                                 }
                                                 // Echo actual state (engaged = true) to TUI.
-                                                let _ = message_bus
-                                                    .send_message(ComponentMessage::new(
-                                                        ComponentId::Qso,
-                                                        ComponentId::Tui,
-                                                        MessageType::FoxModeStatus { on: true },
-                                                        Instant::now(),
-                                                    ))
-                                                    .await;
+                                                echo_fox_mode_status(&message_bus, true).await;
                                             } else {
                                                 // Disengage: clear flag first so the admission
                                                 // cap and the base TX ceiling drop immediately;
@@ -6503,23 +6552,11 @@ impl super::ApplicationCoordinator {
                                                         } else {
                                                             cancelled += 1;
                                                             // PAN-76: drop it from the Fox
-                                                            // set now, not when the event
-                                                            // forwarder sees the cancel
-                                                            // (it repeats this
-                                                            // idempotently). Until then an
-                                                            // immediate re-engage would
-                                                            // read the cancelled CQ as a
-                                                            // Hound in its completed grace
-                                                            // and could start no CQ.
-                                                            if let Ok(mut set) =
-                                                                fox_admitted_qsos.write()
-                                                            {
-                                                                set.remove(
-                                                                    &super::active_tx_qso_key(
-                                                                        &id.to_string(),
-                                                                    ),
-                                                                );
-                                                            }
+                                                            // set now (see the helper).
+                                                            forget_fox_admitted(
+                                                                &fox_admitted_qsos,
+                                                                &id,
+                                                            );
                                                         }
                                                     } else {
                                                         let key = super::active_tx_qso_key(
@@ -6543,14 +6580,7 @@ impl super::ApplicationCoordinator {
                                                     "Fox mode OFF".to_string(), pancetta_core::DiagnosticLevel::Info)
                                                 .await;
                                                 // Echo actual state (disengaged = false) to TUI.
-                                                let _ = message_bus
-                                                    .send_message(ComponentMessage::new(
-                                                        ComponentId::Qso,
-                                                        ComponentId::Tui,
-                                                        MessageType::FoxModeStatus { on: false },
-                                                        Instant::now(),
-                                                    ))
-                                                    .await;
+                                                echo_fox_mode_status(&message_bus, false).await;
                                             }
                                         }
                                         crate::message_bus::QsoMessage::SetOperatingMode {
@@ -8139,6 +8169,10 @@ mod replay_history_seed_tests;
 #[cfg(test)]
 #[path = "qso/tests/respond_to_caller_admission_tests.rs"]
 mod respond_to_caller_admission_tests;
+
+#[cfg(test)]
+#[path = "qso/tests/band_change_fox_tests.rs"]
+mod band_change_fox_tests;
 
 #[cfg(test)]
 #[path = "qso/tests/fox_admitted_tracking_tests.rs"]

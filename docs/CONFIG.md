@@ -695,8 +695,10 @@ Off by default. When enabled, the autonomous operator changes band on its
 own for three reasons, checked every slot in this order: a UTC plan window
 starting (`[[autonomous.band_plan]]`, below), needed activity spotted on
 cqdx.io, and the low-activity round-robin over `bands`. A hop never happens
-while the rig is keyed or while a QSO partner has answered; it waits and is
-re-evaluated next slot. Each hop writes one line, naming its trigger, to the
+while the rig is keyed, while a QSO partner has answered, or while Fox mode
+is on (Shift+X); it waits and is re-evaluated next slot (PAN-447: a band
+change you make yourself in Fox mode ends Fox mode, with the status line
+`Fox mode OFF — band changed`). Each hop writes one line, naming its trigger, to the
 Diagnostics overlay (Shift+D). Every key is restart-required.
 
 | Key | Type | Default | Notes |

@@ -1,5 +1,6 @@
-//! PAN-385 AC17: the hop executor waits while keyed or mid-exchange, and
-//! otherwise tears down, retunes and says why.
+//! PAN-385 AC17: the hop executor waits while keyed or mid-exchange (and,
+//! PAN-447, while Fox mode is on), and otherwise tears down, retunes and
+//! says why.
 
 use super::*;
 use crossbeam_channel::Receiver;
@@ -33,6 +34,7 @@ async fn harness(ptt_active: bool, active_is_ft4: bool) -> Harness {
             ptt_active: Arc::new(AtomicBool::new(ptt_active)),
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             active_is_ft4,
+            fox_mode: Arc::new(AtomicBool::new(false)),
         },
         qso_rx,
         hamlib_rx,
@@ -191,6 +193,40 @@ async fn exchange_in_progress_waits_and_sends_nothing() {
 }
 
 #[tokio::test]
+async fn fox_mode_waits_and_sends_nothing() {
+    // PAN-447: a Fox CQ in CallingCq is not an exchange, so Fox mode holds
+    // the hop on its own, before any exchange or keyed check.
+    let h = harness(false, false).await;
+    h.ctx.fox_mode.store(true, Ordering::Relaxed);
+
+    let outcome = execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &[]).await;
+    assert_eq!(
+        outcome,
+        BandHopOutcome::Waiting("Band hop 20m -> 17m waiting: Fox mode is on".into())
+    );
+    assert_sent_nothing(&h);
+
+    // Fox mode wins over a running exchange.
+    let outcome = execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &["K1ABC".to_string()]).await;
+    assert_eq!(
+        outcome,
+        BandHopOutcome::Waiting("Band hop 20m -> 17m waiting: Fox mode is on".into())
+    );
+    assert_sent_nothing(&h);
+
+    // Once Fox mode ends, the same hop goes ahead.
+    h.ctx.fox_mode.store(false, Ordering::Relaxed);
+    let outcome = execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &[]).await;
+    assert_eq!(
+        outcome,
+        BandHopOutcome::Moved {
+            previous_hz: FROM_HZ,
+            dial_hz: TO_HZ
+        }
+    );
+}
+
+#[tokio::test]
 async fn held_ptt_sync_gate_waits_without_blocking() {
     // A held gate is a key-down under way: the hop returns at once, sends
     // nothing, and the next slot re-reads the exchange snapshot instead of
@@ -287,6 +323,28 @@ fn exchange_waiting_text_names_the_partners() {
             .as_deref(),
         Some("Band hop 20m -> 17m waiting: 2 QSOs in progress")
     );
+}
+
+#[test]
+fn hop_hold_text_prefers_fox_mode() {
+    let reason = ac1_reason();
+    let fox = Some("Band hop 20m -> 17m waiting: Fox mode is on");
+    assert_eq!(hop_hold_text(&reason, true, &[]).as_deref(), fox);
+    assert_eq!(
+        hop_hold_text(&reason, true, &["K1ABC".to_string()]).as_deref(),
+        fox
+    );
+    for exchanges in [
+        vec![],
+        vec!["K1ABC".to_string()],
+        vec!["K1ABC".to_string(), "DL1XYZ".to_string()],
+    ] {
+        assert_eq!(
+            hop_hold_text(&reason, false, &exchanges),
+            exchange_waiting_text(&reason, &exchanges)
+        );
+    }
+    assert_eq!(hop_hold_text(&reason, false, &[]), None);
 }
 
 #[tokio::test]
