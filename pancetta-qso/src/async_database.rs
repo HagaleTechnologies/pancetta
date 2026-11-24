@@ -755,7 +755,8 @@ impl QsoDatabase {
         }
 
         // Execute query
-        let mut result = sqlx::query(&query);
+        // Every value is bound with ?; the only interpolation is the clamped u32 LIMIT.
+        let mut result = sqlx::query(sqlx::AssertSqlSafe(query));
         for binding in bindings {
             result = result.bind(binding);
         }
@@ -847,9 +848,12 @@ impl QsoDatabase {
         let escaped_path = escape_sqlite_string_literal(&partial.to_string_lossy());
 
         // Use VACUUM INTO which atomically creates a complete copy of the database.
-        if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
-            .execute(&self.pool)
-            .await
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "VACUUM INTO '{}'",
+            escaped_path
+        )))
+        .execute(&self.pool)
+        .await
         {
             remove_partial().await;
             return Err(AsyncDatabaseError::Sqlx(e));
@@ -874,9 +878,9 @@ impl QsoDatabase {
             .await? as u64;
 
         // PAN-347: count real confirmations (QSL_RCVD / LOTW_QSL_RCVD of Y or V).
-        let confirmed_qsos: u64 = sqlx::query_scalar::<_, i64>(&format!(
+        let confirmed_qsos: u64 = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM qsos WHERE {CONFIRMED_QSO_SQL}"
-        ))
+        )))
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0) as u64;
@@ -1083,7 +1087,8 @@ impl QsoDatabase {
         }
 
         // Execute query
-        let mut result = sqlx::query(&query);
+        // Every value is bound with ?; the only interpolation is the clamped u32 LIMIT.
+        let mut result = sqlx::query(sqlx::AssertSqlSafe(query));
         for binding in bindings {
             result = result.bind(binding);
         }
@@ -1974,6 +1979,10 @@ impl QsoDatabase {
 }
 
 // QsoDatabase is automatically Send + Sync thanks to SqlitePool
+
+#[cfg(test)]
+#[path = "async_database/tests/bundled_sqlite_version_tests.rs"]
+mod bundled_sqlite_version_tests;
 
 #[cfg(test)]
 #[path = "async_database/tests/stored_timestamp_bytes_tests.rs"]
