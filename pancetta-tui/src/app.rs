@@ -4856,18 +4856,34 @@ impl App {
                 let row = self
                     .selected_dx_hunter_row()
                     .filter(|r| same(&r.call_sign))?;
-                match row.source {
-                    SpotSource::External => {}
-                    SpotSource::ExternalNetwork if row.spot_rf_hz.is_none() => {}
-                    _ => return None,
+                // An `EX+N` row with a network frequency keeps the PAN-287
+                // spot call, which retunes to the spot's dial.
+                if row.source == SpotSource::ExternalNetwork && row.spot_rf_hz.is_some() {
+                    return None;
                 }
-                self.external_origin_refusal(&row.call_sign, row.frequency, &row.mode)
+                self.external_row_refusal(row)
             }
             ActivePanel::Callers => self
                 .selected_caller()
                 .filter(|m| m.call_sign.as_deref().is_some_and(same))
                 .and_then(|m| self.external_decode_refusal(m)),
             _ => None,
+        }
+    }
+
+    /// PAN-429: the PAN-435/PAN-443 refusal for a DX Hunter row heard only
+    /// through WSJT-X (`EXT` or `EX+N`). For these sources the PAN-381 merge
+    /// wrote WSJT-X's dial in MHz into `frequency` and WSJT-X's mode into
+    /// `mode`, so the row is acted on only on pancetta's dial and mode.
+    /// `RX`, `RX+N` and `NET` rows return `None`. Shift+H (Hound engage)
+    /// applies this with no exemption; Space exempts an `EX+N` row with a
+    /// network spot dial, which keeps the PAN-287 spot call.
+    pub fn external_row_refusal(&self, row: &DxStation) -> Option<String> {
+        match row.source {
+            SpotSource::External | SpotSource::ExternalNetwork => {
+                self.external_origin_refusal(&row.call_sign, row.frequency, &row.mode)
+            }
+            SpotSource::Local | SpotSource::Network | SpotSource::Both => None,
         }
     }
 
