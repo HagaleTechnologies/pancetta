@@ -2141,7 +2141,11 @@ impl super::ApplicationCoordinator {
             ptt_active: self.ptt_active.clone(),
             ptt_sync_gate: self.ptt_sync_gate.clone(),
             active_is_ft4,
+            fox_mode: self.fox_mode.clone(),
         };
+        // PAN-447: the Fox mode flag, read each slot to close the
+        // scheduler's hop gate while a Fox CQ is running.
+        let fox_mode_for_hops = self.fox_mode.clone();
         // PAN-72 (Codex round 1 on PR #350, finding 6): the shared Hold/Auto
         // atomic, re-read INSIDE the drain at commit time. The operator can
         // press `f` for Hold after an action was queued but before this
@@ -2382,6 +2386,10 @@ impl super::ApplicationCoordinator {
                                 Vec::new()
                             };
                             let hop_exchange_in_progress = !hop_exchanges.is_empty();
+                            // PAN-447: while Fox mode is on the station stays
+                            // on its band, so the scheduler emits no hop.
+                            let hop_fox_mode = band_hopping_enabled
+                                && fox_mode_for_hops.load(Ordering::Relaxed);
 
                             let mut op = operator.lock().await;
 
@@ -2780,16 +2788,18 @@ impl super::ApplicationCoordinator {
                                 drop(op);
                             } else {
                             // PAN-385: while a partner has answered, the
-                            // scheduler emits no hop.
+                            // scheduler emits no hop; PAN-447: nor while Fox
+                            // mode is on.
                             if band_hopping_enabled {
                                 op.set_exchange_in_progress(hop_exchange_in_progress);
+                                op.set_fox_mode(hop_fox_mode);
                             }
                             // PAN-358: decide on the shared slot clock's time.
                             let actions = op.decide_at_time(slot_clock.now());
                             let skip_records = op.take_skip_log();
                             // PAN-385: a plan-window hop held back by the
-                            // exchange gate emits no `ChangeBand`; report it
-                            // as waiting below.
+                            // exchange (or PAN-447 Fox-mode) gate emits no
+                            // `ChangeBand`; report it as waiting below.
                             let held_band_hop = if band_hopping_enabled {
                                 op.take_held_band_hop()
                             } else {
@@ -2805,8 +2815,9 @@ impl super::ApplicationCoordinator {
                             drop(op);
 
                             if let Some(reason) = held_band_hop {
-                                if let Some(text) = super::band_hop::exchange_waiting_text(
+                                if let Some(text) = super::band_hop::hop_hold_text(
                                     &reason,
+                                    hop_fox_mode,
                                     &hop_exchanges,
                                 ) {
                                     let to_band =

@@ -933,7 +933,8 @@ impl BandStrategy {
     }
 
     /// PAN-385: take the plan-window hop the last `next_hop` held back
-    /// because a partner had answered (the exchange gate was closed). The
+    /// because a partner had answered or Fox mode was on (PAN-447: the
+    /// exchange or Fox-mode gate was closed). The
     /// coordinator reports it as a Diagnostics waiting line; nothing moves
     /// the dial. Taking it means a slot that does not evaluate (paused)
     /// reports nothing stale.
@@ -993,7 +994,8 @@ impl BandStrategy {
         let plan = self.config.plan.clone();
         let (active, pending) = self.scheduler.update_plan(&plan, now, current);
         let grey = self.scheduler.grey_line(self.config.grey_line, now);
-        if self.scheduler.exchange_in_progress() {
+        if self.scheduler.hops_held() {
+            // An exchange is in progress or Fox mode is on (PAN-447).
             // The plan move stays pending; report it as waiting without
             // emitting a hop (no frequency command, no allocator reset).
             self.held_hop = pending
@@ -2866,7 +2868,8 @@ impl AutonomousOperator {
     }
 
     /// PAN-385: take the plan-window hop the last `decide` held back because
-    /// a partner had answered. No `ChangeBand` was emitted for it; the
+    /// a partner had answered or Fox mode was on (PAN-447). No `ChangeBand`
+    /// was emitted for it; the
     /// coordinator reports it as a Diagnostics waiting line.
     pub fn take_held_band_hop(&mut self) -> Option<crate::band_scheduler::BandHopReason> {
         self.band_strategy.take_held_hop()
@@ -2878,6 +2881,12 @@ impl AutonomousOperator {
         self.band_strategy
             .scheduler_mut()
             .set_exchange_in_progress(in_progress);
+    }
+
+    /// PAN-447: whether the coordinator's Fox mode is on; while true no
+    /// band hop is emitted, so a Fox stays on its band and keeps calling.
+    pub fn set_fox_mode(&mut self, on: bool) {
+        self.band_strategy.scheduler_mut().set_fox_mode(on);
     }
 
     /// Clear every piece of allocator state scoped to the current dial's

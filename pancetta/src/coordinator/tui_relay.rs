@@ -1203,7 +1203,9 @@ impl RelayDriverHost for TuiRelayLoop {
             MessageType::FoxModeStatus { on } => {
                 // Echo the authoritative Fox-mode state to the TUI FOX
                 // chip. Sent by the SetFoxMode handler on every path
-                // (engage, refused engage, disengage).
+                // (engage, refused engage, disengage) and by the
+                // BandChanged handler when a band change ends Fox mode
+                // (PAN-447).
                 let _ = tui_msg_tx_relay
                     .send(pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on });
             }
