@@ -1907,6 +1907,11 @@ pub struct App {
     pub current_band_index: usize,
     /// Frequency reported by the radio (via hamlib), if known. In MHz.
     pub radio_frequency: Option<f64>,
+    /// PAN-496: whether the band selection reflects the rig. False at launch,
+    /// when `current_band_index` is only the configured starting frequency;
+    /// the first rig report adopts the rig's band, and any band change the
+    /// operator or coordinator makes first sets it so that report can't undo it.
+    rig_band_synced: bool,
     /// Per-band snapshot cache. On every band switch we stash the band we are
     /// leaving (its decoded messages — the source of BOTH the Band Activity and
     /// Callers lists — and its DX-Hunter stations) keyed by band name with a
@@ -2152,6 +2157,7 @@ impl App {
             next_alert_id: 0,
             current_band_index: default_band_index,
             radio_frequency: None,
+            rig_band_synced: false,
             band_cache: HashMap::new(),
             active_view: Self::load_persisted_view(),
             zoomed: false,
@@ -3255,10 +3261,55 @@ impl App {
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
-    /// Updates radio_frequency for delta display. Does NOT change our target operating frequency.
+    /// Updates radio_frequency for delta display. After the first report it
+    /// does NOT change our target operating frequency.
+    ///
+    /// PAN-496: the first report after launch adopts the rig's band and dial,
+    /// because until then the band selection is only the configured starting
+    /// frequency (20m by default), not where the radio is. Nothing is sent to
+    /// the rig. A band change made before that report wins (see
+    /// `rig_band_synced`).
     pub fn update_frequency(&mut self, freq: u64) {
         let freq_mhz = freq as f64 / 1_000_000.0;
         self.radio_frequency = Some(freq_mhz);
+        if !self.rig_band_synced && freq > 0 {
+            self.adopt_rig_band(freq_mhz);
+        }
+    }
+
+    /// PAN-496: make the rig's reported dial the operating frequency, switching
+    /// the band selection when the dial lies in another configured band.
+    fn adopt_rig_band(&mut self, freq_mhz: f64) {
+        self.rig_band_synced = true;
+        let target = self
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.frequency_range.0 <= freq_mhz && freq_mhz <= b.frequency_range.1);
+        if let Some(idx) = target.filter(|&idx| idx != self.current_band_index) {
+            let old_band = self
+                .config
+                .bands
+                .bands
+                .get(self.current_band_index)
+                .map(|b| b.name.clone());
+            self.current_band_index = idx;
+            self.apply_band_selection(old_band);
+        }
+        self.station_info.operating_frequency = freq_mhz;
+        let band = match target {
+            Some(idx) => self.config.bands.bands[idx].name.clone(),
+            None => "outside the configured bands".to_string(),
+        };
+        self.statuses.push(
+            format!("Rig is on {freq_mhz:.3} MHz ({band})"),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
     }
 
     /// How long a cached per-band snapshot stays restorable. Return to a band
@@ -3313,6 +3364,7 @@ impl App {
     /// pins reset. If the band we are switching TO has a fresh cached snapshot,
     /// it is restored and the stale-cache entry is consumed.
     fn apply_band_selection(&mut self, leaving_band: Option<String>) -> u64 {
+        self.rig_band_synced = true;
         // 1. Stash the band we're leaving so a return within the TTL restores it.
         if let Some(old) = leaving_band {
             if !self.decoded_messages.is_empty() || !self.dx_stations.is_empty() {
@@ -4630,6 +4682,7 @@ impl App {
                 self.station_info.operating_frequency = mhz;
             }
             _ => {
+                self.rig_band_synced = true;
                 self.station_info.operating_frequency = mhz;
             }
         }
@@ -9088,7 +9141,7 @@ mod tests {
 
     // === Task A: DX Hunter unified sort + cursor ===
 
-    fn dx_fixture(
+    pub(super) fn dx_fixture(
         call: &str,
         priority: u32,
         snr: i32,
@@ -12152,3 +12205,7 @@ mod external_decode_tests;
 #[cfg(test)]
 #[path = "app/tests/dial_label_tests.rs"]
 mod dial_label_tests;
+
+#[cfg(test)]
+#[path = "app/tests/startup_rig_band_tests.rs"]
+mod startup_rig_band_tests;
