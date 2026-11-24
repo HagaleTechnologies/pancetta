@@ -80,11 +80,11 @@ anyhow = "1.0"
 # System utilities
 uuid = { version = "1.23", features = ["v4", "serde"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
-dirs = "7"
+dirs = "6"
 num_cpus = "1.0"
 
 # Signal handling
-signal-hook = "0.4"
+signal-hook = "0.3"
 
 # HTTP client and networking
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "json", "stream", "multipart", "cookies", "query", "form"] }
@@ -110,7 +110,7 @@ url = "2.5"
 base64 = "0.23"
 
 # TLS and WebSocket support
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 
 # HTTP server and WebSocket upgrade (remote_gateway)
 axum = { version = "0.8", features = ["ws"] }
