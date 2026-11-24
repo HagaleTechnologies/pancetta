@@ -601,13 +601,13 @@ pub fn compute_spot_call_tx_offset(
     (tx_off, Some(tx_off))
 }
 
-/// PAN-287: a band change empties the cross-parity call queue. A call parked
-/// on the old band must never promote and transmit on the new one. Returns
-/// the dropped callsigns in queue order, so each can be reported.
 /// PAN-447: the status and Diagnostics line when a band change ends Fox
 /// mode.
 const FOX_MODE_ENDED_BY_BAND_CHANGE: &str = "Fox mode OFF — band changed";
 
+/// PAN-287: a band change empties the cross-parity call queue. A call parked
+/// on the old band must never promote and transmit on the new one. Returns
+/// the dropped callsigns in queue order, so each can be reported.
 fn drain_parked_calls_on_band_change(
     queue: &mut std::collections::VecDeque<PendingManualCall>,
 ) -> Vec<String> {
