@@ -1003,8 +1003,10 @@ in the slot the step landed.
   frame, and a frame whose audio is playing finishes. The two-period band, the late-forward rule,
   `PTT_HOLD_SLACK_MS` and `ptt_hold_exceeds_bound` are gone. The cost is one retry cycle for a
   frame whose slot was still ahead.
-
-`classify_deadline_jump` no longer has a production caller.
+  PAN-484 deleted `classify_deadline_jump` (no caller left) and added the TX worker's former
+  checks, its wiring and a ban on direct `SystemTime::now`/`Timestamp::now` reads in
+  `tx/worker.rs`, `tx/ptt.rs` and `tx/supersede.rs` (one PTT-admission stamp exempt) to
+  `pancetta/tests/slot_clock_invariant.rs`.
 
 ## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
 

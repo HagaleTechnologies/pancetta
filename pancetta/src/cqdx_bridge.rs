@@ -627,6 +627,7 @@ impl CqdxBridge {
             // Last band we re-fetched per-band needs for. `None` until the
             // dial frequency is first observed.
             let mut last_needed_band: Option<String> = None;
+            let mut last_never_worked_attempt: Option<Instant> = None;
             // PAN-85: remember the last US state actually forwarded for each
             // callsign (uppercased key), so a state that is learned *or
             // corrected* later still reaches the TUI. Repeats of an unchanged
@@ -682,6 +683,24 @@ impl CqdxBridge {
                                 bridge.record_dxcc_failure(&e);
                             }
                         }
+                    }
+                }
+
+                // PAN-495: the never-worked set comes only from the
+                // all-bands list. A start with the dial already known never
+                // asks for it, and a failed fetch must not leave ATNO dead
+                // for the session, so fetch it here until it loads.
+                if !dxcc_blocked
+                    && !cached_lookup.never_worked_loaded()
+                    && need_retry_due(last_never_worked_attempt, Instant::now())
+                {
+                    last_never_worked_attempt = Some(Instant::now());
+                    match client.fetch_needed(None).await {
+                        Ok(rows) => {
+                            let n = cached_lookup.update_never_worked(&rows);
+                            info!("cqdx.io never-worked (all bands): {n} DXCC identities");
+                        }
+                        Err(e) => debug!("cqdx.io all-bands needed fetch failed ({e}); will retry"),
                     }
                 }
 
@@ -1113,6 +1132,10 @@ mod opportunity_tests;
 #[cfg(test)]
 #[path = "cqdx_bridge/tests/activation_feed_tests.rs"]
 mod activation_feed_tests;
+
+#[cfg(test)]
+#[path = "cqdx_bridge/tests/all_bands_retry_tests.rs"]
+mod all_bands_retry_tests;
 
 #[cfg(test)]
 mod tests {

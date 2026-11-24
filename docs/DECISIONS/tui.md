@@ -798,6 +798,7 @@ offset on the wrong dial), and two identical dials on a band
   WSJT-X decode after a manual QSY to another band, so that the frequency
   modal does not leave Space refusing".
 
+<<<<<<< HEAD
 ## WSJT-X decodes keep their own state (PAN-434, 2026-11)
 
 PAN-381 split the relay's rank inputs by origin. Three other places still
@@ -822,3 +823,25 @@ mixed WSJT-X (`EXT`) decodes with pancetta's own.
   the row's WSJT-X grid through the TUI's grid fallback. `DxStation` has one
   grid field, so that needs a row-model change; it has its own follow-up
   ticket.
+=======
+## Hound engage on WSJT-X rows follows the dial rule (PAN-429, 2026-11)
+
+PAN-435 and PAN-443 covered Space and directed replies. Shift+H still engaged
+an `EXT` or `EX+N` row at WSJT-X's audio offset on pancetta's own dial, even
+when WSJT-X heard the Fox on another band.
+
+- **One helper.** Shift+H calls `App::external_row_refusal`, the
+  `external_origin_refusal` check for `EXT` and `EX+N` rows, and shows the
+  `Can't work …` line Space shows when it refuses a row. Space's DX Hunter
+  arm calls the same helper after its `EX+N` spot-call exemption, so Space is
+  unchanged.
+- **`EX+N` refuses even with a spot dial.** Space on such a row has the
+  PAN-287 spot-call QSY. Hound has no spot-call path, and the row's offset
+  came from WSJT-X, so engaging at the spot's offset would be new behaviour.
+  Pancetta never retunes for Shift+H.
+- **`NET` rows are a follow-up.** Shift+H on a `NET` row spotted on another
+  band still engages at 1500 Hz on pancetta's dial. That is a network-spot
+  gap, not an `EXT` one. Follow-up ticket: "Operators should not engage Hound
+  on a network-spotted Fox from another band, so that Shift+H never calls a
+  Fox on a dial nobody heard it on".
+>>>>>>> 46e08ff044169155f52398515d9bddafcf79311b

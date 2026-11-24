@@ -183,7 +183,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |
 <!-- coordinator-modules:end -->
 
-PAN-358: `pancetta_core::SlotClock` is the one time source for slot timing in the autonomous tick, the clock-skew monitor, the QSO watchdog and the queued-call TTL. The coordinator owns it over `active_slot_ns`, and `slot_clock_driver.rs` publishes its step events so the queued-call TTL task wakes on a step.
+PAN-358: `pancetta_core::SlotClock` is the one time source for slot timing in the autonomous tick, the DSP decode-window cutter, the clock-skew monitor, the QSO watchdog, the queued-call TTL and the TX worker (PAN-484). The coordinator owns it over `active_slot_ns`, and `slot_clock_driver.rs` publishes its step events so the queued-call TTL task wakes on a step.
 
 **Communication model**: crossbeam channels carry point-to-point data (audio samples,
 decoded messages, waterfall frames). A `MessageBus` handles broadcast control events
@@ -214,6 +214,7 @@ through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses).
 piece, the PAN-381 decode listener (`pancetta/src/coordinator/wsjtx_udp/ingest.rs`), binds
 a separate receive-only loopback socket on `decode_listen`, learns a same-host WSJT-X's
 dial from its `Status(1)` datagrams and turns each live `Decode(2)` into a `RelayedDecode`
+<<<<<<< HEAD
 tagged `DecodeOrigin::WsjtxUdp`. The supervisor tracks the listener as its own
 `ComponentId::WsjtxDecodeListener` (degrade-only), apart from the companion's `WsjtxUdp`.
 The outbound taps touch no existing `→Tui` send path.
@@ -221,6 +222,15 @@ The decode listener is the one exception: when `accept_decodes = true` it sends 
 clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous, PSKReporter
 and the remote gateway never see its decodes), and with it off `pancetta-tui` behavior
 stays byte-identical whether or not `[network.wsjtx_udp]` is enabled.
+=======
+tagged `DecodeOrigin::WsjtxUdp`. The outbound taps touch no existing `→Tui` send path.
+The decode listener is the one exception: when `accept_decodes = true` it sends decodes
+only on a clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous,
+PSKReporter and the remote gateway never see them); its only bus traffic is `remote.wsjtx`
+diagnostics (bind, bind-failure, refusal and drop-summary lines), and with it off
+`pancetta-tui` behavior stays byte-identical whether or not `[network.wsjtx_udp]` is
+enabled.
+>>>>>>> 46e08ff044169155f52398515d9bddafcf79311b
 
 ---
 

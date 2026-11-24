@@ -97,7 +97,7 @@ impl<T> NeedList<T> {
 }
 
 /// DXCC identity set. Prefix fallback is reserved for IDs unknown to this build.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct EntitySet {
     ids: HashSet<u16>,
     fallback: HashSet<String>,
@@ -175,6 +175,11 @@ pub struct CachedStationLookup {
     /// the same cqdx answer from its `atno` flag. Empty/inert until a cqdx
     /// list loads, so `!` is never shown for an unknown status.
     needed_atno: Arc<RwLock<EntitySet>>,
+    /// PAN-495: the entities cqdx's all-bands list names, i.e. never worked
+    /// on any band. `None` until an all-bands answer loads. cqdx's `atno`
+    /// flag on a per-band answer means "never confirmed" (cqdx-api.v1), so
+    /// an ATNO also needs a match here.
+    never_worked: Arc<RwLock<Option<EntitySet>>>,
     /// 4-char grid squares cqdx.io lists as still needed for award
     /// tracking, with the list's availability (PAN-93).
     needed_grids: Arc<RwLock<NeedList>>,
@@ -240,6 +245,7 @@ impl CachedStationLookup {
             recent_failure_window,
             needed_dxcc: Arc::new(RwLock::new(NeedList::default())),
             needed_atno: Arc::new(RwLock::new(EntitySet::default())),
+            never_worked: Arc::new(RwLock::new(None)),
             needed_grids: Arc::new(RwLock::new(NeedList::default())),
             rarity_scores: Arc::new(RwLock::new(HashMap::new())),
             rarity_by_entity: Arc::new(RwLock::new(HashMap::new())),
@@ -267,6 +273,39 @@ impl CachedStationLookup {
 
     fn local_is_atno(&self, entity: Option<&str>) -> bool {
         entity.is_some_and(|e| !self.is_home_entity(Some(e)) && !self.local_log.read().is_worked(e))
+    }
+
+    /// PAN-495: cqdx's ATNO verdict. The `atno` flag alone means "never
+    /// confirmed"; never worked also needs the all-bands list to name the
+    /// entity and the local logbook (current this session) not to hold it.
+    fn cqdx_atno(&self, call: &str, entity: Option<&str>) -> bool {
+        if !self.needed_atno.read().matches(call, entity) {
+            return false;
+        }
+        if !self
+            .never_worked
+            .read()
+            .as_ref()
+            .is_some_and(|set| set.matches(call, entity))
+        {
+            return false;
+        }
+        let log = self.local_log.read();
+        !entity.is_some_and(|e| log.available && log.is_worked(e))
+    }
+
+    /// PAN-494: cqdx's per-band verdict when its loaded list is for `band`
+    /// (cqdx: not confirmed on that band across the full history). `None`
+    /// when the loaded list is all-bands or for another band.
+    fn cqdx_needed_on_band(&self, call: &str, entity: Option<&str>, band: &str) -> Option<bool> {
+        let list = self.needed_dxcc.read();
+        match &list.availability {
+            NeedListAvailability::Loaded {
+                band: Some(list_band),
+                ..
+            } if list_band.eq_ignore_ascii_case(band) => Some(list.entries.matches(call, entity)),
+            _ => None,
+        }
     }
 
     /// PAN-347: the operator's own DXCC entity, never needed, ATNO, new on
@@ -521,16 +560,31 @@ impl CachedStationLookup {
         band: Option<String>,
         fetched_at: UtcTimestamp,
     ) {
+        let entries = EntitySet::from_prefixes(patterns);
+        if band.is_none() {
+            *self.never_worked.write() = Some(entries.clone());
+        }
         let mut list = self.needed_dxcc.write();
-        list.entries = EntitySet::from_prefixes(patterns);
+        list.entries = entries;
         list.availability = NeedListAvailability::Loaded { fetched_at, band };
     }
 
     /// Install the set of ATNO ("all-time new one") DXCC prefixes. Should
     /// be a subset of the `needed_dxcc` set and written by the same cqdx
     /// answer. Uppercase enforced. Replaces the prior set on each call.
+    ///
+    /// PAN-495: these prefixes are ATNO in the never-worked sense, so they
+    /// also join the never-worked set. Production installs cqdx answers via
+    /// `update_needed_entities`, where only an all-bands answer does that.
     pub fn update_needed_atno(&self, prefixes: HashSet<String>) {
-        *self.needed_atno.write() = EntitySet::from_prefixes(prefixes);
+        let atno = EntitySet::from_prefixes(prefixes);
+        {
+            let mut never = self.never_worked.write();
+            let set = never.get_or_insert_with(EntitySet::default);
+            set.ids.extend(atno.ids.iter().copied());
+            set.fallback.extend(atno.fallback.iter().cloned());
+        }
+        *self.needed_atno.write() = atno;
     }
 
     /// Install a cqdx needed-grid answer (4-char uppercase squares) and
@@ -649,10 +703,7 @@ impl CachedStationLookup {
         };
         let entity = pancetta_core::dxcc::entity_for_callsign(&call);
         let needed = self.needed_status_for(&call, entity) == NeedStatus::Needed;
-        (
-            needed,
-            needed && self.needed_atno.read().matches(&call, entity),
-        )
+        (needed, needed && self.cqdx_atno(&call, entity))
     }
 
     /// Needed-entity verdict and source. The unconfirmed policy uses a
@@ -674,9 +725,7 @@ impl CachedStationLookup {
         };
         let entity = pancetta_core::dxcc::entity_for_callsign(&call);
         match self.verdict_for(&call, entity) {
-            (NeedStatus::Needed, NeedSource::Cqdx) => {
-                (true, self.needed_atno.read().matches(&call, entity))
-            }
+            (NeedStatus::Needed, NeedSource::Cqdx) => (true, self.cqdx_atno(&call, entity)),
             (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, self.local_is_atno(entity)),
             _ => (false, false),
         }
@@ -712,6 +761,23 @@ impl CachedStationLookup {
         }
     }
 
+    /// PAN-495: true once an all-bands cqdx answer has set the never-worked set.
+    pub fn never_worked_loaded(&self) -> bool {
+        self.never_worked.read().is_some()
+    }
+
+    /// PAN-495: install an all-bands cqdx answer as the never-worked set
+    /// only, leaving the loaded (possibly per-band) needed list alone.
+    pub(crate) fn update_never_worked(&self, rows: &[pancetta_cqdx::NeededEntity]) -> usize {
+        let mut set = EntitySet::default();
+        for row in rows {
+            set.insert_row(row.entity_id, &row.prefix);
+        }
+        let n = set.len();
+        *self.never_worked.write() = Some(set);
+        n
+    }
+
     /// Install authoritative cqdx IDs independently of entity metadata loading.
     pub(crate) fn update_needed_entities(
         &self,
@@ -733,6 +799,9 @@ impl CachedStationLookup {
             fallback = needed.fallback.len(),
             "Installed needed DXCC identities"
         );
+        if band.is_none() {
+            *self.never_worked.write() = Some(needed.clone());
+        }
         *self.needed_dxcc.write() = NeedList {
             entries: needed,
             availability: NeedListAvailability::Loaded { fetched_at, band },
@@ -1040,7 +1109,7 @@ impl WorkedStationLookup for CachedStationLookup {
         let entity = pancetta_core::dxcc::entity_for_callsign(&call);
         match self.verdict_for(&call, entity) {
             (_, NeedSource::LocalLogbook) => self.local_is_atno(entity),
-            _ => self.needed_atno.read().matches(&call, entity),
+            _ => self.cqdx_atno(&call, entity),
         }
     }
 
@@ -1094,6 +1163,13 @@ impl WorkedStationLookup for CachedStationLookup {
         }
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
         if band.ends_with("MHZ") {
+            return false;
+        }
+        // PAN-494: cqdx's list for this band covers the operator's full
+        // history; the local logbook holds only pancetta's own QSOs. cqdx
+        // can rule the entity out; a QSO logged since its fetch still
+        // clears it through the local checks below.
+        if self.cqdx_needed_on_band(&upper, Some(entity), &band) == Some(false) {
             return false;
         }
         if self.confirmation_policy() && self.local_log_available() {
@@ -2900,6 +2976,10 @@ pub(crate) mod test_support {
         (tmp, l)
     }
 }
+
+#[cfg(test)]
+#[path = "priority_evaluator/tests/cqdx_need_source_tests.rs"]
+mod cqdx_need_source_tests;
 
 #[cfg(test)]
 mod pan348 {

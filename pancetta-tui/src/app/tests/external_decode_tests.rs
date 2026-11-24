@@ -190,6 +190,37 @@ async fn space_on_external_network_row_keeps_the_spot_call() {
     ));
 }
 
+/// PAN-429: the dial rule Shift+H applies covers only rows heard through
+/// WSJT-X (`EXT`, `EX+N`, with or without a spot dial). `RX`, `RX+N` and
+/// `NET` rows are never refused by it.
+#[tokio::test]
+async fn external_row_refusal_covers_only_rows_heard_through_wsjtx() {
+    let refusal = "Can't work N4BP. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8.";
+    for source in ALL {
+        for spot_rf_hz in [None, Some(14_075_210)] {
+            let mut app = app_with_row("N4BP", source.clone()).await;
+            app.station_info.operating_frequency = 14.074;
+            app.station_info.mode = "FT8".to_string();
+            app.radio_frequency = None;
+            {
+                let row = app.dx_stations.get_mut("N4BP").unwrap();
+                row.frequency = 7.074;
+                row.mode = "FT8".to_string();
+                row.spot_rf_hz = spot_rf_hz;
+            }
+            let expected = match source {
+                SpotSource::External | SpotSource::ExternalNetwork => Some(refusal.to_string()),
+                SpotSource::Local | SpotSource::Network | SpotSource::Both => None,
+            };
+            assert_eq!(
+                app.external_row_refusal(&app.dx_stations["N4BP"]),
+                expected,
+                "{source:?} spot {spot_rf_hz:?}"
+            );
+        }
+    }
+}
+
 /// Codex review on PR #700: a QSO-outcome rescore names the origin of the
 /// inputs it was scored from, and applies only to a row of that origin. A
 /// row pancetta heard itself (`RX`, `RX+N`) takes only native rescores; an

@@ -20,7 +20,8 @@ categories = ["multimedia::audio", "encoding", "science"]
 # PAN-384: whitelist of what the crates.io package ships. It carries the
 # ft8_lib `ft8/`, `fft/` and `common/` directories (build.rs compiles all but
 # common/audio.c and common/wave.c; about 0.2 MB) and their license, and
-# leaves out tests, benches, fixtures and the rest of the submodule (test
+# leaves out the test and bench code, every test fixture except the one
+# off-air WAV listed below (PAN-369), and the rest of the submodule (test
 # WAVs, demo/utils, and the WSJT-X files in ft4_ft8_public/ that carry no
 # license header). Without it the package is about 25 MiB. A whitelist fails
 # closed: a new large file in the submodule cannot slip in.
