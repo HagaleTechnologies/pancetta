@@ -433,8 +433,10 @@ GridTracker stays off unless you turn it on.
   FT8 and FT4 decodes are shown: replays, `.wav` decodes and low-confidence
   decodes are dropped.
 - **WSJT-X sends to one UDP Server.** Pointing it at pancetta stops its
-  traffic to companions on port 2237, such as GridTracker. Use pancetta's own
-  companion broadcast (`enabled = true`, above) to feed GridTracker instead.
+  traffic to companions on port 2237, such as GridTracker. Pancetta does not
+  pass WSJT-X's decodes on. Its own companion broadcast (`enabled = true`,
+  above) feeds GridTracker pancetta's own decodes and logged QSOs, not
+  WSJT-X's.
 - **Loopback only.** `decode_listen` must be `127.0.0.1` or `[::1]` with a
   fixed port that differs from `destination`; anything else is refused at
   load. `Shift+D` shows the listener's bind line and any dropped-datagram
