@@ -19,18 +19,7 @@ yanked = "deny"
 unmaintained = "all"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
-ignore = [
-    # SQLite < 3.54.0 can return leftover process memory when it opens a
-    # database next to a crafted `-wal` file with a different page size. The
-    # bundled copy comes from libsqlite3-sys 0.30.1 via sqlx-sqlite 0.8.6. The
-    # fix needs libsqlite3-sys >= 0.39, but no released sqlx accepts it
-    # (sqlx-sqlite 0.9.0 caps it at < 0.38; sqlx main pins 0.37). Pancetta
-    # only opens its own qso.db under the user's data directory, so an
-    # attacker needs write access to that directory, which already gives
-    # them the account. Accepted by the owner on PAN-390 (2026-11-09).
-    # Remove this once sqlx accepts libsqlite3-sys >= 0.39 and bump sqlx.
-    { id = "RUSTSEC-2026-0459", reason = "no sqlx release accepts patched libsqlite3-sys >=0.39; local-only, needs write access to the user's data dir (PAN-390)" },
-]
+ignore = []
 
 [licenses]
 # Permissive licenses we accept for transitive deps. The workspace itself
@@ -70,7 +59,7 @@ multiple-versions = "deny"
 skip = [
     # Each entry names the older semver-compatible line, so a patch release
     # within it still matches; a new major/minor line needs a fresh entry.
-    # axum 0.8.9, hyper-util 0.1.20, sqlx-core 0.8.6, wiremock 0.6.5: upstream semver requirement cannot use the newer line.
+    # axum 0.8.9, hyper-util 0.1.20, sqlx-core 0.9.1, wiremock 0.6.5: upstream semver requirement cannot use the newer line.
     { name = "base64", version = "0.22" },
     # nix 0.26.4: upstream semver requirement cannot use the newer line.
     { name = "bitflags", version = "1" },
@@ -88,15 +77,11 @@ skip = [
     { name = "curve25519-dalek", version = "4" },
     # blake2 0.10.6, sha1 0.10.7, sha2 0.10.9: upstream semver requirement cannot use the newer line.
     { name = "digest", version = "0.10" },
-    # hashbrown 0.15.5: upstream semver requirement cannot use the newer line.
-    { name = "foldhash", version = "0.1" },
     # ring 0.17.14: upstream semver requirement cannot use the newer line.
     { name = "getrandom", version = "0.2" },
     # rand_core 0.9.5, snow 0.10.0, tempfile 3.27.0: upstream semver requirement cannot use the newer line.
     { name = "getrandom", version = "0.3" },
-    # hashlink 0.10.0, sqlx-core 0.8.6: upstream semver requirement cannot use the newer line.
-    { name = "hashbrown", version = "0.15" },
-    # kasuari 0.4.12: upstream semver requirement cannot use the newer line.
+    # hashlink 0.11.1, kasuari 0.4.12, sqlx-core 0.9.1: upstream semver requirement cannot use the newer line.
     { name = "hashbrown", version = "0.16" },
     # biquad 0.4.2: upstream semver requirement cannot use the newer line.
     { name = "libm", version = "0.1" },
@@ -106,20 +91,12 @@ skip = [
     { name = "rand", version = "0.9" },
     # rand 0.9.5, rand_chacha 0.9.0: upstream semver requirement cannot use the newer line.
     { name = "rand_core", version = "0.9" },
-    # snow 0.10.0, sqlx-core 0.8.6: upstream semver requirement cannot use the newer line.
+    # snow 0.10.0: upstream semver requirement cannot use the newer line.
     { name = "sha2", version = "0.10" },
     # curve25519-dalek-derive 0.1.1, darling_core 0.23.0, darling_macro 0.23.0, derive_more-impl 2.1.1, instability 0.3.12, strum_macros 0.28.0, synstructure 0.13.2, tokio-macros 2.7.1, tracing-attributes 0.1.31, tracing-test-macro 0.2.6, visibility 0.1.1, windows-implement 0.60.2, windows-interface 0.59.3, yoke-derive 0.8.2, zerocopy-derive 0.8.55, zerofrom-derive 0.1.7, zerovec-derive 0.11.3: upstream semver requirement cannot use the newer line.
     { name = "syn", version = "2" },
-    # winapi-util 0.1.11: upstream semver requirement cannot use the newer line.
-    { name = "windows-sys", version = "0.48" },
     # errno 0.3.14, rustix 1.1.4, rustls-platform-verifier 0.7.0, serialport 4.10.1, tempfile 3.27.0: upstream semver requirement cannot use the newer line.
     { name = "windows-sys", version = "0.52" },
-    # windows-sys 0.48.0: upstream semver requirement cannot use the newer line.
-    { name = "windows-targets", version = "0.48" },
-    # windows-targets 0.48.5: upstream semver requirement cannot use the newer line.
-    { name = "windows_x86_64_gnu", version = "0.48" },
-    # windows-targets 0.48.5: upstream semver requirement cannot use the newer line.
-    { name = "windows_x86_64_msvc", version = "0.48" },
 ]
 
 wildcards = "deny"
