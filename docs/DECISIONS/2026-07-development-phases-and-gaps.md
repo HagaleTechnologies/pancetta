@@ -120,7 +120,7 @@ Component failure and QSO-engine restart are intentionally distinct operator dia
 | Hamlib | All active QSOs | `ComponentCrash("Hamlib")` |
 | Audio | All active QSOs | `ComponentCrash("Audio")` |
 | StationAgent | Remote-origin QSOs only | `ComponentCrash("StationAgent")` |
-| Autonomous, DxCluster, PskReporter, RemoteGateway, Dsp, Ft8Decoder, Ft8Transmitter, Tui, Config, Coordinator, WsjtxUdp | None | No QSO failure emitted |
+| Autonomous, DxCluster, PskReporter, RemoteGateway, Dsp, Ft8Decoder, Ft8Transmitter, Tui, Config, Coordinator, WsjtxUdp, WsjtxDecodeListener | None | No QSO failure emitted |
 
 The scope is dependency-based, not restart-policy-based: Audio remains deliberately `DegradeOnly`
 but its loss still invalidates every active on-air exchange, while a StationAgent crash cannot

@@ -190,6 +190,37 @@ async fn space_on_external_network_row_keeps_the_spot_call() {
     ));
 }
 
+/// PAN-429: the dial rule Shift+H applies covers only rows heard through
+/// WSJT-X (`EXT`, `EX+N`, with or without a spot dial). `RX`, `RX+N` and
+/// `NET` rows are never refused by it.
+#[tokio::test]
+async fn external_row_refusal_covers_only_rows_heard_through_wsjtx() {
+    let refusal = "Can't work N4BP. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8.";
+    for source in ALL {
+        for spot_rf_hz in [None, Some(14_075_210)] {
+            let mut app = app_with_row("N4BP", source.clone()).await;
+            app.station_info.operating_frequency = 14.074;
+            app.station_info.mode = "FT8".to_string();
+            app.radio_frequency = None;
+            {
+                let row = app.dx_stations.get_mut("N4BP").unwrap();
+                row.frequency = 7.074;
+                row.mode = "FT8".to_string();
+                row.spot_rf_hz = spot_rf_hz;
+            }
+            let expected = match source {
+                SpotSource::External | SpotSource::ExternalNetwork => Some(refusal.to_string()),
+                SpotSource::Local | SpotSource::Network | SpotSource::Both => None,
+            };
+            assert_eq!(
+                app.external_row_refusal(&app.dx_stations["N4BP"]),
+                expected,
+                "{source:?} spot {spot_rf_hz:?}"
+            );
+        }
+    }
+}
+
 /// Codex review on PR #700: a QSO-outcome rescore names the origin of the
 /// inputs it was scored from, and applies only to a row of that origin. A
 /// row pancetta heard itself (`RX`, `RX+N`) takes only native rescores; an
@@ -225,5 +256,86 @@ async fn rank_refresh_applies_only_to_a_row_of_its_origin() {
             before + 777,
             "{source:?} row ignored a rescore of its own origin"
         );
+    }
+}
+
+/// A Band Activity line for `call` heard on `dial_mhz`, from WSJT-X when
+/// `external` (PAN-434).
+fn decode_on(call: &str, dial_mhz: f64, external: bool) -> DecodedMessageView {
+    let mut v = decode(call, external);
+    v.frequency = dial_mhz;
+    v
+}
+
+/// PAN-434 ticket scenario 2: K1ABC is worked on 20m and WSJT-X has 40m
+/// decodes of K1ABC in Band Activity. A QSO-outcome rescore marks only
+/// K1ABC's 20m lines worked, whichever receiver heard them.
+#[tokio::test]
+async fn worked_mark_stays_on_the_rows_band() {
+    let mut app = fixture_app().await;
+    for line in [
+        decode_on("K1ABC", 14.074, false),
+        decode_on("K1ABC", 7.074, true),
+        decode_on("K1ABC", 7.076, true),
+        decode_on("K1ABC", 14.074, true),
+        decode_on("W9XYZ", 14.074, true),
+    ] {
+        app.add_decoded_message(line).await.unwrap();
+    }
+    // The native decode made the row, and WSJT-X decodes never move it.
+    assert_eq!(app.dx_stations["K1ABC"].source, SpotSource::Local);
+    assert_eq!(app.dx_stations["K1ABC"].frequency, 14.074);
+
+    let mut factors = pancetta_qso::PriorityScorer::new(
+        pancetta_qso::priority::PriorityWeights::default(),
+        Box::new(pancetta_qso::priority::NullLookup),
+    )
+    .score_tiered_explained("K1ABC", None, -10, 14_074_000.0)
+    .factors;
+    factors.worked_on_band = true;
+    let score = app.dx_stations["K1ABC"].local_rank.unwrap().score;
+    app.refresh_local_rank_from("K1ABC", score, factors, false);
+
+    let marks: Vec<(&str, f64, bool, bool)> = app
+        .decoded_messages
+        .iter()
+        .map(|m| {
+            (
+                m.call_sign.as_deref().unwrap_or_default(),
+                m.frequency,
+                m.external,
+                m.worked_before,
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            ("K1ABC", 14.074, false, true),
+            ("K1ABC", 7.074, true, false),
+            ("K1ABC", 7.076, true, false),
+            ("K1ABC", 14.074, true, true),
+            ("W9XYZ", 14.074, true, false),
+        ],
+        "only K1ABC's 20m lines are marked worked"
+    );
+    assert!(app.dx_stations["K1ABC"].worked_before);
+}
+
+/// PAN-434: worked marks compare dials with `is_band_change`, and an unknown
+/// dial matches (PAN-69's fail-open rule).
+#[test]
+fn same_band_dial_follows_is_band_change() {
+    for (a, b) in [
+        (14.074, 14.095),
+        (0.0, 7.074),
+        (f64::NAN, 7.074),
+        (14_074_000.0, 14_074_000.0),
+        (0.4742, 0.4742),
+    ] {
+        assert!(same_band_dial(a, b), "({a}, {b}) is one band");
+    }
+    for (a, b) in [(14.074, 7.074), (0.4742, 7.074)] {
+        assert!(!same_band_dial(a, b), "({a}, {b}) are different bands");
     }
 }

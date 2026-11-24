@@ -214,11 +214,15 @@ through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses).
 piece, the PAN-381 decode listener (`pancetta/src/coordinator/wsjtx_udp/ingest.rs`), binds
 a separate receive-only loopback socket on `decode_listen`, learns a same-host WSJT-X's
 dial from its `Status(1)` datagrams and turns each live `Decode(2)` into a `RelayedDecode`
-tagged `DecodeOrigin::WsjtxUdp`. The outbound taps touch no existing `→Tui` send path.
-The decode listener is the one exception: when `accept_decodes = true` it sends only on a
-clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous, PSKReporter
-and the remote gateway never see its decodes), and with it off `pancetta-tui` behavior
-stays byte-identical whether or not `[network.wsjtx_udp]` is enabled.
+tagged `DecodeOrigin::WsjtxUdp`. The supervisor tracks the listener as its own
+`ComponentId::WsjtxDecodeListener` (degrade-only), apart from the companion's `WsjtxUdp`.
+The outbound taps touch no existing `→Tui` send path.
+The decode listener is the one exception: when `accept_decodes = true` it sends decodes
+only on a clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous,
+PSKReporter and the remote gateway never see them); its only bus traffic is `remote.wsjtx`
+diagnostics (bind, bind-failure, refusal and drop-summary lines), and with it off
+`pancetta-tui` behavior stays byte-identical whether or not `[network.wsjtx_udp]` is
+enabled.
 
 ---
 

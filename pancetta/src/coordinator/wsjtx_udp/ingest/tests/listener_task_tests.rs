@@ -623,3 +623,172 @@ async fn listener_runs_without_companion_broadcast() {
     assert_eq!(d.dial_hz, 7_074_000);
     stop(coordinator).await;
 }
+
+// ---------------------------------------------------------------------------
+// PAN-434: the listener is its own supervised component.
+// ---------------------------------------------------------------------------
+
+const LISTENER_DEGRADED: &str = "WSJT-X decode listener stopped -- no WSJT-X decodes until restart";
+
+/// Abort every supervised task, wait until each has finished, then run one
+/// supervisor pass.
+async fn fail_every_task_and_supervise(coordinator: &mut ApplicationCoordinator) {
+    for (_, task) in &coordinator.named_task_handles {
+        task.abort();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !coordinator
+        .named_task_handles
+        .iter()
+        .all(|(_, task)| task.is_finished())
+    {
+        assert!(Instant::now() < deadline, "aborted tasks did not finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    coordinator.check_task_handles().await;
+}
+
+/// What one supervisor pass sent to the TUI.
+struct SupervisorReports {
+    /// `supervisor` Diagnostics rows.
+    diagnostics: Vec<(DiagnosticLevel, String)>,
+    /// Status-line texts.
+    status_lines: Vec<String>,
+    /// Every message, as debug text.
+    every_message: Vec<String>,
+}
+
+fn supervisor_reports(
+    tui_bus: &crossbeam_channel::Receiver<ComponentMessage>,
+) -> SupervisorReports {
+    let mut diagnostics = Vec::new();
+    let mut status_lines = Vec::new();
+    let mut every_message = Vec::new();
+    for msg in tui_bus.try_iter() {
+        every_message.push(format!("{msg:?}"));
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target: "supervisor",
+                level,
+                text,
+                ..
+            } => diagnostics.push((level, text)),
+            MessageType::StatusUpdate { text, .. } => status_lines.push(text),
+            _ => {}
+        }
+    }
+    SupervisorReports {
+        diagnostics,
+        status_lines,
+        every_message,
+    }
+}
+
+/// PAN-434 ticket scenario 3: with `accept_decodes = true`, a failed decode
+/// listener is reported as the decode listener, not the companion broadcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_failure_names_the_decode_listener() {
+    let Station {
+        mut coordinator,
+        _scratch,
+    } = station(|_| {}, false, None).await;
+    let (_tx, tui_bus) = coordinator
+        .message_bus
+        .create_channel(ComponentId::Tui)
+        .await
+        .unwrap();
+    coordinator
+        .start_wsjtx_decode_ingest()
+        .await
+        .unwrap()
+        .expect("listener bound");
+    assert_eq!(
+        coordinator.named_task_handles.last().map(|(id, _)| *id),
+        Some(ComponentId::WsjtxDecodeListener)
+    );
+    // The bind line is a `remote.wsjtx` Info event, not a supervisor report.
+    let _ = tui_bus.try_iter().count();
+
+    fail_every_task_and_supervise(&mut coordinator).await;
+    let SupervisorReports {
+        diagnostics,
+        status_lines,
+        every_message,
+    } = supervisor_reports(&tui_bus);
+    assert_eq!(
+        diagnostics,
+        vec![(
+            DiagnosticLevel::Error,
+            format!("WsjtxDecodeListener {LISTENER_DEGRADED}")
+        )]
+    );
+    assert_eq!(
+        status_lines,
+        vec![format!("WsjtxDecodeListener: {LISTENER_DEGRADED}")]
+    );
+    assert!(!every_message.is_empty());
+    for message in &every_message {
+        assert!(!message.contains("WsjtxUdp"), "{message}");
+    }
+    let map = coordinator.component_status.read().await;
+    assert_eq!(
+        crate::coordinator::health::degraded_summary(&map),
+        Some(format!("WsjtxDecodeListener: {LISTENER_DEGRADED}"))
+    );
+}
+
+/// PAN-434: a companion failure and a listener failure in the same
+/// supervisor pass are reported apart. Under one shared id the second was
+/// never reported, because the supervisor keys its status on the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn companion_and_listener_failures_are_reported_apart() {
+    let Station {
+        mut coordinator,
+        _scratch,
+    } = station(|_| {}, false, None).await;
+    let (_tx, tui_bus) = coordinator
+        .message_bus
+        .create_channel(ComponentId::Tui)
+        .await
+        .unwrap();
+    // A stand-in for the companion socket's task, registered first as the
+    // coordinator does. Aborted rather than panicked, so the log stays clean.
+    coordinator.named_task_handles.push((
+        ComponentId::WsjtxUdp,
+        tokio::spawn(std::future::pending::<anyhow::Result<()>>()),
+    ));
+    coordinator
+        .start_wsjtx_decode_ingest()
+        .await
+        .unwrap()
+        .expect("listener bound");
+    let _ = tui_bus.try_iter().count();
+
+    fail_every_task_and_supervise(&mut coordinator).await;
+    let mut texts: Vec<String> = supervisor_reports(&tui_bus)
+        .diagnostics
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        vec![
+            format!("WsjtxDecodeListener {LISTENER_DEGRADED}"),
+            "WsjtxUdp Component failed".to_owned(),
+        ]
+    );
+    let map = coordinator.component_status.read().await;
+    for (id, error) in [
+        (ComponentId::WsjtxDecodeListener, LISTENER_DEGRADED),
+        (ComponentId::WsjtxUdp, "Component failed"),
+    ] {
+        let status = map.get(&id).expect("status entry");
+        assert_eq!(
+            status.state,
+            crate::coordinator::ComponentState::Failed(error.to_owned()),
+            "{id}"
+        );
+        assert_eq!(status.error_count, 1, "{id}");
+    }
+}
