@@ -34,7 +34,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Database dependencies
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "sqlite-unlock-notify", "uuid"] }
 
 # Logging and tracing
 tracing = "0.1"

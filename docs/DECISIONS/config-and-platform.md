@@ -1671,10 +1671,19 @@ which bundles SQLite 3.54.1, and the `deny.toml` ignore is deleted.
 `qso_index_runs_on_sqlite_patched_for_rustsec_2026_0459` asks the open pool
 for `sqlite_version()` and fails below 3.54.0.
 
-**`sqlite-bundled`, not `sqlite`.** In sqlx 0.9 the `sqlite` feature also
-turns on extension loading, deserialize and unlock-notify. `sqlite-bundled`
-is the surface 0.8's `sqlite` gave, so those stay compiled out, and both
-`pancetta-qso` and the `pancetta` dev-dependency request it.
+**`sqlite-bundled` plus `sqlite-unlock-notify`, not `sqlite`.** In sqlx 0.9
+the `sqlite` feature is `sqlite-bundled` plus extension loading, deserialize
+and unlock-notify. sqlx-sqlite 0.8.6 always built SQLite with unlock-notify
+and compiled the other two out. Both `pancetta-qso` and the `pancetta`
+dev-dependency request `sqlite-bundled` and `sqlite-unlock-notify`, which
+gives the same `libsqlite3-sys` feature set as 0.8.6: `bundled`,
+`bundled_bindings`, `cc`, `pkg-config`, `unlock_notify` and `vcpkg`.
+Unlock-notify matters for a `:memory:` index (`--replay`, `new_in_memory`),
+which sqlx opens with a shared cache: without it a pooled reader fails with
+"database table is locked" while another connection holds an uncommitted
+write, instead of waiting for the commit.
+`in_memory_index_reader_waits_for_a_shared_cache_writer` covers that wait.
+The file-backed `qso.db` uses no shared cache.
 
 **Two `cargo update` steps.** `cargo update -p sqlx` leaves
 `libsqlite3-sys` at 0.30.1, because sqlx-sqlite 0.9.1 still accepts it.
