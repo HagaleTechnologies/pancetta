@@ -468,8 +468,8 @@ pub(super) fn decode_window_reanchor_text(reanchor: &Reanchor) -> String {
 }
 
 /// Receive-overload measurement slot index: the slot `slot_boundary` starts,
-/// counted on the active period `slot_ns` (FT8: the same number as
-/// `as_second().div_euclid(15)`).
+/// counted on the active period `slot_ns` (FT8: the Unix second of the
+/// boundary floor-divided by 15).
 pub(super) fn overload_slot_index(slot_boundary: UtcTimestamp, slot_ns: i64) -> i64 {
     slot_boundary
         .as_nanosecond()

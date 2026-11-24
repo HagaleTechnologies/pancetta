@@ -653,8 +653,9 @@ async fn unconfirmed_local_atno_keeps_its_mark_after_a_cqdx_spot_refresh() {
 async fn atno_mark_agrees_with_the_displayed_score() {
     use pancetta_qso::priority::PriorityTier;
     // C3 and C3b: a higher network ATNO rank survives a subsequent local decode.
+    // PAN-495: the local log must not hold the entity; a worked entity is never ATNO.
     {
-        let (_tmp, lookup) = offline_lookup(&adif(&[("DL1ABC".into(), "FT8", 14.074, "")])).await;
+        let (_tmp, lookup) = offline_lookup(&adif(&[("JA1ABC".into(), "FT8", 14.074, "")])).await;
         lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
         lookup.update_needed_dxcc(["DL".into()].into_iter().collect());
         lookup.update_needed_atno(["DL".into()].into_iter().collect());
