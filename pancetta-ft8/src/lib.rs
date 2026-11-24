@@ -312,8 +312,17 @@ pub enum Ft8Error {
     #[error("Time synchronization error: {0}")]
     SyncError(String),
 
-    /// A configuration value was invalid, or an audio output stream could
-    /// not be built or started; the string describes which.
+    /// An encode, modulate, transmit or tier-probe operation was refused or
+    /// failed; the string says why. In every build the causes include a
+    /// modulator setting or multi-signal layout out of range (sample rate,
+    /// base frequency, power level, Gaussian BT, signal separation) and a
+    /// tier probe that cannot read its sample window or was built without
+    /// the reference decoder. With the `transmit` feature they also include
+    /// a refused transmission (emergency stop, safety monitor, power limit,
+    /// band edge, invalid transmitter settings), a PTT serial port or GPIO
+    /// pin that could not be opened or is not compiled in, a failed PTT key
+    /// or unkey write, and an audio output device that could not be found or
+    /// whose stream could not be built or started.
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
