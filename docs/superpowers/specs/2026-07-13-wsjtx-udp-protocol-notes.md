@@ -11,7 +11,8 @@ must be treated as best-effort by the implementer.
 
 **Role naming:** pancetta plays the *WSJT-X role* (upstream confusingly calls it the
 "client"; the listening companion app — GridTracker, JTAlert, a logger — is the
-"server"). Current protocol state as of WSJT-X 3.0.1 (May 2026).
+"server"). The PAN-381 decode listener (§1) is the one exception: there pancetta
+plays the server role. Current protocol state as of WSJT-X 3.0.1 (May 2026).
 
 ---
 
@@ -24,6 +25,7 @@ must be treated as best-effort by the implementer.
 | Datagram = 1 message | No batching, no fragmentation handling. Keep datagrams comfortably under MTU; py-wsjtx rejects > 2048 bytes, so treat ~1400 B as a practical ceiling (only `LoggedADIF` gets close) |
 | Direction OUT (pancetta → apps) | Heartbeat, Status, Decode, Clear, QSOLogged, Close, WSPRDecode, LoggedADIF |
 | Direction IN (apps → pancetta) | Heartbeat, Clear, Reply, Close, Replay, HaltTx, FreeText, Location, HighlightCallsign, SwitchConfiguration, Configure, AnnotationInfo |
+| Direction IN, PAN-381 decode listener (WSJT-X → pancetta) | Decode, Status (through Mode only), Close |
 
 **Who binds what.** The WSJT-X-role process (pancetta) opens **one** UDP socket on an
 **ephemeral local port**, sends all outbound messages to the single configured
@@ -33,6 +35,15 @@ of the datagrams they receive. Verified in GridTracker (BSD-3): it stores `remot
 from each received packet and sends Reply/HaltTx/Configure to exactly that addr:port;
 k0swe/wsjtx-go (Apache-2.0) does the same. So pancetta must keep its sending socket
 open and poll it for requests — there is no separate listening port on the WSJT-X side.
+
+**PAN-381 decode listener (server role).** Separately from the WSJT-X-role socket
+above, pancetta can bind a second, receive-only UDP socket on a fixed loopback
+address (`[network.wsjtx_udp] decode_listen`, default `127.0.0.1:2238`) when
+`accept_decodes = true`. Here pancetta plays the *companion* role: a same-host
+WSJT-X's **UDP Server** setting points at that address, and pancetta also consumes
+WSJT-X's **Decode (2)** and **Status (1)** datagrams (Status through its Mode field
+only; later fields are ignored under the trailing-bytes rule). This socket never
+sends a datagram, so it never answers or replies to WSJT-X.
 
 ### Pancetta admission policy (PAN-312, not an upstream protocol requirement)
 
@@ -237,6 +248,17 @@ closed).
 (`<adif_ver:5>3.1.0`, `<programid:6>WSJT-X`, `<EOH>`) + one `<EOR>`-terminated record,
 `\n`-separated. Emit together with QSOLogged(5); loggers variously consume one or the
 other.
+
+**PAN-381 decode listener.** The separate loopback decode listener (§1) also consumes
+**Decode (2)** with the OUT layout above (all fields through `OffAir`; missing
+trailing fields read as their defaults) and **Status (1)** through `Mode` (only
+`DialFrequency` is used; a decode's mode comes from its own mode glyph). It acts
+only on a live decode (`New = true`, `OffAir = false`, `LowConfidence = false`) with mode glyph
+`~` or `+` from a sender Id whose latest Status carried a non-zero dial and that is
+still among the 8 most recently updated Ids it remembers; a zero-dial Status or a
+Close from that Id forgets its dial. The range checks and the own-Id echo
+drop are listed in `docs/DECISIONS/remote-operation.md` (PAN-381, D5). Every other
+message type is ignored there.
 
 ### IN — pancetta consumes
 
