@@ -1659,3 +1659,37 @@ accepted it. `UtcTimestamp::strftime` writes a year below 0 with the sign
 inside the four-character `%Y` width (`-027`, where chrono wrote `-0027`);
 only malformed data carries such a year, and
 `documented_narrowings_from_chrono_hold` pins both narrowings.
+
+## SQLite 3.54 through sqlx 0.9 (PAN-394, 2026-11-24)
+
+RUSTSEC-2026-0459 covers SQLite below 3.54.0, which can return leftover
+process memory when it opens a database next to a crafted `-wal` file. The
+owner accepted the risk on PAN-390 while no sqlx release accepted a patched
+`libsqlite3-sys`. `sqlx-sqlite` 0.9.1 accepts `libsqlite3-sys >=0.30.1,
+<0.41.0`, so the workspace now uses sqlx 0.9.1 with `libsqlite3-sys` 0.40.0,
+which bundles SQLite 3.54.1, and the `deny.toml` ignore is deleted.
+`qso_index_runs_on_sqlite_patched_for_rustsec_2026_0459` asks the open pool
+for `sqlite_version()` and fails below 3.54.0.
+
+**`sqlite-bundled`, not `sqlite`.** In sqlx 0.9 the `sqlite` feature also
+turns on extension loading, deserialize and unlock-notify. `sqlite-bundled`
+is the surface 0.8's `sqlite` gave, so those stay compiled out, and both
+`pancetta-qso` and the `pancetta` dev-dependency request it.
+
+**Two `cargo update` steps.** `cargo update -p sqlx` leaves
+`libsqlite3-sys` at 0.30.1, because sqlx-sqlite 0.9.1 still accepts it.
+`cargo update -p libsqlite3-sys` then moves it to 0.40.0. A lockfile
+regenerated after a merge conflict needs both commands.
+
+**No direct `libsqlite3-sys` floor.** Cargo Deny, with an empty `ignore`
+list, fails any lock below 0.39, and the version test fails at runtime below
+SQLite 3.54.0. A direct dependency that no source file names would also trip
+`cargo machete`.
+
+**`AssertSqlSafe`.** sqlx 0.9 refuses a dynamic SQL string unless it is
+wrapped in `sqlx::AssertSqlSafe`. `async_database.rs` has four: the
+`search_qsos` and `search_qsos_records` builders, whose values are all bound with `?` and whose only
+interpolation is the clamped `u32` `LIMIT`; `VACUUM INTO`, whose target has
+no bind form and is escaped by `escape_sqlite_string_literal`; and the
+confirmed-count query, which formats the constant `CONFIRMED_QSO_SQL`. Any
+new dynamic SQL needs the same wrapper and a comment saying why it is safe.
