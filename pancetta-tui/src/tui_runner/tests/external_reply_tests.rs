@@ -4,9 +4,14 @@
 // and in pancetta's mode, with a status line and no command. A WSJT-X decode
 // on pancetta's own dial and mode is acted on, including on a band
 // `pancetta_core::Band` cannot name.
-use super::key_tests::{key, make_runner};
+//
+// PAN-429: Shift+H (Hound engage) on a DX Hunter `EXT` or `EX+N` row follows
+// the same rule and shows the same line. An `EX+N` row with a network spot
+// dial keeps the PAN-287 spot call on Space, and Enter in DX Hunter only
+// opens Why.
+use super::key_tests::{key, key_shift, make_runner};
 use super::*;
-use crate::app::{ActivePanel, DecodedMessageView};
+use crate::app::{ActivePanel, DecodedMessageView, SpotSource};
 use pancetta_core::time::UtcTimestamp;
 
 /// A decode a same-host WSJT-X sent, as the relay builds it: dial in MHz and
@@ -465,4 +470,206 @@ async fn directed_replies_answer_an_ext_caller_on_pancettas_band_and_mode() {
         cmd_rx.try_recv(),
         Ok(TuiCommand::RespondToCaller { ref callsign, .. }) if callsign == "N4BP"
     ));
+}
+
+/// A cqdx.io network spot of `call` on `rf_hz`, the same values as
+/// `external_decode_tests.rs`'s `spot`.
+fn cqdx_spot(call: &str, rf_hz: u64) -> crate::tui_runner::CqdxSpotInfo {
+    crate::tui_runner::CqdxSpotInfo {
+        dx_call: call.to_string(),
+        band: "20m".to_string(),
+        mode: "FT8".to_string(),
+        frequency_hz: rf_hz,
+        grid: None,
+        rarity_tier: "common".to_string(),
+        reporter_count: 2,
+        best_snr: Some(-10),
+        confidence: 0.9,
+        first_seen: UtcTimestamp::now().as_second(),
+        last_seen: UtcTimestamp::now().as_second(),
+        is_notable: false,
+        notable_type: None,
+        entity_name: "United States".to_string(),
+        needed: false,
+        atno: false,
+    }
+}
+
+/// Put pancetta on `pancetta_mhz` FT8 with no rig readback, merge a cqdx.io
+/// spot of N4BP at 14 075 210 Hz, then add a WSJT-X CQ from N4BP heard on
+/// `dial_mhz` in `mode`. The row's `spot_rf_hz` is then set to `spot_rf_hz`,
+/// and DX Hunter is focused on the resulting `EX+N` row.
+async fn seed_ex_n_at(
+    app: &Arc<RwLock<App>>,
+    pancetta_mhz: f64,
+    spot_rf_hz: Option<u64>,
+    dial_mhz: f64,
+    mode: &str,
+) {
+    let mut a = app.write().await;
+    a.station_info.operating_frequency = pancetta_mhz;
+    a.station_info.mode = "FT8".to_string();
+    a.radio_frequency = None;
+    a.merge_spot_groups(&[cqdx_spot("N4BP", 14_075_210)]);
+    a.add_decoded_message(ext_decode("CQ N4BP EM70", dial_mhz, mode, false))
+        .await
+        .unwrap();
+    let row = a.dx_stations.get_mut("N4BP").unwrap();
+    row.spot_rf_hz = spot_rf_hz;
+    assert_eq!(row.source, SpotSource::ExternalNetwork);
+    a.active_panel = ActivePanel::DxHunter;
+    a.dx_hunter_scroll = 0;
+    assert_eq!(a.focused_callsign().as_deref(), Some("N4BP"));
+}
+
+/// PAN-429 AC5: Shift+H on an `EXT` row, and on an `EX+N` row with a network
+/// spot dial, heard by WSJT-X off pancetta's dial or mode, sends nothing and
+/// sets the line Space sets for that row.
+#[tokio::test]
+async fn shift_h_refuses_an_ext_or_ex_n_row_off_pancettas_dial() {
+    let mut cases = BAND_OR_MODE_REFUSALS.to_vec();
+    cases.push((
+        14.090,
+        "FT8",
+        "Can't work N4BP. WSJT-X heard it on 14.090 MHz FT8. Pancetta is on 14.074 MHz FT8.",
+    ));
+    for (dial_mhz, mode, refusal) in cases {
+        for ex_n in [false, true] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            if ex_n {
+                seed_ex_n_at(&app, 14.074, Some(14_075_210), dial_mhz, mode).await;
+            } else {
+                seed_cq_at(&app, 14.074, dial_mhz, mode, ActivePanel::DxHunter).await;
+            }
+            r.handle_key_event(key_shift('H')).await.unwrap();
+            let sent = cmd_rx.try_recv();
+            assert!(
+                sent.is_err(),
+                "EX+N {ex_n}: Shift+H on a row heard on {dial_mhz} {mode} must send nothing, \
+                 got {sent:?}"
+            );
+            assert_eq!(
+                app.read().await.status_message(),
+                refusal,
+                "EX+N {ex_n}: {dial_mhz} {mode}"
+            );
+        }
+    }
+}
+
+/// PAN-429 AC5: a rig readback on another band refuses Shift+H on an `EXT`
+/// row even when WSJT-X and the operating frequency share a dial.
+#[tokio::test]
+async fn shift_h_refuses_an_ext_row_while_the_rig_reads_another_band() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_cq_at(&app, 14.074, 14.074, "FT8", ActivePanel::DxHunter).await;
+    app.write().await.radio_frequency = Some(7.074);
+    r.handle_key_event(key_shift('H')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Can't work N4BP. WSJT-X heard it on 20m FT8. Pancetta is on 20m FT8 (rig reads 40m)."
+    );
+}
+
+/// PAN-429 AC6: on pancetta's dial and mode, Shift+H engages an `EXT` or
+/// `EX+N` row at WSJT-X's offset and parity, as before.
+#[tokio::test]
+async fn shift_h_engages_an_ext_or_ex_n_row_on_pancettas_dial() {
+    for ex_n in [false, true] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        if ex_n {
+            seed_ex_n_at(&app, 14.074, Some(14_075_210), 14.074, "FT8").await;
+        } else {
+            seed_cq_at(&app, 14.074, 14.074, "FT8", ActivePanel::DxHunter).await;
+        }
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::EngageHound {
+                callsign,
+                fox_freq,
+                dx_parity,
+                fox_grid,
+            }) => {
+                assert_eq!(callsign, "N4BP", "EX+N {ex_n}");
+                assert_eq!(fox_freq, 1234, "EX+N {ex_n}");
+                assert_eq!(
+                    dx_parity,
+                    Some(pancetta_core::slot::SlotParity::Even),
+                    "EX+N {ex_n}"
+                );
+                assert_eq!(fox_grid, None, "EX+N {ex_n}");
+            }
+            other => panic!("EX+N {ex_n}: expected EngageHound, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "EX+N {ex_n}: one command");
+        assert_eq!(
+            app.read().await.status_message(),
+            "Hound: engaging N4BP as Fox...",
+            "EX+N {ex_n}"
+        );
+    }
+}
+
+/// PAN-429 AC2: a network-spotted row that WSJT-X then hears on 40m (`EX+N`)
+/// keeps the PAN-287 spot call on Space. Pancetta retunes to the spot's dial
+/// at the spot's offset and never calls at WSJT-X's 1234 Hz.
+#[tokio::test]
+async fn space_on_a_cross_band_ex_n_row_calls_the_network_spot() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_ex_n_at(&app, 14.074, Some(14_075_210), 7.074, "FT8").await;
+    r.handle_key_event(key(' ')).await.unwrap();
+    match cmd_rx.try_recv() {
+        Ok(TuiCommand::CallNetworkSpot {
+            callsign,
+            band,
+            dial_hz,
+            audio_offset_hz,
+        }) => {
+            assert_eq!(callsign, "N4BP");
+            assert_eq!(band, "20M");
+            assert_eq!(dial_hz, 14_074_000);
+            assert_eq!(audio_offset_hz, Some(1210));
+        }
+        other => panic!("expected the PAN-287 spot call, got {other:?}"),
+    }
+    let next = cmd_rx.try_recv();
+    assert!(
+        next.is_err(),
+        "Space sends exactly one command, got {next:?}"
+    );
+}
+
+/// PAN-429 AC3: an `EX+N` row with no network spot dial, heard by WSJT-X on
+/// 40m while pancetta is on 20m, is refused like an `EXT` row.
+#[tokio::test]
+async fn space_refuses_a_cross_band_ex_n_row_with_no_spot_dial() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_ex_n_at(&app, 14.074, None, 7.074, "FT8").await;
+    r.handle_key_event(key(' ')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Can't work N4BP. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8."
+    );
+}
+
+/// PAN-429 AC4: Enter in DX Hunter opens Why and never calls, for an `EXT`
+/// row and an `EX+N` row heard by WSJT-X on another band.
+#[tokio::test]
+async fn enter_on_a_cross_band_ext_or_ex_n_dx_row_opens_why_and_sends_nothing() {
+    for ex_n in [false, true] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        if ex_n {
+            seed_ex_n_at(&app, 14.074, Some(14_075_210), 7.074, "FT8").await;
+        } else {
+            seed_cq_at(&app, 14.074, 7.074, "FT8", ActivePanel::DxHunter).await;
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let sent = cmd_rx.try_recv();
+        assert!(sent.is_err(), "EX+N {ex_n}: Enter sent {sent:?}");
+        assert!(app.read().await.show_why, "EX+N {ex_n}: Enter opens Why");
+    }
 }

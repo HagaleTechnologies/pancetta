@@ -2438,27 +2438,38 @@ impl TuiRunner {
             Action::EngageHound => {
                 // Pull callsign + fox_freq + parity from the selected row,
                 // and also the grid (one extra field beyond get_selected_station).
-                let selected = app.displayed_dx_stations();
-                if let Some(station) = selected.get(app.dx_hunter_scroll) {
-                    let callsign = station.call_sign.clone();
-                    let fox_freq = station.audio_offset_hz.unwrap_or(1500);
-                    let dx_parity = station.slot_parity;
-                    let fox_grid = station.grid_square.clone();
-                    self.message_tx.send(TuiCommand::EngageHound {
-                        callsign: callsign.clone(),
-                        fox_freq,
-                        dx_parity,
-                        fox_grid,
-                    })?;
-                    {
+                // PAN-429: a Fox heard only through WSJT-X (`EXT`, `EX+N`)
+                // is engaged only on pancetta's dial and mode, the same rule
+                // Space follows (PAN-435, PAN-443). Its offset is WSJT-X's,
+                // and Hound has no spot-call path, so an `EX+N` row with a
+                // network spot dial is refused too. Pancetta never retunes.
+                let selected = app.selected_dx_hunter_row().map(|station| {
+                    (
+                        station.call_sign.clone(),
+                        station.audio_offset_hz.unwrap_or(1500),
+                        station.slot_parity,
+                        station.grid_square.clone(),
+                        app.external_row_refusal(station),
+                    )
+                });
+                match selected {
+                    Some((_, _, _, _, Some(refusal))) => {
+                        app.set_local_status(refusal, pancetta_core::DiagnosticLevel::Warn);
+                    }
+                    Some((callsign, fox_freq, dx_parity, fox_grid, None)) => {
+                        self.message_tx.send(TuiCommand::EngageHound {
+                            callsign: callsign.clone(),
+                            fox_freq,
+                            dx_parity,
+                            fox_grid,
+                        })?;
                         let text = format!("Hound: engaging {} as Fox...", callsign);
                         app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                    };
-                } else {
-                    {
+                    }
+                    None => {
                         let text = "No DX station selected for Hound".to_string();
                         app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
-                    };
+                    }
                 }
             }
             Action::HoundFocusHint => {
