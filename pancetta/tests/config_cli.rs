@@ -796,7 +796,9 @@ mod terminal {
             }
         }
 
-        /// Everything the child has printed so far, both streams.
+        /// Everything the child has printed so far, both streams. Each stream is
+        /// drained on its own thread, so assert on it only after `wait_for` has
+        /// seen the needle or after `wait_exit()`.
         pub(super) fn combined(&self) -> String {
             format!(
                 "{}{}",
@@ -885,6 +887,11 @@ fn interactive_broken_config_offers_repair_and_decline_preserves_file() {
             child.wait_for(
                 "Re-run first-time setup? (overwrites the broken config on save) [y/N]: ",
             );
+            // stderr is drained on its own thread, so the stdout prompt can show up
+            // first. The child prints these lines before the prompt; wait for each.
+            child.wait_for("ERROR: your saved configuration failed to load:");
+            child.wait_for(&path.display().to_string());
+            child.wait_for(diagnostic);
             let offered = child.combined();
             assert!(
                 offered.contains("ERROR: your saved configuration failed to load:"),
