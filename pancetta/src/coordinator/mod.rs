@@ -2138,6 +2138,9 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         ComponentId::Config | ComponentId::Coordinator => RestartPolicy::DegradeOnly,
         // Companion protocol integration; not critical for autonomous operation.
         ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
+        // Display-only WSJT-X decodes (PAN-434); a restart would need a
+        // socket rebind, so the listener degrades and is reported instead.
+        ComponentId::WsjtxDecodeListener => RestartPolicy::DegradeOnly,
     }
 }
 
@@ -2183,7 +2186,8 @@ pub(crate) fn qso_drop_for(
         | ComponentId::PskReporter
         | ComponentId::RemoteGateway
         | ComponentId::Autonomous
-        | ComponentId::WsjtxUdp => None,
+        | ComponentId::WsjtxUdp
+        | ComponentId::WsjtxDecodeListener => None,
     }
 }
 
@@ -2203,6 +2207,9 @@ fn degradation_message(id: ComponentId) -> &'static str {
             "Remote gateway failed -- remote operation unavailable until restart"
         }
         ComponentId::StationAgent => "Remote-TX security agent lost -- remote TX disarmed",
+        ComponentId::WsjtxDecodeListener => {
+            "WSJT-X decode listener stopped -- no WSJT-X decodes until restart"
+        }
         _ => "Component failed",
     }
 }
@@ -5616,6 +5623,10 @@ mod tests {
             Restartable
         );
         assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::WsjtxDecodeListener),
+            DegradeOnly
+        );
     }
 
     #[test]
@@ -5640,6 +5651,7 @@ mod tests {
             ComponentId::RemoteGateway,
             ComponentId::Autonomous,
             ComponentId::WsjtxUdp,
+            ComponentId::WsjtxDecodeListener,
         ] {
             assert!(qso_drop_for(id).is_none(), "{id}");
         }
@@ -5656,6 +5668,7 @@ mod tests {
             ComponentId::Hamlib,
             ComponentId::StationAgent,
             ComponentId::Audio,
+            ComponentId::WsjtxDecodeListener,
         ] {
             assert_ne!(degradation_message(id), "Component failed", "{id}");
         }

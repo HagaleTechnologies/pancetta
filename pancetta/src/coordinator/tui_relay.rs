@@ -127,13 +127,17 @@ impl<K: std::hash::Hash + Eq + Clone, V> RelayCache<K, V> {
     }
 }
 
-/// Keep the last decoded grid for this exact callsign and band during the relay
-/// session. Report/acknowledgment frames omit it; a later grid replaces it.
+/// Keep the last decoded grid for this exact callsign, band and origin during
+/// the relay session. Report/acknowledgment frames omit it; a later grid from
+/// the same origin replaces it. `external` is `true` for a same-host WSJT-X
+/// decode, so neither origin fills a grid-less frame from the other's grid
+/// (PAN-434).
 fn display_grid(
-    last_grids: &mut RelayCache<(String, String), String>,
+    last_grids: &mut RelayCache<(String, String, bool), String>,
     call_sign: Option<&str>,
     grid: Option<&str>,
     dial_mhz: f64,
+    external: bool,
 ) -> Option<String> {
     let Some(call) = call_sign else {
         return grid.map(str::to_owned);
@@ -141,6 +145,7 @@ fn display_grid(
     let key = (
         call.to_owned(),
         pancetta_qso::utils::frequency_to_band(dial_mhz * 1_000_000.0),
+        external,
     );
     if let Some(grid) = grid {
         last_grids.insert(key, grid.to_owned());
@@ -935,7 +940,7 @@ struct TuiRelayLoop {
     /// PAN-316: bounded by the shared `RelayCache` policy (24 h TTL,
     /// 4,096 entries) instead of an unbounded HashMap.
     sent_states: RelayCache<String, String>,
-    last_grids: RelayCache<(String, String), String>,
+    last_grids: RelayCache<(String, String, bool), String>,
     last_rank_inputs: RelayCache<(String, bool), RankInputs>,
     last_rig_state: Option<u8>,
     last_audio_default: Option<bool>,
@@ -5143,7 +5148,7 @@ fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
 /// production conversion — the relay thread itself has no test harness
 /// (see the note at its spawn, and `TxPolicyCmdCtx` for the same pattern).
 struct RelayDecodeCtx<'a> {
-    last_grids: &'a mut RelayCache<(String, String), String>,
+    last_grids: &'a mut RelayCache<(String, String, bool), String>,
     last_rank_inputs: &'a mut RelayCache<(String, bool), RankInputs>,
     station_coords: Option<(f64, f64)>,
     lookup: &'a crate::priority_evaluator::CachedStationLookup,
@@ -5164,11 +5169,24 @@ fn decoded_view_for_relay(
     let decoded_msg = &relayed.message;
     let call_sign = decoded_msg.message.from_callsign.clone();
     let dial_mhz = decode_view_dial_mhz(relayed);
+    // PAN-381: an external (WSJT-X UDP) decode shows the mode its glyph
+    // named, not pancetta's own protocol mode, and is tagged for display.
+    // Enrichment and the display rank below are the same code path a native
+    // decode takes. PAN-434: the tag also keys the grid memory, so a
+    // grid-less frame shows only a grid the same receiver heard.
+    let (mode, external) = match relayed.origin {
+        super::pipeline::DecodeOrigin::WsjtxUdp { mode } => (mode, true),
+        super::pipeline::DecodeOrigin::Native => (
+            pancetta_config::OperatingMode::from_u8(ctx.protocol_mode),
+            false,
+        ),
+    };
     let grid_square = display_grid(
         ctx.last_grids,
         call_sign.as_deref(),
         decoded_msg.message.grid_square.as_deref(),
         dial_mhz,
+        external,
     );
     let is_directed_at_us =
         decode_directed_at_us_flag(decoded_msg.message.to_callsign.as_deref(), ctx.our_callsign);
@@ -5208,18 +5226,6 @@ fn decoded_view_for_relay(
         decoded_msg.snr_db,
         dial_mhz,
     );
-    // PAN-381: an external (WSJT-X UDP) decode shows the mode its glyph
-    // named, not pancetta's own protocol mode, and is tagged for display.
-    // Everything above — enrichment and the display rank — is the same
-    // code path a native decode takes.
-    let (mode, external) = match relayed.origin {
-        super::pipeline::DecodeOrigin::WsjtxUdp { mode } => (mode, true),
-        super::pipeline::DecodeOrigin::Native => (
-            pancetta_config::OperatingMode::from_u8(ctx.protocol_mode),
-            false,
-        ),
-    };
-
     if let Some(call) = call_sign.as_deref() {
         // PAN-381: native and WSJT-X inputs are kept apart. The TUI leaves a
         // row pancetta heard itself untouched by a WSJT-X decode, so each
@@ -6368,7 +6374,7 @@ mod tui_relay_tests {
                 ]
             };
             for (text, grid) in frames {
-                let grid = super::display_grid(&mut last_grids, Some("K1ABC"), grid, 14.074);
+                let grid = super::display_grid(&mut last_grids, Some("K1ABC"), grid, 14.074, false);
                 let (priority_score, priority_factors) =
                     super::display_rank(&scorer, Some("K1ABC"), grid.as_deref(), -10.0, 14.074);
                 app.add_decoded_message(DecodedMessageView {
@@ -6422,14 +6428,18 @@ mod tui_relay_tests {
             (Some("K1ABC"), 7.074),
             (None, 14.074),
         ] {
-            assert_eq!(super::display_grid(&mut last_grids, call, None, band), None);
+            assert_eq!(
+                super::display_grid(&mut last_grids, call, None, band, false),
+                None
+            );
         }
         assert_eq!(
-            super::display_grid(&mut last_grids, Some("K1ABC"), Some("FN43"), 14.074).as_deref(),
+            super::display_grid(&mut last_grids, Some("K1ABC"), Some("FN43"), 14.074, false)
+                .as_deref(),
             Some("FN43")
         );
         assert_eq!(
-            super::display_grid(&mut last_grids, Some("K1ABC"), None, 14.074).as_deref(),
+            super::display_grid(&mut last_grids, Some("K1ABC"), None, 14.074, false).as_deref(),
             Some("FN43")
         );
     }
