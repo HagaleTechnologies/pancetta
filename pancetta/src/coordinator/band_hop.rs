@@ -124,6 +124,9 @@ pub(crate) struct BandHopCtx {
     pub ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
     /// FT4 mode: hop to the band's FT4 dial instead of the configured FT8 one.
     pub active_is_ft4: bool,
+    /// PAN-447: the coordinator's Fox mode flag. While it is set no hop is
+    /// carried out: a Fox stays on its band and keeps calling.
+    pub fox_mode: Arc<AtomicBool>,
 }
 
 /// The Diagnostics waiting line for a hop held back by partner-answered
@@ -139,6 +142,20 @@ pub(crate) fn exchange_waiting_text(
     }
 }
 
+/// The Diagnostics waiting line for a hop held back by Fox mode (PAN-447)
+/// or by partner-answered `exchanges`, or `None` when neither holds it.
+/// Fox mode wins: it holds the hop however many exchanges are running.
+pub(crate) fn hop_hold_text(
+    reason: &pancetta_qso::BandHopReason,
+    fox_mode_on: bool,
+    exchanges: &[String],
+) -> Option<String> {
+    if fox_mode_on {
+        return Some(reason.waiting_text("Fox mode is on"));
+    }
+    exchange_waiting_text(reason, exchanges)
+}
+
 /// What `execute_band_hop` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BandHopOutcome {
@@ -150,8 +167,9 @@ pub(crate) enum BandHopOutcome {
 }
 
 /// Carry out an operator `ChangeBand` (PAN-385, PAN-287 style). Waits,
-/// sending nothing, while a partner has answered (`exchanges`) or while the
-/// rig is keyed (rechecked under `ptt_sync_gate`). The gate is only tried,
+/// sending nothing, while Fox mode is on (PAN-447), while a partner has
+/// answered (`exchanges`) or while the rig is keyed (rechecked under
+/// `ptt_sync_gate`). The gate is only tried,
 /// never awaited: a held gate means a key-down is under way, so the hop
 /// waits for the next slot, which reads a fresh exchange snapshot, instead of
 /// acting on this one after an unbounded wait. Otherwise, under the gate,
@@ -169,7 +187,7 @@ pub(crate) async fn execute_band_hop(
     reason: &pancetta_qso::BandHopReason,
     exchanges: &[String],
 ) -> BandHopOutcome {
-    if let Some(text) = exchange_waiting_text(reason, exchanges) {
+    if let Some(text) = hop_hold_text(reason, ctx.fox_mode.load(Ordering::Relaxed), exchanges) {
         return BandHopOutcome::Waiting(text);
     }
     // FT4-mode dial override: the band-hop config carries FT8 dials. In FT4
