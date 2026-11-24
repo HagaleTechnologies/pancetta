@@ -480,7 +480,8 @@ pub(super) fn overload_slot_index(slot_boundary: UtcTimestamp, slot_ns: i64) -> 
 ///
 /// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
 /// Each file is ~303 KB.  When total usage exceeds [`WAV_RECORDING_MAX_BYTES`],
-/// the oldest files are deleted to make room.
+/// the oldest files are deleted to make room. Each window is written as
+/// `<name>.part` and renamed to `<name>` when complete (PAN-471).
 pub(super) struct WavRecorder {
     dir: std::path::PathBuf,
     /// Running estimate of the top-level `*.wav` bytes in `dir`. Files moved
@@ -499,6 +500,7 @@ pub(super) struct WavRecorder {
 impl WavRecorder {
     fn open(dir: std::path::PathBuf, max_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        Self::remove_stale_parts(&dir);
 
         // Sum existing recording sizes
         // A partial scan still counts every readable WAV, the best lower
@@ -517,6 +519,32 @@ impl WavRecorder {
             #[cfg(test)]
             eviction_hook: None,
         })
+    }
+
+    /// Remove top-level `ft8_*.wav.part` files a crash left mid-write
+    /// (PAN-471). They are invisible to [`Self::dir_size`], so without this
+    /// their bytes would sit outside the cap for good. Only `ft8_` parts go:
+    /// `raw48/` cleans its own, and other files here are not this writer's.
+    fn remove_stale_parts(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_part = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ft8_") && n.ends_with(".wav.part"));
+            if is_part && path.is_file() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    debug!(
+                        "WAV recorder: cannot remove stale {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Bytes in top-level `*.wav` files: the same flat scope
@@ -599,24 +627,18 @@ impl WavRecorder {
             None => format!("ft8_{}.wav", timestamp.strftime("%Y%m%d_%H%M%S")),
         };
         let path = self.dir.join(&filename);
+        // PAN-471: write under `<name>.part` and rename when finalized, so
+        // the offload and every other reader only ever see whole files. The
+        // size is read before the rename: the offload may move the file
+        // the moment it appears.
+        let part_path = self.dir.join(format!("{filename}.part"));
 
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 12000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-
-        match hound::WavWriter::create(&path, spec) {
-            Ok(mut writer) => {
-                for &s in samples {
-                    let _ = writer.write_sample((s * i16::MAX as f32) as i16);
-                }
-                if let Err(e) = writer.finalize() {
-                    warn!("WAV recorder: finalize error: {}", e);
-                    return;
-                }
-                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        match write_window_wav(&part_path, samples).and_then(|()| {
+            let file_size = std::fs::metadata(&part_path)?.len();
+            std::fs::rename(&part_path, &path)?;
+            Ok(file_size)
+        }) {
+            Ok(file_size) => {
                 self.total_bytes += file_size;
                 debug!(
                     "WAV recorded: {} ({:.0} KB, total {:.1} MB)",
@@ -626,7 +648,8 @@ impl WavRecorder {
                 );
             }
             Err(e) => {
-                warn!("WAV recorder: create error: {}", e);
+                let _ = std::fs::remove_file(&part_path);
+                warn!("WAV recorder: cannot write {}: {}", filename, e);
             }
         }
     }
@@ -699,6 +722,27 @@ impl WavRecorder {
         }
         false
     }
+}
+
+/// Write `samples` as a finalized 12 kHz mono 16-bit WAV at `path`.
+fn write_window_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 12000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let to_io = |e: hound::Error| match e {
+        hound::Error::IoError(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(to_io)?;
+    for &s in samples {
+        writer
+            .write_sample((s * i16::MAX as f32) as i16)
+            .map_err(to_io)?;
+    }
+    writer.finalize().map_err(to_io)
 }
 
 /// Operator-facing startup line when `[audio.recording]` leaves recording
@@ -2849,6 +2893,10 @@ mod dead_air_tests {
 #[cfg(test)]
 #[path = "dsp/tests/decode_window_clock_tests.rs"]
 mod decode_window_clock_tests;
+
+#[cfg(test)]
+#[path = "dsp/tests/wav_recorder_atomic_publish_tests.rs"]
+mod wav_recorder_atomic_publish_tests;
 
 #[cfg(test)]
 mod wav_recorder_tests {

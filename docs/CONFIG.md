@@ -196,6 +196,10 @@ directory = "~/.pancetta/recordings"
   300 KB for FT8), named `ft8_<UTC date>_<time>[_<band>].wav`. Windows of
   digital silence (rig off or unplugged) are skipped. A full day of FT8 is
   about 1.7 GB.
+- A window is written as `ft8_….wav.part` and renamed to its `.wav` name
+  only when complete, so a reader of the folder never sees a half-written
+  recording. Pancetta deletes leftover `ft8_*.wav.part` files at start.
+  Tools that read the folder should match `*.wav`.
 - The directory is capped at 10 GB of top-level `*.wav` files. Past that,
   the oldest recording (by filename) is deleted for each new one.
 - With recording on, pancetta also saves the first 90 s of raw capture once
