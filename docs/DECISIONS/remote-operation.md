@@ -1338,3 +1338,74 @@ Evidence: `cqdx_enabled_seeds_tx_arm_allow_list_empty_regardless_of_static_list`
 (`pancetta/src/coordinator/station_agent/tests/tests.rs`), and
 `unlisted_peer_is_refused_without_state` (`pancetta-agent/src/multi_session.rs`).
 PAN-362 changed documentation, comments and two warning strings only.
+
+## WSJT-X decode ingest (PAN-381), 2026-11
+
+With `[network.wsjtx_udp] accept_decodes = true`, a same-host WSJT-X's live
+Decode(2) datagrams show in Band Activity and DX Hunter tagged `EXT` and are
+scored like pancetta's own. The listener is
+`pancetta/src/coordinator/wsjtx_udp/ingest.rs`.
+
+- **Display only (D1).** An external decode is a `RelayedDecode` with
+  `origin: DecodeOrigin::WsjtxUdp { mode }` sent on a clone of
+  `ft8_to_tui_tx`, never on the message bus. The QSO engine and the
+  autonomous operator read no decode provenance and can key transmit, so
+  keeping external decodes off the bus is what makes "never triggers a
+  transmission on its own" structural. The TUI relay's
+  `decoded_view_for_relay` scores them with the same `PriorityScorer`.
+  Feeding the autonomous scorer, pounce, alerts, PSKReporter, the remote
+  gateway or the WSJT-X re-emit is out of scope. Operator actions are gated
+  by dial (PAN-435, PAN-443): Space and Callers Enter on an external decode
+  refuse with a status line unless WSJT-X's dial is within 10 Hz of
+  pancetta's dial, its mode matches, and the rig readback is not a band
+  change. Pancetta never retunes. The rule and its reasons are in
+  `docs/DECISIONS/tui.md`, "WSJT-X decodes are matched by dial (PAN-443,
+  2026-11)".
+- **A separate receive-only loopback socket (D2).** The listener binds
+  `decode_listen` (default `127.0.0.1:2238`, away from GridTracker's 2237)
+  and never sends a datagram. Validation refuses a non-loopback address,
+  port 0, or an address equal to a parseable `destination`. The start path
+  refuses an unparseable or non-loopback address again even when validation
+  was bypassed. The per-datagram loopback source check is defence in depth,
+  as in PAN-312.
+- **Independent of `enabled` (D3).** `enabled` keeps meaning "pancetta
+  broadcasts as a WSJT-X-role app". An operator using WSJT-X as the modem
+  may not want that broadcast, so `accept_decodes` stands alone.
+- **Dial from Status, never guessed (D4).** The listener parses Status(1)
+  through its Mode field and keeps the last non-zero dial per sender Id, at
+  most 8 Ids with the least recently updated evicted first. A decode from an
+  Id with no dial is dropped and counted; a zero dial or a Close forgets the
+  Id. There is no fallback to pancetta's own dial or to 14.074 MHz, because
+  either would mis-band every decode on a station without CAT.
+- **Only live, confident FT8/FT4 decodes (D5).** `New = true`,
+  `OffAir = false`, `LowConfidence = false`, mode glyph `~` (FT8, 15 s
+  slots) or `+` (FT4, 7.5 s slots). Slot parity comes from the wire `Time`
+  field, rounded to the nearest slot start, because WSJT-X writes an FT4
+  slot start such as 12:00:07.5 at whole-second resolution. Datagrams
+  carrying pancetta's own `instance_id` are dropped as echo. Range checks:
+  SNR -60..=60, finite `|DT| <= 30`, DF up to 6000 Hz, `Time` below one day.
+- **Native constructor and sanitizing (D6).** The text is built with
+  `DecodedMessage::from_ft8lib` and cleaned by the native
+  `sanitize_decoded_message`. An implausible sender call (free text) keeps
+  its text but loses its from-call, to-call and grid, so it shows in Band
+  Activity and creates no DX Hunter row.
+- **Flood bounds (D7).** `try_send` only, because the native decoder sends
+  on the same channel with a blocking `send`. At most 250 forwarded decodes
+  per fixed 15 s window. One summary diagnostic per 60 s, only for
+  operator-actionable drops (non-loopback, malformed, before Status, over
+  budget, display queue full); Info when the only reason is "before Status",
+  Warn otherwise.
+- **Headless and replay start nothing (D12).** In headless mode the only
+  consumer of `ft8_to_tui_tx` is a debug drain; in `--replay` live WSJT-X
+  traffic would mix with replayed decodes. Each case logs one line and
+  binds nothing. Both keys are restart-required.
+- **TUI tags.** `DecodedMessageView.external` drives Band Activity's `EXT `
+  Msg prefix. DX Hunter gains `SpotSource::External` (`EXT`) and
+  `ExternalNetwork` (`EX+N`); a native decode upgrades them to `RX`/`RX+N`,
+  and an external decode never downgrades `RX`/`RX+N` or changes that row's
+  fields. Both paint with the `external` theme token. DX Hunter's Src column
+  keeps its position, so on a narrow panel `EXT` is hidden like `RX` and
+  `NET`; Band Activity's `EXT` shows at every width. The Callers panel does
+  not tag external callers.
+
+Live qualification against a real WSJT-X is pending.
