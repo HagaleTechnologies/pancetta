@@ -292,3 +292,166 @@ fn external_decode_keeps_native_rank_inputs() {
     assert_eq!(inputs.snr_db, -15.0);
     assert!(latest.get(&("K1ABC".to_owned(), false)).is_none());
 }
+
+/// Feed decodes through the relay's conversion with one shared grid and
+/// rank-input memory, as the relay loop does across frames (PAN-434), and
+/// return every view plus the rank-input memory.
+fn views_after(
+    lookup: &CachedStationLookup,
+    decodes: &[RelayedDecode],
+) -> (
+    Vec<pancetta_tui::DecodedMessageView>,
+    RelayCache<(String, bool), RankInputs>,
+) {
+    let scorer = pancetta_qso::PriorityScorer::new(
+        pancetta_qso::priority::PriorityWeights::default(),
+        Box::new(lookup.clone()),
+    );
+    let mut last_grids = RelayCache::default();
+    let mut last_rank_inputs = RelayCache::default();
+    let views = decodes
+        .iter()
+        .map(|relayed| {
+            decoded_view_for_relay(
+                relayed,
+                &mut RelayDecodeCtx {
+                    last_grids: &mut last_grids,
+                    last_rank_inputs: &mut last_rank_inputs,
+                    station_coords: Some((35.0, -97.0)),
+                    lookup,
+                    scorer: &scorer,
+                    our_callsign: "K5ARH",
+                    protocol_mode: 0,
+                },
+            )
+        })
+        .collect();
+    (views, last_rank_inputs)
+}
+
+const WSJTX_FT8: DecodeOrigin = DecodeOrigin::WsjtxUdp {
+    mode: OperatingMode::Ft8,
+};
+
+/// The grid, distance (km) and bearing (degrees) a view shows, rounded.
+fn located(view: &pancetta_tui::DecodedMessageView) -> (Option<&str>, Option<i64>, Option<i64>) {
+    (
+        view.grid_square.as_deref(),
+        view.distance.map(|d| d.round() as i64),
+        view.bearing.map(|b| b.round() as i64),
+    )
+}
+
+/// PAN-434 ticket scenario 1: pancetta heard `CQ K1ABC FN42`, WSJT-X then
+/// sent `CQ K1ABC FN31` on the same band, and pancetta decodes a grid-less
+/// RR73. The native row keeps pancetta's FN42 with its distance and bearing.
+#[test]
+fn wsjtx_grid_does_not_fill_a_native_decode() {
+    let lookup = seeded_lookup();
+    let (views, _) = views_after(
+        &lookup,
+        &[
+            relayed("CQ K1ABC FN42", 14_074_000, DecodeOrigin::Native),
+            relayed("CQ K1ABC FN31", 14_074_000, WSJTX_FT8),
+            relayed("K5ARH K1ABC RR73", 14_074_000, DecodeOrigin::Native),
+        ],
+    );
+    let [native_cq, wsjtx_cq, rr73] = &views[..] else {
+        panic!("three views expected, got {}", views.len());
+    };
+    // The two CQs locate the station differently, so the RR73's match with
+    // the native CQ is pancetta's own grid surviving.
+    assert_eq!(located(native_cq), (Some("FN42"), Some(2397), Some(62)));
+    assert_eq!(located(wsjtx_cq), (Some("FN31"), Some(2213), Some(64)));
+    assert!(!rr73.external, "the RR73 is pancetta's own decode");
+    assert_eq!(rr73.grid_square.as_deref(), Some("FN42"));
+    assert_eq!(rr73.distance, native_cq.distance);
+    assert_eq!(rr73.bearing, native_cq.bearing);
+    assert_ne!(rr73.distance, wsjtx_cq.distance);
+    assert_ne!(rr73.bearing, wsjtx_cq.bearing);
+}
+
+/// PAN-434: the WSJT-X grid stays out of the native score and the native
+/// rank inputs a QSO-outcome rescore uses. FN31 is already worked on 20m and
+/// FN42 is not, so a leaked FN31 would turn `grid_new_on_band` off.
+#[test]
+fn wsjtx_grid_stays_out_of_native_rank_inputs() {
+    let lookup = seeded_lookup();
+    lookup.record_worked_grid("FN31", "20m");
+    let native_cq = relayed("CQ K1ABC FN42", 14_074_000, DecodeOrigin::Native);
+    let native_rr73 = relayed("K5ARH K1ABC RR73", 14_074_000, DecodeOrigin::Native);
+    let (views, rank_inputs) = views_after(
+        &lookup,
+        &[
+            native_cq.clone(),
+            relayed("CQ K1ABC FN31", 14_074_000, WSJTX_FT8),
+            native_rr73.clone(),
+        ],
+    );
+    let native_inputs = rank_inputs
+        .get(&("K1ABC".to_owned(), false))
+        .expect("native K1ABC rank inputs cached");
+    assert_eq!(native_inputs.grid.as_deref(), Some("FN42"));
+    let external_inputs = rank_inputs
+        .get(&("K1ABC".to_owned(), true))
+        .expect("external K1ABC rank inputs cached");
+    assert_eq!(external_inputs.grid.as_deref(), Some("FN31"));
+
+    let rr73 = views.last().expect("RR73 view");
+    let factors = rr73.priority_factors.as_ref().expect("RR73 is scored");
+    assert!(factors.grid_new_on_band, "FN42 is still new on 20m");
+
+    // The same RR73 in a session without the WSJT-X decode scores alike.
+    let (control, _) = views_after(&lookup, &[native_cq, native_rr73]);
+    let control_rr73 = control.last().expect("control RR73 view");
+    assert_eq!(rr73.priority_score, control_rr73.priority_score);
+    assert_eq!(rr73.priority_factors, control_rr73.priority_factors);
+}
+
+/// PAN-434: neither origin borrows the other's grid, and each keeps its own.
+#[test]
+fn wsjtx_decode_does_not_borrow_a_native_grid() {
+    let lookup = seeded_lookup();
+
+    // A grid-less WSJT-X frame does not borrow pancetta's grid.
+    let (views, _) = views_after(
+        &lookup,
+        &[
+            relayed("CQ K1ABC FN42", 14_074_000, DecodeOrigin::Native),
+            relayed("K5ARH K1ABC RR73", 14_074_000, WSJTX_FT8),
+        ],
+    );
+    let wsjtx_rr73 = views.last().expect("WSJT-X RR73 view");
+    assert!(wsjtx_rr73.external);
+    assert_eq!(located(wsjtx_rr73), (None, None, None));
+
+    // A grid-less native frame does not borrow WSJT-X's grid.
+    let (views, _) = views_after(
+        &lookup,
+        &[
+            relayed("CQ K1ABC FN31", 14_074_000, WSJTX_FT8),
+            relayed("K5ARH K1ABC RR73", 14_074_000, DecodeOrigin::Native),
+        ],
+    );
+    let native_rr73 = views.last().expect("native RR73 view");
+    assert!(!native_rr73.external);
+    assert_eq!(located(native_rr73), (None, None, None));
+
+    // A grid-less WSJT-X frame keeps the grid WSJT-X itself sent.
+    let (views, _) = views_after(
+        &lookup,
+        &[
+            relayed("CQ K1ABC FN42", 14_074_000, DecodeOrigin::Native),
+            relayed("CQ K1ABC FN31", 14_074_000, WSJTX_FT8),
+            relayed("K5ARH K1ABC RR73", 14_074_000, WSJTX_FT8),
+        ],
+    );
+    let [_, wsjtx_cq, wsjtx_rr73] = &views[..] else {
+        panic!("three views expected, got {}", views.len());
+    };
+    assert!(wsjtx_rr73.external);
+    assert_eq!(wsjtx_rr73.grid_square.as_deref(), Some("FN31"));
+    assert_eq!(wsjtx_rr73.distance, wsjtx_cq.distance);
+    assert_eq!(wsjtx_rr73.bearing, wsjtx_cq.bearing);
+    assert!(wsjtx_rr73.distance.is_some() && wsjtx_rr73.bearing.is_some());
+}

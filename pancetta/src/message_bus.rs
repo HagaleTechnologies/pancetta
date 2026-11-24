@@ -62,6 +62,10 @@ pub enum ComponentId {
     StationAgent,
     /// WSJT-X UDP companion-protocol component (GridTracker/JTAlert interop).
     WsjtxUdp,
+    /// The PAN-381 WSJT-X decode listener (display-only same-host decodes),
+    /// supervised apart from the companion so its failure is reported on its
+    /// own (PAN-434).
+    WsjtxDecodeListener,
 }
 
 impl std::fmt::Display for ComponentId {
@@ -82,6 +86,7 @@ impl std::fmt::Display for ComponentId {
             ComponentId::RemoteGateway => write!(f, "remote_gateway"),
             ComponentId::StationAgent => write!(f, "station_agent"),
             ComponentId::WsjtxUdp => write!(f, "WsjtxUdp"),
+            ComponentId::WsjtxDecodeListener => write!(f, "WsjtxDecodeListener"),
         }
     }
 }

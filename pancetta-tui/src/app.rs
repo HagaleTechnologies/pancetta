@@ -705,6 +705,16 @@ fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
     hz_from_mhz(mhz).and_then(pancetta_core::Band::from_frequency)
 }
 
+/// `true` unless both dials (MHz) are known and on different bands by
+/// `pancetta_core::types::band::is_band_change` (PAN-434). An unknown dial
+/// fails open, as every band-scoped decode check does (PAN-69).
+fn same_band_dial(a_mhz: f64, b_mhz: f64) -> bool {
+    match (hz_from_mhz(a_mhz), hz_from_mhz(b_mhz)) {
+        (Some(a), Some(b)) => !pancetta_core::types::band::is_band_change(a, b),
+        _ => true,
+    }
+}
+
 /// A dial in Hz as exact MHz text for a status line (PAN-443): every Hz is
 /// kept, trailing zeros are trimmed down to three decimals, so two different
 /// dials never print alike (`14.074 MHz`, `14.0745 MHz`, `0.4742 MHz`).
@@ -4226,7 +4236,9 @@ impl App {
     /// A completed QSO (`worked_on_band`) also marks the row and its retained
     /// decodes worked, so the DX Hunter partition and the Station card agree
     /// with the Why line before the station is decoded again (PAN-228).
-    /// Decodes match by the relay's hash-render identity, not by base call.
+    /// Decodes match by the relay's hash-render identity, not by base call,
+    /// and are marked only on the row's band (PAN-434): the row's dial is the
+    /// latest decode of the rescore's origin, the dial the relay scored.
     pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
         let Some(entry) = self.dx_stations.get_mut(dx_row_call(callsign)) else {
             return;
@@ -4238,10 +4250,13 @@ impl App {
         rank.factors = Some(factors);
         if factors.worked_on_band {
             entry.worked_before = true;
+            let row_dial_mhz = entry.frequency;
             for m in &mut self.decoded_messages {
+                // PAN-434: a line heard on another band (a WSJT-X dial) stays unmarked.
                 if m.call_sign
                     .as_deref()
                     .is_some_and(|c| same_station(c, callsign))
+                    && same_band_dial(row_dial_mhz, m.frequency)
                 {
                     m.worked_before = true;
                 }

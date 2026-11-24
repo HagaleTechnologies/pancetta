@@ -410,7 +410,8 @@ pub(crate) struct IngestContext {
 /// The listener task. Receive-only: it never sends a datagram. A full or
 /// closed display channel drops the decode instead of blocking, because the
 /// native decoder's send on that channel blocks. It never returns early, so
-/// the supervisor never sees `WsjtxUdp` fail because of WSJT-X traffic.
+/// the supervisor never sees `WsjtxDecodeListener` fail because of WSJT-X
+/// traffic.
 pub(crate) async fn run_decode_ingest(ctx: IngestContext) -> Result<()> {
     let mut ingest = DecodeIngest::new(ctx.own_instance_id.clone(), ctx.limits);
     let mut counters = DropCounters::default();
@@ -555,8 +556,10 @@ impl super::super::ApplicationCoordinator {
             limits: IngestLimits::default(),
         };
         let handle = tokio::spawn(run_decode_ingest(ctx));
+        // PAN-434: its own supervisor id, apart from the companion's
+        // `WsjtxUdp`, so a listener failure is reported as the listener's.
         self.named_task_handles
-            .push((ComponentId::WsjtxUdp, handle));
+            .push((ComponentId::WsjtxDecodeListener, handle));
         Ok(Some(local))
     }
 }

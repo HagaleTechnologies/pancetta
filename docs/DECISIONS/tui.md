@@ -818,3 +818,28 @@ when WSJT-X heard the Fox on another band.
   gap, not an `EXT` one. Follow-up ticket: "Operators should not engage Hound
   on a network-spotted Fox from another band, so that Shift+H never calls a
   Fox on a dial nobody heard it on".
+
+## WSJT-X decodes keep their own state (PAN-434, 2026-11)
+
+PAN-381 split the relay's rank inputs by origin. Three other places still
+mixed WSJT-X (`EXT`) decodes with pancetta's own.
+
+- **Grid memory is keyed by origin.** `display_grid` keys its cache
+  `(call, band, external)`. A grid-less frame shows only a grid the same
+  receiver heard. The WSJT-X grid also stays out of the native score
+  (`grid_new_on_band`) and the native rank inputs a QSO outcome rescores.
+- **Worked marks follow the row's band.** `App::refresh_local_rank` marks a
+  retained line only when its dial is on the DX Hunter row's band
+  (`is_band_change`; an unknown dial matches). The row's dial is the latest
+  decode of the rescore's origin, the dial the relay scored, so
+  `DxRankRefresh` carries no dial. A 20m `EXT` line of a call worked on 20m
+  is marked, because worked status belongs to the band, not the receiver.
+- **The listener is its own supervised component.**
+  `ComponentId::WsjtxDecodeListener` (`DegradeOnly`, no QSO scope) gives the
+  listener its own status entry and failure text. Under the shared
+  `WsjtxUdp` id a second failure in one pass was never reported, because
+  the supervisor keys its status on the id.
+- **Out of scope.** A native decode that upgrades an `EXT` row still keeps
+  the row's WSJT-X grid through the TUI's grid fallback. `DxStation` has one
+  grid field, so that needs a row-model change; it has its own follow-up
+  ticket.
