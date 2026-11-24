@@ -5863,5 +5863,9 @@ mod waterfall_session_restore_tests;
 mod slot_clock_consumers_tests;
 
 #[cfg(test)]
+#[path = "tests/tui_slot_timing_tests.rs"]
+mod tui_slot_timing_tests;
+
+#[cfg(test)]
 #[path = "tests/data_dir_tests.rs"]
 mod data_dir_tests;

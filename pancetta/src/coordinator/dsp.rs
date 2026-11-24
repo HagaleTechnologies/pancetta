@@ -453,6 +453,22 @@ pub(super) fn decode_window_clock_step(
     }
 }
 
+/// PAN-477: the slot a due decode window is cut from: the timer's deadline
+/// (the decode-phase instant) minus `decode_phase`, on the DSP's `slot_ns`.
+/// The DSP takes this one value both for the audio slice's boundary and for
+/// the `WindowSlot` it sends, so the decoder stamps parity on the slot whose
+/// audio the window holds, whatever its own clock reads at receipt.
+pub(super) fn decode_window_slot(
+    timer: &SlotTimer,
+    decode_phase: SignedDuration,
+    slot_ns: i64,
+) -> super::pipeline::WindowSlot {
+    super::pipeline::WindowSlot {
+        start: timer.deadline() - decode_phase,
+        slot_ns,
+    }
+}
+
 /// The WARN text for a decode-window re-anchor.
 pub(super) fn decode_window_reanchor_text(reanchor: &Reanchor) -> String {
     match reanchor {
@@ -1295,8 +1311,11 @@ impl super::ApplicationCoordinator {
                         if let Some(raw) = raw_capture.as_mut() {
                             let cached_mode =
                                 pancetta_config::OperatingMode::from_u8(cached_mode_u8);
+                            // PAN-477: the batch's wall time is read through
+                            // the shared slot clock, the same wall value every
+                            // other slot consumer reads.
                             let ctx = super::raw_capture::BatchContext {
-                                end: UtcTimestamp::now(),
+                                end: slot_clock.now(),
                                 dial_hz: last_known_dial_hz,
                                 ft8_active: cached_mode == pancetta_config::OperatingMode::Ft8,
                                 mode_label: super::mode_str(cached_mode),
@@ -1460,7 +1479,9 @@ impl super::ApplicationCoordinator {
                             // timer's deadline is the decode-phase instant,
                             // `decode_phase` past the boundary (FT8 →
                             // :13/:28/:43/:58; FT4 → :6.5 cadence).
-                            let slot_boundary = window_timer.deadline() - dsp_decode_phase;
+                            let window_slot =
+                                decode_window_slot(&window_timer, dsp_decode_phase, dsp_slot_ns);
+                            let slot_boundary = window_slot.start;
                             // PAN-320: the FIR path's newest output sample
                             // reflects input ~312.5 µs in the past, so the
                             // buffer's effective end (what
@@ -1584,6 +1605,9 @@ impl super::ApplicationCoordinator {
                                     // known dial. 0 still means unknown.
                                     dial_hz: cur_dial_hz,
                                     sweep,
+                                    // PAN-477: the slot this window was cut
+                                    // from, the same value as `slot_boundary`.
+                                    slot: window_slot,
                                 },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
                             ) {
@@ -2007,7 +2031,9 @@ mod dial_change_state_tests {
 /// explicit sample indices; nothing sleeps and no rig is involved.
 #[cfg(test)]
 mod dial_change_signal_tests {
-    use super::{apply_dial_change, boundary_anchored_slice, decode_window_clock_step};
+    use super::{
+        apply_dial_change, boundary_anchored_slice, decode_window_clock_step, decode_window_slot,
+    };
     use crate::coordinator::pipeline::DecodeWindow;
     use crate::coordinator::{derive_dsp_timing, WINDOW_LEAD_SECS};
     use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
@@ -2142,7 +2168,8 @@ mod dial_change_signal_tests {
             if self.ft8_buffer.len() < timing.window_samples || !p.due {
                 return None;
             }
-            let slot_boundary = self.timer.deadline() - timing.decode_phase;
+            let window_slot = decode_window_slot(&self.timer, timing.decode_phase, timing.slot_ns);
+            let slot_boundary = window_slot.start;
             let (start, len) = boundary_anchored_slice(
                 self.ft8_buffer.len(),
                 now,
@@ -2155,6 +2182,7 @@ mod dial_change_signal_tests {
                 samples: self.ft8_buffer[start..start + len].to_vec(),
                 dial_hz: cur_dial_hz,
                 sweep: None,
+                slot: window_slot,
             };
             if self.ft8_buffer.len() > timing.overlap_samples {
                 let excess = self.ft8_buffer.len() - timing.overlap_samples;

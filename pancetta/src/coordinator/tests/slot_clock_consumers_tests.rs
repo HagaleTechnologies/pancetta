@@ -13,10 +13,16 @@
 //! four times before the step and for two slots after it; the TX wait stops
 //! polling once it reaches its PTT instant or drops the frame, as the
 //! worker's wait does.
+//!
+//! PAN-477: the decode-parity rows cut a window from the DSP timer on the
+//! same clock, carry it through a real `bounded(2)` channel, step the wall
+//! before the decoder receives it, and check that the decoder stamps the
+//! parity of the slot the DSP cut, not of the receipt time.
 
 use super::autonomous::autonomous_slot_poll;
 use super::clock_monitor::MonitorStepCursor;
-use super::dsp::decode_window_clock_step;
+use super::dsp::{decode_window_clock_step, decode_window_slot};
+use super::pipeline::{forward_or_drop, DecodeWindow, ForwardOutcome, DECODE_FORWARD_TIMEOUT};
 use super::qso::queued_call_ttl_partition_for_test;
 use super::tx::{ptt_wait_step, schedule_tx, PttWaitStep};
 use crate::clock_skew::ClockSkewMonitorCore;
@@ -568,4 +574,109 @@ async fn sub_second_step_changes_no_slot_consumer() {
                 .to_string()
         ]
     );
+}
+
+/// PAN-477: what one decode-parity run observed.
+struct DecodeParityRun {
+    /// The slot the DSP cut the window from.
+    cut_start: UtcTimestamp,
+    /// The parity the decoder stamps from the received window.
+    received_parity: SlotParity,
+    /// The pre-PAN-477 parity: the receipt read minus the decode phase.
+    receipt_parity: SlotParity,
+    /// The clock's resync epoch at receipt.
+    resync_epoch: u64,
+}
+
+/// PAN-477: cut the window the DSP emits at the first decode phase after
+/// 00:00:00 (polling every 250 ms from 1 s before it), send it through a
+/// real `bounded(2)` decode channel, step the wall by `step`, then receive
+/// it as the decoder does.
+fn decode_parity_run(slot_ns: i64, step: SignedDuration) -> DecodeParityRun {
+    let decode_phase = dsp_decode_phase(slot_ns);
+    let manual = ManualClock::new(base() + decode_phase - ms(1_000));
+    let clock = manual.slot_clock(Arc::new(AtomicI64::new(slot_ns)));
+    let mut dsp_timer = SlotTimer::new(&clock.read(), decode_phase, slot_ns);
+    assert_eq!(dsp_timer.deadline(), base() + decode_phase);
+
+    let (tx, rx) = crossbeam_channel::bounded::<DecodeWindow>(2);
+    loop {
+        let reading = clock.read();
+        let poll = decode_window_clock_step(&mut dsp_timer, &reading, slot_ns);
+        assert!(!poll.flush, "no step before the cut");
+        if poll.due {
+            let slot = decode_window_slot(&dsp_timer, decode_phase, slot_ns);
+            let window = DecodeWindow {
+                samples: vec![0.0; 4],
+                dial_hz: 14_074_000,
+                sweep: None,
+                slot,
+            };
+            assert_eq!(
+                forward_or_drop(&tx, window, DECODE_FORWARD_TIMEOUT),
+                ForwardOutcome::Sent
+            );
+            dsp_timer.advance(&reading);
+            break;
+        }
+        manual.advance(POLL);
+    }
+
+    manual.step_wall(step);
+    let reading = clock.read();
+    let received = rx.recv().expect("the window crosses the channel");
+    DecodeParityRun {
+        cut_start: received.slot.start,
+        received_parity: received.slot.parity(),
+        receipt_parity: SlotParity::of_with_period(reading.now - decode_phase, slot_ns),
+        resync_epoch: reading.resync_epoch,
+    }
+}
+
+/// PAN-477 ticket scenario: FT4 with one slot clock; the window the DSP
+/// emits at 00:00:06.5 is received after a +7.5 s clock step and carries
+/// the parity of the slot the DSP cut it from.
+#[test]
+fn ft4_decode_parity_follows_the_dsp_slot_across_a_7_5_s_step() {
+    let run = decode_parity_run(FT4_NS, ms(7_500));
+    assert_eq!(dsp_decode_phase(FT4_NS), ms(6_500));
+    assert_eq!(run.cut_start, base(), "the DSP cut the 00:00:00 slot");
+    assert_eq!(SlotParity::of_with_period(base(), FT4_NS), SlotParity::Even);
+    assert_eq!(run.resync_epoch, 1, "the clock reported the step");
+    assert_eq!(run.received_parity, SlotParity::Even);
+    // The pre-PAN-477 formula, the receipt read minus the decode phase,
+    // lands in the next FT4 slot.
+    assert_eq!(run.receipt_parity, SlotParity::Odd);
+}
+
+/// PAN-477: the decoder stamps the DSP slot's parity for every mode and
+/// for steps of either direction, including steps where the receipt
+/// formula would also have been right and a sub-second step.
+#[test]
+fn decode_parity_follows_the_dsp_slot_for_each_mode_and_step() {
+    let cases: [(&str, i64, i64, u64); 9] = [
+        ("FT4 +7.5 s", FT4_NS, 7_500, 1),
+        ("FT4 -7.5 s", FT4_NS, -7_500, 1),
+        ("FT4 +60 s", FT4_NS, 60_000, 1),
+        ("FT8 +15 s", FT8_NS, 15_000, 1),
+        ("FT8 -15 s", FT8_NS, -15_000, 1),
+        ("FT8 +7.5 s", FT8_NS, 7_500, 1),
+        ("FT2 +3.2 s", FT2_NS, 3_200, 1),
+        ("FT2 -3.2 s", FT2_NS, -3_200, 1),
+        ("FT8 +0.5 s", FT8_NS, 500, 0),
+    ];
+    for (name, slot_ns, step_ms, resync_epoch) in cases {
+        let run = decode_parity_run(slot_ns, ms(step_ms));
+        assert_eq!(
+            run.cut_start,
+            base(),
+            "{name}: the DSP cut the 00:00:00 slot"
+        );
+        assert_eq!(run.resync_epoch, resync_epoch, "{name}: resync epoch");
+        assert_eq!(
+            run.received_parity,
+            SlotParity::of_with_period(base(), slot_ns),
+            "{name}: the decoder stamps the cut slot's parity"
+        );
+    }
 }

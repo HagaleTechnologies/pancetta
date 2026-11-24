@@ -31,10 +31,27 @@ pub(super) const RAW_CAPTURE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The only capture rate raw capture accepts.
 pub(super) const RAW_CAPTURE_RATE_HZ: u32 = 48_000;
 
-const FT8_SLOT_NS: i64 = 15_000_000_000;
-/// 15 s at 48 kHz.
-const FRAMES_PER_SLOT: usize = 720_000;
+/// Raw capture's slot length: FT8's 15 s, never the active mode's period.
+///
+/// PAN-477: this is deliberately not read from the shared `SlotClock`'s
+/// `slot_ns`. `docs/DECISIONS/config-and-platform.md` (Timed raw 48 kHz
+/// capture, decision 3, "FT8 only") fixes slots at 15 s: FT4/FT2 abandon the
+/// slot in progress and pause capture, because FT4 boundaries fall on half
+/// seconds the file name cannot carry.
+const RAW_SLOT_NS: i64 = pancetta_core::slot::SLOT_NS;
+/// One [`RAW_SLOT_NS`] slot at 48 kHz (720,000 frames).
+const FRAMES_PER_SLOT: usize =
+    (RAW_SLOT_NS as u64 * RAW_CAPTURE_RATE_HZ as u64 / 1_000_000_000) as usize;
+const _: () = assert!(FRAMES_PER_SLOT == 720_000);
 /// Wall-clock versus sample-position drift that abandons a slot.
+///
+/// PAN-477: `docs/DECISIONS/config-and-platform.md` (Timed raw 48 kHz
+/// capture, decision 6, "Continuity") keeps this wall-against-sample check.
+/// The shared `SlotClock` compares wall time against the monotonic clock, so
+/// it sees a clock step but cannot see dropped batches, stalls or device
+/// reopens, where the wall and monotonic clocks agree and only the sample
+/// count falls behind. The cutter's wall time ([`BatchContext::end`]) is read
+/// through that clock; this check stays alongside it.
 const CONTINUITY_TOLERANCE_NS: i64 = 250_000_000;
 const WRITER_QUEUE_DEPTH: usize = 2;
 /// hound's largest PCM header (WAVE_FORMAT_EXTENSIBLE); 2-channel 16-bit
@@ -290,7 +307,9 @@ pub(super) fn raw_slot_file_name(slot_start: UtcTimestamp, dial_hz: u64, tx: boo
 /// What the DSP knows about one batch when it hands it over.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BatchContext {
-    /// `UtcTimestamp::now()` when the DSP handles the batch.
+    /// The shared `SlotClock`'s `now()` when the DSP handles the batch
+    /// (the same wall time as `UtcTimestamp::now()`, read through the one
+    /// clock every slot consumer uses; PAN-477).
     pub end: UtcTimestamp,
     /// The DSP's `last_known_dial_hz` after its dial guard (0 = unknown).
     pub dial_hz: u64,
@@ -427,8 +446,8 @@ impl RawSlotCutter {
         // Does a slot's span start fall in this batch's wall-clock range?
         // (slot_ns, frame offset) of a slot that starts in this batch.
         let mut new_slot: Option<(i64, usize)> = None;
-        let k = (end_ns + self.lead_ns).div_euclid(FT8_SLOT_NS);
-        let slot_ns = k * FT8_SLOT_NS;
+        let k = (end_ns + self.lead_ns).div_euclid(RAW_SLOT_NS);
+        let slot_ns = k * RAW_SLOT_NS;
         let span_ns = slot_ns - self.lead_ns;
         if span_ns > prev_end_ns
             && span_ns > self.last_started_span_ns
@@ -474,7 +493,7 @@ impl RawSlotCutter {
             slot.tx |= tx_overlaps(
                 ctx.ptt,
                 ns_to_ms(slot.span_ns),
-                ns_to_ms(slot.span_ns + FT8_SLOT_NS),
+                ns_to_ms(slot.span_ns + RAW_SLOT_NS),
             );
             let wall = start_ns + frames_to_ns(from + take);
             let sample = slot.span_ns + frames_to_ns(slot.frames);

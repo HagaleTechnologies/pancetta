@@ -922,10 +922,10 @@ pub(crate) struct StoredKey {
     /// Same value as the paired `OutMsg::Decode`'s `message`.
     pub(crate) message: String,
     /// The decoder's own authoritative slot parity for this decode
-    /// (`DecodedMessage::slot_parity`, set in `ft8.rs` via
-    /// `slot_parity_for_receipt` — which subtracts `decode_phase` to recover
-    /// the true slot start before taking parity). Carried verbatim from the
-    /// `DecodedMessage` this entry was built from; [`reply_to_call`] reads it
+    /// (`DecodedMessage::slot_parity`, set in `ft8.rs` from the slot the DSP
+    /// cut the decode window from, `DecodeWindow::slot`; PAN-477). Carried
+    /// verbatim from the `DecodedMessage` this entry was built from;
+    /// [`reply_to_call`] reads it
     /// straight off a matched entry rather than re-deriving parity from
     /// `time_ms` (which is stamped at decode-completion time, already past
     /// the slot boundary, and would floor into the wrong 15s slot under

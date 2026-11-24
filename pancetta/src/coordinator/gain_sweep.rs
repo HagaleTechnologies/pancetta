@@ -2,11 +2,34 @@
 //!
 //! All time coordinates are originating UTC slot starts in seconds, never decode
 //! receipt times. PSD input is settled mono 12 kHz audio, with capture lead removed.
+//!
+//! The sweep is FT8-only, so its slot grid is FT8's 15 s ([`FT8_SLOT_SECS`]),
+//! never the active mode's period (PAN-477). `start_gain_sweep` refuses to
+//! start unless the operating mode is FT8 ("Sweep unavailable: requires FT8")
+//! and aborts when the protocol mode changes mid-sweep, so the shared
+//! `SlotClock`'s FT4/FT2 period never applies to a sweep slot. The runtime reads
+//! wall time through that clock; only the period stays FT8's.
 
 use pancetta_core::time::UtcTimestamp;
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// FT8 slot length in seconds: the only slot grid the sweep uses (module doc).
+pub const FT8_SLOT_SECS: i64 = pancetta_core::slot::SLOT_NS / 1_000_000_000;
+
+/// FT8 slot parity of an originating slot start in seconds: 0 even, 1 odd.
+pub fn ft8_slot_parity_index(slot_secs: i64) -> usize {
+    slot_secs.div_euclid(FT8_SLOT_SECS).rem_euclid(2) as usize
+}
+
+/// Start (in seconds) of the next FT8 source slot whose capture boundary, the
+/// slot start minus `lead_secs`, is after `now`.
+pub fn next_ft8_source_slot_secs(now: UtcTimestamp, lead_secs: f64) -> i64 {
+    let slot_ms = FT8_SLOT_SECS * 1000;
+    (now.as_millisecond() + (lead_secs * 1000.0) as i64).div_euclid(slot_ms) * FT8_SLOT_SECS
+        + FT8_SLOT_SECS
+}
 
 const MIN_WINDOWS: usize = 6;
 const MIN_SENDERS: usize = 3;
@@ -76,7 +99,7 @@ impl Schedule {
             self.quiet = false;
             return None;
         }
-        let parity = (slot.div_euclid(15).rem_euclid(2)) as usize;
+        let parity = ft8_slot_parity_index(slot);
         if self.cursor == self.cycle.len() {
             let n = self.settings.len();
             // Prefer the least observed setting/parity, then cyclic rotation.
@@ -298,8 +321,8 @@ impl Report {
                                 o.gain == higher
                                     && !used.contains(i)
                                     && station_maps[*i].contains_key(call)
-                                    && l.slot.div_euclid(15).rem_euclid(2)
-                                        == o.slot.div_euclid(15).rem_euclid(2)
+                                    && ft8_slot_parity_index(l.slot)
+                                        == ft8_slot_parity_index(o.slot)
                                     && (l.slot - o.slot).abs() <= MAX_DISTANCE
                             })
                             .min_by_key(|(_, o)| ((l.slot - o.slot).abs(), o.slot));
@@ -449,6 +472,10 @@ fn periodogram(samples: &[f32], hann: &[f64], norm: f64, fft: &dyn rustfft::Fft<
         .map(|k| frame[k].norm_sqr() / norm * if k == 0 || k == n / 2 { 1.0 } else { 2.0 })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "gain_sweep/tests/ft8_slot_tests.rs"]
+mod ft8_slot_tests;
 
 #[cfg(test)]
 mod tests {
