@@ -1671,10 +1671,18 @@ which bundles SQLite 3.54.1, and the `deny.toml` ignore is deleted.
 `qso_index_runs_on_sqlite_patched_for_rustsec_2026_0459` asks the open pool
 for `sqlite_version()` and fails below 3.54.0.
 
-**`sqlite-bundled`, not `sqlite`.** In sqlx 0.9 the `sqlite` feature also
-turns on extension loading, deserialize and unlock-notify. `sqlite-bundled`
-is the surface 0.8's `sqlite` gave, so those stay compiled out, and both
-`pancetta-qso` and the `pancetta` dev-dependency request it.
+**`sqlite-bundled` plus `sqlite-unlock-notify`, not `sqlite`.** sqlx-sqlite
+0.8.6 always compiled extension loading, (de)serialize and unlock-notify;
+0.9 makes each an opt-in feature, and its `sqlite` feature turns all three
+on. Pancetta calls no extension-loading or deserialize API, so those two stay
+off. Unlock-notify is different: it changes how every statement steps.
+Without it, a connection that finds a table locked by another connection on
+the same shared cache fails with "database table is locked" instead of
+waiting. `QsoDatabase::open(":memory:")`, which replay mode uses, opens a
+shared-cache database across a five-connection pool, so both `pancetta-qso`
+and the `pancetta` dev-dependency request `sqlite-bundled` and
+`sqlite-unlock-notify`. `qso_index_sqlite_keeps_unlock_notify` fails if the
+bundled SQLite loses `SQLITE_ENABLE_UNLOCK_NOTIFY`.
 
 **Two `cargo update` steps.** `cargo update -p sqlx` leaves
 `libsqlite3-sys` at 0.30.1, because sqlx-sqlite 0.9.1 still accepts it.
@@ -1688,8 +1696,8 @@ SQLite 3.54.0. A direct dependency that no source file names would also trip
 
 **`AssertSqlSafe`.** sqlx 0.9 refuses a dynamic SQL string unless it is
 wrapped in `sqlx::AssertSqlSafe`. `async_database.rs` has four: the
-`search_qsos` and `search_qsos_records` builders, whose values are all bound with `?` and whose only
-interpolation is the clamped `u32` `LIMIT`; `VACUUM INTO`, whose target has
-no bind form and is escaped by `escape_sqlite_string_literal`; and the
+`search_qsos` and `search_qsos_records` builders, whose values are all bound
+with `?` and whose only interpolation is the clamped `u32` `LIMIT`;
+`VACUUM INTO`, whose target has no bind form and is escaped by `escape_sqlite_string_literal`; and the
 confirmed-count query, which formats the constant `CONFIRMED_QSO_SQL`. Any
 new dynamic SQL needs the same wrapper and a comment saying why it is safe.
