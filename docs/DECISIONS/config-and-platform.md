@@ -807,6 +807,35 @@ estimate was double); 2 GiB holds 745 stereo files (186 minutes). Stub
 audio only paces close to real time with `input_channels = 1` and
 `buffer_size = 4096`, which the end-to-end tests use.
 
+## Atomic decode-window publish (PAN-471, 2026-11-24)
+
+`WavRecorder::write_window` (`pancetta/src/coordinator/dsp.rs`) used to
+create `ft8_<ts>[_<band>].wav` under its final name and finalize it last, so
+the corpus offload could move a half-written file and lose the window. It
+now follows the raw48 writer (PAN-393 item 8).
+
+1. **Name.** The part is the full final name plus `.part`
+   (`ft8_<ts>[_<band>].wav.part`), as in raw48. Finished names are unchanged.
+2. **Cleanup scope.** `WavRecorder::open` removes top-level regular files
+   named `ft8_*.wav.part` only. This folder also holds
+   `raw_48khz_diagnostic.wav`, `raw48/` (which cleans its own parts) and
+   operator files, so the raw48 rule (`*.wav.part`) would be too wide.
+3. **Every error path removes the part.** A failed create, sample write,
+   finalize or rename deletes the part, counts nothing and logs one line,
+   `WAV recorder: cannot write <name>: <error>`. Before, a finalize failure
+   left a truncated file under the final name.
+4. **Accounting untouched.** `dir_size`, `delete_oldest` and `remeasure`
+   already count only `*.wav`, and raw48 shares `dir_size`. The start-up
+   cleanup stops uncounted part bytes from piling up across crashes.
+5. **Size read before the rename.** The offload may move the file the
+   instant it appears, so the byte count comes from the part.
+6. **Sample write errors propagate.** They were ignored and a broken file
+   was still published; now the part is dropped. hound only fails an i16
+   sample on I/O, so a healthy disk sees no change.
+
+`raw_48khz_diagnostic.wav` (`pancetta/src/coordinator/audio.rs`) is still
+written in place, once per start; it is not an `ft8_*` file.
+
 ## `--replay` feed waits for the QSO history seed (PAN-42, 2026-10-21)
 
 - `run()` starts the replay feeder (`start_pipeline()`) before the QSO
