@@ -1674,10 +1674,16 @@ for `sqlite_version()` and fails below 3.54.0.
 **`sqlite-bundled` plus `sqlite-unlock-notify`, not `sqlite`.** In sqlx 0.9
 the `sqlite` feature is `sqlite-bundled` plus extension loading, deserialize
 and unlock-notify. sqlx-sqlite 0.8.6 always built SQLite with unlock-notify
-and compiled the other two out. Both `pancetta-qso` and the `pancetta`
+and always compiled the other two: it had no `load-extension` or
+`deserialize` feature, so `SqliteConnectOptions::extension` and
+`SqliteConnection::serialize`/`deserialize` were in every build. sqlx 0.9
+puts them behind those features. Both `pancetta-qso` and the `pancetta`
 dev-dependency request `sqlite-bundled` and `sqlite-unlock-notify`, which
 gives the same `libsqlite3-sys` feature set as 0.8.6: `bundled`,
-`bundled_bindings`, `cc`, `pkg-config`, `unlock_notify` and `vcpkg`.
+`bundled_bindings`, `cc`, `pkg-config`, `unlock_notify` and `vcpkg`. The
+three sqlx-sqlite APIs above are no longer built, and nothing in the
+workspace calls them. The bundled SQLite library is still compiled with
+`SQLITE_ENABLE_LOAD_EXTENSION=1`, so only sqlx's Rust wrappers change.
 Unlock-notify matters for a `:memory:` index (`--replay`, `new_in_memory`),
 which sqlx opens with a shared cache: without it a pooled reader fails with
 "database table is locked" while another connection holds an uncommitted
