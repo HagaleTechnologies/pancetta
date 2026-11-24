@@ -1664,29 +1664,6 @@ inside the four-character `%Y` width (`-027`, where chrono wrote `-0027`);
 only malformed data carries such a year, and
 `documented_narrowings_from_chrono_hold` pins both narrowings.
 
-<<<<<<< HEAD
-## Registry MSRV check (PAN-468, 2026-11-24)
-
-`pancetta-core` and `pancetta-ft8` declare `rust-version = "1.88"` (PAN-384). The
-`#![deny(clippy::incompatible_msrv)]` in each `lib.rs` catches std APIs newer than 1.88 in
-the crates' own source, but not a newer language feature or any dependency. The
-`workspace-check` job now installs 1.88.0 next to the pinned 1.98.0 and runs
-`cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8` for the default,
-`--all-features` and `--no-default-features` builds; `scripts/ci/test-ci-msrv.sh` ties that
-version to both manifests.
-
-- **A step, not a job.** A new aggregator job breaks `test-ci-cargo-coverage.sh` and
-  `test-ci-merge-group-verified.sh`, and one outside the aggregator is advisory only. The step
-  inherits the checkout, system headers and `code` path gate, as the PAN-384 dry-run does.
-- **Plain cargo, not `cargo hack`.** No new pinned tool, and cargo already names the
-  dependency: a 2026-11-24 probe that patched in a copy of `hound 3.5.1` declaring
-  `rust-version = "1.89"` printed `hound@3.5.1 requires rustc 1.89`. The real `hound` declares
-  none and passes. `cargo tree -i <dep>` shows who pulled a failing dependency in.
-- **`--locked`, and `CARGO_TARGET_DIR` under `runner.temp`.** A stale lockfile fails instead of
-  re-resolving, and the 1.88 artifacts stay out of the rust-cache; the check takes about 30 s.
-- **No fresh-resolve lane.** CI proves the committed `Cargo.lock`. A lane that re-resolved
-  would fail unrelated PRs whenever an upstream release raised its MSRV.
-=======
 ## SQLite 3.54 through sqlx 0.9 (PAN-394, 2026-11-24)
 
 RUSTSEC-2026-0459 covers SQLite below 3.54.0, which can return leftover
@@ -1729,4 +1706,25 @@ interpolation is the clamped `u32` `LIMIT`; `VACUUM INTO`, whose target has
 no bind form and is escaped by `escape_sqlite_string_literal`; and the
 confirmed-count query, which formats the constant `CONFIRMED_QSO_SQL`. Any
 new dynamic SQL needs the same wrapper and a comment saying why it is safe.
->>>>>>> 816f49c6692b163040f2a491ace0ca931d734bd5
+
+## Registry MSRV check (PAN-468, 2026-11-24)
+
+`pancetta-core` and `pancetta-ft8` declare `rust-version = "1.88"` (PAN-384). The
+`#![deny(clippy::incompatible_msrv)]` in each `lib.rs` catches std APIs newer than 1.88 in
+the crates' own source, but not a newer language feature or any dependency. The
+`workspace-check` job now installs 1.88.0 next to the pinned 1.98.0 and runs
+`cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8` for the default,
+`--all-features` and `--no-default-features` builds; `scripts/ci/test-ci-msrv.sh` ties that
+version to both manifests.
+
+- **A step, not a job.** A new aggregator job breaks `test-ci-cargo-coverage.sh` and
+  `test-ci-merge-group-verified.sh`, and one outside the aggregator is advisory only. The step
+  inherits the checkout, system headers and `code` path gate, as the PAN-384 dry-run does.
+- **Plain cargo, not `cargo hack`.** No new pinned tool, and cargo already names the
+  dependency: a 2026-11-24 probe that patched in a copy of `hound 3.5.1` declaring
+  `rust-version = "1.89"` printed `hound@3.5.1 requires rustc 1.89`. The real `hound` declares
+  none and passes. `cargo tree -i <dep>` shows who pulled a failing dependency in.
+- **`--locked`, and `CARGO_TARGET_DIR` under `runner.temp`.** A stale lockfile fails instead of
+  re-resolving, and the 1.88 artifacts stay out of the rust-cache; the check takes about 30 s.
+- **No fresh-resolve lane.** CI proves the committed `Cargo.lock`. A lane that re-resolved
+  would fail unrelated PRs whenever an upstream release raised its MSRV.
