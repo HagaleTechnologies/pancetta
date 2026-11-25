@@ -7,7 +7,8 @@
 //! sub-second step keeps buffer and deadline.
 
 use super::{
-    decode_window_clock_step, decode_window_reanchor_text, overload_slot_index, Reanchor, SlotTimer,
+    decode_window_clock_step, decode_window_reanchor_text, decode_window_slot, overload_slot_index,
+    Reanchor, SlotTimer,
 };
 use crate::coordinator::derive_dsp_timing;
 use jiff::SignedDuration;
@@ -197,4 +198,34 @@ fn overload_slot_index_uses_the_active_period() {
         overload_slot_index(ft8_boundary, FT8_SLOT_NS),
         ft8_boundary.as_second().div_euclid(15)
     );
+}
+
+/// PAN-477: the slot a due window is cut from is the timer's deadline minus
+/// the decode phase, on the period the DSP cut it with. For FT8 that is the
+/// 00:00:00 slot at the 00:00:13 deadline; FT4's 6.5 s phase cuts the
+/// 00:00:00 slot at 00:00:06.5, and after an advance the next one.
+#[test]
+fn decode_window_slot_is_the_deadline_minus_the_decode_phase() {
+    let (manual, clock, mut timer) = cutter_at(5);
+    assert_eq!(timer.deadline(), at(13));
+    let slot = decode_window_slot(&timer, decode_phase(), FT8_SLOT_NS);
+    assert_eq!(slot.start, timer.deadline() - decode_phase());
+    assert_eq!(slot.start, at(0));
+    assert_eq!(slot.slot_ns, FT8_SLOT_NS);
+
+    manual.advance(std::time::Duration::from_secs(8));
+    let reading = clock.read();
+    assert!(decode_window_clock_step(&mut timer, &reading, FT8_SLOT_NS).due);
+    timer.advance(&reading);
+    let next = decode_window_slot(&timer, decode_phase(), FT8_SLOT_NS);
+    assert_eq!(next.start, at(15));
+
+    let ft4_phase = SignedDuration::from_millis(6_500);
+    let manual = ManualClock::new(at(1));
+    let ft4_clock = manual.slot_clock(Arc::new(AtomicI64::new(FT4_SLOT_NS)));
+    let ft4_timer = SlotTimer::new(&ft4_clock.read(), ft4_phase, FT4_SLOT_NS);
+    let ft4 = decode_window_slot(&ft4_timer, ft4_phase, FT4_SLOT_NS);
+    assert_eq!(ft4_timer.deadline(), at(0) + ft4_phase);
+    assert_eq!(ft4.start, at(0));
+    assert_eq!(ft4.slot_ns, FT4_SLOT_NS);
 }

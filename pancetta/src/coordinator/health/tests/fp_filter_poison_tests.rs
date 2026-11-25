@@ -35,6 +35,10 @@ async fn pan290_poisoned_fp_filter_lock_does_not_kill_decoder() {
                 samples: vec![0.0; 180_000],
                 dial_hz: 14_074_000,
                 sweep: None,
+                slot: crate::coordinator::pipeline::WindowSlot {
+                    start: pancetta_core::time::UtcTimestamp::from_millisecond(0).unwrap(),
+                    slot_ns: pancetta_core::slot::SLOT_NS,
+                },
             })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

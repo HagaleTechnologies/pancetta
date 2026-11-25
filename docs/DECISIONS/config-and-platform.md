@@ -774,6 +774,8 @@ stream into one WAV per FT8 slot for that many minutes after start. Code:
    more than 250 ms is abandoned (dropped batches, stalls, device reopens,
    clock jumps). Span starts only increase, so a backward clock step never
    overwrites a file. Residual: a gap under 250 ms is not detected.
+   PAN-477: the cutter's batch wall time is read from the shared `SlotClock`; this drift check
+   stays because the clock compares wall against monotonic time and cannot see audio gaps.
 7. **Window and restarts.** The start time is a `OnceLock` on
    `DecodePipelineHandles`, which every DSP supervisor restart reuses, so
    a restart neither extends nor restarts the capture. A partial first

@@ -128,6 +128,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `ft8.rs` | FT8 decoder component startup. |
 | `ft8/` | FT8 decoder component startup. |
 | `gain_sweep.rs` | Receive-gain experiment measurements and inference (PAN-244). |
+| `gain_sweep/` | Receive-gain experiment measurements and inference (PAN-244). |
 | `gain_sweep_runtime.rs` | Coordinator runtime driving the receive-gain experiment. |
 | `hamlib.rs` | rigctld TCP client: poll loop, watchdog, SWR metering, gain transactions. |
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
@@ -151,6 +152,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `receive_overload.rs` | Receive-window overload policy and bounded ATT transactions. |
 | `remote_gateway/` | Local read-only WebSocket gateway (Panino). |
 | `replay.rs` | Replay mode: listing recorded WAVs and feeding decode windows. |
+| `replay/` | Replay mode: listing recorded WAVs and feeding decode windows. |
 | `restart_budget.rs` | Reconnect/restart backoff and restart budgets. |
 | `service_notify.rs` | systemd READY/WATCHDOG/STOPPING notifications driven by completed health passes (PAN-335). |
 | `session_state.rs` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |

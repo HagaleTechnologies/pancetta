@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{create_panel_block, format_time_ago};
+use super::{create_panel_block, format_time_ago, slot_clock};
 use crate::app::{ActivePanel, App};
 use crate::theme::{self, Theme};
 
@@ -827,9 +827,11 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // Show QSO timing and progress
+    // Show QSO timing and progress. One wall-clock read per render feeds both
+    // the duration and the slot row.
+    let now = UtcTimestamp::now();
     let duration = if let Some(started) = qso.started_at {
-        let elapsed = UtcTimestamp::now().duration_since(started);
+        let elapsed = now.duration_since(started);
         format!(
             "Duration: {}m {}s",
             elapsed.as_mins(),
@@ -839,21 +841,14 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
         "Duration: Unknown".to_string()
     };
 
-    // FT8 cycle timing (15-second cycles)
-    let now = UtcTimestamp::now();
-    let seconds_in_cycle = now.as_second() % 15;
-    let cycle_progress = seconds_in_cycle as f64 / 15.0;
-
-    let cycle_status = if seconds_in_cycle < 13 {
-        "RX Period"
-    } else {
-        "TX Window"
-    };
+    // PAN-477: the active mode's slot grid and decode point (FT8 15 s / 13 s,
+    // FT4 7.5 s / 6.5 s, FT2 3.2 s / 2.2 s), the same table as the title chip.
+    let timing = slot_clock::qso_timing_row(now, &app.station_info.mode);
 
     let lines = vec![Line::from(vec![
         Span::styled(duration, app.theme.text),
         Span::raw("  "),
-        Span::styled(cycle_status, app.theme.info),
+        Span::styled(timing.label, app.theme.info),
     ])];
 
     let paragraph = Paragraph::new(lines);
@@ -869,9 +864,9 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
         };
 
         let cycle_gauge = Gauge::default()
-            .ratio(cycle_progress)
+            .ratio(timing.ratio)
             .gauge_style(app.theme.info.patch(theme::bg_of(app.theme.page)))
-            .label(format!("{}s", 15 - seconds_in_cycle));
+            .label(format!("{}s", timing.remaining_secs));
 
         f.render_widget(cycle_gauge, progress_area);
     }

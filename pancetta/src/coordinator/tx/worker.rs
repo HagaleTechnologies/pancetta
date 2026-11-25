@@ -51,8 +51,11 @@ pub(crate) fn tx_defers_count() -> u64 {
 /// before its slot is rarely pushed to the next slot.
 ///
 /// This is the FT8 baseline — see [`coalesce_collect_window_ms`] for the
-/// protocol-scaled value actually used at the call site.
-pub(super) const COALESCE_COLLECT_WINDOW_MS: u64 = 800;
+/// protocol-scaled value actually used at the call site. PAN-477: the value
+/// lives in `pancetta_qso::tx_slot`, which the QSO manager's keep-call
+/// ledger reads too.
+pub(super) const COALESCE_COLLECT_WINDOW_MS: u64 =
+    pancetta_qso::tx_slot::COALESCE_COLLECT_WINDOW_MS;
 
 /// Scale the coalesce-collection wait to the active protocol's slot period.
 ///
@@ -113,8 +116,10 @@ pub(super) const COALESCE_MAX_EXTENSION_MS: u64 = 3000;
 /// subtracted from the headroom explicitly in `adaptive_coalesce_cap_ms`
 /// (PAN-117). Without both, a request that arrives with headroom just barely
 /// covering the extension alone could still get pushed past the
-/// `tx_late_max_ms` cliff the key-time final gate enforces.
-pub(super) const COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
+/// `tx_late_max_ms` cliff the key-time final gate enforces. PAN-477: the
+/// value lives in `pancetta_qso::tx_slot`.
+pub(super) const COALESCE_CAP_SAFETY_MARGIN_MS: u64 =
+    pancetta_qso::tx_slot::COALESCE_CAP_SAFETY_MARGIN_MS;
 
 /// Protocol-scaled `COALESCE_MAX_EXTENSION_MS` — see that constant's doc.
 pub(super) fn coalesce_max_extension_ms(protocol: pancetta_ft8::Protocol) -> u64 {
@@ -138,13 +143,20 @@ pub(super) fn coalesce_max_extension_ms(protocol: pancetta_ft8::Protocol) -> u64
 /// effective cap as its unconditional backstop, and
 /// `adaptive_coalesce_cap_ms`'s probe passes this same value so its
 /// deferred branch matches the decision the worker actually makes.
+///
+/// PAN-477: delegates to `pancetta_qso::tx_slot::current_slot_acceptance_cap_ms`
+/// on the protocol's slot period, the one implementation the QSO manager's
+/// keep-call ledger shares. It equals
+/// `tx_late_max_ms_effective - coalesce_collect_window_ms - margin` for every
+/// protocol (`tx_slot_agreement_tests`).
 pub(super) fn current_slot_acceptance_cap_ms(
     protocol: pancetta_ft8::Protocol,
     tx_late_max_ms: u64,
 ) -> u64 {
-    tx_late_max_ms_effective(protocol, tx_late_max_ms)
-        .saturating_sub(coalesce_collect_window_ms(protocol))
-        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
+    pancetta_qso::tx_slot::current_slot_acceptance_cap_ms(
+        pancetta_ft8::ProtocolParams::from_protocol(protocol).slot_ns(),
+        tx_late_max_ms,
+    )
 }
 
 /// PAN-117 (PR #450 review round 2): the multi-TX arm's queue-time
@@ -273,23 +285,12 @@ pub fn schedule_tx(
     sample_rate: u32,
     slot_ns: i64,
 ) -> TxSchedule {
-    use pancetta_core::slot::{
-        current_slot_start_with_period, next_slot_with_parity_with_period, SlotParity,
-    };
-
-    let cur_start = current_slot_start_with_period(now, slot_ns);
-    let cur_parity = SlotParity::of_with_period(cur_start, slot_ns);
-    let mstr_in_cur_slot = (now - cur_start).as_millis_i64().max(0) as u64;
-
     // Decide which slot to target. The current slot is viable iff its
-    // parity matches AND we haven't burned past tx_late_max_ms.
-    let use_current = cur_parity == required_parity && mstr_in_cur_slot <= tx_late_max_ms;
-    let target = if use_current {
-        cur_start
-    } else {
-        next_slot_with_parity_with_period(now, required_parity, slot_ns)
-    };
-    let deferred = !use_current;
+    // parity matches AND we haven't burned past tx_late_max_ms. PAN-477:
+    // the rule is `pancetta_qso::tx_slot::tx_target_slot`, which the QSO
+    // manager's keep-call ledger calls too, so the two never drift.
+    let (target, deferred) =
+        pancetta_qso::tx_slot::tx_target_slot(now, required_parity, tx_late_max_ms, slot_ns);
 
     let (silent_pad_samples, cursor_offset_samples) =
         pad_and_cursor_for_target(now, target, sample_rate);
