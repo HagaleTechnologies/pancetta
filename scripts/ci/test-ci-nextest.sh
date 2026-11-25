@@ -76,7 +76,7 @@ assert ci["overrides"] == [
         "retries": 1,
     },
     {
-        "filter": "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))",
+        "filter": "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | binary(=subtraction_recall_superset) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))",
         "threads-required": "num-cpus",
         "retries": 1,
     },
