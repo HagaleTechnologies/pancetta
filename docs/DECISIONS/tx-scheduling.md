@@ -139,11 +139,11 @@ wall clock (added to the PAN-484 ban).
 - **Deferred.** A per-entry resync epoch in `A7ExpectedCall` would let a
   post-step sighting end the hold early; it needs a `pancetta-qso` field and an
   `ft8.rs` change. Revisit if on-air use shows the hold costs QSOs.
-- **Accepted residuals, all over-holding.** During the window the hold applies
-  even when a post-step sighting shows the opposite parity. After a backward
-  step of S seconds, pre-step sightings come back once the window ends with
-  their age understated by S. A forward step under 1 s overstates age by under
-  1 s, which matters only for a sighting within 1 s of the window edge.
+- **Remaining effects.** During the window the hold applies even when a
+  post-step sighting shows the opposite parity. After a backward step of S
+  seconds, pre-step sightings can reappear once the window ends with their
+  age understated by S. A forward step under 1 s can push a sighting near the
+  end of the window past the freshness cutoff.
 - **Tests.** `dx_parity_clock_step_tests` pins the step, eviction, sub-resync,
   window-end and older-epoch cases at function level, the Step 4d text and the
   bundle mask, and runs the real worker for a frame scheduled after the step
