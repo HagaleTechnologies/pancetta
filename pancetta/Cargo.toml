@@ -103,7 +103,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 
 [build-dependencies]
-jiff = { version = "0.2", default-features = false, features = ["std"] }
+jiff = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 pancetta-dx = { path = "../pancetta-dx", features = ["qrz-test-support"] }
