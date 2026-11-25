@@ -34,8 +34,9 @@ def check(target):
         assert len(versions.get(name, set())) == 1, (target, name, versions.get(name))
     assert len(members) == 14
     # PAN-384: the two crates.io crates promise registry users an older MSRV
-    # (1.88, held by #![deny(clippy::incompatible_msrv)] in each lib.rs); every
-    # other member inherits the workspace 1.98.
+    # (1.88, held by #![deny(clippy::incompatible_msrv)] in each lib.rs and by
+    # the workspace-check MSRV step, PAN-468); every other member inherits the
+    # workspace 1.98.
     registry_msrv = {'pancetta-core': '1.88', 'pancetta-ft8': '1.88'}
     for key in members:
         p = packages[key]

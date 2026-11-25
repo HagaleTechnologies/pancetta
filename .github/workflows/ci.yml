@@ -678,6 +678,27 @@ jobs:
       - name: Publish dry-run, pancetta-core + pancetta-ft8 (PAN-384)
         run: bash scripts/ci/check-publish-package.sh
 
+      # PAN-468: rust-version 1.88 on pancetta-core and pancetta-ft8 is a
+      # promise to registry users. The clippy deny in each lib.rs covers std
+      # APIs in the crates' own source only; this step compiles both crates and
+      # their dependencies with 1.88.0, so a newer language feature, or a
+      # dependency whose own rust-version is above 1.88, fails here and cargo
+      # names the dependency. rust-toolchain.toml keeps plain `cargo` on
+      # 1.98.0; `+1.88.0` selects the older compiler. Move this version only
+      # with the crates' rust-version, never in a 1.98 bump (PAN-56).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.88.0
+
+      - name: MSRV check, pancetta-core + pancetta-ft8 on Rust 1.88.0 (PAN-468)
+        env:
+          # Outside target/ so 1.88 artifacts stay out of the rust-cache.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/msrv-target
+        run: |
+          cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8
+          cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8 --all-features
+          cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8 --no-default-features
+
       - name: Build examples
         run: cargo build --workspace --exclude pancetta-research --examples
 
