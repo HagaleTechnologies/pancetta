@@ -72,7 +72,12 @@ async fn echoed_password_with_session_timeout_does_not_reauthenticate() {
 async fn genuine_not_found_beside_an_echoed_credential_is_still_a_miss() {
     let (base, _queries) = spawn_mock(vec![error_reply("Not found: K1ABC")]);
     let client = keyed_client(base, "K1ABC", "pw-secret", "key-secret").await;
-    assert_eq!(lookup_error(&client).await, "QRZ lookup error: Not found");
+    let err = client.lookup("K1ABC").await.unwrap_err();
+    assert!(
+        matches!(err.kind(), DxErrorInner::CallsignNotFound(msg) if msg == "QRZ lookup error: Not found"),
+        "expected a callsign miss, got {:?}",
+        err.kind()
+    );
 }
 
 #[tokio::test]

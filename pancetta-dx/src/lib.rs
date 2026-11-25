@@ -94,6 +94,12 @@ pub enum DxErrorInner {
     #[error("External service error: {0}")]
     ExternalService(String),
 
+    /// QRZ answered a lookup and has no record of the callsign (PAN-478).
+    /// Only a lookup reply builds it, never a login. Displays exactly like
+    /// `ExternalService`, so log lines do not change.
+    #[error("External service error: {0}")]
+    CallsignNotFound(String),
+
     /// An online-logbook upload failed; `class` says whether a retry can
     /// help (PAN-57). Displays exactly like `ExternalService`, so log lines
     /// do not change.
@@ -344,6 +350,10 @@ mod tests {
             (
                 DxErrorInner::ExternalService("unavailable".into()),
                 "External service error: unavailable",
+            ),
+            (
+                DxErrorInner::CallsignNotFound("missing".into()),
+                "External service error: missing",
             ),
         ] {
             let err: DxError = inner.into();
