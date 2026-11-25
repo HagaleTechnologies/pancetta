@@ -1,14 +1,81 @@
-//! Slot progress and station TX parity for the shared title row.
+//! Slot progress and station TX parity for the shared title row, and the
+//! QSO panel's timing row.
+//!
+//! PAN-477: both read the wall clock once per render (`UtcTimestamp::now()`,
+//! the same wall value the coordinator's shared `SlotClock::now()` returns;
+//! the TUI holds no `SlotClock` and a display has no deadline to re-anchor)
+//! and the active mode's slot grid from the tables here. A `pancetta` test
+//! (`tui_slot_tables_match_dsp_timing`) pins both tables to the DSP's
+//! `derive_dsp_timing`.
 use jiff::SignedDuration;
 use pancetta_core::slot::{current_slot_start_with_period, SlotParity, SLOT_NS};
 use pancetta_core::time::SignedDurationExt as _;
 use pancetta_core::time::UtcTimestamp;
 
-fn slot_period_ns(mode: &str) -> i64 {
+const NS_PER_SEC: i64 = 1_000_000_000;
+
+/// Slot length of `mode` in nanoseconds: FT8 15 s, FT4 7.5 s, FT2 3.2 s. A
+/// mode string the TUI does not know uses FT8's grid.
+pub fn slot_period_ns(mode: &str) -> i64 {
     match mode.trim().to_ascii_uppercase().as_str() {
         "FT4" => 7_500_000_000,
         "FT2" => 3_200_000_000,
         _ => SLOT_NS,
+    }
+}
+
+/// Time into a slot at which `mode`'s decode fires, in nanoseconds: FT8 13 s,
+/// FT4 6.5 s, FT2 2.2 s (the slot minus the DSP's decode margin). A mode
+/// string the TUI does not know uses FT8's.
+pub fn decode_phase_ns(mode: &str) -> i64 {
+    match mode.trim().to_ascii_uppercase().as_str() {
+        "FT4" => 6_500_000_000,
+        "FT2" => 2_200_000_000,
+        _ => 13 * NS_PER_SEC,
+    }
+}
+
+/// The QSO panel's timing row for one instant (PAN-477).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QsoTimingRow {
+    /// `TX Window` once the slot reaches the mode's decode point, else
+    /// `RX Period`.
+    pub label: &'static str,
+    /// Gauge fill: whole seconds into the slot over the slot length.
+    pub ratio: f64,
+    /// Countdown label: whole seconds left in the slot, rounded up.
+    pub remaining_secs: i64,
+    /// Start of the slot `now` falls in, on the mode's grid.
+    pub slot_start: UtcTimestamp,
+    /// Parity of that slot on the mode's grid.
+    pub parity: SlotParity,
+}
+
+/// Build the QSO panel's timing row for `now` on `mode`'s slot grid. For FT8
+/// the label, fill and countdown equal the historical whole-second values
+/// (`RX Period` before 13 s, fill `s/15`, countdown `15 - s`).
+pub fn qso_timing_row(now: UtcTimestamp, mode: &str) -> QsoTimingRow {
+    let period = slot_period_ns(mode);
+    let slot_start = current_slot_start_with_period(now, period);
+    let elapsed = (now - slot_start)
+        .as_nanos_i64()
+        .unwrap_or(0)
+        .clamp(0, period);
+    let label = if elapsed >= decode_phase_ns(mode) {
+        "TX Window"
+    } else {
+        "RX Period"
+    };
+    let whole_secs = elapsed / NS_PER_SEC;
+    let period_secs = period as f64 / NS_PER_SEC as f64;
+    let ratio = (whole_secs as f64 / period_secs).clamp(0.0, 1.0);
+    let remaining_secs = (period - elapsed + NS_PER_SEC - 1) / NS_PER_SEC;
+    QsoTimingRow {
+        label,
+        ratio,
+        remaining_secs,
+        slot_start,
+        parity: SlotParity::of_with_period(now, period),
     }
 }
 
@@ -30,6 +97,10 @@ pub fn slot_clock_text(now: UtcTimestamp, mode: &str, tx: Option<SlotParity>) ->
     let secs = elapsed / 1_000_000_000;
     format!("[{current} {bar} {secs:02}s │ TX:{tx}]")
 }
+
+#[cfg(test)]
+#[path = "slot_clock/tests/qso_timing_row_tests.rs"]
+mod qso_timing_row_tests;
 
 #[cfg(test)]
 mod tests {

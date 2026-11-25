@@ -556,32 +556,9 @@ fn waterfall_from_reference_capture(
     Some(grid.to_waterfall_data(window_len))
 }
 
-/// Compute the active protocol's slot parity for a decoded window.
-///
-/// `received_utc` is the window's receipt timestamp (captured immediately on
-/// recv, before any decode work — see the comment at the call site). The
-/// slot start is recovered by subtracting `decode_phase` (how far past the
-/// slot boundary the window arrives), then parity is derived over the given
-/// `slot_ns` period.
-///
-/// Pulled out of the decode loop as a small pure function so a live mode
-/// switch can be exercised in a unit test: this function has no memory of a
-/// prior call, so feeding it freshly-read `decode_phase`/`slot_ns` values
-/// every iteration (as the decode loop in `start_ft8_pipeline` does) can
-/// never "stick" to a stale mode's period the way caching them once at
-/// thread startup did.
-fn slot_parity_for_receipt(
-    received_utc: UtcTimestamp,
-    decode_phase: SignedDuration,
-    slot_ns: i64,
-) -> pancetta_core::slot::SlotParity {
-    let slot_start = received_utc - decode_phase;
-    pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns)
-}
-
 /// Translate a tagged decode into the shape [`pancetta_qso::CrossTimeState`]
 /// records. `slot_ns` is the period this window's `slot_parity` was
-/// computed on (the decode loop's per-iteration `slot_ns`).
+/// computed on: the period the DSP cut the window with (PAN-477).
 ///
 /// PAN-146: carries the band and slot grid of the observation so the TX
 /// worker's DX-parity gate can ignore a parity heard on another band or
@@ -997,21 +974,9 @@ impl super::ApplicationCoordinator {
         // until `Ft8Config::cross_sequence_a7_enabled` flips true.
         let cross_sequence_cache = self.cross_sequence_cache.clone();
 
-        // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9). Re-read from
-        // this shared atomic once per decode-loop iteration (below, inside the
-        // `while` loop) so a live mode switch (Shift+M) is picked up promptly
-        // rather than only at thread startup. Read by the parity-stamping
-        // sites via `SlotParity::of_with_period`. mode=FT8 is byte-identical
-        // to the prior `SlotParity::of` (which hardcodes 15e9).
-        let active_slot_ns = self.active_slot_ns.clone();
-
-        // Active protocol decode phase (FT8 → 13e9, FT4 → 6.5e9 ns): how far
-        // past the slot boundary the window is received. Subtracted below to
-        // recover the slot start before parity-stamping. Also re-read once per
-        // iteration alongside `active_slot_ns` for the same reason. mode=FT8
-        // is 13e9 ns, byte-identical to the prior hardcoded
-        // `SignedDuration::from_secs(13)`.
-        let active_decode_phase_ns = self.active_decode_phase_ns.clone();
+        // PAN-477: the slot period and decode phase are not read here. Each
+        // window carries the slot the DSP cut it from (`DecodeWindow::slot`),
+        // and every period-dependent value below comes from that.
 
         // decoder-speed-overhaul Task 12: decode-budget metrics.
         // `decode_last_elapsed_ms`/`decode_last_budget_exhausted` are written
@@ -1103,13 +1068,14 @@ impl super::ApplicationCoordinator {
                         samples: window,
                         dial_hz,
                         sweep,
+                        slot: window_slot,
                     }) => {
-                        // Capture receipt time immediately — before any decode
-                        // work — so parity tagging is invariant under decode
-                        // latency. (If we captured now() after decode, a slow
-                        // slot on a loaded MiniPC could push us into slot N+1
-                        // and produce the wrong parity, causing the autonomous
-                        // operator to TX in the same slot as the DX.)
+                        // PAN-477: receipt time no longer feeds slot math.
+                        // Parity, the desense slot and the A7 seed age come
+                        // from `window_slot`, the slot the DSP cut; a clock
+                        // step or a queue wait cannot move it. This read
+                        // only timestamps the spectrum rows sent to the
+                        // remote gateway (display values a client reads).
                         let window_received_utc = UtcTimestamp::now();
                         let receipt_ptt_on = last_ptt_on_ms.load(Ordering::Acquire);
                         let receipt_ptt_off = last_ptt_off_ms.load(Ordering::Acquire);
@@ -1134,21 +1100,6 @@ impl super::ApplicationCoordinator {
                         // PAN-165: scoped fast-path time for this window's
                         // `window timing` line (0 when it did not run).
                         let mut window_scoped_ms: u64 = 0;
-
-                        // Re-read the active protocol slot length/decode phase
-                        // once per iteration (not once at thread startup) so a
-                        // live mode switch (Shift+M -> try_switch_operating_mode
-                        // updating these atomics) is reflected in this window's
-                        // parity stamp. Stamping stale-period parity forever
-                        // after a switch would let the QSO state machine latch
-                        // the wrong tx_parity -> on-air collision, the exact
-                        // failure half-duplex parity scheduling exists to
-                        // prevent. mode=FT8 is byte-identical to before (same
-                        // constant value read every iteration instead of once).
-                        let slot_ns = active_slot_ns.load(Ordering::Relaxed);
-                        let decode_phase = SignedDuration::from_nanos(
-                            active_decode_phase_ns.load(Ordering::Relaxed),
-                        );
 
                         // PAN-164: one read of the shared decode-window
                         // state per window. Budget, decoder fields and flags
@@ -1249,8 +1200,7 @@ impl super::ApplicationCoordinator {
                             // current window as "slot N+1" for the
                             // look-up — seeds are from slot N which is the
                             // opposite parity).
-                            let current_parity =
-                                slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
+                            let current_parity = window_slot.parity();
                             let opposite_parity: u8 = match current_parity {
                                 pancetta_core::slot::SlotParity::Even => 1,
                                 pancetta_core::slot::SlotParity::Odd => 0,
@@ -1259,8 +1209,12 @@ impl super::ApplicationCoordinator {
                                 .read()
                                 .ok()
                                 .map(|cache_guard| {
+                                    // PAN-477: the seed age counts slots
+                                    // between DSP slot starts, on this
+                                    // window's period.
                                     cache_guard.get_a7_candidates_with_parity(
-                                        std::time::SystemTime::now(),
+                                        window_slot.start,
+                                        window_slot.slot_ns,
                                         pancetta_qso::CROSS_SEQUENCE_DEFAULT_MAX_AGE_SLOTS,
                                         opposite_parity,
                                     )
@@ -1394,8 +1348,7 @@ impl super::ApplicationCoordinator {
                         // already-consumed messages by rejecting them at
                         // is_message_relevant (state has already advanced).
                         if !scoped_decodes.is_empty() {
-                            let scoped_parity =
-                                slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
+                            let scoped_parity = window_slot.parity();
                             for mut decoded_msg in scoped_decodes {
                                 decoded_msg.slot_parity = Some(scoped_parity);
                                 // I-16: sanitize at the bus boundary (scoped
@@ -1931,10 +1884,8 @@ impl super::ApplicationCoordinator {
                         );
 
                         let observation = super::desense::WindowObservation {
-                            slot_start_ms: (window_received_utc - decode_phase)
-                                .as_millisecond()
-                                .max(0) as u64,
-                            slot_len_ms: (slot_ns / 1_000_000).max(1) as u64,
+                            slot_start_ms: window_slot.start_ms(),
+                            slot_len_ms: window_slot.len_ms(),
                             decoded_count: decoded_messages.len(),
                             band: pancetta_core::Band::from_frequency(dial_hz),
                             last_ptt_on_ms: receipt_ptt_on,
@@ -1967,13 +1918,11 @@ impl super::ApplicationCoordinator {
                             });
                         }
 
-                        // Window's audio came from the slot that started 13s before
-                        // receipt; computing parity from the receipt timestamp keeps the
-                        // tag invariant under decode latency. (next_slot_start would
-                        // give the wrong slot if decode pushes us into the next slot
-                        // before we tag.)
-                        let window_parity =
-                            slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
+                        // PAN-477: the window's audio came from the slot the DSP
+                        // cut it from; stamping that slot's parity keeps the tag
+                        // invariant under decode latency, queue wait and a clock
+                        // step between the cut and receipt.
+                        let window_parity = window_slot.parity();
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
@@ -2162,8 +2111,14 @@ impl super::ApplicationCoordinator {
                                 pancetta_core::slot::SlotParity::Even => 0u8,
                                 pancetta_core::slot::SlotParity::Odd => 1u8,
                             });
-                            cross_time_state
-                                .record_decode(&cross_time_decode_record(decoded_msg, slot_ns));
+                            // PAN-477: a window cut just before a live mode
+                            // switch keeps the period it was cut on, so the
+                            // record's `slot_ns` is the period its parity was
+                            // computed on (PAN-146).
+                            cross_time_state.record_decode(&cross_time_decode_record(
+                                decoded_msg,
+                                window_slot.slot_ns,
+                            ));
 
                             // hb-237: cross-sequence A7 cache populate.
                             // Only when the master flag is on, only for
@@ -2187,7 +2142,8 @@ impl super::ApplicationCoordinator {
                                                 call,
                                                 decoded_msg.frequency_offset,
                                                 parity,
-                                                decoded_msg.timestamp,
+                                                window_slot.start,
+                                                window_slot.slot_ns,
                                                 filter,
                                             )
                                         } else {
@@ -2195,7 +2151,8 @@ impl super::ApplicationCoordinator {
                                                 call,
                                                 decoded_msg.frequency_offset,
                                                 parity,
-                                                decoded_msg.timestamp,
+                                                window_slot.start,
+                                                window_slot.slot_ns,
                                             );
                                             true
                                         };
@@ -2416,17 +2373,17 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod cross_sequence_invocation_tests {
     use super::{a7_seeds_to_cross_sequence_seeds, invoke_cross_sequence_consumer};
+    use pancetta_core::time::UtcTimestamp;
     use pancetta_ft8::{Ft8Config, Ft8Decoder, WINDOW_SAMPLES};
     use pancetta_qso::A7SeedEntry;
     use std::collections::HashSet;
-    use std::time::SystemTime;
 
     fn make_seed(call: &str, freq_hz: f64) -> A7SeedEntry {
         A7SeedEntry {
             callsign: call.to_string(),
             freq_hz,
             slot_parity: 0,
-            decoded_at: SystemTime::now(),
+            slot_start: UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         }
     }
 
@@ -2748,66 +2705,6 @@ mod sanitize_decoded_field_tests {
                 .chars()
                 .all(|c| c != '\u{1b}' && c != '\u{7f}' && c >= '\u{20}'));
         }
-    }
-}
-
-#[cfg(test)]
-mod slot_parity_for_receipt_tests {
-    use super::slot_parity_for_receipt;
-    use jiff::SignedDuration;
-    use pancetta_core::slot::SlotParity;
-    use pancetta_core::time::UtcTimestamp;
-
-    /// mode=FT8 regression: feeding the historical hardcoded values (13s
-    /// decode phase, 15s slot) reproduces the same parity `SlotParity::of`
-    /// (which hardcodes those exact constants) would give — the
-    /// live-mode-switch fix must not change FT8 behavior.
-    #[test]
-    fn ft8_params_match_legacy_hardcoded_formula() {
-        let received: UtcTimestamp = UtcTimestamp::from_nanosecond_i64(20_000_000_000); // t=20s
-        let ft8_decode_phase = SignedDuration::from_nanos(13_000_000_000); // 13s
-        let ft8_slot_ns = 15_000_000_000i64; // 15s
-
-        let via_helper = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
-        let via_legacy_formula = SlotParity::of(received - ft8_decode_phase);
-        assert_eq!(via_helper, via_legacy_formula);
-        // Concretely: slot_start = 20s - 13s = 7s, which falls in the [0,15)
-        // slot -> index 0 -> Even.
-        assert_eq!(via_helper, SlotParity::Even);
-    }
-
-    /// This is the regression test for the Critical whole-branch-review
-    /// finding: the decode loop used to read `active_slot_ns`/
-    /// `active_decode_phase_ns` ONCE at thread startup and never again, so a
-    /// live mode switch (Shift+M) never changed the parity stamped on
-    /// subsequently decoded frames. `slot_parity_for_receipt` is the pure
-    /// function the (now-fixed) loop calls with freshly-read atomics every
-    /// iteration; this test proves the SAME receipt instant produces a
-    /// DIFFERENT parity when fed FT4's period instead of FT8's — i.e. the
-    /// function has no memory of a prior call and always reflects whatever
-    /// (slot_ns, decode_phase) it's given "this iteration". If the loop
-    /// were still caching the pre-switch (FT8) values, every post-switch
-    /// window would keep landing on the FT8 answer.
-    #[test]
-    fn same_receipt_instant_differs_by_active_mode_period() {
-        let received: UtcTimestamp = UtcTimestamp::from_nanosecond_i64(20_000_000_000); // t=20s
-
-        let ft8_decode_phase = SignedDuration::from_nanos(13_000_000_000); // 13s
-        let ft8_slot_ns = 15_000_000_000i64; // 15s
-        let ft8_parity = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
-
-        let ft4_decode_phase = SignedDuration::from_nanos(6_500_000_000); // 6.5s
-        let ft4_slot_ns = 7_500_000_000i64; // 7.5s
-        let ft4_parity = slot_parity_for_receipt(received, ft4_decode_phase, ft4_slot_ns);
-
-        // FT8: slot_start = 20 - 13 = 7s -> index 7/15 = 0 -> Even.
-        assert_eq!(ft8_parity, SlotParity::Even);
-        // FT4: slot_start = 20 - 6.5 = 13.5s -> index 13.5/7.5 = 1 -> Odd.
-        assert_eq!(ft4_parity, SlotParity::Odd);
-        // The critical property: same instant, different mode period ->
-        // different (correct) parity. A stale-cache bug would keep
-        // returning `ft8_parity` for both.
-        assert_ne!(ft8_parity, ft4_parity);
     }
 }
 
@@ -3807,3 +3704,7 @@ mod decode_log_level_tests {
 #[cfg(test)]
 #[path = "ft8/tests/fp_filter_poison_tests.rs"]
 mod fp_filter_poison_tests;
+
+#[cfg(test)]
+#[path = "ft8/tests/window_slot_tests.rs"]
+mod window_slot_tests;

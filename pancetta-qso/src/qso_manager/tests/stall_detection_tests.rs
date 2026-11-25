@@ -4121,11 +4121,13 @@ fn keep_call_tx_slot_uses_the_scheduler_current_slot_acceptance() {
 
     // The FT8 acceptance cap at the 3000 ms default is
     // 3000 - 800 - 500 = 1700 ms; FT4's is 1500 - 400 - 500 = 600 ms;
-    // FT2's saturates to 0 ms.
-    assert_eq!(keep_call_acceptance_cap_ms(15_000, 3000), 1700);
-    assert_eq!(keep_call_acceptance_cap_ms(7_500, 3000), 600);
-    assert_eq!(keep_call_acceptance_cap_ms(3_200, 3000), 0);
-    assert_eq!(keep_call_acceptance_cap_ms(15_000, 1000), 0);
+    // FT2's saturates to 0 ms. PAN-477: the keep-call ledger reads the
+    // TX worker's own cap from the shared `tx_slot` rule.
+    use crate::tx_slot::current_slot_acceptance_cap_ms;
+    assert_eq!(current_slot_acceptance_cap_ms(15_000_000_000, 3000), 1700);
+    assert_eq!(current_slot_acceptance_cap_ms(7_500_000_000, 3000), 600);
+    assert_eq!(current_slot_acceptance_cap_ms(3_200_000_000, 3000), 0);
+    assert_eq!(current_slot_acceptance_cap_ms(15_000_000_000, 1000), 0);
 
     // FT8, off-parity or past the window: strictly the next own slot.
     assert_eq!(

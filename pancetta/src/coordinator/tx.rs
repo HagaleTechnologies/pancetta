@@ -212,6 +212,9 @@ mod coalesce_tests;
 #[cfg(test)]
 #[path = "tx/tests/protocol_tx_tests.rs"]
 mod protocol_tx_tests;
+#[cfg(test)]
+#[path = "tx/tests/tx_slot_agreement_tests.rs"]
+mod tx_slot_agreement_tests;
 
 /// Unit tests for the remote-TX arm gate helper (`remote_tx_permitted`).
 ///

@@ -296,6 +296,7 @@ impl super::ApplicationCoordinator {
                     original,
                     &self.message_bus.gain_tx_gate,
                     lead,
+                    &self.slot_clock(),
                 )
                 .await
                 {

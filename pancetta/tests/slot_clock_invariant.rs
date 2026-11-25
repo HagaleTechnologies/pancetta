@@ -13,6 +13,16 @@
 //! PTT-hold bound are gone, and a frame scheduled before a resync is dropped
 //! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"). PAN-484 added
 //! its former checks and its wiring to this scan.
+//!
+//! PAN-477 moved the remaining slot math onto the shared grid: decode parity
+//! and the A7 seed age come from the slot the DSP cut the window from
+//! (`DecodeWindow::slot`), and the always-answer caller key, the keep-call
+//! TX slot (`pancetta_qso::tx_slot`), the replay pre-roll and the TUI QSO
+//! timing row follow the active period. Two sites stay FT8-only by recorded
+//! decision, with the reason in their code: raw 48 kHz capture
+//! (`docs/DECISIONS/config-and-platform.md`, raw capture decisions 3 and 6)
+//! and the receive-gain sweep (refused outside FT8). The last test keeps
+//! each site's former code from coming back.
 
 use std::path::{Path, PathBuf};
 
@@ -105,8 +115,8 @@ fn no_per_site_slot_clock_code_remains() {
             }
         }
     }
-    // FT8-only slot math in the DSP cutter's file; other files keep theirs
-    // until the FT8-only follow-up moves them.
+    // FT8-only slot math in the DSP cutter's file. The other PAN-477 sites
+    // are checked by `pan477_sites_read_the_shared_slot_grid`.
     let dsp_rel = "pancetta/src/coordinator/dsp.rs";
     let slot_math = needle("div_euclid(", "15)");
     for (i, line) in read(dsp_rel).lines().enumerate() {
@@ -216,5 +226,121 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
     assert!(
         coordinator.contains(&needle("spawn_slot_clock", "_driver(")),
         "the coordinator must start the slot-clock driver"
+    );
+}
+
+/// Lines of `rel` containing `banned`, as `file:line: text`.
+fn lines_containing(rel: &str, banned: &str, found: &mut Vec<String>) {
+    for (i, line) in read(rel).lines().enumerate() {
+        if line.contains(banned) {
+            found.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+        }
+    }
+}
+
+#[test]
+fn pan477_sites_read_the_shared_slot_grid() {
+    let root = workspace_root();
+    let mut found = Vec::new();
+
+    // Deleted helpers, mirrors and FT8-only constants, anywhere scanned.
+    let banned_everywhere = [
+        // The decoder's receipt-time parity helper.
+        needle("slot_parity_for", "_receipt"),
+        // The FT8-only autonomous parity helpers.
+        needle("from_unix", "_secs"),
+        needle("SlotParity::", "current()"),
+        needle("should_transmit_this", "_slot"),
+        // The keep-call mirrors of the TX worker's acceptance rule.
+        needle("keep_call_acceptance", "_cap_ms"),
+        needle("TX_WORKER", "_COALESCE_"),
+        // The A7 seed cache's FT8 slot length.
+        needle("SLOT_DURATION", "_SECS"),
+    ];
+    for file in scanned_files() {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            for b in &banned_everywhere {
+                if line.contains(b.as_str()) {
+                    let rel = file.strip_prefix(&root).unwrap();
+                    found.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    // Per-file former code.
+    let per_file: [(&str, Vec<String>); 7] = [
+        (
+            "pancetta/src/coordinator/ft8.rs",
+            vec![
+                needle("window_received_utc - ", "decode_phase"),
+                needle("active_decode", "_phase_ns"),
+                needle("SystemTime", "::now()"),
+            ],
+        ),
+        (
+            "pancetta/src/coordinator/raw_capture.rs",
+            vec![needle("FT8_SLOT", "_NS")],
+        ),
+        (
+            "pancetta/src/coordinator/dsp.rs",
+            vec![needle("end: UtcTimestamp", "::now()")],
+        ),
+        (
+            "pancetta-qso/src/cross_sequence.rs",
+            vec![needle("System", "Time")],
+        ),
+        (
+            "pancetta/src/coordinator/qso.rs",
+            vec![
+                needle("unix_secs_of_decode ", "/ 15"),
+                needle("floor(unix_seconds ", "/ 15)"),
+            ],
+        ),
+        (
+            "pancetta/src/coordinator/replay.rs",
+            vec![
+                needle("replay_preroll_wait(UtcTimestamp", "::now())"),
+                needle("slot::next_slot", "_start("),
+            ],
+        ),
+        (
+            "pancetta-tui/src/ui/qso_status.rs",
+            vec![needle("% ", "15"), needle("/ ", "15.0")],
+        ),
+    ];
+    for (rel, needles) in &per_file {
+        for n in needles {
+            lines_containing(rel, n, &mut found);
+        }
+    }
+    for rel in [
+        "pancetta/src/coordinator/gain_sweep.rs",
+        "pancetta/src/coordinator/gain_sweep_runtime.rs",
+    ] {
+        lines_containing(rel, &needle("div_euclid(", "15"), &mut found);
+    }
+    lines_containing(
+        "pancetta/src/coordinator/gain_sweep_runtime.rs",
+        &needle("Timestamp", "::now()"),
+        &mut found,
+    );
+
+    assert!(
+        found.is_empty(),
+        "PAN-477 slot math is back; read the slot the DSP cut, the shared \
+         SlotClock or the active period instead:\n{}",
+        found.join("\n")
+    );
+
+    let dsp = read("pancetta/src/coordinator/dsp.rs");
+    assert!(
+        dsp.contains(&needle("end: slot_clock", ".now()")),
+        "raw capture's batch wall time must come from the shared SlotClock"
+    );
+    assert!(
+        dsp.contains(&needle("decode_window", "_slot(")),
+        "the DSP must stamp each decode window with decode_window_slot"
     );
 }

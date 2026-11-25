@@ -398,42 +398,14 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
     }
 }
 
-/// The TX worker's base coalesce-collection window at FT8 (its
-/// `COALESCE_COLLECT_WINDOW_MS`), mode-scaled like there. Mirrored for
-/// [`keep_call_acceptance_cap_ms`]; `pancetta-qso` cannot depend on the
-/// `pancetta` crate that owns the original.
-const TX_WORKER_COALESCE_COLLECT_WINDOW_MS: u64 = 800;
-
-/// The TX worker's fixed (unscaled) coalesce safety margin (its
-/// `COALESCE_CAP_SAFETY_MARGIN_MS`). Mirrored for
-/// [`keep_call_acceptance_cap_ms`].
-const TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
-
-/// Mirror of the TX worker's `current_slot_acceptance_cap_ms` (PAN-117),
-/// the cap `schedule_tx` decides current-slot acceptance against for a
-/// single `TransmitRequest` — which every keep-call re-send is: the
-/// mode-scaled `tx_late_max_ms`, minus the mode-scaled base coalesce
-/// window, minus the fixed safety margin, saturating at 0. Each term is
-/// scaled and rounded separately, exactly as the worker's
-/// `tx_late_max_ms_effective` / `coalesce_collect_window_ms` do, from the
-/// live slot length (FT8 15 s → ratio 1, FT4 1/2, FT2 ~0.213) instead of a
-/// second protocol source. FT8 at the 3000 ms default → 1700 ms; FT4 →
-/// 600 ms; FT2 → 0 ms.
-fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
-    let ratio = slot_millis as f64 / 15_000.0;
-    let scale = |ms: u64| ((ms as f64) * ratio).round() as u64;
-    scale(tx_late_max_ms)
-        .saturating_sub(scale(TX_WORKER_COALESCE_COLLECT_WINDOW_MS))
-        .saturating_sub(TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS) as i64
-}
-
 /// The own-parity TX slot a keep-call rearm emission at `now` feeds
 /// (PAN-128), derived with the TX scheduler's own current-slot
-/// acceptance rule (`pancetta::coordinator::tx::schedule_tx`): the
-/// CURRENT slot when its parity matches the QSO's latched
-/// `QsoMetadata::tx_parity` and `now` is still inside the worker's
-/// queue-time acceptance window ([`keep_call_acceptance_cap_ms`]);
-/// otherwise the first own-parity slot STRICTLY after `now`.
+/// acceptance rule, [`crate::tx_slot::tx_target_slot`], the same function
+/// `pancetta::coordinator::tx::schedule_tx` calls (PAN-477): the CURRENT
+/// slot when its parity matches the QSO's latched `QsoMetadata::tx_parity`
+/// and `now` is still inside the worker's queue-time acceptance window
+/// ([`crate::tx_slot::current_slot_acceptance_cap_ms`]); otherwise the
+/// first own-parity slot STRICTLY after `now`.
 ///
 /// The result is PROVISIONAL (PAN-223): the TX worker decides the real
 /// target slot from the instant it dequeues the request, and reports it
@@ -479,7 +451,8 @@ fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
 /// `tx_late_max_ms` minus the mode-scaled base coalesce window minus the
 /// fixed safety margin — 1700 ms for FT8 at the 3000 ms default), which is
 /// what `schedule_tx` is actually called with for a keep-call
-/// `TransmitRequest`. It should match exactly, in both directions, so the
+/// `TransmitRequest`. Both read it from [`crate::tx_slot`], so they match
+/// exactly, in both directions, so the
 /// provisional key is already right whenever the worker dequeues the
 /// emission promptly and the re-key changes nothing: a WIDER
 /// ledger window tags an emission the worker defers (say 2.0 s into own
@@ -488,10 +461,11 @@ fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
 /// double-counts one TX opportunity (Codex round 2 on PR #477); a NARROWER
 /// one splits the in-window pair the same way.
 ///
-/// Known approximation (documented in the PAN-128 plan): a runtime mode
-/// switch or the one-time `tx_parity_provisional` correction changes the
-/// values this returns, which can add at most one extra count at the
-/// boundary.
+/// Known approximation (documented in the PAN-128 plan): the slot rule is
+/// shared with the worker, but the ledger stamps at EMISSION time. A runtime
+/// mode switch or the one-time `tx_parity_provisional` correction between
+/// the emission and the worker's dequeue changes the slot that emission
+/// maps to, which can add at most one extra count at the boundary.
 fn keep_call_tx_slot(
     now: UtcTimestamp,
     slot_millis: i64,
@@ -501,17 +475,12 @@ fn keep_call_tx_slot(
     let slot_ns = slot_millis * 1_000_000;
     match tx_parity {
         Some(p) => {
-            // `schedule_tx`'s rule: the current slot is the target iff its
-            // parity matches AND we haven't burned past the queue-time
-            // acceptance cap the worker passes it.
-            let cur_start = pancetta_core::slot::current_slot_start_with_period(now, slot_ns);
-            if pancetta_core::slot::SlotParity::of_with_period(cur_start, slot_ns) == p {
-                let mstr_in_cur_slot = (now - cur_start).as_millis_i64().max(0);
-                if mstr_in_cur_slot <= keep_call_acceptance_cap_ms(slot_millis, tx_late_max_ms) {
-                    return cur_start;
-                }
-            }
-            pancetta_core::slot::next_slot_with_parity_with_period(now, p, slot_ns)
+            // `schedule_tx`'s rule, from the one shared implementation: the
+            // current slot is the target iff its parity matches AND we
+            // haven't burned past the queue-time acceptance cap the worker
+            // passes it.
+            let cap = crate::tx_slot::current_slot_acceptance_cap_ms(slot_ns, tx_late_max_ms);
+            crate::tx_slot::tx_target_slot(now, p, cap, slot_ns).0
         }
         None => {
             pancetta_core::slot::next_slot_start_with_period(now, SignedDuration::ZERO, slot_ns)

@@ -1,9 +1,14 @@
 //! Coordinator-owned receive-gain experiment. CAT operations never hold ptt_sync_gate.
+//!
+//! PAN-477: wall time is read through the coordinator's shared `SlotClock`;
+//! the slot grid stays FT8's because the sweep only runs in FT8 (see the
+//! `gain_sweep` module doc and the mode guard below).
 use super::{gain_sweep::*, pipeline::*, ApplicationCoordinator};
 use anyhow::{anyhow, Context, Result};
 use jiff::SignedDuration;
 use pancetta_core::time::SignedDurationExt as _;
 use pancetta_core::time::UtcTimestamp;
+use pancetta_core::SlotClock;
 use std::{
     path::PathBuf,
     sync::{
@@ -56,6 +61,7 @@ impl ApplicationCoordinator {
         let policy = self.tx_policy.clone();
         let generation = self.hamlib_generation.clone();
         let snapshot = self.gain_sweep_original.clone();
+        let clock = self.slot_clock();
         Ok(Some(tokio::spawn(async move {
             struct EndSweep(Arc<AtomicBool>);
             impl Drop for EndSweep {
@@ -109,25 +115,24 @@ impl ApplicationCoordinator {
                         || generation.load(Ordering::Acquire) != initial_generation {
                         failure = Some("Dial, mode or Hamlib generation changed".into()); break;
                     }
-                    let now = UtcTimestamp::now();
-                    let slot_secs = (now.as_millisecond() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
+                    let slot_secs = next_ft8_source_slot_secs(clock.now(), lead);
                     let slot = UtcTimestamp::from_parts(slot_secs, 0).context("Invalid source slot")?;
                     let boundary = slot - SignedDuration::from_millis((lead * 1000.0) as i64);
-                    let wait = (boundary - UtcTimestamp::now()).to_std().unwrap_or_default();
+                    let wait = (boundary - clock.now()).to_std().unwrap_or_default();
                     let wake = Instant::now() + wait;
                     while Instant::now() < wake.min(end) && !shutdown.load(Ordering::Acquire) {
                         sleep_until((Instant::now() + Duration::from_millis(50)).min(wake).min(end)).await;
                     }
                     if Instant::now() >= end || shutdown.load(Ordering::Acquire) { continue; }
-                    let lateness = UtcTimestamp::now().duration_since(boundary).as_millis_i64();
+                    let lateness = clock.now().duration_since(boundary).as_millis_i64();
                     if !(0..=50).contains(&lateness) { skip(&mut report, slot_secs, "late boundary or clock discontinuity"); continue; }
                     // Configured TX parity is reserved even with no queued frame.
                     // Auto can choose either parity, so both remain unavailable.
                     let cfg = config.read().await;
                     let blocked_parity = if pancetta_core::TxPolicy::from_u8(policy.load(Ordering::Acquire)).allows_any_tx() {
                         match cfg.station.tx_self_parity {
-                            pancetta_config::station::TxSelfParity::Even => slot_secs.div_euclid(15).rem_euclid(2) == 0,
-                            pancetta_config::station::TxSelfParity::Odd => slot_secs.div_euclid(15).rem_euclid(2) == 1,
+                            pancetta_config::station::TxSelfParity::Even => ft8_slot_parity_index(slot_secs) == 0,
+                            pancetta_config::station::TxSelfParity::Odd => ft8_slot_parity_index(slot_secs) == 1,
                             _ => false,
                         }
                     } else { false };
@@ -148,7 +153,7 @@ impl ApplicationCoordinator {
                         bus.gain_tx_gate.store(0, Ordering::Release);
                         skip(&mut report, slot_secs, "parity balance quiet slot"); continue;
                     };
-                    let budget = (slot - SignedDuration::from_millis(250) - UtcTimestamp::now()).to_std().unwrap_or_default();
+                    let budget = (slot - SignedDuration::from_millis(250) - clock.now()).to_std().unwrap_or_default();
                     let deadline = Instant::now() + budget;
                     let transaction = async {
                         anyhow::ensure!(rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off, "Rig is transmitting");
@@ -159,7 +164,7 @@ impl ApplicationCoordinator {
                         Ok(Ok(())) => {
                             current = pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db };
                             // Do not release TX exclusion until the 250 ms settling interval ends.
-                            let settle = (slot - UtcTimestamp::now()).to_std().unwrap_or_default();
+                            let settle = (slot - clock.now()).to_std().unwrap_or_default();
                             sleep(settle).await;
                             epoch += 1;
                             let capture_admitted = capture.lock().unwrap_or_else(|e| e.into_inner()).admit(GainCaptureMetadata {
@@ -186,7 +191,7 @@ impl ApplicationCoordinator {
                     capture.lock().unwrap_or_else(|e| e.into_inner()).invalidate_all("unconfirmed final gain");
                 }
                 println!("Restoring original gain settings...");
-                let restored = restore(&*rig, original, &bus.gain_tx_gate, lead).await;
+                let restored = restore(&*rig, original, &bus.gain_tx_gate, lead, &clock).await;
                 // A reported terminal restoration failure also ends cleanup
                 // ownership. Keep the TX inhibit, but do not restart a fresh
                 // 30-second deadline during ordinary shutdown.
@@ -231,6 +236,7 @@ pub(super) async fn restore(
     original: pancetta_hamlib::ReceiveGain,
     gate: &AtomicU64,
     lead: f64,
+    clock: &SlotClock,
 ) -> bool {
     let end = Instant::now() + Duration::from_secs(30);
     // Inhibit new key-downs, including when a prior pending key-down has not
@@ -239,23 +245,16 @@ pub(super) async fn restore(
     let restored = tokio::time::timeout_at(end, async {
         loop {
             let _ = rig.connect().await;
-            let now = UtcTimestamp::now();
-            let slot_secs =
-                (now.as_millisecond() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
+            let slot_secs = next_ft8_source_slot_secs(clock.now(), lead);
             let slot =
                 UtcTimestamp::from_parts(slot_secs, 0).context("Invalid restoration boundary")?;
             let boundary = slot - SignedDuration::from_millis((lead * 1000.0) as i64);
-            sleep(
-                (boundary - UtcTimestamp::now())
-                    .to_std()
-                    .unwrap_or_default(),
-            )
-            .await;
-            if UtcTimestamp::now().duration_since(boundary).as_millis_i64() > 50 {
+            sleep((boundary - clock.now()).to_std().unwrap_or_default()).await;
+            if clock.now().duration_since(boundary).as_millis_i64() > 50 {
                 continue;
             }
             let deadline = Instant::now()
-                + (slot - SignedDuration::from_millis(250) - UtcTimestamp::now())
+                + (slot - SignedDuration::from_millis(250) - clock.now())
                     .to_std()
                     .unwrap_or_default();
             let attempt = tokio::time::timeout_at(deadline, async {
@@ -268,7 +267,7 @@ pub(super) async fn restore(
             })
             .await;
             if matches!(attempt, Ok(Ok(()))) {
-                sleep((slot - UtcTimestamp::now()).to_std().unwrap_or_default()).await;
+                sleep((slot - clock.now()).to_std().unwrap_or_default()).await;
                 return anyhow::Ok(());
             }
             let _ = rig.disconnect().await;
