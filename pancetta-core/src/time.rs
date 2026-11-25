@@ -491,7 +491,9 @@ impl TryFrom<SystemTime> for UtcTimestamp {
 
 impl From<UtcTimestamp> for SystemTime {
     fn from(t: UtcTimestamp) -> Self {
-        SystemTime::from(t.0)
+        // jiff 1.0 changed From<Timestamp> to TryFrom; UtcTimestamp always
+        // represents a real-world time well within SystemTime's range.
+        SystemTime::try_from(t.0).expect("UtcTimestamp within SystemTime range")
     }
 }
 
