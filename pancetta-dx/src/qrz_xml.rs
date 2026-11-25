@@ -163,9 +163,11 @@ impl QrzXmlClient {
     /// Look up a callsign, returning the parsed [`QrzLookup`].
     ///
     /// Authenticates lazily on first use and transparently re-authenticates
-    /// once if QRZ reports the session has expired (`Session Timeout`). Any
-    /// QRZ-reported error (bad credentials, callsign not found, …) maps to a
-    /// [`DxError`]; **no credential or session-key value is ever included** in
+    /// once if QRZ reports the session has expired (`Session Timeout`). A
+    /// callsign miss (a lookup reply saying `Not found`, or an empty record) is
+    /// [`DxErrorInner::CallsignNotFound`]; every other QRZ-reported error, a
+    /// failed login included, is [`DxErrorInner::ExternalService`] (PAN-478).
+    /// **No credential or session-key value is ever included** in
     /// an error or log line; network failures carry no URL (see
     /// [`NetworkError`](crate::NetworkError)). A response body over 64 KiB is
     /// refused with [`DxErrorInner::ResponseTooLarge`] once that much has been read.
@@ -286,7 +288,11 @@ impl QrzXmlClient {
             let safe = if session_expiry_phrase(|phrase| text.mentions(phrase)) {
                 "Session Timeout".to_string()
             } else if text.says("not found") {
-                "Not found".to_string()
+                // The one place a lookup `<Error>` becomes a callsign miss; a
+                // login error never reaches here (PAN-478).
+                return Err(DxError::from(DxErrorInner::CallsignNotFound(
+                    "QRZ lookup error: Not found".into(),
+                )));
             } else {
                 text.display()
             };
@@ -301,7 +307,7 @@ impl QrzXmlClient {
             ))
         })?;
         if lookup == QrzLookup::default() {
-            return Err(DxError::from(DxErrorInner::ExternalService(format!(
+            return Err(DxError::from(DxErrorInner::CallsignNotFound(format!(
                 "QRZ returned no callsign data for '{callsign}'"
             ))));
         }
@@ -990,3 +996,7 @@ mod error_redaction_tests;
 #[cfg(test)]
 #[path = "qrz_xml/tests/credential_echo_tests.rs"]
 mod credential_echo_tests;
+
+#[cfg(test)]
+#[path = "qrz_xml/tests/callsign_miss_tests.rs"]
+mod callsign_miss_tests;
