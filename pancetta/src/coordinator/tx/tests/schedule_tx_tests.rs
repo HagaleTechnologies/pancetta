@@ -446,12 +446,36 @@ fn a7_call_in(
     }
 }
 
-/// Keying on 20 m, FT8 grid.
+/// Keying on 20 m, FT8 grid, with the gate's clock reading taken now.
 fn ft8_20m() -> super::DxParityContext {
+    ft8_20m_at(std::time::SystemTime::now())
+}
+
+/// Keying on 20 m, FT8 grid, with the gate's clock reading at `now`: no
+/// clock events, and the frame scheduled under the current (zero) resync
+/// epoch (PAN-489).
+fn ft8_20m_at(now: std::time::SystemTime) -> super::DxParityContext {
     super::DxParityContext {
         dial_hz: DIAL_20M,
         slot_ns: SLOT_NS,
+        clock: pancetta_core::slot_clock::SlotReading {
+            now: UtcTimestamp::try_from(now).unwrap(),
+            slot_ns: SLOT_NS,
+            epoch: 0,
+            resync_epoch: 0,
+            last_event: None,
+            last_resync: None,
+        },
+        scheduled_resync_epoch: 0,
     }
+}
+
+/// A real-clock `SlotClock` for the async resolver (PAN-489): no step
+/// happens during these tests, so the step hold never applies.
+fn test_slot_clock() -> pancetta_core::SlotClock {
+    pancetta_core::SlotClock::system(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        SLOT_NS,
+    )))
 }
 
 #[test]
@@ -465,13 +489,10 @@ fn dx_parity_conflict_true_when_fresh_and_same_parity() {
 
     // 5Z4VJ was just observed transmitting on Odd — the exact parity we
     // are about to key into (the PAN-141 collision shape).
-    assert!(super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now,
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, ft8_20m_at(now), &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// Codex P2 on PR #370 (round 2): the table is populated from on-air
@@ -487,13 +508,10 @@ fn dx_parity_conflict_true_for_lowercase_query_against_uppercase_table_entry() {
         .unwrap()
         .record(a7_call("5Z4VJ", 1, now));
 
-    assert!(super::dx_parity_conflict(
-        "5z4vj",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now,
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5z4vj", SlotParity::Odd, ft8_20m_at(now), &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// Codex P2 on PR #370 (round 3): a QSO can latch a compound spelling
@@ -510,13 +528,10 @@ fn dx_parity_conflict_true_for_compound_callsign_against_bare_table_entry() {
         .unwrap()
         .record(a7_call("G8BCG", 1, now));
 
-    assert!(super::dx_parity_conflict(
-        "EA8/G8BCG",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now,
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("EA8/G8BCG", SlotParity::Odd, ft8_20m_at(now), &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// Local review gate, round 3: a compound and bare spelling of the same
@@ -539,8 +554,9 @@ fn dx_parity_conflict_uses_newest_matching_entry_not_a_stale_alias() {
         .unwrap()
         .record(a7_call("G8BCG", 0 /* Even */, now));
 
-    assert!(
-        !super::dx_parity_conflict("G8BCG", SlotParity::Odd, ft8_20m(), &cts, now,),
+    assert_eq!(
+        super::dx_parity_conflict("G8BCG", SlotParity::Odd, ft8_20m_at(now), &cts),
+        None,
         "the newest entry (Even, now) must win over the older Odd alias"
     );
 }
@@ -555,13 +571,10 @@ fn dx_parity_conflict_false_when_fresh_and_opposite_parity() {
         .record(a7_call("5Z4VJ", 0 /* Even */, now));
 
     // Still consistent with our latched assumption — proceed.
-    assert!(!super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now,
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, ft8_20m_at(now), &cts),
+        None
+    );
 }
 
 #[test]
@@ -575,25 +588,29 @@ fn dx_parity_conflict_false_when_entry_older_than_freshness_window() {
 
     // Same-parity evidence exists but it's stale relative to OUR
     // freshness window — must not block a genuinely fine transmission.
-    assert!(!super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        std::time::SystemTime::now(),
-    ));
+    assert_eq!(
+        super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft8_20m_at(std::time::SystemTime::now()),
+            &cts
+        ),
+        None
+    );
 }
 
 #[test]
 fn dx_parity_conflict_false_when_no_entry() {
     let cts = pancetta_qso::CrossTimeState::empty();
-    assert!(!super::dx_parity_conflict(
-        "UNKNOWN",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        std::time::SystemTime::now(),
-    ));
+    assert_eq!(
+        super::dx_parity_conflict(
+            "UNKNOWN",
+            SlotParity::Odd,
+            ft8_20m_at(std::time::SystemTime::now()),
+            &cts
+        ),
+        None
+    );
 }
 
 #[test]
@@ -604,13 +621,15 @@ fn dx_parity_conflict_fails_open_on_poisoned_lock() {
         panic!("poison");
     }));
     assert!(cts.a7_recent_calls.is_poisoned());
-    assert!(!super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        std::time::SystemTime::now(),
-    ));
+    assert_eq!(
+        super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft8_20m_at(std::time::SystemTime::now()),
+            &cts
+        ),
+        None
+    );
 }
 
 #[test]
@@ -641,22 +660,17 @@ fn dx_parity_conflict_ignores_entry_heard_on_another_band() {
     let on_15m = super::DxParityContext {
         dial_hz: DIAL_15M,
         slot_ns: SLOT_NS,
+        ..ft8_20m_at(now)
     };
-    assert!(!super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        on_15m,
-        &cts,
-        now
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, on_15m, &cts),
+        None
+    );
     // Control: the same entry still holds on its own band.
-    assert!(super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, ft8_20m_at(now), &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// FT8 and FT4 parities describe different slot boundaries: an FT8-grid
@@ -672,14 +686,12 @@ fn dx_parity_conflict_ignores_entry_from_another_slot_grid() {
     let ft4_20m = super::DxParityContext {
         dial_hz: DIAL_20M,
         slot_ns: FT4_SLOT_NS,
+        ..ft8_20m_at(now)
     };
-    assert!(!super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        ft4_20m,
-        &cts,
-        now
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, ft4_20m, &cts),
+        None
+    );
 }
 
 /// Band granularity, not exact dial: an entry keeps the exact dial its
@@ -695,14 +707,12 @@ fn dx_parity_conflict_still_holds_after_intra_band_retune() {
     let retuned = super::DxParityContext {
         dial_hz: 14_090_000,
         slot_ns: SLOT_NS,
+        ..ft8_20m_at(now)
     };
-    assert!(super::dx_parity_conflict(
-        "5Z4VJ",
-        SlotParity::Odd,
-        retuned,
-        &cts,
-        now
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, retuned, &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// With the dial unknown (0) on either side there is no band switch to
@@ -721,22 +731,22 @@ fn dx_parity_conflict_skips_band_check_when_a_dial_is_unknown() {
         let live = super::DxParityContext {
             dial_hz: live_dial,
             slot_ns: SLOT_NS,
+            ..ft8_20m_at(now)
         };
-        assert!(
-            super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, live, &cts, now),
+        assert_eq!(
+            super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, live, &cts),
+            Some(super::DxParityHold::CollidingParity),
             "entry dial {entry_dial}, live dial {live_dial} must still hold"
         );
         let ft4 = super::DxParityContext {
             dial_hz: live_dial,
             slot_ns: FT4_SLOT_NS,
+            ..ft8_20m_at(now)
         };
-        assert!(!super::dx_parity_conflict(
-            "5Z4VJ",
-            SlotParity::Odd,
-            ft4,
-            &cts,
-            now
-        ));
+        assert_eq!(
+            super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, ft4, &cts),
+            None
+        );
     }
 }
 
@@ -758,13 +768,10 @@ fn dx_parity_conflict_newest_pick_is_among_in_context_entries() {
         .write()
         .unwrap()
         .record(a7_call_in("G8BCG", 0, now, DIAL_15M, SLOT_NS));
-    assert!(super::dx_parity_conflict(
-        "G8BCG",
-        SlotParity::Odd,
-        ft8_20m(),
-        &cts,
-        now
-    ));
+    assert_eq!(
+        super::dx_parity_conflict("G8BCG", SlotParity::Odd, ft8_20m_at(now), &cts),
+        Some(super::DxParityHold::CollidingParity)
+    );
 }
 
 /// End to end through the async resolver with the live dial atom: the
@@ -787,28 +794,34 @@ async fn dx_parity_conflict_for_qso_scopes_to_live_dial() {
     ));
     let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
     let dial = std::sync::atomic::AtomicU64::new(DIAL_15M);
-    assert!(
-        !super::dx_parity_conflict_for_qso(
-            Some(&qso_id.to_string()),
-            SlotParity::Odd,
-            &dial,
-            SLOT_NS,
-            &rx,
-            &cts,
-        )
-        .await
-    );
-    dial.store(DIAL_20M, Ordering::Relaxed);
-    assert!(
+    assert_eq!(
         super::dx_parity_conflict_for_qso(
             Some(&qso_id.to_string()),
             SlotParity::Odd,
             &dial,
             SLOT_NS,
+            &test_slot_clock(),
+            0,
             &rx,
-            &cts,
+            &cts
         )
-        .await
+        .await,
+        None
+    );
+    dial.store(DIAL_20M, Ordering::Relaxed);
+    assert_eq!(
+        super::dx_parity_conflict_for_qso(
+            Some(&qso_id.to_string()),
+            SlotParity::Odd,
+            &dial,
+            SLOT_NS,
+            &test_slot_clock(),
+            0,
+            &rx,
+            &cts
+        )
+        .await,
+        Some(super::DxParityHold::CollidingParity)
     );
 }
 
@@ -833,6 +846,7 @@ fn final_single_tx_gate_denial_ignores_out_of_context_entry() {
     let on_15m = super::DxParityContext {
         dial_hz: DIAL_15M,
         slot_ns: SLOT_NS,
+        ..ft8_20m()
     };
     assert!(super::final_single_tx_gate_denial(
         Some("qso-kenya"),
@@ -888,7 +902,7 @@ fn bundle_live_mask_holds_only_items_observed_in_context() {
     let callsigns = vec![Some("5Z4VJ".to_string()), Some("EA8BCG".to_string())];
     let (live, held) =
         super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
-    assert_eq!(held, vec![true, false]);
+    assert_eq!(held, vec![Some(super::DxParityHold::CollidingParity), None]);
     assert_eq!(live, vec![false, true]);
 }
 
@@ -924,16 +938,19 @@ async fn dx_parity_conflict_for_qso_reproduces_pan_141_pileup_collision() {
         .record(a7_call("5Z4VJ", 1, now));
 
     let (_tx, rx) = tokio::sync::watch::channel(Some(manager.clone()));
-    assert!(
+    assert_eq!(
         super::dx_parity_conflict_for_qso(
             Some(&qso_id.to_string()),
             SlotParity::Odd,
             &std::sync::atomic::AtomicU64::new(DIAL_20M),
             SLOT_NS,
+            &test_slot_clock(),
+            0,
             &rx,
-            &cts,
+            &cts
         )
         .await,
+        Some(super::DxParityHold::CollidingParity),
         "must detect the collision: DX just observed on the exact parity we're about to key"
     );
 
@@ -961,16 +978,19 @@ async fn dx_parity_conflict_for_qso_proceeds_when_second_decode_is_stale() {
         .record(a7_call("5Z4VJ", 1, decoded_at));
 
     let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
-    assert!(
-        !super::dx_parity_conflict_for_qso(
+    assert_eq!(
+        super::dx_parity_conflict_for_qso(
             Some(&qso_id.to_string()),
             SlotParity::Odd,
             &std::sync::atomic::AtomicU64::new(DIAL_20M),
             SLOT_NS,
+            &test_slot_clock(),
+            0,
             &rx,
-            &cts,
+            &cts
         )
-        .await
+        .await,
+        None
     );
 }
 
@@ -981,27 +1001,33 @@ async fn dx_parity_conflict_for_qso_proceeds_when_second_decode_is_stale() {
 async fn dx_parity_conflict_for_qso_fails_open_without_target_or_manager() {
     let cts = pancetta_qso::CrossTimeState::empty();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    assert!(
-        !super::dx_parity_conflict_for_qso(
+    assert_eq!(
+        super::dx_parity_conflict_for_qso(
             None,
             SlotParity::Odd,
             &std::sync::atomic::AtomicU64::new(DIAL_20M),
             SLOT_NS,
+            &test_slot_clock(),
+            0,
             &rx,
-            &cts,
+            &cts
         )
-        .await
+        .await,
+        None
     );
-    assert!(
-        !super::dx_parity_conflict_for_qso(
+    assert_eq!(
+        super::dx_parity_conflict_for_qso(
             Some("00000000-0000-0000-0000-000000000000"),
             SlotParity::Odd,
             &std::sync::atomic::AtomicU64::new(DIAL_20M),
             SLOT_NS,
+            &test_slot_clock(),
+            0,
             &rx,
-            &cts,
+            &cts
         )
-        .await
+        .await,
+        None
     );
 }
 
@@ -1253,7 +1279,7 @@ fn bundle_live_mask_matches_established_semantics() {
     let (live, held) =
         super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
     assert_eq!(live, vec![true, true]);
-    assert_eq!(held, vec![false, false]);
+    assert_eq!(held, vec![None, None]);
 
     active
         .write()
@@ -1262,7 +1288,7 @@ fn bundle_live_mask_matches_established_semantics() {
     let (live, held) =
         super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
     assert_eq!(live, vec![true, false]);
-    assert_eq!(held, vec![false, false]);
+    assert_eq!(held, vec![None, None]);
 }
 
 /// PAN-148 (Finding 1, PR #370 round 2): pins the multi-TX race. Step

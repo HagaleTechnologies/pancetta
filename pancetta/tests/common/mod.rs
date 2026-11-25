@@ -208,6 +208,9 @@ pub struct CoordSim {
     consumers: Vec<tokio::task::JoinHandle<()>>,
     outcomes: crossbeam_channel::Receiver<ComponentMessage>,
     arm_now: pancetta_agent::arm::ArmTime,
+    /// The clock the sim's TX worker reads (PAN-489: DX sightings are
+    /// stamped from it, as the worker's DX-parity gate reads it).
+    utc_clock: pancetta_core::time::UtcClock,
     pub our_callsign: String,
     pub timeline: Timeline,
     slot: u64,
@@ -409,6 +412,7 @@ impl CoordSim {
             consumers,
             outcomes,
             arm_now,
+            utc_clock,
         }
     }
 
@@ -433,7 +437,7 @@ impl CoordSim {
                     SlotParity::Even => 0,
                     SlotParity::Odd => 1,
                 },
-                decoded_at: std::time::SystemTime::now(),
+                decoded_at: std::time::SystemTime::from((self.utc_clock)()),
                 captured_dial_hz: dial_hz,
                 slot_ns: 15_000_000_000,
             });

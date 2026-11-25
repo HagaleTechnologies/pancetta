@@ -200,15 +200,26 @@ async fn ticking_harness() -> (
     ManualClock,
     tokio::task::JoinHandle<()>,
 ) {
-    use super::worker_gate_tests::worker_harness_with_slot_clock;
-    use std::sync::atomic::Ordering;
-
     let boundary = pancetta_core::slot::next_slot_start_with_period(
         UtcTimestamp::now(),
         SignedDuration::ZERO,
         SLOT_NS,
     );
-    let manual = ManualClock::new(boundary - SignedDuration::from_millis(1_200));
+    ticking_harness_at(boundary - SignedDuration::from_millis(1_200)).await
+}
+
+/// [`ticking_harness`] with the `ManualClock` starting at `start` (PAN-489).
+pub(super) async fn ticking_harness_at(
+    start: UtcTimestamp,
+) -> (
+    super::worker_gate_tests::Harness,
+    ManualClock,
+    tokio::task::JoinHandle<()>,
+) {
+    use super::worker_gate_tests::worker_harness_with_slot_clock;
+    use std::sync::atomic::Ordering;
+
+    let manual = ManualClock::new(start);
     let h =
         worker_harness_with_slot_clock(manual.slot_clock(Arc::new(AtomicI64::new(SLOT_NS)))).await;
     h.coordinator
@@ -260,16 +271,19 @@ async fn send_bundle(h: &super::worker_gate_tests::Harness) {
 /// What a drop produced: the PTT states Hamlib saw in order, the failed
 /// completions, every TUI diagnostic and how many audio frames were routed.
 #[derive(Debug)]
-struct DropOutcome {
-    ptt: Vec<bool>,
-    failed: Vec<String>,
-    diagnostics: Vec<String>,
+pub(super) struct DropOutcome {
+    pub(super) ptt: Vec<bool>,
+    pub(super) failed: Vec<String>,
+    pub(super) diagnostics: Vec<String>,
 }
 
 /// Collect until every text in `texts` has a `TransmitComplete`. Autonomous
 /// is drained before Hamlib each pass, so a PTT-off queued before the last
 /// report is in `ptt`.
-async fn await_drop_outcome(h: &super::worker_gate_tests::Harness, texts: &[&str]) -> DropOutcome {
+pub(super) async fn await_drop_outcome(
+    h: &super::worker_gate_tests::Harness,
+    texts: &[&str],
+) -> DropOutcome {
     use crate::message_bus::{MessageType, RigControlMessage};
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut out = DropOutcome {
@@ -312,7 +326,7 @@ async fn await_drop_outcome(h: &super::worker_gate_tests::Harness, texts: &[&str
     out
 }
 
-fn count_prefixed(diagnostics: &[String], prefix: &str) -> usize {
+pub(super) fn count_prefixed(diagnostics: &[String], prefix: &str) -> usize {
     diagnostics.iter().filter(|d| d.starts_with(prefix)).count()
 }
 
