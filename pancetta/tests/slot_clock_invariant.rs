@@ -84,6 +84,29 @@ fn needle(a: &str, b: &str) -> String {
     format!("{a}{b}")
 }
 
+/// Direct `Timestamp::now`/`SystemTime::now` calls in `text`, the contents of
+/// the TX timing file `rel`, as `file:line` reports, and the number of exempt
+/// `.admit_ptt(` stamps (a `tx/ptt.rs` line only).
+fn wall_reads(rel: &str, text: &str) -> (Vec<String>, usize) {
+    let calls = [needle("Timestamp", "::now"), needle("SystemTime", "::now")];
+    let mut reads = Vec::new();
+    let mut admission_stamps = 0;
+    for (i, line) in text.lines().enumerate() {
+        let Some(wall) = calls.iter().find(|w| line.contains(w.as_str())) else {
+            continue;
+        };
+        if rel.ends_with("/ptt.rs") && line.contains(".admit_ptt(") {
+            admission_stamps += 1;
+        } else {
+            reads.push(format!(
+                "{rel}:{}: read slot timing through the shared SlotClock, not {wall}",
+                i + 1
+            ));
+        }
+    }
+    (reads, admission_stamps)
+}
+
 #[test]
 fn no_per_site_slot_clock_code_remains() {
     let banned = [
@@ -204,21 +227,11 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
     // receive-overload PTT admission stamp in `tx/ptt.rs` (`.admit_ptt(`),
     // which is not slot timing and stays on the wall clock; it must stay
     // exactly one line, so a second or a stale exemption fails.
-    let wall_reads = [needle("Timestamp", "::now"), needle("SystemTime", "::now")];
     let mut admission_stamps = 0;
     for rel in TX_TIMING_FILES {
-        for (i, line) in read(rel).lines().enumerate() {
-            let Some(wall) = wall_reads.iter().find(|w| line.contains(w.as_str())) else {
-                continue;
-            };
-            let admission_stamp = rel.ends_with("/ptt.rs") && line.contains(".admit_ptt(");
-            assert!(
-                admission_stamp,
-                "{rel}:{}: read slot timing through the shared SlotClock, not {wall}",
-                i + 1
-            );
-            admission_stamps += 1;
-        }
+        let (reads, stamps) = wall_reads(rel, &read(rel));
+        assert!(reads.is_empty(), "{}", reads.join("\n"));
+        admission_stamps += stamps;
     }
     assert_eq!(
         admission_stamps, 1,
@@ -231,6 +244,53 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
         coordinator.contains(&needle("spawn_slot_clock", "_driver(")),
         "the coordinator must start the slot-clock driver"
     );
+}
+
+/// PAN-489: the wall-read ban above covers the DX-parity gate. Each file is
+/// in `TX_TIMING_FILES` and clean today, and `wall_reads`, the scan
+/// `every_consumer_is_wired_to_the_coordinator_clock` runs over every
+/// `TX_TIMING_FILES` entry, reports a direct `SystemTime::now()` or
+/// `UtcTimestamp::now()` call appended to it at that call's line.
+#[test]
+fn wall_read_ban_covers_the_dx_parity_gate() {
+    for rel in [
+        "pancetta/src/coordinator/tx/gate.rs",
+        "pancetta/src/coordinator/tx/bundle.rs",
+    ] {
+        assert!(
+            TX_TIMING_FILES.contains(&rel),
+            "{rel} must be in TX_TIMING_FILES"
+        );
+        let mut text = read(rel);
+        assert_eq!(wall_reads(rel, &text), (Vec::new(), 0), "{rel} is clean");
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let probe_line = text.lines().count() + 1;
+        for (call, wall) in [
+            (
+                needle("std::time::SystemTime", "::now()"),
+                needle("SystemTime", "::now"),
+            ),
+            (
+                needle("UtcTimestamp", "::now()"),
+                needle("Timestamp", "::now"),
+            ),
+        ] {
+            let probed = format!("{text}let _probe = {call};\n");
+            assert_eq!(
+                wall_reads(rel, &probed),
+                (
+                    vec![format!(
+                        "{rel}:{probe_line}: read slot timing through the shared \
+                         SlotClock, not {wall}"
+                    )],
+                    0
+                ),
+                "a {call} appended to {rel} must be reported"
+            );
+        }
+    }
 }
 
 /// Lines of `rel` containing `banned`, as `file:line: text`.
