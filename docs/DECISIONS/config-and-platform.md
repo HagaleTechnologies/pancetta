@@ -881,7 +881,10 @@ written in place, once per start; it is not an `ft8_*` file.
   .github/workflows/` lists the inputs (`supply-chain.yml`'s step has none yet). `ci.yml`'s
   `changes` filter and `docs.yml`'s push filter both list `rust-toolchain.toml`, so the Rust
   lanes and the docs build re-run on the bump. A missed input still builds with the pinned
-  compiler; it only brings the second download back.
+  compiler; it only brings the second download back. The `toolchain: 1.88.0` input in
+  `workspace-check` is the registry MSRV of `pancetta-core` and `pancetta-ft8` (PAN-468). It is
+  not part of a 1.98 bump and moves only with their `rust-version`;
+  `scripts/ci/test-ci-msrv.sh` fails if the two disagree.
 - **Rejected.** Floating `stable`: on 2026-10-14 stale local stables (1.94.1, 1.96.1) on macOS 27
   emitted proc-macro dylibs that dyld refused to load. A `scripts/check-rust-toolchain-pin.sh`
   guard like manta's: CI run logs already show the override putting 1.98.0 behind every `cargo`
@@ -1435,11 +1438,12 @@ draft. macOS signing and notarization remain PAN-265.
   `libgit2-sys` and `openssl-src` handle bundled C the same way.
 - **`rust-version = "1.88"` with `#![deny(clippy::incompatible_msrv)]`.** Both
   libraries compile with 1.88.0 on the current lockfile. The deny makes CI's
-  existing clippy step fail on any std API newer than 1.88. Without it, such
-  a use would only warn. PAN-315 later set every workspace member to the
-  workspace `rust-version` 1.98; these two crates are its only exception,
-  named in `scripts/ci/test-dependency-policy.py` (`cargo +1.88.0 check -p
-  pancetta-core -p pancetta-ft8` re-verified after the merge, 2026-11-19).
+  existing clippy step fail on any std API newer than 1.88 in the crates' own
+  source. Without it, such a use would only warn. PAN-315 later set every
+  workspace member to the workspace `rust-version` 1.98; these two crates are
+  its only exception, named in `scripts/ci/test-dependency-policy.py`. Since
+  PAN-468, `workspace-check` also builds both crates on 1.88.0; see the
+  PAN-468 section.
 - **README links pin the release tag.** A published README cannot change,
   and a `blob/main` link would drift away from the published version. The
   links use `blob/pancetta-ft8-v<version>/`, the version test updates them at
@@ -1739,3 +1743,25 @@ interpolation is the clamped `u32` `LIMIT`; `VACUUM INTO`, whose target has
 no bind form and is escaped by `escape_sqlite_string_literal`; and the
 confirmed-count query, which formats the constant `CONFIRMED_QSO_SQL`. Any
 new dynamic SQL needs the same wrapper and a comment saying why it is safe.
+
+## Registry MSRV check (PAN-468, 2026-11-24)
+
+`pancetta-core` and `pancetta-ft8` declare `rust-version = "1.88"` (PAN-384). The
+`#![deny(clippy::incompatible_msrv)]` in each `lib.rs` catches std APIs newer than 1.88 in
+the crates' own source, but not a newer language feature or any dependency. The
+`workspace-check` job now installs 1.88.0 next to the pinned 1.98.0 and runs
+`cargo +1.88.0 check --locked -p pancetta-core -p pancetta-ft8` for the default,
+`--all-features` and `--no-default-features` builds; `scripts/ci/test-ci-msrv.sh` ties that
+version to both manifests.
+
+- **A step, not a job.** A new aggregator job breaks `test-ci-cargo-coverage.sh` and
+  `test-ci-merge-group-verified.sh`, and one outside the aggregator is advisory only. The step
+  inherits the checkout, system headers and `code` path gate, as the PAN-384 dry-run does.
+- **Plain cargo, not `cargo hack`.** No new pinned tool, and cargo already names the
+  dependency: a 2026-11-24 probe that patched in a copy of `hound 3.5.1` declaring
+  `rust-version = "1.89"` printed `hound@3.5.1 requires rustc 1.89`. The real `hound` declares
+  none and passes. `cargo tree -i <dep>` shows who pulled a failing dependency in.
+- **`--locked`, and `CARGO_TARGET_DIR` under `runner.temp`.** A stale lockfile fails instead of
+  re-resolving, and the 1.88 artifacts stay out of the rust-cache; the check takes about 30 s.
+- **No fresh-resolve lane.** CI proves the committed `Cargo.lock`. A lane that re-resolved
+  would fail unrelated PRs whenever an upstream release raised its MSRV.
