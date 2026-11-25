@@ -28,7 +28,13 @@ use super::*;
 /// item transmit" mask every caller ultimately wants; `parity_hold_mask` is
 /// returned alongside it only so a caller that reports per-item drop
 /// reasons (Step 4b's partial-staleness branch) can distinguish "ended" from
-/// "held for colliding DX parity" without a second pass.
+/// "held for colliding DX parity" (or, PAN-489, "held for a recent clock
+/// step") without a second pass.
+///
+/// PAN-489: every item is judged against the one shared-slot-clock reading
+/// `context` carries, so the whole bundle shares one `now` and nothing here
+/// reads the wall clock. An item with no resolved partner (CQ, manual) is
+/// never held.
 pub(super) fn bundle_live_mask(
     encoded_qso_ids: &[Option<String>],
     callsigns: &[Option<String>],
@@ -36,20 +42,19 @@ pub(super) fn bundle_live_mask(
     context: DxParityContext,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-) -> (Vec<bool>, Vec<bool>) {
-    let now = std::time::SystemTime::now();
-    let parity_hold_mask: Vec<bool> = callsigns
+) -> (Vec<bool>, Vec<Option<DxParityHold>>) {
+    let parity_hold_mask: Vec<Option<DxParityHold>> = callsigns
         .iter()
         .map(|callsign| {
-            callsign.as_deref().is_some_and(|cs| {
-                dx_parity_conflict(cs, required_parity, context, cross_time_state, now)
-            })
+            callsign
+                .as_deref()
+                .and_then(|cs| dx_parity_conflict(cs, required_parity, context, cross_time_state))
         })
         .collect();
     let live_mask = encoded_qso_ids
         .iter()
         .zip(parity_hold_mask.iter())
-        .map(|(id, &held)| tx_qso_is_live(id.as_deref(), active_tx_qsos) && !held)
+        .map(|(id, held)| tx_qso_is_live(id.as_deref(), active_tx_qsos) && held.is_none())
         .collect();
     (live_mask, parity_hold_mask)
 }

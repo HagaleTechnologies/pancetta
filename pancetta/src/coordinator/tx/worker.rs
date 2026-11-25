@@ -2464,30 +2464,35 @@ impl super::super::ApplicationCoordinator {
                                         // retry/watchdog cadence (`rearm_manual_calls_at`,
                                         // `manual_call_max_calls`, `report_timeout`) decides
                                         // what happens next.
-                                        if dx_parity_conflict_for_qso(
+                                        // PAN-489: the gate reads the shared slot clock
+                                        // and holds, stating the step, for one freshness
+                                        // window after a resync this frame was scheduled
+                                        // after.
+                                        if let Some(hold) = dx_parity_conflict_for_qso(
                                             qso_id.as_deref(),
                                             required_parity,
                                             &operating_frequency_hz,
                                             slot_ns,
+                                            &timing.slot_clock,
+                                            timing.scheduled_resync_epoch,
                                             &qso_manager_watch,
                                             &cross_time_state,
                                         )
                                         .await
                                         {
+                                            let reason =
+                                                dx_parity_hold_reason(hold, required_parity);
                                             info!(
                                                 target: "pancetta::tx.policy",
-                                                "holding TX for QSO {}: DX observed transmitting on the colliding parity {:?} within the freshness window: '{}'",
+                                                "holding TX for QSO {}: {reason}: '{}'",
                                                 qso_id.as_deref().unwrap_or("?"),
-                                                required_parity,
                                                 message_text
                                             );
                                             emit_diagnostic(
                                                 &message_bus,
                                                 "tx.policy",
                                                 pancetta_core::DiagnosticLevel::Info,
-                                                format!(
-                                                "holding TX: DX observed transmitting on the colliding parity {required_parity:?} within the freshness window: '{message_text}'"
-                                            ),
+                                                format!("holding TX: {reason}: '{message_text}'"),
                                                 qso_id.as_deref(),
                                             )
                                             .await;
@@ -3102,7 +3107,12 @@ impl super::super::ApplicationCoordinator {
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
-                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
+                                            DxParityContext::live(
+                                                &operating_frequency_hz,
+                                                slot_ns,
+                                                &timing.slot_clock,
+                                                timing.scheduled_resync_epoch,
+                                            ),
                                             &active_tx_qsos,
                                             final_gate_callsign.as_deref(),
                                             &cross_time_state,
@@ -5279,7 +5289,12 @@ impl super::super::ApplicationCoordinator {
                                         &encoded_qso_ids,
                                         &step_4b_callsigns,
                                         required_parity,
-                                        DxParityContext::live(&operating_frequency_hz, slot_ns),
+                                        DxParityContext::live(
+                                            &operating_frequency_hz,
+                                            slot_ns,
+                                            &timing.slot_clock,
+                                            timing.scheduled_resync_epoch,
+                                        ),
                                         &active_tx_qsos,
                                         &cross_time_state,
                                     );
@@ -5340,9 +5355,10 @@ impl super::super::ApplicationCoordinator {
                                     }
 
                                     if !live_mask.iter().any(|&live| live) {
+                                        let hold_summary = bundle_hold_summary(&parity_hold_mask);
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "dropping stale multi-TX bundle: all {} item(s) ended or held (colliding DX parity) during the pre-PTT wait",
+                                            "dropping stale multi-TX bundle: all {} item(s) ended or held ({hold_summary}) during the pre-PTT wait",
                                             encoded_qso_ids.len()
                                         );
                                         emit_diagnostic(
@@ -5350,7 +5366,7 @@ impl super::super::ApplicationCoordinator {
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "dropping stale multi-TX bundle: all {} item(s) ended or held (colliding DX parity) during the pre-PTT wait",
+                                                "dropping stale multi-TX bundle: all {} item(s) ended or held ({hold_summary}) during the pre-PTT wait",
                                                 encoded_qso_ids.len()
                                             ),
                                             None,
@@ -5616,12 +5632,15 @@ impl super::super::ApplicationCoordinator {
                                                             item.qso_id.as_deref().unwrap_or("?"),
                                                             item.message_text
                                                         );
-                                                    } else if parity_held {
+                                                    } else if let Some(hold) = parity_held {
+                                                        let reason = dx_parity_hold_reason(
+                                                            hold,
+                                                            required_parity,
+                                                        );
                                                         info!(
                                                             target: "pancetta::tx.policy",
-                                                            "holding multi-TX item at key-time for QSO {}: DX observed transmitting on the colliding parity {:?} within the freshness window: '{}'",
+                                                            "holding multi-TX item at key-time for QSO {}: {reason}: '{}'",
                                                             item.qso_id.as_deref().unwrap_or("?"),
-                                                            required_parity,
                                                             item.message_text
                                                         );
                                                         emit_diagnostic(
@@ -5629,7 +5648,7 @@ impl super::super::ApplicationCoordinator {
                                                             "tx.policy",
                                                             pancetta_core::DiagnosticLevel::Info,
                                                             format!(
-                                                                "holding multi-TX item: DX observed transmitting on the colliding parity {required_parity:?} within the freshness window: '{}'",
+                                                                "holding multi-TX item: {reason}: '{}'",
                                                                 item.message_text
                                                             ),
                                                             item.qso_id.as_deref(),
@@ -6166,7 +6185,12 @@ impl super::super::ApplicationCoordinator {
                                             &encoded_qso_ids_final,
                                             &final_gate_callsigns,
                                             required_parity,
-                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
+                                            DxParityContext::live(
+                                                &operating_frequency_hz,
+                                                slot_ns,
+                                                &timing.slot_clock,
+                                                timing.scheduled_resync_epoch,
+                                            ),
                                             &active_tx_qsos,
                                             &cross_time_state,
                                         );
@@ -6185,11 +6209,13 @@ impl super::super::ApplicationCoordinator {
                                         let held = final_parity_hold_mask
                                             .iter()
                                             .zip(final_live_mask.iter())
-                                            .filter(|(&held, &live)| held && !live)
+                                            .filter(|(held, &live)| held.is_some() && !live)
                                             .count();
+                                        let hold_summary =
+                                            bundle_hold_summary(&final_parity_hold_mask);
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held (colliding DX parity) since the key-time check ({held} held)",
+                                            "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held ({hold_summary}) since the key-time check ({held} held)",
                                             final_live_mask.len()
                                         );
                                         emit_diagnostic(
@@ -6197,7 +6223,7 @@ impl super::super::ApplicationCoordinator {
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held (colliding DX parity) since the key-time check",
+                                                "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held ({hold_summary}) since the key-time check",
                                                 final_live_mask.len()
                                             ),
                                             None,

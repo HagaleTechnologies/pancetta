@@ -110,6 +110,45 @@ parameter at all four call sites (Step 4b/4d, single and multi TX).
   `dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
   with a fresh 20 m sighting keys, and the same call on 20 m is held.
 
+## The DX-parity gate holds across a clock step (PAN-489, 2026-11-25)
+
+The gate aged each sighting's wall-clock `decoded_at` against
+`SystemTime::now()`. After a system clock step every pre-step sighting either
+errored out (backward) or looked stale (forward), so the gate reported no
+conflict and the worker could key on the parity the DX was using.
+`DxParityContext` now carries the gate's one `SlotClock` reading and the
+frame's `scheduled_resync_epoch`, and `tx/gate.rs` and `tx/bundle.rs` read no
+wall clock (added to the PAN-484 ban).
+
+- **Step rule.** When the reading's latest resync is younger than one
+  freshness window (a reading before the step's `observed_at` counts as
+  inside) and the frame was scheduled under the reading's resync epoch, the
+  gate holds every frame to a resolved partner with `DxParityHold::ClockStepped`,
+  before reading the table and before the poisoned-lock fail-open. Pre-step
+  sightings cannot be aged without a per-entry epoch, and a forward step can let
+  the table evict them, so the hold does not depend on finding the entry. The
+  texts say so: `system clock stepped -10.0 s within the DX-parity window, so
+  the DX's earlier sightings cannot be aged`. CQ, manual and tune frames have no
+  partner and are never held.
+- **Sub-resync tolerance.** A sighting dated at most `SLOT_RESYNC_THRESHOLD_MS`
+  into the future counts as age zero; one dated further ahead is a pre-step
+  sighting already older than the window in real time, and is skipped.
+- **The fence keeps frames scheduled before the step.** A frame whose
+  scheduled epoch is older runs the normal age rule, and the PAN-483 fence
+  drops it before PTT-on with the step's size. One owner per case.
+- **Deferred.** A per-entry resync epoch in `A7ExpectedCall` would let a
+  post-step sighting end the hold early; it needs a `pancetta-qso` field and an
+  `ft8.rs` change. Revisit if on-air use shows the hold costs QSOs.
+- **Accepted residuals, all over-holding.** During the window the hold applies
+  even when a post-step sighting shows the opposite parity. After a backward
+  step of S seconds, pre-step sightings come back once the window ends with
+  their age understated by S. A forward step under 1 s overstates age by under
+  1 s, which matters only for a sighting within 1 s of the window edge.
+- **Tests.** `dx_parity_clock_step_tests` pins the step, eviction, sub-resync,
+  window-end and older-epoch cases at function level, the Step 4d text and the
+  bundle mask, and runs the real worker for a frame scheduled after the step
+  (held) and before it (dropped by the fence).
+
 ## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
 
 During a keyed transmission the worker takes messages off its own
@@ -1006,7 +1045,8 @@ in the slot the step landed.
   PAN-484 deleted `classify_deadline_jump` (no caller left) and added the TX worker's former
   checks, its wiring and a ban on direct `SystemTime::now`/`Timestamp::now` reads in
   `tx/worker.rs`, `tx/ptt.rs` and `tx/supersede.rs` (one PTT-admission stamp exempt) to
-  `pancetta/tests/slot_clock_invariant.rs`.
+  `pancetta/tests/slot_clock_invariant.rs`. PAN-489 added `tx/gate.rs` and `tx/bundle.rs`
+  (the DX-parity gate) to that ban.
 
 **PAN-477: the remaining slot math.** The sites PAN-358 left on their own clock or on FT8's 15 s
 slot now read the shared grid, or say in code why they must not:

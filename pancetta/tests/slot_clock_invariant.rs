@@ -12,7 +12,9 @@
 //! The TX worker moved onto the clock in PAN-483: its PAN-114 wait band and
 //! PTT-hold bound are gone, and a frame scheduled before a resync is dropped
 //! (`docs/DECISIONS/tx-scheduling.md`, "One UTC slot clock"). PAN-484 added
-//! its former checks and its wiring to this scan.
+//! its former checks and its wiring to this scan. PAN-489 added the DX-parity
+//! gate (`tx/gate.rs`, `tx/bundle.rs`), which ages the DX's sightings against
+//! the worker's clock reading and holds a frame across a resync.
 //!
 //! PAN-477 moved the remaining slot math onto the shared grid: decode parity
 //! and the A7 seed age come from the slot the DSP cut the window from
@@ -63,11 +65,13 @@ fn scanned_files() -> Vec<PathBuf> {
     files
 }
 
-/// The TX worker's slot-timing files.
-const TX_TIMING_FILES: [&str; 3] = [
+/// The TX worker's slot-timing files, including the DX-parity gate (PAN-489).
+const TX_TIMING_FILES: [&str; 5] = [
     "pancetta/src/coordinator/tx/worker.rs",
     "pancetta/src/coordinator/tx/ptt.rs",
     "pancetta/src/coordinator/tx/supersede.rs",
+    "pancetta/src/coordinator/tx/gate.rs",
+    "pancetta/src/coordinator/tx/bundle.rs",
 ];
 
 fn read(rel: &str) -> String {
@@ -195,7 +199,7 @@ fn every_consumer_is_wired_to_the_coordinator_clock() {
         }
     }
     // A direct `Timestamp::now`/`SystemTime::now` call skips the clock's step
-    // detection. This covers only these three files and only direct calls,
+    // detection. This covers only these five files and only direct calls,
     // not helpers such as `now_epoch_ms`. The one exempt line is the
     // receive-overload PTT admission stamp in `tx/ptt.rs` (`.admit_ptt(`),
     // which is not slot timing and stays on the wall clock; it must stay

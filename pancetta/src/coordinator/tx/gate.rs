@@ -430,6 +430,12 @@ pub(super) fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
 /// evidence only if it was observed in this context — a parity heard on
 /// another band says nothing about this one, and a parity computed on
 /// another protocol's slot grid describes different slot boundaries.
+///
+/// PAN-489: it also carries the gate's one reading of the coordinator's
+/// shared [`pancetta_core::SlotClock`] and the resync epoch the frame was
+/// scheduled under, so the age rule and the clock-step hold
+/// ([`dx_parity_conflict`]) read the same time the rest of the TX worker
+/// does, never the wall clock directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DxParityContext {
     /// Live RX dial (Hz) from `operating_frequency_hz`; `0` = unknown.
@@ -437,18 +443,51 @@ pub(super) struct DxParityContext {
     /// Slot period (ns) `required_parity` was computed on. Also sets the
     /// freshness window ([`dx_parity_freshness_window`]).
     pub(super) slot_ns: i64,
+    /// PAN-489: the shared slot clock, read at the gate.
+    pub(super) clock: pancetta_core::slot_clock::SlotReading,
+    /// PAN-489: the clock's resync epoch when the frame's schedule was
+    /// computed (`SlotTimingContext::scheduled_resync_epoch`).
+    pub(super) scheduled_resync_epoch: u64,
 }
 
 impl DxParityContext {
-    /// Reads the live dial now — call at the gate, not earlier.
+    /// Reads the live dial and the shared slot clock now — call at the gate,
+    /// not earlier.
     pub(super) fn live(
         operating_frequency_hz: &std::sync::atomic::AtomicU64,
         slot_ns: i64,
+        slot_clock: &pancetta_core::SlotClock,
+        scheduled_resync_epoch: u64,
     ) -> Self {
         Self {
             dial_hz: operating_frequency_hz.load(Ordering::Relaxed),
             slot_ns,
+            clock: slot_clock.read(),
+            scheduled_resync_epoch,
         }
+    }
+
+    /// PAN-489: the resync this frame was scheduled after, while it is younger
+    /// than one freshness window. Sightings recorded before that step carry
+    /// pre-step wall stamps that cannot be aged against post-step time (a
+    /// backward step dates them into the future, a forward step ages them out
+    /// or lets the table evict them), so the gate holds instead of failing
+    /// open. A frame scheduled under an older epoch is left to the PAN-483
+    /// fence, which drops it before PTT-on. A reading earlier than the step's
+    /// own `observed_at` (a further backward step that did not resync) counts
+    /// as inside the window.
+    fn recent_resync(self) -> Option<pancetta_core::slot_clock::WallClockJump> {
+        let event = self.clock.last_resync?;
+        if self.clock.resync_epoch != self.scheduled_resync_epoch {
+            return None;
+        }
+        let since = self.clock.now - event.observed_at;
+        let window = dx_parity_freshness_window(self.slot_ns);
+        let inside = match std::time::Duration::try_from(since) {
+            Ok(elapsed) => elapsed <= window,
+            Err(_) => true,
+        };
+        inside.then(|| event.jump())
     }
 
     /// Same slot grid, and same band per [`super::super::is_band_change`] — the rule
@@ -474,11 +513,13 @@ impl DxParityContext {
 /// in QSO must transmit on OPPOSITE parities, a DX transmitting on the exact
 /// slot we're about to use means they're mid-exchange with someone else in
 /// that window — keying now would collide with that exchange, not reach
-/// them. Returns `false` (proceed) on anything short of that positive fresh
+/// them. Returns `None` (proceed) on anything short of that positive fresh
 /// signal: no entry for this callsign, an entry older than the freshness
 /// window, or an unreadable (poisoned) table — this gate only ever blocks a
 /// TX on POSITIVE fresh evidence of a collision, never on missing data,
 /// mirroring `tx_qso_is_live`'s own fail-open posture on a poisoned lock.
+/// The one exception is a recent clock step (PAN-489, below), after which
+/// the evidence cannot be aged at all.
 ///
 /// Codex P2 on PR #370 (round 2, superseded by round 3): the lookup must
 /// use the repo's established callsign-equivalence rules, not an exact
@@ -508,35 +549,95 @@ impl DxParityContext {
 /// [`DxParityContext::observed_in`]) are candidates, and the context filter
 /// runs before the newest-entry pick, so an out-of-context alias can neither
 /// hold the frame nor hide an in-context entry.
+///
+/// PAN-489: `now` is `context.clock.now`, the gate's reading of the shared
+/// slot clock. For one freshness window after a resync the frame was
+/// scheduled after, every call returns [`DxParityHold::ClockStepped`] before
+/// the table is read (and before the poisoned-lock fail-open): pre-step
+/// sightings cannot be aged, so the gate holds rather than fail open. A
+/// sighting dated at most [`pancetta_core::slot_clock::SLOT_RESYNC_THRESHOLD_MS`]
+/// into the future (a sub-resync backward step) counts as age zero; one dated
+/// further ahead is a pre-step sighting already older than the window in real
+/// time, and is skipped.
 pub(super) fn dx_parity_conflict(
     their_callsign: &str,
     required_parity: pancetta_core::slot::SlotParity,
     context: DxParityContext,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    now: std::time::SystemTime,
-) -> bool {
+) -> Option<DxParityHold> {
+    if let Some(jump) = context.recent_resync() {
+        return Some(DxParityHold::ClockStepped(jump));
+    }
     let freshness_window = dx_parity_freshness_window(context.slot_ns);
+    let future_tolerance = std::time::Duration::from_millis(
+        pancetta_core::slot_clock::SLOT_RESYNC_THRESHOLD_MS.unsigned_abs(),
+    );
+    let now = std::time::SystemTime::from(context.clock.now);
+    let fresh = |decoded_at: std::time::SystemTime| match now.duration_since(decoded_at) {
+        Ok(age) => age <= freshness_window,
+        Err(ahead) => ahead.duration() <= future_tolerance,
+    };
     let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
-        return false;
+        return None;
     };
     let newest = a7
         .entries_with_parity(0)
         .chain(a7.entries_with_parity(1))
         .filter(|entry| pancetta_core::callsign::callsigns_match(&entry.callsign, their_callsign))
         .filter(|entry| context.observed_in(entry))
-        .filter(|entry| {
-            now.duration_since(entry.decoded_at)
-                .is_ok_and(|age| age <= freshness_window)
-        })
+        .filter(|entry| fresh(entry.decoded_at))
         .max_by_key(|entry| entry.decoded_at);
-    let Some(entry) = newest else {
-        return false;
-    };
+    let entry = newest?;
     let observed = match entry.slot_parity {
         0 => pancetta_core::slot::SlotParity::Even,
         _ => pancetta_core::slot::SlotParity::Odd,
     };
-    observed == required_parity
+    (observed == required_parity).then_some(DxParityHold::CollidingParity)
+}
+
+/// PAN-489: why the DX-parity gate held a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DxParityHold {
+    /// PAN-141: the DX was observed transmitting on the parity the frame
+    /// would key into, within the freshness window.
+    CollidingParity,
+    /// PAN-489: the shared slot clock resynced within the last freshness
+    /// window, after the frame was scheduled, so the DX's earlier sightings
+    /// cannot be aged. Carries the step.
+    ClockStepped(pancetta_core::slot_clock::WallClockJump),
+}
+
+/// PAN-489: the reason fragment for a DX-parity hold, shared by the Step
+/// 4b-parity and bundle per-item hold texts. The `CollidingParity` fragment is
+/// the PAN-141 text, unchanged.
+pub(super) fn dx_parity_hold_reason(
+    hold: DxParityHold,
+    required_parity: pancetta_core::slot::SlotParity,
+) -> String {
+    match hold {
+        DxParityHold::CollidingParity => format!(
+            "DX observed transmitting on the colliding parity {required_parity:?} within the freshness window"
+        ),
+        DxParityHold::ClockStepped(jump) => format!(
+            "system clock stepped {:+.1} s within the DX-parity window, so the DX's earlier sightings cannot be aged",
+            jump.signed_secs()
+        ),
+    }
+}
+
+/// PAN-489: the parenthetical a bundle summary names its holds with —
+/// unchanged unless some item was held for a clock step.
+pub(super) fn bundle_hold_summary(holds: &[Option<DxParityHold>]) -> String {
+    match holds.iter().find_map(|hold| match hold {
+        Some(DxParityHold::ClockStepped(jump)) => Some(*jump),
+        _ => None,
+    }) {
+        Some(jump) => format!(
+            "DX-parity window after a {:+.1} s clock step",
+            jump.signed_secs()
+        ),
+        None => "colliding DX parity".to_string(),
+    }
 }
 
 /// PAN-141: resolves `qso_id` to its established DX callsign via the
@@ -577,23 +678,31 @@ pub(super) async fn resolve_their_callsign(
 ///
 /// PAN-146: the live dial is read AFTER the resolver's await, alongside the
 /// clock, so a band switch landing during that await is seen.
+///
+/// PAN-489: the clock is the shared `slot_clock`, read in the same
+/// [`DxParityContext::live`] call.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dx_parity_conflict_for_qso(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
     operating_frequency_hz: &std::sync::atomic::AtomicU64,
     slot_ns: i64,
+    slot_clock: &pancetta_core::SlotClock,
+    scheduled_resync_epoch: u64,
     qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-) -> bool {
-    let Some(their_callsign) = resolve_their_callsign(qso_id, qso_manager_watch).await else {
-        return false;
-    };
+) -> Option<DxParityHold> {
+    let their_callsign = resolve_their_callsign(qso_id, qso_manager_watch).await?;
     dx_parity_conflict(
         &their_callsign,
         required_parity,
-        DxParityContext::live(operating_frequency_hz, slot_ns),
+        DxParityContext::live(
+            operating_frequency_hz,
+            slot_ns,
+            slot_clock,
+            scheduled_resync_epoch,
+        ),
         cross_time_state,
-        std::time::SystemTime::now(),
     )
 }
 
@@ -608,7 +717,12 @@ pub(super) async fn dx_parity_conflict_for_qso(
 pub(super) enum FinalGateDenial {
     StaleQso,
     DxParityConflict,
-    TooLateToDecode { elapsed_ms: u64, late_max_ms: u64 },
+    /// PAN-489: the DX-parity gate held for a recent clock step.
+    DxParityClockStep(pancetta_core::slot_clock::WallClockJump),
+    TooLateToDecode {
+        elapsed_ms: u64,
+        late_max_ms: u64,
+    },
 }
 
 /// PAN-141 (Step 4b) / PAN-148 (Step 4d): resolves every id's DX callsign —
@@ -668,19 +782,14 @@ pub(super) fn final_single_tx_gate_denial(
     if !tx_qso_is_live(qso_id, active_tx_qsos) {
         return Some(FinalGateDenial::StaleQso);
     }
-    let conflict = their_callsign.is_some_and(|callsign| {
-        dx_parity_conflict(
-            callsign,
-            required_parity,
-            context,
-            cross_time_state,
-            std::time::SystemTime::now(),
-        )
+    let hold = their_callsign.and_then(|callsign| {
+        dx_parity_conflict(callsign, required_parity, context, cross_time_state)
     });
-    if conflict {
-        return Some(FinalGateDenial::DxParityConflict);
+    match hold {
+        Some(DxParityHold::CollidingParity) => Some(FinalGateDenial::DxParityConflict),
+        Some(DxParityHold::ClockStepped(jump)) => Some(FinalGateDenial::DxParityClockStep(jump)),
+        None => None,
     }
-    None
 }
 
 /// PAN-145: compare raw QsoId epochs after `PttGuard::new` has set
@@ -738,6 +847,16 @@ pub(super) fn final_gate_denial_text(
                 "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
             ),
         ),
+        FinalGateDenial::DxParityClockStep(jump) => {
+            let reason = dx_parity_hold_reason(DxParityHold::ClockStepped(jump), required_parity);
+            (
+                format!(
+                    "holding TX at final pre-PTT check for QSO {}: {reason}: '{message_text}'",
+                    qso_id.unwrap_or("?")
+                ),
+                format!("holding TX at final pre-PTT check: {reason}: '{message_text}'"),
+            )
+        }
         FinalGateDenial::TooLateToDecode {
             elapsed_ms,
             late_max_ms,

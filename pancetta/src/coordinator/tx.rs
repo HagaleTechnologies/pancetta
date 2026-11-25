@@ -320,6 +320,9 @@ mod worker_unkey_tests;
 #[path = "tx/tests/tx_log_worker_tests.rs"]
 mod tx_log_worker_tests;
 
+#[cfg(test)]
+#[path = "tx/tests/dx_parity_clock_step_tests.rs"]
+mod dx_parity_clock_step_tests;
 /// PAN-146: the DX-parity gate, through the real TX worker, scopes its a7
 /// evidence to the live dial's band. A DX kept fresh on 20 m Odd holds an
 /// Odd call on 20 m, and does not hold the same call after the operator
