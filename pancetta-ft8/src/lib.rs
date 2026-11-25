@@ -303,8 +303,15 @@ pub enum Ft8Error {
     #[error("Signal processing error: {0}")]
     SignalProcessingError(String),
 
-    /// A message could not be decoded or unpacked, or the LDPC encoder
-    /// rejected an input length; the string describes why.
+    /// A message could not be encoded, packed, decoded or unpacked; the
+    /// string says why. Despite the name, this is also the encoder's error.
+    /// Causes include message text, a callsign or an exchange field (signal
+    /// report, transmitter count, class, section, state, RST, CQ modifier)
+    /// that the protocol cannot represent; free text that is too long or has
+    /// an unsupported character; a DXpedition frame whose Hounds are not
+    /// standard callsigns or whose Fox cannot be hashed, and every call to
+    /// the deprecated `Ft8Encoder::encode_dxpedition`; a payload or LDPC
+    /// input of the wrong length; and a tier probe decoder pass that panicked.
     #[error("Message decoding error: {0}")]
     MessageDecodingError(String),
 
