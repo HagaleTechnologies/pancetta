@@ -1,5 +1,6 @@
 use anyhow::Result;
 use jiff::SignedDuration;
+use pancetta_core::slot_clock::SlotReading;
 use pancetta_core::time::UtcTimestamp;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -161,15 +162,74 @@ pub(crate) fn interleave_mono(mono: &[f32], channels: u16) -> Vec<f32> {
     out
 }
 
-/// How long to wait, from `now`, until the next true UTC FT8 slot boundary
-/// (:00/:15/:30/:45). Replayed audio is a real off-air capture naturally
-/// aligned to slot boundaries when it was recorded; the live pipeline's
-/// decoder buffers incoming audio into windows keyed to the real wall clock,
-/// so starting the feed loop mid-slot would misalign every subsequent
-/// window. Waiting for the next boundary re-establishes that alignment.
-pub(crate) fn replay_preroll_wait(now: UtcTimestamp) -> Duration {
-    let next_boundary = pancetta_core::slot::next_slot_start(now, SignedDuration::ZERO);
-    pancetta_core::slot::duration_until(next_boundary, now)
+/// How long to wait, from `reading.now`, until the active mode's next UTC
+/// slot boundary (FT8 :00/:15/:30/:45; FT4 every 7.5 s; FT2 every 3.2 s),
+/// on the period the shared `SlotClock` reports. Replayed audio is a real
+/// off-air capture naturally aligned to slot boundaries when it was
+/// recorded; the live pipeline's DSP cuts incoming audio into windows keyed
+/// to the shared slot clock, so starting the feed loop mid-slot would
+/// misalign every subsequent window. Waiting for the next boundary
+/// re-establishes that alignment. Used for the operator-facing info line;
+/// the wait itself polls [`replay_preroll_poll`] (PAN-477).
+pub(crate) fn replay_preroll_wait(reading: &SlotReading) -> Duration {
+    pancetta_core::slot::duration_until(replay_preroll_target(reading), reading.now)
+}
+
+/// The boundary the replay pre-roll waits for: the next slot start of the
+/// active period strictly after `reading.now` (a read exactly on a boundary
+/// waits a full slot, as `next_slot_start` always has).
+pub(crate) fn replay_preroll_target(reading: &SlotReading) -> UtcTimestamp {
+    pancetta_core::slot::next_slot_start_with_period(
+        reading.now,
+        SignedDuration::ZERO,
+        reading.slot_ns,
+    )
+}
+
+/// The longest single sleep of the replay pre-roll, so a wall-clock step or
+/// a shutdown request is seen within this long (PAN-477).
+pub(crate) const REPLAY_PREROLL_POLL: Duration = Duration::from_millis(50);
+
+/// What the replay pre-roll does next (see [`replay_preroll_poll`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrerollPoll {
+    /// Not at the boundary yet: sleep this long (at most
+    /// [`REPLAY_PREROLL_POLL`]) and poll again.
+    Sleep(Duration),
+    /// The boundary has arrived: start the feed.
+    Start,
+}
+
+/// One step of the replay pre-roll on the shared slot clock (PAN-477).
+///
+/// Before `target` it sleeps `min(remaining, REPLAY_PREROLL_POLL)`. From
+/// `target` until `CLOCK_STEP_THRESHOLD_MS` (250 ms) past it, it starts:
+/// lateness below that is a step the shared clock does not report either.
+/// Later than that, a forward step or a stall carried the wall past the
+/// boundary, so the feed would start mid-slot: `target` moves to the next
+/// boundary of the active period after `reading.now` and it sleeps again. A
+/// backward step that leaves the target within one slot of the wall keeps it:
+/// the wall simply has further to go to the same boundary. A longer backward
+/// step (the target more than one active slot ahead) retargets to the next
+/// boundary after `reading.now`, so an NTP correction of minutes or hours
+/// never stalls the replay for that long.
+pub(crate) fn replay_preroll_poll(reading: &SlotReading, target: &mut UtcTimestamp) -> PrerollPoll {
+    let now = reading.now;
+    if (*target - now).as_nanos() > i128::from(reading.slot_ns) {
+        *target = replay_preroll_target(reading);
+    }
+    if now < *target {
+        let remaining = pancetta_core::slot::duration_until(*target, now);
+        return PrerollPoll::Sleep(remaining.min(REPLAY_PREROLL_POLL));
+    }
+    let late = now - *target;
+    let tolerance = SignedDuration::from_millis(pancetta_core::slot_clock::CLOCK_STEP_THRESHOLD_MS);
+    if late < tolerance {
+        return PrerollPoll::Start;
+    }
+    *target = replay_preroll_target(reading);
+    let remaining = pancetta_core::slot::duration_until(*target, now);
+    PrerollPoll::Sleep(remaining.min(REPLAY_PREROLL_POLL))
 }
 
 /// How often [`wait_for_qso_consumer`] re-checks the shutdown flag while the
@@ -252,9 +312,9 @@ impl super::ApplicationCoordinator {
     /// `[audio] input_channels` (see [`interleave_mono`]), and paced in
     /// real time via the same `audio_to_dsp_tx` channel a real `cpal::Device`
     /// or `PANCETTA_STUB_AUDIO` would use. Before the feed loop starts, waits
-    /// for the next true UTC slot boundary (see [`replay_preroll_wait`]) so
-    /// the replayed audio's phase lines up with the live decoder's
-    /// wall-clock-keyed 15s windows. Once the directory is exhausted,
+    /// on the shared slot clock for the active mode's next slot boundary
+    /// (see [`replay_preroll_poll`]) so the replayed audio's phase lines up
+    /// with the live DSP's slot-clock-keyed windows. Once the directory is exhausted,
     /// waits [`REPLAY_GRACE_PERIOD`] then triggers the same graceful
     /// shutdown Ctrl+C uses, so `--replay` is a finite, self-terminating
     /// mode suitable for scripted demos and automated tests. Before the
@@ -324,6 +384,9 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let last_timestamp = self.last_audio_timestamp.clone();
         let mut qso_consumer_ready = self.qso_consumer_ready.subscribe();
+        // PAN-477: the pre-roll waits on the coordinator's one slot clock,
+        // with the active mode's period.
+        let preroll_clock = self.slot_clock();
 
         let handle = tokio::spawn(async move {
             // PAN-42: seed first, then pre-roll, so the slot-boundary
@@ -334,14 +397,29 @@ impl super::ApplicationCoordinator {
                 info!("Replay: shutdown requested before the QSO component was ready; nothing fed");
                 return Ok(());
             }
-            let preroll_wait = replay_preroll_wait(UtcTimestamp::now());
+            let first_reading = preroll_clock.read();
+            let mut preroll_target = replay_preroll_target(&first_reading);
+            let preroll_wait = replay_preroll_wait(&first_reading);
             if preroll_wait > Duration::ZERO {
                 info!(
                     "Replay: waiting {:?} for next UTC slot boundary before starting feed",
                     preroll_wait
                 );
             }
-            tokio::time::sleep(preroll_wait).await;
+            // PAN-477: poll the shared clock rather than sleeping the whole
+            // wall-clock wait on the monotonic clock, so a wall step during
+            // the pre-roll retargets instead of starting mid-slot, and a
+            // shutdown during the pre-roll is honoured.
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    info!("Replay: shutdown requested during the slot pre-roll; nothing fed");
+                    return Ok(());
+                }
+                match replay_preroll_poll(&preroll_clock.read(), &mut preroll_target) {
+                    PrerollPoll::Start => break,
+                    PrerollPoll::Sleep(nap) => tokio::time::sleep(nap).await,
+                }
+            }
 
             // Absolute-deadline pacing: every chunk's due time is recomputed
             // from `feed_start` plus the exact duration of all audio already
@@ -413,6 +491,10 @@ impl super::ApplicationCoordinator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "replay/tests/preroll_tests.rs"]
+mod preroll_tests;
 
 #[cfg(test)]
 mod tests {
@@ -669,26 +751,6 @@ mod tests {
         // empty buffer if it ever reaches here.
         assert_eq!(interleave_mono(&[1.0, 2.0], 0), vec![1.0, 2.0]);
         assert!(interleave_mono(&[], 2).is_empty());
-    }
-
-    #[test]
-    fn replay_preroll_wait_lands_on_next_boundary_mid_slot() {
-        // 7s into a slot that started at :00:00 -> next boundary is :00:15,
-        // so the wait should be exactly 8s.
-        let now = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 7).unwrap();
-        let wait = replay_preroll_wait(now);
-        assert_eq!(wait, Duration::from_secs(8));
-    }
-
-    #[test]
-    fn replay_preroll_wait_on_exact_boundary_waits_a_full_slot() {
-        // next_slot_start with a zero min_lead always advances to the *next*
-        // boundary even when `now` is exactly on one (see
-        // pancetta-core/src/slot.rs `slot_boundary_aligned_picks_next`), so
-        // starting replay exactly at :00:00 should wait the full 15s.
-        let now = UtcTimestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let wait = replay_preroll_wait(now);
-        assert_eq!(wait, Duration::from_secs(15));
     }
 
     // ---- PAN-42: QSO-consumer gate ----

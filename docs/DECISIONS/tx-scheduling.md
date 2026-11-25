@@ -1008,6 +1008,35 @@ in the slot the step landed.
   `tx/worker.rs`, `tx/ptt.rs` and `tx/supersede.rs` (one PTT-admission stamp exempt) to
   `pancetta/tests/slot_clock_invariant.rs`.
 
+**PAN-477: the remaining slot math.** The sites PAN-358 left on their own clock or on FT8's 15 s
+slot now read the shared grid, or say in code why they must not:
+- Decode parity: each `DecodeWindow` carries the slot the DSP cut it from (`WindowSlot`, from
+  `dsp::decode_window_slot`, the timer deadline minus the decode phase). The decoder stamps parity,
+  the desense slot, the cross-time record's `slot_ns` and the A7 query from it and reads no
+  active-period atomic. A receipt read from the shared clock would not do: after a +7.5 s FT4 step
+  it still lands in the next slot. Residual (D3): the desense slot start is now the exact boundary,
+  up to one forward timeout plus one queued window earlier than the old receipt-based value.
+- A7 seed age (D5): entries carry their DSP slot start; age is
+  `(query_start - entry_start).div_euclid(slot_ns)` on the query's period, an entry from a later
+  slot (a backward resync) is dropped, and LRU follows insertion order. FT8 results are unchanged;
+  FT4 no longer returns 3-slot-old seeds.
+- Always-answer caller key (D6): `(timestamp - decode_phase).div_euclid(slot_ns)` on the shared
+  clock's period, moved one slot back when the decode's parity says so. Residual: the bus carries
+  `pancetta_ft8::DecodedMessage` (stable API), so the key cannot read the DSP's slot directly.
+- Keep-call TX slot: `pancetta_qso::tx_slot::tx_target_slot` is the one current-slot rule;
+  `schedule_tx` and `keep_call_tx_slot` both call it and the TX worker's acceptance cap delegates to
+  it. A mode switch or provisional-parity correction can still change the slot an emission maps to.
+- The FT8-only autonomous parity helpers with no production caller are deleted.
+- Replay pre-roll (D9): waits on the shared clock for the active period's next boundary, polling
+  every 50 ms, and retargets to the next boundary when a forward step or stall carries the wall more
+  than 250 ms past it. Residual: lateness under 250 ms is not a step, and a step after the feed
+  starts is not realigned.
+- TUI QSO timing row: follows the active mode's period and decode point (FT8 unchanged); it reads
+  the wall clock once per render, as the title chip does, because the TUI has no `SlotClock`.
+- FT8-only by decision: raw 48 kHz capture (`config-and-platform.md`, raw capture decisions 3 and
+  6; its batch wall time now comes from the shared clock) and the receive-gain sweep (refused
+  outside FT8, aborted on a mode change; its slot math is named FT8 math and reads the shared clock).
+
 ## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
 
 Six-lane review L5 H-7: the `tx_late_max_ms` default was 8000 ms, past the mathematical floor of

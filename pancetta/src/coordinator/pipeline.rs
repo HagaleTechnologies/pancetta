@@ -76,11 +76,47 @@ pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 /// with the samples themselves removes the race: whichever band the
 /// window's audio came from is fixed the moment the window is built and
 /// never re-derived from state that can change out from under it.
+///
+/// PAN-477: `slot` is the slot the DSP cut the window from, fixed when the
+/// window is built. The decoder stamps parity, the desense slot, the
+/// cross-time record's period and the A7 seed age from it and never
+/// re-derives any of them from its own receipt time, which a clock step or
+/// a queue wait can move into another slot.
 #[derive(Debug, Clone)]
 pub(crate) struct DecodeWindow {
     pub(crate) samples: Vec<f32>,
     pub(crate) dial_hz: u64,
     pub(crate) sweep: Option<GainCapturedWindow>,
+    pub(crate) slot: WindowSlot,
+}
+
+/// PAN-477: the UTC slot a decode window's audio was cut from: the DSP
+/// timer's deadline minus the decode phase (`dsp::decode_window_slot`), on
+/// the slot period the DSP cut it with. A window cut just before a mode
+/// switch keeps the period it was cut on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowSlot {
+    /// The slot's UTC start (a boundary of `slot_ns`).
+    pub(crate) start: UtcTimestamp,
+    /// The slot period the DSP cut the window on (FT8 15e9, FT4 7.5e9 ns).
+    pub(crate) slot_ns: i64,
+}
+
+impl WindowSlot {
+    /// The cut slot's parity on its own period.
+    pub(crate) fn parity(&self) -> pancetta_core::slot::SlotParity {
+        pancetta_core::slot::SlotParity::of_with_period(self.start, self.slot_ns)
+    }
+
+    /// The slot start in Unix milliseconds, clamped at 0.
+    pub(crate) fn start_ms(&self) -> u64 {
+        self.start.as_millisecond().max(0) as u64
+    }
+
+    /// The slot length in milliseconds, at least 1.
+    pub(crate) fn len_ms(&self) -> u64 {
+        (self.slot_ns / 1_000_000).max(1) as u64
+    }
 }
 
 /// Immutable source attribution for one admitted receive-gain measurement.
@@ -502,6 +538,13 @@ mod tests {
     use super::*;
     use crate::message_bus::MessageBus;
 
+    fn test_window_slot() -> WindowSlot {
+        WindowSlot {
+            start: UtcTimestamp::from_millisecond(0).unwrap(),
+            slot_ns: pancetta_core::slot::SLOT_NS,
+        }
+    }
+
     #[tokio::test]
     async fn decode_bus_channels_register_idempotently() {
         let bus = MessageBus::new(64).expect("bus construction");
@@ -572,6 +615,7 @@ mod tests {
                 samples: vec![0.0; 4],
                 dial_hz: 14_074_000,
                 sweep: None,
+                slot: test_window_slot(),
             })
             .unwrap();
         assert!(handles.dsp_to_ft8_rx.recv().is_ok());
@@ -597,6 +641,7 @@ mod tests {
                 samples: vec![0.1; 4],
                 dial_hz: live_dial_hz.load(Ordering::Relaxed),
                 sweep: None,
+                slot: test_window_slot(),
             })
             .unwrap();
 

@@ -62,27 +62,6 @@ fn effective_slot_ns(raw: i64) -> i64 {
 }
 
 impl SlotParity {
-    /// Parity on the FT8 15 s grid, from whole unix seconds.
-    ///
-    /// Kept for FT8-grid callers (the sim harness and tests). The live slot
-    /// gate uses [`SlotParity::of_time_with_period`], because a 7.5 s FT4
-    /// boundary cannot be expressed in whole seconds (PAN-356).
-    pub fn from_unix_secs(secs: i64) -> Self {
-        let slot_number = secs / 15;
-        if slot_number % 2 == 0 {
-            SlotParity::Even
-        } else {
-            SlotParity::Odd
-        }
-    }
-
-    /// Parity right now on the FT8 15 s grid, in whole seconds. Kept for
-    /// FT8-grid callers; the live slot gate uses
-    /// [`SlotParity::of_time_with_period`].
-    pub fn current() -> Self {
-        Self::from_unix_secs(UtcTimestamp::now().as_second())
-    }
-
     /// Parity of the slot containing `t`, for a slot length of `slot_ns`
     /// nanoseconds (the active mode's `active_slot_ns`). A non-positive
     /// `slot_ns` falls back to the FT8 15 s slot. Delegates to
@@ -230,17 +209,6 @@ impl SlotManager {
                 self.auto_detect_odd_activity,
             );
         }
-    }
-
-    /// Decide what to do in the current slot.
-    pub fn should_transmit_this_slot(&mut self) -> SlotDecision {
-        self.should_transmit_at(UtcTimestamp::now().as_second())
-    }
-
-    /// Decide what to do at a given unix timestamp, on the FT8 15 s grid
-    /// (testable). The live gate uses [`SlotManager::should_transmit_at_time`].
-    pub fn should_transmit_at(&mut self, unix_secs: i64) -> SlotDecision {
-        self.decide_for_parity(SlotParity::from_unix_secs(unix_secs))
     }
 
     /// Decide what to do at `now`, with slots `slot_ns` nanoseconds long (the
@@ -3859,14 +3827,22 @@ mod tests {
 
     #[test]
     fn test_slot_parity_derivation() {
+        // PAN-477: the FT8-only whole-second helper is gone; the FT8 grid
+        // is `of_time_with_period` on `SLOT_NS`, at fixed instants.
+        let ft8 = |secs: i64| {
+            SlotParity::of_time_with_period(
+                UtcTimestamp::from_parts(secs, 0).expect("valid instant"),
+                pancetta_core::slot::SLOT_NS,
+            )
+        };
         // Slot 0 (t=0..14) -> Even
-        assert_eq!(SlotParity::from_unix_secs(0), SlotParity::Even);
-        assert_eq!(SlotParity::from_unix_secs(14), SlotParity::Even);
+        assert_eq!(ft8(0), SlotParity::Even);
+        assert_eq!(ft8(14), SlotParity::Even);
         // Slot 1 (t=15..29) -> Odd
-        assert_eq!(SlotParity::from_unix_secs(15), SlotParity::Odd);
-        assert_eq!(SlotParity::from_unix_secs(29), SlotParity::Odd);
+        assert_eq!(ft8(15), SlotParity::Odd);
+        assert_eq!(ft8(29), SlotParity::Odd);
         // Slot 2 (t=30..44) -> Even
-        assert_eq!(SlotParity::from_unix_secs(30), SlotParity::Even);
+        assert_eq!(ft8(30), SlotParity::Even);
     }
 
     // PAN-356: 2026-01-01T00:00:00Z. Divisible by both 15 s and 7.5 s, so
@@ -3905,16 +3881,22 @@ mod tests {
                     expected,
                     "FT4 tick {k} at +{latency_ms} ms"
                 );
-                // FT8 15 s through the period-aware path is the old grid.
+                // FT8 15 s through the period-aware path is the shared
+                // FT8 grid (PAN-477: cross-checked against
+                // `pancetta_core::slot::SlotParity::of`, not a local copy).
+                let ft8_grid = match pancetta_core::slot::SlotParity::of(t) {
+                    pancetta_core::slot::SlotParity::Even => SlotParity::Even,
+                    pancetta_core::slot::SlotParity::Odd => SlotParity::Odd,
+                };
                 assert_eq!(
                     SlotParity::of_time_with_period(t, PAN356_FT8_SLOT_NS),
-                    SlotParity::from_unix_secs(t.as_second()),
+                    ft8_grid,
                     "FT8 grid at FT4 tick {k} +{latency_ms} ms"
                 );
                 // A non-positive slot length falls back to FT8 15 s.
                 assert_eq!(
                     SlotParity::of_time_with_period(t, 0),
-                    SlotParity::from_unix_secs(t.as_second()),
+                    ft8_grid,
                     "zero slot length at FT4 tick {k} +{latency_ms} ms"
                 );
             }
@@ -8977,84 +8959,105 @@ mod dx_busy_tests {
         );
     }
 
+    /// PAN-477: the feed instants these FQ-F2 tests use — one Even and one
+    /// Odd FT8 slot (2026-01-01T00:00:00Z and +15 s), fixed so the tests no
+    /// longer depend on the wall-clock phase when they run.
+    fn fq_f2_feed_instants() -> [UtcTimestamp; 2] {
+        let base = UtcTimestamp::from_parts(1_767_225_600, 0).expect("valid base");
+        [
+            base + SignedDuration::from_millis(3_250),
+            base + SignedDuration::from_millis(18_250),
+        ]
+    }
+
     /// FQ-F2 (part 1): `feed_decoded_messages_at` must stamp each decoded
     /// message's `DecodeHistory` entry using THAT message's own carried
-    /// `slot_parity`, not the wall clock at feed time. We prove this by
-    /// picking a message parity that DISAGREES with the real wall-clock
-    /// parity at the moment of the call — if the old wall-clock-stamping
-    /// bug were still present, the disagreeing message would land in the
-    /// wall-clock's slot instead of its own.
+    /// `slot_parity`, not the slot of the feed instant. We prove this by
+    /// picking a message parity that DISAGREES with the feed instant's
+    /// parity — if the old wall-clock-stamping bug were still present, the
+    /// disagreeing message would land in the feed instant's slot instead of
+    /// its own. Both parities are fed, at fixed instants (PAN-477).
     #[test]
     fn decode_history_uses_message_own_parity_not_wall_clock() {
-        let mut op = op_even("K5ARH");
-        let evaluator = NullDxEvaluator;
+        for now in fq_f2_feed_instants() {
+            let mut op = op_even("K5ARH");
+            let evaluator = NullDxEvaluator;
 
-        let wall_clock = SlotParity::current();
-        let disagreeing = match wall_clock {
-            SlotParity::Even => pancetta_core::slot::SlotParity::Odd,
-            SlotParity::Odd => pancetta_core::slot::SlotParity::Even,
-        };
-        let agreeing = match wall_clock {
-            SlotParity::Even => pancetta_core::slot::SlotParity::Even,
-            SlotParity::Odd => pancetta_core::slot::SlotParity::Odd,
-        };
-        let expected_slot_for_disagreeing = match disagreeing {
-            pancetta_core::slot::SlotParity::Even => TimeSlot::First,
-            pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
-        };
-        let expected_slot_for_agreeing = match agreeing {
-            pancetta_core::slot::SlotParity::Even => TimeSlot::First,
-            pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
-        };
-        assert_ne!(
-            expected_slot_for_disagreeing, expected_slot_for_agreeing,
-            "sanity: disagreeing and agreeing parities must map to different TimeSlots"
-        );
+            // The parity of the feed instant on the operator's (FT8) grid —
+            // the slot the old wall-clock-stamping bug would have used.
+            let wall_clock = SlotParity::of_time_with_period(now, pancetta_core::slot::SLOT_NS);
+            let disagreeing = match wall_clock {
+                SlotParity::Even => pancetta_core::slot::SlotParity::Odd,
+                SlotParity::Odd => pancetta_core::slot::SlotParity::Even,
+            };
+            let agreeing = match wall_clock {
+                SlotParity::Even => pancetta_core::slot::SlotParity::Even,
+                SlotParity::Odd => pancetta_core::slot::SlotParity::Odd,
+            };
+            let expected_slot_for_disagreeing = match disagreeing {
+                pancetta_core::slot::SlotParity::Even => TimeSlot::First,
+                pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
+            };
+            let expected_slot_for_agreeing = match agreeing {
+                pancetta_core::slot::SlotParity::Even => TimeSlot::First,
+                pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
+            };
+            assert_ne!(
+                expected_slot_for_disagreeing, expected_slot_for_agreeing,
+                "sanity: disagreeing and agreeing parities must map to different TimeSlots"
+            );
 
-        let mut msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0);
-        msg.slot_parity = Some(disagreeing);
+            let mut msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0);
+            msg.slot_parity = Some(disagreeing);
 
-        op.feed_decoded_messages_at(&[msg], &evaluator, UtcTimestamp::now());
+            op.feed_decoded_messages_at(&[msg], &evaluator, now);
 
-        assert_eq!(
-            op.decode_history
-                .activity_near_in_slot(1500.0, 10.0, expected_slot_for_disagreeing),
-            1,
-            "message must be recorded under ITS OWN carried parity's slot"
-        );
-        assert_eq!(
-            op.decode_history
-                .activity_near_in_slot(1500.0, 10.0, expected_slot_for_agreeing),
-            0,
-            "message must NOT be recorded under the wall-clock's slot when \
-             it disagrees with the message's own carried parity"
-        );
+            assert_eq!(
+                op.decode_history.activity_near_in_slot(
+                    1500.0,
+                    10.0,
+                    expected_slot_for_disagreeing
+                ),
+                1,
+                "message must be recorded under ITS OWN carried parity's slot (feed at {now})"
+            );
+            assert_eq!(
+                op.decode_history
+                    .activity_near_in_slot(1500.0, 10.0, expected_slot_for_agreeing),
+                0,
+                "message must NOT be recorded under the feed instant's slot when \
+                 it disagrees with the message's own carried parity (feed at {now})"
+            );
+        }
     }
 
     /// FQ-F2 regression: messages with `slot_parity: None` (test scaffolding
-    /// / untracked decodes) must keep falling back to the wall-clock-derived
-    /// slot, unchanged from pre-fix behavior.
+    /// / untracked decodes) must keep falling back to the slot of the feed
+    /// instant (the caller's slot-clock reading), unchanged from pre-fix
+    /// behavior.
     #[test]
     fn decode_history_falls_back_to_wall_clock_when_parity_untracked() {
-        let mut op = op_even("K5ARH");
-        let evaluator = NullDxEvaluator;
+        for now in fq_f2_feed_instants() {
+            let mut op = op_even("K5ARH");
+            let evaluator = NullDxEvaluator;
 
-        let wall_clock = SlotParity::current();
-        let expected_slot = if wall_clock == SlotParity::Even {
-            TimeSlot::First
-        } else {
-            TimeSlot::Second
-        };
+            let wall_clock = SlotParity::of_time_with_period(now, pancetta_core::slot::SLOT_NS);
+            let expected_slot = if wall_clock == SlotParity::Even {
+                TimeSlot::First
+            } else {
+                TimeSlot::Second
+            };
 
-        let msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0); // slot_parity: None
-        op.feed_decoded_messages_at(&[msg], &evaluator, UtcTimestamp::now());
+            let msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0); // slot_parity: None
+            op.feed_decoded_messages_at(&[msg], &evaluator, now);
 
-        assert_eq!(
-            op.decode_history
-                .activity_near_in_slot(1500.0, 10.0, expected_slot),
-            1,
-            "untracked-parity message must fall back to the wall-clock slot"
-        );
+            assert_eq!(
+                op.decode_history
+                    .activity_near_in_slot(1500.0, 10.0, expected_slot),
+                1,
+                "untracked-parity message must fall back to the feed instant's slot ({now})"
+            );
+        }
     }
 
     /// FQ-F2 (part 2): `record_slot_activity` (which feeds

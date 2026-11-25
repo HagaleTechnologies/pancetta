@@ -1926,27 +1926,70 @@ fn classify_caller_answer(
 // part 2: after our initiation watchdog retires a QSO, if that DX then calls
 // us we still answer.
 
-/// Compute a monotonically-increasing slot index from a decode timestamp.
+/// Compute the per-slot creation-dedup key of a decode (PAN-477).
 ///
-/// FT8 windows are 15 seconds wide and aligned to UTC. Two decodes that fall
-/// in the same window produce the same key; decodes in adjacent windows produce
-/// consecutive keys. Used by the per-slot creation-dedup set in the decode
-/// loop so that repeated decodes of the same station within one 15-second
-/// window only attempt QSO creation once.
+/// Two decodes from the same decode window produce the same key; decodes
+/// from adjacent windows produce consecutive keys. Used by the per-slot
+/// creation-dedup set in the decode loop so that repeated decodes of the same
+/// station within one slot only attempt QSO creation once.
 ///
 /// # Formula
 /// ```text
-/// slot_key = floor(unix_seconds / 15)
+/// k   = floor((timestamp - decode_phase) / slot_ns)
+/// key = k - 1   if parity is Some(p) and slot k's parity is not p
+///       k       otherwise
 /// ```
 ///
-/// A `SystemTime` before UNIX_EPOCH (e.g. in unit tests) returns 0.
+/// `slot_ns` is the active mode's period, read from the coordinator's one
+/// `SlotClock` (FT8 15 s, FT4 7.5 s, FT2 3.2 s), and `decode_phase` is the
+/// DSP's cut point inside the slot (`active_decode_phase_ns`). A decode is
+/// stamped after its window was cut, so subtracting the decode phase maps it
+/// back to the slot it was cut from; the parity alignment keeps one window's
+/// decodes on one key even when decode latency carries the stamp across a
+/// slot boundary (the decode's parity is the DSP slot's own after PAN-477).
+///
+/// It cannot read the DSP's slot directly: the bus carries
+/// `pancetta_ft8::DecodedMessage`, whose fields are `pancetta-ft8` stable
+/// API (PAN-380), so a slot field there is a separate change proposed in
+/// dispensa first.
+///
+/// The alignment moves the key back at most one slot, so it holds while a
+/// decode is stamped less than `2 * slot_ns - decode_phase` after its slot
+/// start (FT8 17 s, FT4 8.5 s, FT2 4.2 s); a later stamp, or a window cut
+/// just before a mode switch, can share a later window's key, which only
+/// skips one creation attempt in that slot.
+///
+/// A non-positive `slot_ns` falls back to FT8's period. A timestamp before
+/// UNIX_EPOCH maps to a negative index rather than panicking.
 #[inline]
-fn caller_creation_slot_key(timestamp: std::time::SystemTime) -> u64 {
-    timestamp
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / 15
+fn caller_creation_slot_key(
+    timestamp: std::time::SystemTime,
+    parity: Option<pancetta_core::slot::SlotParity>,
+    decode_phase: SignedDuration,
+    slot_ns: i64,
+) -> i64 {
+    let slot_ns = if slot_ns > 0 {
+        slot_ns
+    } else {
+        pancetta_core::slot::SLOT_NS
+    };
+    let timestamp_ns = match timestamp.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_nanos())
+            .map(|ns| -ns)
+            .unwrap_or(i64::MIN),
+    };
+    let phase_ns = decode_phase.as_nanos_i64().unwrap_or(0);
+    let index = timestamp_ns.saturating_sub(phase_ns).div_euclid(slot_ns);
+    let index_parity = if index.rem_euclid(2) == 0 {
+        pancetta_core::slot::SlotParity::Even
+    } else {
+        pancetta_core::slot::SlotParity::Odd
+    };
+    match parity {
+        Some(wanted) if wanted != index_parity => index.saturating_sub(1),
+        _ => index,
+    }
 }
 
 /// PAN-78: the ONE concurrent-QSO capacity rule for every QSO the QSO
@@ -3637,6 +3680,11 @@ impl super::ApplicationCoordinator {
             // PAN-358: queued manual calls are stamped and aged on the
             // coordinator's slot clock (PAN-289 age rule, `ClockStamp`).
             let queue_clock = self.slot_clock();
+            // PAN-477: the always-answer caller dedup keys decodes on the
+            // active period read from the shared slot clock, minus the DSP's
+            // decode phase (see `caller_creation_slot_key`).
+            let caller_key_clock = self.slot_clock();
+            let caller_key_decode_phase_ns = self.active_decode_phase_ns();
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -4765,25 +4813,27 @@ impl super::ApplicationCoordinator {
                 // Per-slot decode-creation dedup (#fix/duplicate-qso-73 Part B).
                 //
                 // FT8 decoders routinely emit 2-4 copies of the same station in
-                // one 15-second window (different candidate frequencies / passes).
+                // one decode window (different candidate frequencies / passes).
                 // `process_message` MUST run for every decode so active QSOs
                 // advance on every copy. But `maybe_answer_caller` (QSO
                 // *creation*) only needs to fire ONCE per station per slot — all
                 // subsequent copies can skip creation because the first already
                 // opened (or gated) it.
                 //
-                // Keying strategy: `slot_key = unix_secs_of_decode / 15`.
-                // Because `decoded_msg.timestamp` is a `SystemTime` stamped by
-                // the decoder, multiple decodes from the same 15-second window
-                // share the same `slot_key`. We dedup by `(slot_key,
-                // base_callsign)`, where `base_callsign` collapses compound
-                // variants (`EA8/G8BCG` and `G8BCG` → `G8BCG`).
+                // Keying strategy (PAN-477): `caller_creation_slot_key` maps
+                // the decoder's `decoded_msg.timestamp`, minus the DSP decode
+                // phase, onto the active mode's slot grid (period read from
+                // the shared `SlotClock`) and aligns it to the decode's own
+                // parity, so every decode from one window shares one
+                // `slot_key` in FT8, FT4 and FT2 alike. We dedup by
+                // `(slot_key, base_callsign)`, where `base_callsign` collapses
+                // compound variants (`EA8/G8BCG` and `G8BCG` → `G8BCG`).
                 //
                 // The set is a simple `(last_slot_key, HashSet<String>)`: when
                 // the slot_key changes (new window), we clear and restart. This
                 // is O(1) amortised and requires no locking (loop is single-task).
-                let mut caller_dedup: (u64, std::collections::HashSet<String>) =
-                    (0, std::collections::HashSet::new());
+                let mut caller_dedup: (i64, std::collections::HashSet<String>) =
+                    (i64::MIN, std::collections::HashSet::new());
 
                 // PAN-42: the receiver loop starts here, so the replay
                 // feeder may start feeding now (the history seed above has
@@ -4890,12 +4940,20 @@ impl super::ApplicationCoordinator {
 
                                             // Per-slot dedup gate for always-answer
                                             // creation. Derive the slot key from the
-                                            // decode timestamp (floor(unix_secs/15)).
-                                            let decode_slot_key =
-                                                caller_creation_slot_key(decoded_msg.timestamp);
+                                            // decode timestamp on the active period
+                                            // of the shared slot clock (PAN-477).
+                                            let decode_slot_key = caller_creation_slot_key(
+                                                decoded_msg.timestamp,
+                                                decoded_msg.slot_parity,
+                                                SignedDuration::from_nanos(
+                                                    caller_key_decode_phase_ns
+                                                        .load(Ordering::Relaxed),
+                                                ),
+                                                caller_key_clock.read().slot_ns,
+                                            );
 
                                             // Refresh the dedup set when the slot
-                                            // changes (new 15-second window).
+                                            // changes (new decode window).
                                             if decode_slot_key != caller_dedup.0 {
                                                 caller_dedup.0 = decode_slot_key;
                                                 caller_dedup.1.clear();
