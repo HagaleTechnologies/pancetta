@@ -17,15 +17,18 @@ retries = 1
 
 # Wall-clock decode results: these tests run alone on the runner.
 # `pan318_overlap_tests` decodes under the 250 ms Standard budget and
-# compares overlapped vs sequential entry timings by design. `station_max_preset_decodes_like_the_station`
-# passes no DecodeBudget, but `decode_window` still applies its legacy
-# call-anchored 2 s BudgetTracker (`decoder.rs`, `BudgetTracker::new`),
-# so under CPU contention pass 0 overruns 2 s, pass 1 is skipped and
-# CQ UW5EJX/MM is lost. Under nextest's cross-binary parallelism both
-# fail (station_max 12/12, overlap 5/12 of concurrent copies locally);
+# compares overlapped vs sequential entry timings by design.
+# `station_max_preset_decodes_like_the_station` (no DecodeBudget) and
+# `subtraction_recall_superset` (`DecodeBudget::unlimited()`) decode two
+# passes, but `decode_window` still applies its legacy call-anchored 2 s
+# BudgetTracker (`decoder.rs`, `BudgetTracker::new`), so under CPU
+# contention pass 0 overruns 2 s, pass 1 is skipped and CQ UW5EJX/MM is
+# lost. Under nextest's cross-binary parallelism all three fail
+# (station_max 12/12, overlap 5/12 of concurrent copies locally;
+# subtraction_recall_superset 2/2 full runs on 32 cores, PAN-487);
 # alone they pass.
 [[profile.ci.overrides]]
-filter = "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))"
+filter = "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | binary(=subtraction_recall_superset) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))"
 threads-required = "num-cpus"
 retries = 1
 
