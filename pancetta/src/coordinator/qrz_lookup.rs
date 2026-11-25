@@ -167,14 +167,10 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
                 result(&tx, callsign, Some(lookup));
             }
             // DxError is a private-box wrapper (PAN-328); match the borrowed
-            // inner kind the same way qrz_xml's session-expiry path does.
+            // inner kind. Only the client's typed miss, built from a lookup
+            // reply, is cached, so a failed login can never be (PAN-478).
             Ok(Err(err))
-                if matches!(
-                    err.kind(),
-                    pancetta_dx::DxErrorInner::ExternalService(msg)
-                        if msg.to_ascii_lowercase().contains("not found")
-                            || msg.contains("returned no callsign data")
-                ) =>
+                if matches!(err.kind(), pancetta_dx::DxErrorInner::CallsignNotFound(_)) =>
             {
                 cache.lock().await.insert(callsign.clone(), None);
                 result(&tx, callsign, None);
@@ -230,6 +226,19 @@ mod tests {
     pub(super) async fn speaking_qrz_server(
         body: &'static str,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        qrz_server(
+            "<QRZDatabase><Session><Key>abc</Key></Session></QRZDatabase>",
+            body,
+        )
+        .await
+    }
+
+    /// A QRZ stand-in that answers every login (`username=`) with `login` and
+    /// every lookup with `body`, counting connections.
+    pub(super) async fn qrz_server(
+        login: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let count = Arc::new(AtomicUsize::new(0));
@@ -242,7 +251,7 @@ mod tests {
                 let n = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..n]);
                 let response = if request.contains("username=") {
-                    "<QRZDatabase><Session><Key>abc</Key></Session></QRZDatabase>"
+                    login
                 } else {
                     body
                 };
@@ -383,3 +392,7 @@ mod tests {
 #[cfg(test)]
 #[path = "qrz_lookup/tests/credential_echo_tests.rs"]
 mod credential_echo_tests;
+
+#[cfg(test)]
+#[path = "qrz_lookup/tests/login_failure_tests.rs"]
+mod login_failure_tests;
