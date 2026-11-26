@@ -95,8 +95,6 @@ skip = [
     { name = "sha2", version = "0.10" },
     # curve25519-dalek-derive 0.1.1, darling_core 0.23.0, darling_macro 0.23.0, derive_more-impl 2.1.1, instability 0.3.12, strum_macros 0.28.0, synstructure 0.13.2, tokio-macros 2.7.1, tracing-attributes 0.1.31, tracing-test-macro 0.2.6, visibility 0.1.1, windows-implement 0.60.2, windows-interface 0.59.3, yoke-derive 0.8.2, zerocopy-derive 0.8.55, zerofrom-derive 0.1.7, zerovec-derive 0.11.3: upstream semver requirement cannot use the newer line.
     { name = "syn", version = "2" },
-    # crossterm 0.29.0, signal-hook-mio 0.2.5, termion 4.0.4: upstream semver requirement cannot use the newer line.
-    { name = "signal-hook", version = "0.3" },
     # errno 0.3.14, rustix 1.1.4, rustls-platform-verifier 0.7.0, serialport 4.10.1, tempfile 3.27.0: upstream semver requirement cannot use the newer line.
     { name = "windows-sys", version = "0.52" },
 ]
