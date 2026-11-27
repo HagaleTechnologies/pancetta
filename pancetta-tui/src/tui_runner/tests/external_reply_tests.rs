@@ -709,12 +709,20 @@ async fn space_calls_a_same_dial_ext_row_after_a_frequency_modal_qsy_to_another_
         while cmd_rx.try_recv().is_ok() {}
         submit_freq_modal(&mut r, "7.074").await;
         while cmd_rx.try_recv().is_ok() {}
+        assert_eq!(
+            app.read().await.status_message(),
+            "Dial 7.074 MHz (simplex)"
+        );
         r.handle_message(TuiMessage::FrequencyUpdate {
             vfo: 0,
             frequency: 7_074_000,
         })
         .await
         .unwrap();
+        assert_eq!(
+            app.read().await.status_message(),
+            "Dial 7.074 MHz (simplex)"
+        );
         seed_cq_keeping_readback(&app, 7.074, panel).await;
         r.handle_key_event(key(' ')).await.unwrap();
         assert!(
@@ -809,4 +817,52 @@ async fn space_refuses_an_old_band_ext_row_while_a_frequency_modal_qsy_settles()
         app.read().await.status_message(),
         "Can't work N4BP. WSJT-X heard it on 20m FT8. Pancetta is on 40m FT8 (rig reads 20m)."
     );
+}
+
+#[tokio::test]
+async fn space_uses_the_selected_ext_cq_after_qsy_with_a_retained_native_report() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    {
+        let mut state = app.write().await;
+        state.update_frequency(14_074_000);
+        let text = format!("{} N4BP -08", state.station_info.call_sign);
+        let mut report = ext_decode(&text, 14.074, "FT8", true);
+        report.external = false;
+        report.delta_freq = 1550.0;
+        state.add_decoded_message(report).await.unwrap();
+    }
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 7_074_000,
+    })
+    .await
+    .unwrap();
+    seed_cq_keeping_readback(&app, 7.074, ActivePanel::BandActivity).await;
+    // The retained directed report is pinned ahead of the CQ.
+    app.write().await.band_activity_scroll = 1;
+    r.handle_key_event(key(' ')).await.unwrap();
+    let command = cmd_rx.try_recv().unwrap();
+    assert!(
+        matches!(command, TuiCommand::CallStation { ref callsign, frequency: 1234, dx_parity: Some(pancetta_core::slot::SlotParity::Even) } if callsign == "N4BP"),
+        "expected to call the selected 40m CQ, got {command:?}"
+    );
+}
+
+#[tokio::test]
+async fn frequency_modal_rejects_a_dial_that_rounds_to_zero() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 14_074_000,
+    })
+    .await
+    .unwrap();
+    submit_freq_modal(&mut r, "0.0000001").await;
+
+    let sent = cmd_rx.try_recv();
+    assert!(sent.is_err(), "invalid dial sent {sent:?}");
+    let state = app.read().await;
+    assert!(state.freq_modal.visible);
+    assert_eq!(state.station_info.operating_frequency, 14.074);
+    assert!(state.status_message().starts_with("Invalid RX dial"));
 }

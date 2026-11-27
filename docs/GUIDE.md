@@ -426,7 +426,13 @@ GridTracker stays off unless you turn it on.
   for another dial on the same band,
   `Can't work N4BP. WSJT-X heard it on 14.090 MHz FT8. Pancetta is on 14.074 MHz FT8.`
   Pancetta never retunes to WSJT-X's dial, so tune the rig there first.
-  The action is also refused while the rig still reads another band after a band key, Shift+F or spot QSY (up to 3 s). Once the rig settles on another band through Shift+F, its own controls or an autonomous hop, pancetta's band and dial follow it and the status line reads `Rig is on 7.074 MHz (40M)` (PAN-475).
+  After a band key, Shift+F or spot QSY, pancetta holds the new target
+  for up to 3 seconds while the rig still reports the old band. During
+  that time the action is refused. Shift+F sets the target when you
+  press Enter and shows, for example, `Dial 7.074 MHz (simplex)`.
+  When a front-panel change or an autonomous hop takes the rig to another
+  band and pancetta adopts the readback, the status line shows, for
+  example, `Rig is on 7.074 MHz (40M)` (PAN-475).
 - **Decodes wait for WSJT-X's status.** Pancetta bands each decode by the
   dial WSJT-X reports in its Status messages, so it drops decodes until
   WSJT-X has sent one (normally within a few seconds of starting). Only live

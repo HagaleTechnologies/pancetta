@@ -140,3 +140,35 @@ async fn a_frequency_modal_qsy_sets_the_dial_and_band_without_clearing_lists() {
     assert!(!app.decoded_messages.is_empty());
     assert_eq!(app.status_message(), status_before);
 }
+
+#[tokio::test]
+async fn a_band_key_caches_only_its_band_after_qsy_kept_live_rows() {
+    for manual in [false, true] {
+        let mut app = fixture_app().await;
+        app.update_frequency(14_074_000);
+        let mut old = tests::fixture_view("N4BP", -8);
+        old.frequency = 14.074;
+        app.add_decoded_message(old).await.unwrap();
+
+        if manual {
+            app.apply_manual_qsy(7_074_000);
+        }
+        app.update_frequency(7_074_000);
+        let mut current = tests::fixture_view("K1ABC", -8);
+        current.frequency = 7.074;
+        app.add_decoded_message(current).await.unwrap();
+        assert_eq!(app.decoded_messages.len(), 2);
+        assert_eq!(app.dx_stations.len(), 2);
+
+        assert_eq!(app.band_up(), 10_136_000);
+        assert_eq!(app.band_down(), 7_074_000);
+        let restored: Vec<_> = app
+            .decoded_messages
+            .iter()
+            .map(|row| row.frequency)
+            .collect();
+        assert_eq!(restored, [7.074]);
+        assert_eq!(app.dx_stations.len(), 1);
+        assert!(app.dx_stations.contains_key("K1ABC"));
+    }
+}

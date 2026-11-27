@@ -3431,9 +3431,9 @@ impl App {
     ///
     /// `leaving_band` is the name of the band we are switching AWAY from (the
     /// one whose live lists are about to be cleared), or `None` on the initial
-    /// selection where there is nothing to stash. The leaving band's decoded
-    /// messages and DX stations are snapshotted into `band_cache` (so a return
-    /// within [`Self::BAND_CACHE_TTL_SECS`] can restore who was calling us),
+    /// selection where there is nothing to stash. Spot-only rows and rows
+    /// heard on the leaving band or an unknown band go into `band_cache`
+    /// (so a return within [`Self::BAND_CACHE_TTL_SECS`] restores callers),
     /// then ALL live lists (Band Activity, Callers — both derive from
     /// `decoded_messages` — and the DX Hunter) are cleared and their cursors /
     /// pins reset. If the band we are switching TO has a fresh cached snapshot,
@@ -3442,15 +3442,36 @@ impl App {
         self.rig_band_synced = true;
         // 1. Stash the band we're leaving so a return within the TTL restores it.
         if let Some(old) = leaving_band {
-            if !self.decoded_messages.is_empty() || !self.dx_stations.is_empty() {
-                self.band_cache.insert(
-                    old,
-                    BandSnapshot {
-                        decoded_messages: self.decoded_messages.clone(),
-                        dx_stations: self.dx_stations.clone(),
-                        captured_at: UtcTimestamp::now(),
-                    },
-                );
+            // A manual QSY can leave rows from several bands in the live lists.
+            let belongs_to_leaving_band = |mhz, known_band: Option<pancetta_core::Band>| {
+                self.configured_band_index(mhz)
+                    .map_or(known_band.is_none(), |idx| {
+                        self.config.bands.bands[idx].name == old
+                    })
+            };
+            let snapshot = BandSnapshot {
+                decoded_messages: self
+                    .decoded_messages
+                    .iter()
+                    .filter(|msg| {
+                        belongs_to_leaving_band(msg.frequency, band_from_mhz(msg.frequency))
+                    })
+                    .cloned()
+                    .collect(),
+                dx_stations: self
+                    .dx_stations
+                    .iter()
+                    .filter(|(_, row)| {
+                        // DX Hunter keeps spot-only rows from any band for QSY.
+                        row.audio_offset_hz.is_none()
+                            || belongs_to_leaving_band(row.frequency, row.band)
+                    })
+                    .map(|(call, row)| (call.clone(), row.clone()))
+                    .collect(),
+                captured_at: UtcTimestamp::now(),
+            };
+            if !snapshot.decoded_messages.is_empty() || !snapshot.dx_stations.is_empty() {
+                self.band_cache.insert(old, snapshot);
             }
         }
 
@@ -4847,17 +4868,21 @@ impl App {
 
         // PAN-435: refuse the selected row before looking up older replies
         // for the same callsign.
-        if let Some(message) = self.focused_external_row_refusal(&callsign) {
+        let external_origin = self.focused_external_origin(&callsign);
+        if let Some(message) = external_origin
+            .and_then(|(call, dial, mode)| self.external_origin_refusal(call, dial, mode))
+        {
             return Some(SpaceAction::Refused { message });
         }
 
-        // A reply on the current dial also needs a compatible decode when
-        // the focused row itself came from another source.
+        // A retained native report from another band cannot stand in for
+        // the selected WSJT-X decode after a QSY.
         let directed = self.decoded_messages.iter().rev().find(|m| {
             m.is_directed_at_us
                 && m.call_sign
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&callsign))
+                && external_origin.is_none_or(|(_, dial, _)| same_band_dial(dial, m.frequency))
                 && self.external_decode_refusal(m).is_none()
         });
         if let Some(msg) = directed {
@@ -4966,22 +4991,16 @@ impl App {
         self.external_origin_refusal(call, msg.frequency, &msg.mode)
     }
 
-    /// PAN-435, PAN-443: [`Self::external_decode_refusal`] for the row under
-    /// the focused panel's cursor, when that row is `callsign` and was heard
-    /// only through WSJT-X. A DX Hunter `EXT` row carries WSJT-X's dial in
-    /// MHz in `frequency`. An `EX+N` row with a network frequency keeps its
-    /// existing spot-call path and uses the spot's dial.
-    fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
+    /// The callsign, dial in MHz and mode from the selected `EXT` or `EX+N`
+    /// row matching `callsign`. An `EX+N` row with a network frequency
+    /// keeps the PAN-287 spot-call path.
+    fn focused_external_origin(&self, callsign: &str) -> Option<(&str, f64, &str)> {
         let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
-        match self.active_panel {
-            ActivePanel::BandActivity => {
-                let displayed = self.displayed_messages();
-                let msg = displayed.get(self.band_activity_scroll)?;
-                if !msg.call_sign.as_deref().is_some_and(same) {
-                    return None;
-                }
-                self.external_decode_refusal(msg)
-            }
+        let msg = match self.active_panel {
+            ActivePanel::BandActivity => self
+                .displayed_messages()
+                .get(self.band_activity_scroll)
+                .copied()?,
             ActivePanel::DxHunter => {
                 let row = self
                     .selected_dx_hunter_row()
@@ -4991,14 +5010,21 @@ impl App {
                 if row.source == SpotSource::ExternalNetwork && row.spot_rf_hz.is_some() {
                     return None;
                 }
-                self.external_row_refusal(row)
+                return matches!(
+                    row.source,
+                    SpotSource::External | SpotSource::ExternalNetwork
+                )
+                .then_some((
+                    row.call_sign.as_str(),
+                    row.frequency,
+                    row.mode.as_str(),
+                ));
             }
-            ActivePanel::Callers => self
-                .selected_caller()
-                .filter(|m| m.call_sign.as_deref().is_some_and(same))
-                .and_then(|m| self.external_decode_refusal(m)),
-            _ => None,
-        }
+            ActivePanel::Callers => self.selected_caller()?,
+            _ => return None,
+        };
+        let call = msg.call_sign.as_deref()?;
+        (msg.external && same(call)).then_some((call, msg.frequency, msg.mode.as_str()))
     }
 
     /// PAN-429: the PAN-435/PAN-443 refusal for a DX Hunter row heard only
@@ -6111,17 +6137,9 @@ pub fn format_s_meter(db_over_s9: i32) -> String {
 }
 
 /// Parse an operator-entered frequency in MHz (e.g. "14.085") to Hz. Returns
-/// `None` for empty or malformed input. Rounds to the nearest Hz.
+/// `None` if the input is invalid or rounds to zero Hz.
 pub fn parse_mhz_to_hz(s: &str) -> Option<u64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let mhz: f64 = t.parse().ok()?;
-    if !mhz.is_finite() || mhz <= 0.0 {
-        return None;
-    }
-    Some((mhz * 1_000_000.0).round() as u64)
+    hz_from_mhz(s.trim().parse().ok()?)
 }
 
 /// Region-aware TX-outside-band-plan check: `true` when `tx_rf_hz` is outside
