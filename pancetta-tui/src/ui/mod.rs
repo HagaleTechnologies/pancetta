@@ -967,7 +967,7 @@ fn title_bar_left_line(app: &App, width: u16, now: UtcTimestamp) -> Line<'_> {
 /// it off screen; the chips priority-fit into whatever is left (see
 /// `title_rank` for the drop order).
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let utc_clock = now.strftime("%H:%M:%S UTC").to_string();
     let clock_width = Span::raw(utc_clock.as_str()).width() as u16;
     let [left_area, clock_area] =
@@ -1202,7 +1202,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             // PAN-344: the typed completion toast outranks ordinary status
             // text (which stays stored and reappears on expiry) but never
             // compose input. Rendered in place — no layout change.
-            None => match app.active_toast_text(UtcTimestamp::now()) {
+            None => match app.active_toast_text(crate::render_time::now()) {
                 Some(toast) => Span::styled(toast, app.theme.info.add_modifier(Modifier::BOLD)),
                 // PAN-351: leveled transient status colors by severity.
                 None => Span::styled(
@@ -1256,7 +1256,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Collect recent decoded signal frequencies
-    let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(30);
+    let cutoff = crate::render_time::now() - SignedDuration::from_secs(30);
     let signal_freqs: Vec<f64> = app
         .decoded_messages
         .iter()
@@ -1267,7 +1267,7 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Build (freq, parity, timestamp) tuples for the occupancy strip from
     // recent decodes. Filter to last 60s; the widget further trims per-column
     // (±37.5 Hz of column center, and re-checks the 60s cutoff defensively).
-    let cutoff = UtcTimestamp::now() - SignedDuration::from_secs(60);
+    let cutoff = crate::render_time::now() - SignedDuration::from_secs(60);
     let decoded_for_occupancy: Vec<(f64, pancetta_core::slot::SlotParity, UtcTimestamp)> = app
         .decoded_messages
         .iter()
@@ -2121,7 +2121,7 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
     {
         use crate::presentation::TxMeterRow;
         let capability = app.tx_meter_capability;
-        let row = if let Some(reading) = app.tx_meter_live_at(UtcTimestamp::now()) {
+        let row = if let Some(reading) = app.tx_meter_live_at(crate::render_time::now()) {
             TxMeterRow::Live {
                 reading,
                 alc_limit: capability.and_then(|c| c.alc_limit),
@@ -2261,7 +2261,7 @@ pub fn format_bearing(bearing: Option<f64>) -> String {
 
 /// Helper function to format time ago
 pub fn format_time_ago(timestamp: UtcTimestamp) -> String {
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let duration = now.duration_since(timestamp);
 
     if duration.as_secs() < 60 {

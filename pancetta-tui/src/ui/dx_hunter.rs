@@ -178,7 +178,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // the DXCC "Entity" is what the operator scans for. PAN-88: narrow panels
     // show fewer, whole columns (see `visible_columns`).
     let columns = visible_columns(area.width);
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let header_cells = columns
         .iter()
         .map(|c| Cell::from(c.header()).style(app.theme.title.add_modifier(Modifier::BOLD)));

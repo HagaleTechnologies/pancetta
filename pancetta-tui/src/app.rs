@@ -3541,7 +3541,7 @@ impl App {
         const STALE_AFTER_SECS: i64 = 5;
         let swr = self.swr?;
         let at = self.swr_at?;
-        if (UtcTimestamp::now() - at).as_secs() > STALE_AFTER_SECS {
+        if (crate::render_time::now() - at).as_secs() > STALE_AFTER_SECS {
             return None;
         }
         Some(format!("SWR {swr:.1}:1"))
@@ -3554,7 +3554,7 @@ impl App {
     pub fn s_meter_display(&self) -> Option<String> {
         let db = self.signal_strength_db?;
         let at = self.signal_strength_at?;
-        if (UtcTimestamp::now() - at).as_secs() > SIGNAL_STRENGTH_STALE_AFTER_SECS {
+        if (crate::render_time::now() - at).as_secs() > SIGNAL_STRENGTH_STALE_AFTER_SECS {
             return None;
         }
         Some(format_s_meter(db))
@@ -3570,7 +3570,8 @@ impl App {
     pub fn signal_strength_status_bar(&self) -> String {
         match (self.signal_strength_db, self.signal_strength_at) {
             (Some(db), Some(at))
-                if (UtcTimestamp::now() - at).as_secs() <= SIGNAL_STRENGTH_STALE_AFTER_SECS =>
+                if (crate::render_time::now() - at).as_secs()
+                    <= SIGNAL_STRENGTH_STALE_AFTER_SECS =>
             {
                 format!("S:{db:+}")
             }

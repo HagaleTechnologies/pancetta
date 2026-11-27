@@ -155,7 +155,7 @@ fn decode(
     source: DecodeSource,
 ) -> crate::app::DecodedMessageView {
     crate::app::DecodedMessageView {
-        timestamp: UtcTimestamp::now() - SignedDuration::from_secs(10),
+        timestamp: crate::render_time::now() - SignedDuration::from_secs(10),
         frequency: 14_074_000.0,
         mode: "FT8".to_string(),
         snr,
@@ -180,7 +180,7 @@ fn decode(
 }
 
 fn banner(call: &str, qso_id: &str) -> crate::app::ActiveQsoBanner {
-    let at = UtcTimestamp::now() - SignedDuration::from_secs(10);
+    let at = crate::render_time::now() - SignedDuration::from_secs(10);
     crate::app::ActiveQsoBanner {
         their_callsign: call.to_string(),
         state: "wait rpt".to_string(),
@@ -217,7 +217,7 @@ fn engaged_banner() -> crate::app::ActiveQsoBanner {
     let mut b = banner("W1AW", "qso-1");
     b.call_count = 2;
     b.max_calls = 5;
-    b.watchdog_deadline = Some(UtcTimestamp::now() + SignedDuration::from_secs(120));
+    b.watchdog_deadline = Some(crate::render_time::now() + SignedDuration::from_secs(120));
     b
 }
 
@@ -236,7 +236,7 @@ fn dx_station(call: &str, priority_score: u32) -> crate::app::DxStation {
         frequency: 14.074,
         band: None,
         mode: "FT8".to_string(),
-        last_seen: UtcTimestamp::now() - SignedDuration::from_secs(10),
+        last_seen: crate::render_time::now() - SignedDuration::from_secs(10),
         snr: -10,
         distance: None,
         bearing: None,
@@ -281,7 +281,7 @@ fn placement() -> crate::app::PlacementView {
         openness: (0..96).map(|i| (i % 5) as u8).collect(),
         bin_hz: 25.0,
         range: (200.0, 2600.0),
-        received_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
+        received_at: crate::render_time::now() - SignedDuration::from_secs(10),
     }
 }
 
@@ -305,16 +305,20 @@ fn placement() -> crate::app::PlacementView {
 /// Not every state reaches a golden: the ✓/✗ history needs a taller
 /// single-QSO panel than any surface draws, and the readiness strip folds
 /// the Notice into its `+N more` counter at 100 columns.
-async fn fixture(name: ThemeName) -> App {
+async fn fixture(name: ThemeName, at: UtcTimestamp) -> App {
+    let mut config = Config::default();
+    config.ui.theme = name;
+    config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+    let app = App::new(config, None).await.expect("fixture App::new");
+    crate::render_time::with_utc(at, || populate_fixture(app))
+}
+
+fn populate_fixture(mut app: App) -> App {
     use self::DecodeSource::{External, Native, OwnTx};
     use crate::app::{ActivePanel, SpotSource};
     use crate::upload_status::{QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget};
     use pancetta_core::slot::SlotParity::{Even, Odd};
     use pancetta_core::DiagnosticLevel;
-    let mut config = Config::default();
-    config.ui.theme = name;
-    config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
-    let mut app = App::new(config, None).await.expect("fixture App::new");
     app.color_capability = ColorCapability::TwoFiftySix;
     app.station_info.operating_frequency = 14.074;
     let own = app.station_info.call_sign.clone();
@@ -396,7 +400,7 @@ async fn fixture(name: ThemeName) -> App {
     ] {
         app.diagnostic_events
             .push_back(crate::app::DiagnosticEventRecord {
-                ts: UtcTimestamp::now() - SignedDuration::from_secs(10),
+                ts: crate::render_time::now() - SignedDuration::from_secs(10),
                 target: "qso",
                 level,
                 text: text.into(),
@@ -421,7 +425,7 @@ async fn fixture(name: ThemeName) -> App {
             outcome,
             last_state: last_state.into(),
             freq_hz: 14_074_000,
-            ts: UtcTimestamp::now() - SignedDuration::from_secs(10),
+            ts: crate::render_time::now() - SignedDuration::from_secs(10),
             brief_timeline: vec![],
         });
     }
@@ -460,7 +464,7 @@ async fn fixture(name: ThemeName) -> App {
         app.qso_history.push_back(crate::app::QsoHistoryItem {
             call_sign: call_sign.to_string(),
             success,
-            completed_at: UtcTimestamp::now() - SignedDuration::from_secs(10),
+            completed_at: crate::render_time::now() - SignedDuration::from_secs(10),
         });
     }
 
@@ -679,8 +683,17 @@ fn cell_key(c: &Cell) -> (String, Color, Color, Modifier) {
 }
 
 async fn render(theme: ThemeName, surface: Surface) -> Snapshot {
-    let mut app = fixture(theme).await;
-    render_with(&mut app, surface)
+    render_with_clock(theme, surface, UtcTimestamp::now).await
+}
+
+async fn render_with_clock(
+    theme: ThemeName,
+    surface: Surface,
+    clock: impl FnOnce() -> UtcTimestamp,
+) -> Snapshot {
+    let at = clock();
+    let mut app = fixture(theme, at).await;
+    crate::render_time::with_utc(at, || render_with(&mut app, surface))
 }
 
 fn render_with(app: &mut App, surface: Surface) -> Snapshot {
@@ -749,7 +762,7 @@ fn render_with(app: &mut App, surface: Surface) -> Snapshot {
                 let mut drift = banner("F5DRF", "qso-3");
                 drift.pending_freq_drift_hz = Some(25.0);
                 drift.pending_freq_drift_since =
-                    Some(UtcTimestamp::now() - SignedDuration::from_secs(10));
+                    Some(crate::render_time::now() - SignedDuration::from_secs(10));
                 app.apply_active_qsos(vec![engaged_banner(), hound, drift], vec![queued_call()]);
             }
             let buf = draw_panel(app, surface);
@@ -1111,3 +1124,7 @@ async fn light_glyphs_meet_3_to_1() {
 async fn high_contrast_glyphs_meet_4_5_to_1() {
     contrast_failures(ThemeName::HighContrast, 4.5, &all_snapshots().await);
 }
+
+#[cfg(test)]
+#[path = "tests/overlay_snapshot_clock_tests.rs"]
+mod overlay_snapshot_clock_tests;

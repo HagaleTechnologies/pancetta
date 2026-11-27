@@ -43,6 +43,7 @@ pub mod dx_reason;
 pub mod keymap;
 mod presentation;
 pub mod readiness;
+mod render_time;
 pub mod spot_call;
 mod status;
 pub mod theme;

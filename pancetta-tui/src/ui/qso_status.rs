@@ -490,7 +490,7 @@ fn watchdog_line(
     }
     let mut s = format!("Call {}/{}", call_count, max_calls);
     if let Some(deadline) = deadline {
-        let remaining = deadline.duration_since(UtcTimestamp::now());
+        let remaining = deadline.duration_since(crate::render_time::now());
         let secs = remaining.as_secs();
         if secs > 0 {
             s.push_str(&format!(" · stops {}:{:02}", secs / 60, secs % 60));
@@ -829,7 +829,7 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Show QSO timing and progress. One wall-clock read per render feeds both
     // the duration and the slot row.
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let duration = if let Some(started) = qso.started_at {
         let elapsed = now.duration_since(started);
         format!(
