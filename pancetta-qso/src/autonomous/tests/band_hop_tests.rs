@@ -952,6 +952,48 @@ fn pan385_window_rotation_skips_duplicate_bands() {
 }
 
 #[test]
+fn pan452_window_rotation_reaches_a_band_after_a_non_adjacent_duplicate() {
+    // `[40m, 80m, 40m, 20m]` passes validation. The quiet rotation runs
+    // over the distinct bands in first-occurrence order, 40m -> 80m -> 20m,
+    // so 20m is reached (before PAN-452 it alternated 80m and 40m).
+    let plan = vec![window(
+        "00:00-06:00",
+        &[Band::Band40m, Band::Band80m, Band::Band40m, Band::Band20m],
+    )];
+    let bands = &[(14_074_000, "20m"), (7_074_000, "40m")];
+    let mut h = Harness::new(bands, plan, Some("FN42"), |_| {});
+    h.dial = 7_074_000;
+    let start = utc(2026, 11, 17, 1, 0, 0);
+    let mut hops = Vec::new();
+    for k in 0..120 {
+        let a = h.slot(start + secs(15 * k), &[], None);
+        if let Some((dial, reason)) = hop_of(&a) {
+            assert!(
+                matches!(reason, BandHopReason::LowActivity { .. }),
+                "{reason:?}"
+            );
+            hops.push(dial);
+            h.dial = dial;
+        }
+    }
+    assert!(hops.len() >= 4, "hops: {hops:?}");
+    assert_eq!(&hops[..4], &[3_573_000, 14_074_000, 7_074_000, 3_573_000]);
+}
+
+#[test]
+fn pan452_window_with_one_distinct_band_never_hops() {
+    let plan = vec![window("00:00-06:00", &[Band::Band40m, Band::Band40m])];
+    let bands = &[(14_074_000, "20m"), (7_074_000, "40m")];
+    let mut h = Harness::new(bands, plan, Some("FN42"), |_| {});
+    h.dial = 7_074_000;
+    let start = utc(2026, 11, 17, 1, 0, 0);
+    for k in 0..120 {
+        let a = h.slot(start + secs(15 * k), &[], None);
+        assert!(hop_of(&a).is_none(), "no hop at slot {k}");
+    }
+}
+
+#[test]
 fn pan385_plan_hop_held_by_an_exchange_is_reported_as_waiting() {
     let mut h = Harness::new(SCENARIO2_BANDS, scenario2_plan(), Some("FN42"), |_| {});
     h.dial = 14_074_000;

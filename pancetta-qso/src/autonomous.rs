@@ -994,14 +994,17 @@ impl BandStrategy {
             if self.settling_cycles > 0 || self.low_activity_cycles < self.config.hop_threshold {
                 return None;
             }
-            let bands = &plan[i].bands;
-            // The next band after the current one that differs from it, in
-            // window order, so a duplicate entry (legal in config) cannot
-            // pin the rotation on the current band.
+            // Rotate over the window's distinct bands in first-occurrence
+            // order: a duplicate entry (legal in config), adjacent or not,
+            // can neither pin the rotation nor strand a later band (PAN-452).
+            let mut bands: Vec<pancetta_core::Band> = Vec::new();
+            for b in &plan[i].bands {
+                if !bands.contains(b) {
+                    bands.push(*b);
+                }
+            }
             let next = match current.and_then(|c| bands.iter().position(|b| *b == c)) {
-                Some(p) => (1..bands.len())
-                    .map(|k| bands[(p + k) % bands.len()])
-                    .find(|b| Some(*b) != current),
+                Some(p) => bands.get((p + 1) % bands.len()).copied(),
                 None => bands.first().copied(),
             }?;
             if Some(next) == current {
