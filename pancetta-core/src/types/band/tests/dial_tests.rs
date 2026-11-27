@@ -36,3 +36,8 @@ fn is_band_change_uses_100_khz_off_the_band_table() {
 fn is_band_change_ignores_an_unknown_old_dial() {
     assert!(!is_band_change(0, 14_074_000));
 }
+
+#[test]
+fn freq_command_settle_window_is_three_seconds() {
+    assert_eq!(FREQ_COMMAND_SETTLE_MS, 3_000);
+}

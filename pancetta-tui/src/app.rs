@@ -1922,6 +1922,8 @@ pub struct App {
     /// the first rig report adopts the rig's band, and any band change the
     /// operator or coordinator makes first sets it so that report can't undo it.
     rig_band_synced: bool,
+    /// PAN-475: last dial commanded by a band key, Shift+F or spot QSY.
+    commanded_dial: Option<(u64, std::time::Instant)>,
     /// Per-band snapshot cache. On every band switch we stash the band we are
     /// leaving (its decoded messages — the source of BOTH the Band Activity and
     /// Callers lists — and its DX-Hunter stations) keyed by band name with a
@@ -2168,6 +2170,7 @@ impl App {
             current_band_index: default_band_index,
             radio_frequency: None,
             rig_band_synced: false,
+            commanded_dial: None,
             band_cache: HashMap::new(),
             active_view: Self::load_persisted_view(),
             zoomed: false,
@@ -3278,25 +3281,94 @@ impl App {
     /// because until then the band selection is only the configured starting
     /// frequency (20m by default), not where the radio is. Nothing is sent to
     /// the rig. A band change made before that report wins (see
-    /// `rig_band_synced`).
+    /// `rig_band_synced`). Later cross-band reports follow the rig once no
+    /// pancetta-commanded QSY is settling (PAN-475).
     pub fn update_frequency(&mut self, freq: u64) {
+        self.update_frequency_at(freq, std::time::Instant::now());
+    }
+
+    /// PAN-496 adopts the first report; PAN-475 follows later settled band changes.
+    pub(crate) fn update_frequency_at(&mut self, freq: u64, now: std::time::Instant) {
         let freq_mhz = freq as f64 / 1_000_000.0;
         self.radio_frequency = Some(freq_mhz);
-        if !self.rig_band_synced && freq > 0 {
-            self.adopt_rig_band(freq_mhz);
+        if freq == 0 {
+            return;
         }
+        if !self.rig_band_synced {
+            self.adopt_rig_band(freq_mhz);
+        } else if self.rig_settled_on_another_band(freq, now) {
+            self.follow_rig_band(freq_mhz);
+        }
+    }
+
+    fn configured_band_index(&self, mhz: f64) -> Option<usize> {
+        self.config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.frequency_range.0 <= mhz && mhz <= b.frequency_range.1)
+    }
+
+    fn announce_rig_dial(&mut self, freq_mhz: f64, band_idx: Option<usize>) {
+        let band = band_idx
+            .map(|idx| self.config.bands.bands[idx].name.clone())
+            .unwrap_or_else(|| "outside the configured bands".to_string());
+        self.statuses.push(
+            format!("Rig is on {freq_mhz:.3} MHz ({band})"),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
+    }
+
+    fn note_commanded_dial(&mut self, dial_hz: u64) {
+        self.commanded_dial = Some((dial_hz, std::time::Instant::now()));
+    }
+
+    fn rig_settled_on_another_band(&self, readback_hz: u64, now: std::time::Instant) -> bool {
+        use pancetta_core::types::band::{is_band_change, FREQ_COMMAND_SETTLE_MS};
+        let Some(target) = hz_from_mhz(self.station_info.operating_frequency) else {
+            return false;
+        };
+        if !is_band_change(target, readback_hz) {
+            return false;
+        }
+        !matches!(self.commanded_dial, Some((commanded, at))
+            if is_band_change(commanded, readback_hz)
+                && now.saturating_duration_since(at)
+                    < std::time::Duration::from_millis(FREQ_COMMAND_SETTLE_MS))
+    }
+
+    /// Follow a settled rig band without clearing the live decode rows or cache.
+    fn follow_rig_band(&mut self, freq_mhz: f64) {
+        self.rig_band_synced = true;
+        let target = self.configured_band_index(freq_mhz);
+        if let Some(idx) = target {
+            self.current_band_index = idx;
+        }
+        self.station_info.operating_frequency = freq_mhz;
+        self.announce_rig_dial(freq_mhz, target);
+    }
+
+    /// PAN-475: Shift+F sets the target immediately, so old-band EXT rows refuse
+    /// while the rig slews. Existing decode rows stay available.
+    pub fn apply_manual_qsy(&mut self, dial_hz: u64) {
+        self.note_commanded_dial(dial_hz);
+        self.rig_band_synced = true;
+        let mhz = dial_hz as f64 / 1_000_000.0;
+        if let Some(idx) = self.configured_band_index(mhz) {
+            self.current_band_index = idx;
+        }
+        self.station_info.operating_frequency = mhz;
     }
 
     /// PAN-496: make the rig's reported dial the operating frequency, switching
     /// the band selection when the dial lies in another configured band.
     fn adopt_rig_band(&mut self, freq_mhz: f64) {
         self.rig_band_synced = true;
-        let target = self
-            .config
-            .bands
-            .bands
-            .iter()
-            .position(|b| b.frequency_range.0 <= freq_mhz && freq_mhz <= b.frequency_range.1);
+        let target = self.configured_band_index(freq_mhz);
         if let Some(idx) = target.filter(|&idx| idx != self.current_band_index) {
             let old_band = self
                 .config
@@ -3308,18 +3380,7 @@ impl App {
             self.apply_band_selection(old_band);
         }
         self.station_info.operating_frequency = freq_mhz;
-        let band = match target {
-            Some(idx) => self.config.bands.bands[idx].name.clone(),
-            None => "outside the configured bands".to_string(),
-        };
-        self.statuses.push(
-            format!("Rig is on {freq_mhz:.3} MHz ({band})"),
-            pancetta_core::DiagnosticLevel::Info,
-            crate::status::Origin::Local,
-            None,
-            None,
-            std::time::Instant::now(),
-        );
+        self.announce_rig_dial(freq_mhz, target);
     }
 
     /// How long a cached per-band snapshot stays restorable. Return to a band
@@ -3345,7 +3406,9 @@ impl App {
             .name
             .clone();
         self.current_band_index = (self.current_band_index + 1) % num_bands;
-        self.apply_band_selection(Some(old_band))
+        let dial = self.apply_band_selection(Some(old_band));
+        self.note_commanded_dial(dial);
+        dial
     }
 
     /// Switch to the previous band (lower frequency). Returns the new FT8 dial frequency in Hz.
@@ -3358,7 +3421,9 @@ impl App {
             .name
             .clone();
         self.current_band_index = (self.current_band_index + num_bands - 1) % num_bands;
-        self.apply_band_selection(Some(old_band))
+        let dial = self.apply_band_selection(Some(old_band));
+        self.note_commanded_dial(dial);
+        dial
     }
 
     /// Apply the current band selection, updating operating frequency.
@@ -3366,9 +3431,9 @@ impl App {
     ///
     /// `leaving_band` is the name of the band we are switching AWAY from (the
     /// one whose live lists are about to be cleared), or `None` on the initial
-    /// selection where there is nothing to stash. The leaving band's decoded
-    /// messages and DX stations are snapshotted into `band_cache` (so a return
-    /// within [`Self::BAND_CACHE_TTL_SECS`] can restore who was calling us),
+    /// selection where there is nothing to stash. Spot-only rows and rows
+    /// heard on the leaving band or an unknown band go into `band_cache`
+    /// (so a return within [`Self::BAND_CACHE_TTL_SECS`] restores callers),
     /// then ALL live lists (Band Activity, Callers — both derive from
     /// `decoded_messages` — and the DX Hunter) are cleared and their cursors /
     /// pins reset. If the band we are switching TO has a fresh cached snapshot,
@@ -3377,15 +3442,36 @@ impl App {
         self.rig_band_synced = true;
         // 1. Stash the band we're leaving so a return within the TTL restores it.
         if let Some(old) = leaving_band {
-            if !self.decoded_messages.is_empty() || !self.dx_stations.is_empty() {
-                self.band_cache.insert(
-                    old,
-                    BandSnapshot {
-                        decoded_messages: self.decoded_messages.clone(),
-                        dx_stations: self.dx_stations.clone(),
-                        captured_at: UtcTimestamp::now(),
-                    },
-                );
+            // A manual QSY can leave rows from several bands in the live lists.
+            let belongs_to_leaving_band = |mhz, known_band: Option<pancetta_core::Band>| {
+                self.configured_band_index(mhz)
+                    .map_or(known_band.is_none(), |idx| {
+                        self.config.bands.bands[idx].name == old
+                    })
+            };
+            let snapshot = BandSnapshot {
+                decoded_messages: self
+                    .decoded_messages
+                    .iter()
+                    .filter(|msg| {
+                        belongs_to_leaving_band(msg.frequency, band_from_mhz(msg.frequency))
+                    })
+                    .cloned()
+                    .collect(),
+                dx_stations: self
+                    .dx_stations
+                    .iter()
+                    .filter(|(_, row)| {
+                        // DX Hunter keeps spot-only rows from any band for QSY.
+                        row.audio_offset_hz.is_none()
+                            || belongs_to_leaving_band(row.frequency, row.band)
+                    })
+                    .map(|(call, row)| (call.clone(), row.clone()))
+                    .collect(),
+                captured_at: UtcTimestamp::now(),
+            };
+            if !snapshot.decoded_messages.is_empty() || !snapshot.dx_stations.is_empty() {
+                self.band_cache.insert(old, snapshot);
             }
         }
 
@@ -4677,12 +4763,8 @@ impl App {
     /// otherwise only the operating frequency moves.
     pub fn apply_spot_qsy(&mut self, dial_hz: u64) {
         let mhz = dial_hz as f64 / 1_000_000.0;
-        let target = self
-            .config
-            .bands
-            .bands
-            .iter()
-            .position(|b| b.frequency_range.0 <= mhz && mhz <= b.frequency_range.1);
+        self.note_commanded_dial(dial_hz);
+        let target = self.configured_band_index(mhz);
         match target {
             Some(idx) if idx != self.current_band_index => {
                 let old_band = self
@@ -4786,17 +4868,21 @@ impl App {
 
         // PAN-435: refuse the selected row before looking up older replies
         // for the same callsign.
-        if let Some(message) = self.focused_external_row_refusal(&callsign) {
+        let external_origin = self.focused_external_origin(&callsign);
+        if let Some(message) = external_origin
+            .and_then(|(call, dial, mode)| self.external_origin_refusal(call, dial, mode))
+        {
             return Some(SpaceAction::Refused { message });
         }
 
-        // A reply on the current dial also needs a compatible decode when
-        // the focused row itself came from another source.
+        // A retained native report from another band cannot stand in for
+        // the selected WSJT-X decode after a QSY.
         let directed = self.decoded_messages.iter().rev().find(|m| {
             m.is_directed_at_us
                 && m.call_sign
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&callsign))
+                && external_origin.is_none_or(|(_, dial, _)| same_band_dial(dial, m.frequency))
                 && self.external_decode_refusal(m).is_none()
         });
         if let Some(msg) = directed {
@@ -4905,22 +4991,16 @@ impl App {
         self.external_origin_refusal(call, msg.frequency, &msg.mode)
     }
 
-    /// PAN-435, PAN-443: [`Self::external_decode_refusal`] for the row under
-    /// the focused panel's cursor, when that row is `callsign` and was heard
-    /// only through WSJT-X. A DX Hunter `EXT` row carries WSJT-X's dial in
-    /// MHz in `frequency`. An `EX+N` row with a network frequency keeps its
-    /// existing spot-call path and uses the spot's dial.
-    fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
+    /// The callsign, dial in MHz and mode from the selected `EXT` or `EX+N`
+    /// row matching `callsign`. An `EX+N` row with a network frequency
+    /// keeps the PAN-287 spot-call path.
+    fn focused_external_origin(&self, callsign: &str) -> Option<(&str, f64, &str)> {
         let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
-        match self.active_panel {
-            ActivePanel::BandActivity => {
-                let displayed = self.displayed_messages();
-                let msg = displayed.get(self.band_activity_scroll)?;
-                if !msg.call_sign.as_deref().is_some_and(same) {
-                    return None;
-                }
-                self.external_decode_refusal(msg)
-            }
+        let msg = match self.active_panel {
+            ActivePanel::BandActivity => self
+                .displayed_messages()
+                .get(self.band_activity_scroll)
+                .copied()?,
             ActivePanel::DxHunter => {
                 let row = self
                     .selected_dx_hunter_row()
@@ -4930,14 +5010,21 @@ impl App {
                 if row.source == SpotSource::ExternalNetwork && row.spot_rf_hz.is_some() {
                     return None;
                 }
-                self.external_row_refusal(row)
+                return matches!(
+                    row.source,
+                    SpotSource::External | SpotSource::ExternalNetwork
+                )
+                .then_some((
+                    row.call_sign.as_str(),
+                    row.frequency,
+                    row.mode.as_str(),
+                ));
             }
-            ActivePanel::Callers => self
-                .selected_caller()
-                .filter(|m| m.call_sign.as_deref().is_some_and(same))
-                .and_then(|m| self.external_decode_refusal(m)),
-            _ => None,
-        }
+            ActivePanel::Callers => self.selected_caller()?,
+            _ => return None,
+        };
+        let call = msg.call_sign.as_deref()?;
+        (msg.external && same(call)).then_some((call, msg.frequency, msg.mode.as_str()))
     }
 
     /// PAN-429: the PAN-435/PAN-443 refusal for a DX Hunter row heard only
@@ -6050,17 +6137,9 @@ pub fn format_s_meter(db_over_s9: i32) -> String {
 }
 
 /// Parse an operator-entered frequency in MHz (e.g. "14.085") to Hz. Returns
-/// `None` for empty or malformed input. Rounds to the nearest Hz.
+/// `None` if the input is invalid or rounds to zero Hz.
 pub fn parse_mhz_to_hz(s: &str) -> Option<u64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let mhz: f64 = t.parse().ok()?;
-    if !mhz.is_finite() || mhz <= 0.0 {
-        return None;
-    }
-    Some((mhz * 1_000_000.0).round() as u64)
+    hz_from_mhz(s.trim().parse().ok()?)
 }
 
 /// Region-aware TX-outside-band-plan check: `true` when `tx_rf_hz` is outside
@@ -12241,3 +12320,7 @@ mod dial_label_tests;
 #[cfg(test)]
 #[path = "app/tests/startup_rig_band_tests.rs"]
 mod startup_rig_band_tests;
+
+#[cfg(test)]
+#[path = "app/tests/settled_rig_band_tests.rs"]
+mod settled_rig_band_tests;

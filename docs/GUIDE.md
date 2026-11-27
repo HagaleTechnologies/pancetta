@@ -157,7 +157,7 @@ match theirs. `c` starts a repeating CQ of your own; `s` stops it.
   CQ-hunting offset. AUTO only; in HOLD it reports a no-op rather than
   breaking your pin. In AUTO, pancetta also does this on its own after
   `[autonomous] qso_stall_switch_after` cycles with no reply.
-- `Shift+F` sets the **dial** frequency (and optional split TX dial) via CAT.
+- `Shift+F` sets the **dial** frequency (and optional split TX dial) via CAT. Pancetta's band and dial move to it when you press Enter.
 
 ### …enable autonomous operation (the supervised way)?
 
@@ -426,7 +426,13 @@ GridTracker stays off unless you turn it on.
   for another dial on the same band,
   `Can't work N4BP. WSJT-X heard it on 14.090 MHz FT8. Pancetta is on 14.074 MHz FT8.`
   Pancetta never retunes to WSJT-X's dial, so tune the rig there first.
-  The action is also refused when rig readback reports a different band.
+  After a band key, Shift+F or spot QSY, pancetta holds the new target
+  for up to 3 seconds while the rig still reports the old band. During
+  that time the action is refused. Shift+F sets the target when you
+  press Enter and shows, for example, `Dial 7.074 MHz (simplex)`.
+  When a front-panel change or an autonomous hop takes the rig to another
+  band and pancetta adopts the readback, the status line shows, for
+  example, `Rig is on 7.074 MHz (40M)` (PAN-475).
 - **Decodes wait for WSJT-X's status.** Pancetta bands each decode by the
   dial WSJT-X reports in its Status messages, so it drops decodes until
   WSJT-X has sent one (normally within a few seconds of starting). Only live

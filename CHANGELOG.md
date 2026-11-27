@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-475: Shift+F now sets pancetta's target dial when Enter is pressed. Cross-band moves through Shift+F or the rig's own controls are reflected in the TUI after the rig settles, so Space on a same-dial WSJT-X `EXT` row can call. A cross-band readback not commanded by pancetta is followed with `Rig is on 7.074 MHz (40M)`; for 3 s after a band key, Shift+F or spot QSY, an old-band readback is treated as rig lag. Live decode rows stay visible. Automated coverage only; real rig and WSJT-X qualification pending.
+
 - PAN-452: a band listed twice in an `[[autonomous.band_plan]]` window no longer stops quiet-band rotation from reaching bands listed after it. A window of 40m, 80m, 40m, 20m now rotates through 40m, 80m and 20m in first-occurrence order.
 
 - PAN-453: needed-activity band counts now refresh each band's cqdx.io needed set independently. Failed requests retry after 60 seconds, a failing band no longer stalls later bands or fresh spots, and counts expire after 20 minutes without a successful needed-set load. Automated coverage only.

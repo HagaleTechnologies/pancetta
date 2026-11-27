@@ -341,6 +341,10 @@ pub fn same_dial(current_hz: u64, target_hz: u64) -> bool {
 /// that lands the rig somewhere a QSO can no longer complete. 100 kHz.
 pub const BAND_CHANGE_HZ_THRESHOLD: u64 = 100_000;
 
+/// PAN-475: the coordinator poll and TUI allow rigctld three seconds to settle
+/// after a pancetta-commanded dial change.
+pub const FREQ_COMMAND_SETTLE_MS: u64 = 3_000;
+
 /// Decide whether a dial-frequency change (`old_hz` → `new_hz`) is a genuine
 /// **band change**, versus a tiny tune wobble. The coordinator's C9
 /// active-QSO teardown is one user; the TUI's WSJT-X rig-lag guard
