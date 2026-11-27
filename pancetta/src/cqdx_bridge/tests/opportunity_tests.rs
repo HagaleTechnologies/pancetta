@@ -285,3 +285,293 @@ async fn opportunity_poller_stops_after_a_permanent_error() {
     assert!(bridge.band_opportunities().await.is_none());
     server.verify().await;
 }
+
+#[test]
+fn needed_set_refresh_and_retry_are_per_band() {
+    let start = tokio::time::Instant::now();
+    let mut band = OpportunityNeededBand::default();
+    assert!(band.due(start));
+    band.set = Some(HashMap::from([(1, false)]));
+    band.loaded_at = Some(start);
+    assert!(!band.due(start + Duration::from_secs(599)));
+    assert!(band.due(start + Duration::from_secs(600)));
+    band.retry_at = Some(start + Duration::from_secs(660));
+    assert!(!band.due(start + Duration::from_secs(659)));
+    assert!(band.due(start + Duration::from_secs(660)));
+    assert!(band.usable(start + Duration::from_secs(1199)).is_some());
+    assert!(band.usable(start + Duration::from_secs(1200)).is_none());
+    band.set = Some(HashMap::from([(2, true)]));
+    band.loaded_at = Some(start + Duration::from_secs(660));
+    band.retry_at = None;
+    assert!(!band.due(start + Duration::from_secs(1259)));
+    assert!(band.due(start + Duration::from_secs(1260)));
+    assert_eq!(
+        band.usable(start + Duration::from_secs(1260))
+            .unwrap()
+            .get(&2),
+        Some(&true)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn opportunity_snapshot_omits_expired_needed_sets() {
+    let now = tokio::time::Instant::now();
+    let published = PublishedOpportunities {
+        snapshot: OpportunitySnapshot {
+            as_of: UtcTimestamp::now(),
+            bands: vec![counts(Band::Band20m, 0, 0), counts(Band::Band17m, 2, 1)],
+        },
+        expires: HashMap::from([
+            (Band::Band20m, now + Duration::from_secs(1200)),
+            (Band::Band17m, now + Duration::from_secs(600)),
+        ]),
+    };
+    assert_eq!(published.current(now).unwrap().bands.len(), 2);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(
+        published
+            .current(tokio::time::Instant::now())
+            .unwrap()
+            .bands,
+        vec![counts(Band::Band20m, 0, 0)]
+    );
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert!(published.current(tokio::time::Instant::now()).is_none());
+}
+
+#[tokio::test]
+async fn opportunity_poller_stops_after_permanent_needed_error() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/api/v1/entities/needed",
+        200,
+        needed_ids_json(&[(1, false)]),
+    )
+    .await;
+    mount(
+        &server,
+        "/api/v1/entities",
+        200,
+        serde_json::json!({"entities": []}),
+    )
+    .await;
+    mount(
+        &server,
+        "/api/v1/entities/needed-grids",
+        200,
+        serde_json::json!({"grids": []}),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/entities/needed"))
+        .and(query_param("band", "20m"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (bridge, _) = started_bridge(&server, 1).await;
+    let handle = bridge.spawn_opportunity_poller(
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        vec![Band::Band20m, Band::Band17m],
+    );
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    handle.abort();
+    assert!(bridge.pending().blocked);
+    assert!(bridge.band_opportunities().await.is_none());
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.url.path() == "/api/v1/spots"
+        || r.url.query_pairs().any(|(k, v)| k == "band" && v == "17m")));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn opportunity_poller_backs_off_and_recovers_from_needed_500s() {
+    use std::sync::atomic::AtomicUsize;
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/api/v1/entities/needed",
+        200,
+        needed_ids_json(&[(1, false)]),
+    )
+    .await;
+    mount(
+        &server,
+        "/api/v1/entities",
+        200,
+        serde_json::json!({"entities": []}),
+    )
+    .await;
+    mount(
+        &server,
+        "/api/v1/entities/needed-grids",
+        200,
+        serde_json::json!({"grids": []}),
+    )
+    .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    for band in ["20m", "17m"] {
+        let attempts = attempts.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed"))
+            .and(query_param("band", band))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(needed_ids_json(&[(1, false)]))
+                }
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/spots"))
+        .and(query_param("live", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"groups": [
+                spot_json("JA1ABC", "17m", "FT8", 1, UtcTimestamp::now().as_second()),
+            ]})),
+        )
+        .mount(&server)
+        .await;
+    let (bridge, _) = started_bridge(&server, 1).await;
+    let handle = spawn_for(&bridge);
+    for _ in 0..80 {
+        if attempts.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(bridge.band_opportunities().await.is_none());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "retry must wait 60 s");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let snapshot = wait_for_snapshot(&bridge).await;
+    handle.abort();
+    assert_eq!(
+        snapshot.bands,
+        vec![counts(Band::Band20m, 0, 0), counts(Band::Band17m, 1, 0)]
+    );
+}
+
+async fn opportunity_transport_case(poll_interval_secs: u64) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 8192];
+                let mut used = 0;
+                while used < buf.len() {
+                    let n = socket.read(&mut buf[used..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    used += n;
+                    if buf[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf[..used]);
+                let target = head
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                seen.lock().await.push(target.clone());
+                if target.contains("band=17m") {
+                    return;
+                }
+                let body = if target.starts_with("/api/v1/spots") {
+                    serde_json::json!({"groups": [spot_json("JA1ABC", "15m", "FT8", 7,
+                        UtcTimestamp::now().as_second())]})
+                } else if target.starts_with("/api/v1/entities/needed-grids") {
+                    serde_json::json!({"grids": []})
+                } else if target.starts_with("/api/v1/entities/needed") {
+                    if target.contains("band=15m") {
+                        needed_ids_json(&[(7, false)])
+                    } else {
+                        needed_ids_json(&[(9, false)])
+                    }
+                } else {
+                    serde_json::json!({"entities": []})
+                };
+                let bytes = body.to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    bytes.len(),
+                    bytes
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    let lookup = Arc::new(CachedStationLookup::new());
+    let config = pancetta_config::network::CqdxConfig {
+        poll_interval_secs,
+        ..cfg(&url, Some(TOKEN))
+    };
+    let bridge = Arc::new(CqdxBridge::from_config(&config, lookup).unwrap());
+    bridge.startup().await.unwrap();
+    let handle = bridge.spawn_opportunity_poller(
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        vec![Band::Band20m, Band::Band17m, Band::Band15m],
+    );
+    tokio::time::sleep(Duration::from_secs(poll_interval_secs) + Duration::from_millis(300)).await;
+    let snapshot = bridge.band_opportunities().await.unwrap();
+    handle.abort();
+    server.abort();
+    assert_eq!(
+        snapshot.bands,
+        vec![counts(Band::Band20m, 0, 0), counts(Band::Band15m, 1, 0)]
+    );
+    let got = requests.lock().await;
+    let failed: Vec<_> = got
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.contains("band=17m"))
+        .collect();
+    assert_eq!(failed.len(), if poll_interval_secs > 60 { 2 } else { 1 });
+    let later_band = got
+        .iter()
+        .position(|r| r.contains("band=15m"))
+        .expect("15m loaded");
+    assert!(later_band > failed[0].0);
+    if failed.len() == 2 {
+        assert!(later_band < failed[1].0);
+    }
+    assert!(
+        got.iter()
+            .filter(|r| r.starts_with("/api/v1/spots"))
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn opportunity_poller_keeps_polling_after_needed_transport_error() {
+    opportunity_transport_case(1).await;
+}
+
+#[tokio::test]
+async fn opportunity_poller_resumes_after_transport_error_with_long_poll_interval() {
+    opportunity_transport_case(61).await;
+}

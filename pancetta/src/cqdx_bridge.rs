@@ -82,6 +82,44 @@ fn need_retry_due(last: Option<Instant>, now: Instant) -> bool {
 /// activity on its band, and how often the per-band needed sets refresh.
 const OPPORTUNITY_WINDOW_SECS: i64 = 600;
 const OPPORTUNITY_NEEDED_REFRESH: Duration = Duration::from_secs(600);
+const OPPORTUNITY_NEEDED_EXPIRY: Duration = Duration::from_secs(1200);
+
+#[derive(Default)]
+struct OpportunityNeededBand {
+    set: Option<HashMap<u32, bool>>,
+    loaded_at: Option<tokio::time::Instant>,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl OpportunityNeededBand {
+    fn due(&self, now: tokio::time::Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+            && self
+                .loaded_at
+                .is_none_or(|at| now.duration_since(at) >= OPPORTUNITY_NEEDED_REFRESH)
+    }
+
+    fn usable(&self, now: tokio::time::Instant) -> Option<&HashMap<u32, bool>> {
+        self.loaded_at
+            .filter(|at| now.duration_since(*at) < OPPORTUNITY_NEEDED_EXPIRY)
+            .and(self.set.as_ref())
+    }
+}
+
+struct PublishedOpportunities {
+    snapshot: OpportunitySnapshot,
+    expires: HashMap<Band, tokio::time::Instant>,
+}
+
+impl PublishedOpportunities {
+    fn current(&self, now: tokio::time::Instant) -> Option<OpportunitySnapshot> {
+        let mut snapshot = self.snapshot.clone();
+        snapshot
+            .bands
+            .retain(|entry| self.expires.get(&entry.band).is_some_and(|at| now < *at));
+        (!snapshot.bands.is_empty()).then_some(snapshot)
+    }
+}
 
 /// PAN-359 (D10): the activation feed is fetched at most this often, inside
 /// the live-spot poller. cqdx.io refreshes it every 2 minutes.
@@ -204,7 +242,9 @@ async fn refresh_worked_references(
         }
         Ok(None) => {
             if !not_offered_logged.swap(true, Ordering::Relaxed) {
-                info!("cqdx.io activation feed not offered (404); worked stations get no SIG/SIG_INFO");
+                info!(
+                    "cqdx.io activation feed not offered (404); worked stations get no SIG/SIG_INFO"
+                );
             } else {
                 debug!("cqdx.io activation feed still not offered (404)");
             }
@@ -330,7 +370,7 @@ pub struct CqdxBridge {
     pending: std::sync::Mutex<PendingLoads>,
     /// PAN-385: the latest all-band needed-activity snapshot written by the
     /// opportunity poller (`None` until its first successful spots fetch).
-    opportunities: Arc<RwLock<Option<OpportunitySnapshot>>>,
+    opportunities: Arc<RwLock<Option<PublishedOpportunities>>>,
     /// PAN-359: the worked-station activation book the spot poller fills
     /// from cqdx.io's activation feed, shared with the `QsoManager`. `None`
     /// fetches no activations.
@@ -385,7 +425,11 @@ impl CqdxBridge {
 
     /// PAN-385: the latest all-band needed-activity snapshot, if any.
     pub async fn band_opportunities(&self) -> Option<OpportunitySnapshot> {
-        self.opportunities.read().await.clone()
+        self.opportunities
+            .read()
+            .await
+            .as_ref()
+            .and_then(|published| published.current(tokio::time::Instant::now()))
     }
 
     /// Attach the coordinator's shared dial-frequency atomic so the spot
@@ -915,9 +959,11 @@ impl CqdxBridge {
     /// Every `poll_interval` it fetches live spots for every band and mode
     /// (`fetch_live_spots(None, None)`) and, after each successful fetch,
     /// writes an [`OpportunitySnapshot`] counted by [`count_needed_by_band`].
-    /// Every [`OPPORTUNITY_NEEDED_REFRESH`] it re-fetches each candidate
-    /// band's needed set (lowercase band name, per the API contract), keeping
-    /// a band's previous set when its fetch fails. It shares the live-spot
+    /// Each band's needed set refreshes after [`OPPORTUNITY_NEEDED_REFRESH`];
+    /// a retryable failure waits [`NEED_DATA_RETRY`] for that band. A transport
+    /// error ends the pass, and the next pass resumes after that band. Counts
+    /// expire after [`OPPORTUNITY_NEEDED_EXPIRY`] without a successful load.
+    /// It shares the live-spot
     /// poll's gates: nothing is requested once a permanent error has blocked
     /// the session, nor before the DXCC need list has loaded, nor while the
     /// 2-hour no-decode watchdog has paused polling. A permanent error from
@@ -942,8 +988,8 @@ impl CqdxBridge {
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
             let mut polling_paused = false;
-            let mut needed: HashMap<Band, HashMap<u32, bool>> = HashMap::new();
-            let mut last_needed_refresh: Option<Instant> = None;
+            let mut needed: HashMap<Band, OpportunityNeededBand> = HashMap::new();
+            let mut next_band = 0;
 
             loop {
                 timer.tick().await;
@@ -981,83 +1027,95 @@ impl CqdxBridge {
                     }
                 }
 
-                let refresh_due = last_needed_refresh.is_none_or(|t| {
-                    Instant::now().saturating_duration_since(t) >= OPPORTUNITY_NEEDED_REFRESH
-                });
-                // A band whose needed set has never loaded is retried every
-                // poll until it loads; until then the snapshot has no entry
-                // for it (unknown, never zero).
-                let missing: Vec<Band> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|band| !needed.contains_key(band))
-                    .collect();
-                if refresh_due || !missing.is_empty() {
-                    let to_fetch = if refresh_due {
-                        candidates.clone()
-                    } else {
-                        missing
-                    };
-                    // Stamp the refresh only once a pass loads something, so
-                    // an all-failed pass retries on the next poll instead of
-                    // publishing all-zero snapshots for ten minutes.
-                    let mut any_loaded = false;
-                    let mut server_unreachable = false;
-                    for band in &to_fetch {
-                        match client.fetch_needed(Some(band.name())).await {
-                            Ok(rows) => {
-                                any_loaded = true;
-                                needed.insert(
-                                    *band,
-                                    rows.iter().map(|r| (r.entity_id, r.atno)).collect(),
-                                );
-                            }
-                            Err(e) if !retry_can_help(&e) => {
-                                warn!(
-                                    "cqdx.io needed fetch for {} failed permanently ({e}); \
-                                     stopping until restart",
-                                    band.name()
-                                );
-                                bridge.pending().blocked = true;
-                                break;
-                            }
-                            // A transport error ends the pass, as it does
-                            // for the PAN-93 loads (`stops_sequence`): the
-                            // next band would only wait out another timeout.
-                            Err(e @ CqdxError::Http(_)) => {
-                                debug!(
-                                    "cqdx.io needed fetch for {} failed ({e}); keeping prior \
-                                     sets until the next poll",
-                                    band.name()
-                                );
-                                server_unreachable = true;
-                                break;
-                            }
-                            Err(e) => debug!(
-                                "cqdx.io needed fetch for {} failed ({e}); keeping its prior set",
-                                band.name()
-                            ),
-                        }
-                    }
-                    if bridge.pending().blocked || (server_unreachable && !any_loaded) {
+                let mut interrupted = false;
+                for offset in 0..candidates.len() {
+                    let index = (next_band + offset) % candidates.len();
+                    let band = candidates[index];
+                    if !needed
+                        .entry(band)
+                        .or_default()
+                        .due(tokio::time::Instant::now())
+                    {
                         continue;
                     }
-                    if refresh_due && any_loaded {
-                        last_needed_refresh = Some(Instant::now());
+                    match client.fetch_needed(Some(band.name())).await {
+                        Ok(rows) => {
+                            let state = needed.get_mut(&band).unwrap();
+                            state.set = Some(rows.iter().map(|r| (r.entity_id, r.atno)).collect());
+                            state.loaded_at = Some(tokio::time::Instant::now());
+                            state.retry_at = None;
+                        }
+                        Err(e) if !retry_can_help(&e) => {
+                            warn!(
+                                "cqdx.io needed fetch for {} failed permanently ({e}); \
+                                     stopping until restart",
+                                band.name()
+                            );
+                            bridge.pending().blocked = true;
+                            break;
+                        }
+                        // A transport error ends the pass, as it does
+                        // for the PAN-93 loads (`stops_sequence`): the
+                        // next band would only wait out another timeout.
+                        Err(e @ CqdxError::Http(_)) => {
+                            debug!(
+                                "cqdx.io needed fetch for {} failed ({e}); retrying this band in 60 s and resuming the pass after it",
+                                band.name()
+                            );
+                            needed.get_mut(&band).unwrap().retry_at =
+                                Some(tokio::time::Instant::now() + NEED_DATA_RETRY);
+                            next_band = (index + 1) % candidates.len();
+                            interrupted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            debug!(
+                                "cqdx.io needed fetch for {} failed ({e}); retrying this band in 60 s",
+                                band.name()
+                            );
+                            needed.get_mut(&band).unwrap().retry_at =
+                                Some(tokio::time::Instant::now() + NEED_DATA_RETRY);
+                        }
                     }
+                }
+                if !interrupted {
+                    next_band = 0;
+                }
+                if bridge.pending().blocked {
+                    continue;
+                }
+                let now = tokio::time::Instant::now();
+                let usable: HashMap<Band, HashMap<u32, bool>> = needed
+                    .iter()
+                    .filter_map(|(band, state)| state.usable(now).map(|set| (*band, set.clone())))
+                    .collect();
+                if usable.is_empty() {
+                    continue;
                 }
 
                 match client.fetch_live_spots(None, None).await {
                     Ok(groups) => {
                         let as_of = UtcTimestamp::now();
                         let bands =
-                            count_needed_by_band(&groups, &needed, &candidates, as_of.as_second());
+                            count_needed_by_band(&groups, &usable, &candidates, as_of.as_second());
                         debug!(
                             "cqdx.io opportunity poll: {} spot groups, {:?}",
                             groups.len(),
                             bands
                         );
-                        *opportunities.write().await = Some(OpportunitySnapshot { as_of, bands });
+                        let expires = needed
+                            .iter()
+                            .filter_map(|(band, state)| {
+                                state
+                                    .loaded_at
+                                    .filter(|_| usable.contains_key(band))
+                                    .map(|at| (*band, at + OPPORTUNITY_NEEDED_EXPIRY))
+                            })
+                            .collect();
+                        *opportunities.write().await = Some(PublishedOpportunities {
+                            snapshot: OpportunitySnapshot { as_of, bands },
+                            expires,
+                        });
                     }
                     Err(e) if !retry_can_help(&e) => {
                         warn!(
