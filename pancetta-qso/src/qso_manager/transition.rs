@@ -476,7 +476,8 @@ impl QsoManager {
             // redundant re-TX the operator observed). Stamping here suppresses
             // that slot's rearm at the source, the same way the regression
             // stamp already suppresses a double-send on a repeated DX frame.
-            if qso_initiated_by == CallInitiation::Manual {
+            // PAN-498: the regression block below stamps only replies; a corrected report queues none.
+            if qso_initiated_by == CallInitiation::Manual && !is_manual_regression {
                 progress.metadata.last_call_at = Some(message.timestamp);
             }
 

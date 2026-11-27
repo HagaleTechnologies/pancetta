@@ -364,6 +364,59 @@ async fn repeated_report_leaves_call_count_and_last_call_at_alone() {
     );
 }
 
+#[tokio::test]
+async fn corrected_report_leaves_call_count_and_last_call_at_alone() {
+    let manager = manager();
+    let qso_id = manager
+        .respond_to_cq_manual(DX.into(), FREQ, None)
+        .await
+        .unwrap();
+    manager
+        .process_message(
+            MessageType::SignalReport {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+                report: -7,
+            },
+            format!("{} {} -07", OUR, DX),
+            FREQ,
+            Some(-15.0),
+        )
+        .await
+        .unwrap();
+    let pinned = UtcTimestamp::now() - SignedDuration::from_secs(20);
+    {
+        let mut qsos = manager.qsos.write().await;
+        qsos.get_mut(&qso_id).unwrap().metadata.last_call_at = Some(pinned);
+    }
+    let calls = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
+    let mut rx = manager.subscribe();
+    manager
+        .process_message(
+            MessageType::SignalReport {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+                report: -9,
+            },
+            format!("{} {} -09", OUR, DX),
+            FREQ,
+            Some(-15.0),
+        )
+        .await
+        .unwrap();
+    let progress = manager.get_qso(qso_id).await.unwrap();
+    assert!(matches!(
+        progress.state,
+        QsoState::SendingReport {
+            their_report: Some(-9),
+            ..
+        }
+    ));
+    assert_eq!(progress.metadata.call_count, calls);
+    assert_eq!(progress.metadata.last_call_at, Some(pinned));
+    assert!(sends(&drain(&mut rx)).is_empty());
+}
+
 /// On-air regression (9K2MP, 2026-06-22): once the DX has ENGAGED (we're in
 /// SendingReport — we received their report), the call-count cap must NOT
 /// retire the QSO. Previously a DX that re-requested several times blew past
