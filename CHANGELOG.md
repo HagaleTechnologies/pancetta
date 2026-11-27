@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 - PAN-452: a band listed twice in an `[[autonomous.band_plan]]` window no longer stops quiet-band rotation from reaching bands listed after it. A window of 40m, 80m, 40m, 20m now rotates through 40m, 80m and 20m in first-occurrence order.
 
+=======
+- PAN-453: needed-activity band counts now refresh each band's cqdx.io needed set independently. Failed requests retry after 60 seconds, a failing band no longer stalls later bands or fresh spots, and counts expire after 20 minutes without a successful needed-set load. Automated coverage only.
+>>>>>>> e3efef31971c8eecab9625a93c474e0400c170d5
 - PAN-489: the TX check that holds a call while the DX is working someone else on your slot no longer lets the call through after a system clock step. Before, a step of 1 s or more in either direction made the DX's earlier decodes look too new or too old to count, so the call could key on the slot the DX was using. Now, for two slots of the current mode after the step is seen, a call to a station you are in QSO with that the TX worker picks up after the step is held, and the `tx.policy` line reads `holding TX: system clock stepped -10.0 s within the DX-parity window, so the DX's earlier sightings cannot be aged`. A call it picked up before the step is still dropped with `dropping stale TX after a -10.0 s clock jump` (PAN-483). A CQ, or any frame with no QSO partner, is not held. To tolerate small backward steps, the check treats a DX sighting dated up to 1 s into the future as fresh. Automated coverage only; no real clock step has been tested.
 - PAN-468: internal only. CI now builds `pancetta-core` and `pancetta-ft8` with Rust 1.88.0, their declared minimum (default, all and no default features), so a newer language feature or a dependency that needs a newer Rust fails CI and names the dependency. Before, only a clippy lint on the crates' own std API use checked it. No behaviour change.
 - PAN-478: a failed QRZ login no longer reads as a callsign miss. If QRZ refuses the login with wording such as `not found`, Shift+L now shows `<CALL> lookup failed` and caches nothing, so the next lookup tries again. Before, it showed `<CALL> not found on QRZ` and kept every callsign looked up during the bad login cached as missing until restart. A genuine `Not found` from a QRZ lookup is shown and cached as before. Automated coverage only.
