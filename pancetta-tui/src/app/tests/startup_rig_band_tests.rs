@@ -54,15 +54,19 @@ async fn first_rig_report_in_the_same_band_adopts_the_exact_dial() {
 }
 
 #[tokio::test]
-async fn later_rig_reports_only_move_the_delta() {
+async fn a_later_rig_report_in_the_same_band_only_moves_the_delta() {
     let mut app = fixture_app().await;
     app.update_frequency(18_100_000);
 
-    app.update_frequency(7_074_000);
+    app.update_frequency(18_110_000);
 
-    assert_eq!(shown_band(&app), "17M", "only the first report is adopted");
+    assert_eq!(
+        shown_band(&app),
+        "17M",
+        "same-band readback only moves delta"
+    );
     assert_eq!(app.station_info.operating_frequency, 18.1);
-    assert_eq!(app.radio_frequency, Some(7.074));
+    assert_eq!(app.radio_frequency, Some(18.11));
 }
 
 #[tokio::test]

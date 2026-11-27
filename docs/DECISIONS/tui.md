@@ -796,7 +796,7 @@ offset on the wrong dial), and two identical dials on a band
   modal or front-panel QSY to another band, which already misfires at band
   level. Follow-up ticket: "Operators should be able to answer a same-dial
   WSJT-X decode after a manual QSY to another band, so that the frequency
-  modal does not leave Space refusing".
+  modal does not leave Space refusing" (fixed by PAN-475).
 
 ## Hound engage on WSJT-X rows follows the dial rule (PAN-429, 2026-11)
 
@@ -818,6 +818,14 @@ when WSJT-X heard the Fox on another band.
   gap, not an `EXT` one. Follow-up ticket: "Operators should not engage Hound
   on a network-spotted Fox from another band, so that Shift+H never calls a
   Fox on a dial nobody heard it on".
+
+## The TUI follows a settled rig band (PAN-475, 2026-11)
+
+The TUI follows a cross-band rig readback once no pancetta-commanded QSY is settling. The coordinator and TUI share `FREQ_COMMAND_SETTLE_MS` (3 s). During that window an old-band readback remains lag, so the PAN-443 refusal guard still blocks a call on the old band. Afterward the readback becomes the target dial.
+
+Following the rig updates the band chip and operating frequency without clearing Band Activity, Callers, DX Hunter or the band cache. Clearing them would erase the `EXT` row the operator is trying to answer. Shift+F sets the target dial when Enter sends the CAT command, so an old-band `EXT` row is refused while the rig slews. Spot QSY and band keys stamp the same commanded-dial window. A slow rig that has not moved after 3 s is followed back to its reported band, matching the coordinator's decision. No change is made to the WSJT-X dial guard itself.
+
+Out of scope: changing the WSJT-X dial tolerance, retuning to a WSJT-X decode, clearing live lists on a manual QSY, and a new rig-settle configuration option.
 
 ## WSJT-X decodes keep their own state (PAN-434, 2026-11)
 

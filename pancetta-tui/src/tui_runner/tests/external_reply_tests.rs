@@ -673,3 +673,140 @@ async fn enter_on_a_cross_band_ext_or_ex_n_dx_row_opens_why_and_sends_nothing() 
         assert!(app.read().await.show_why, "EX+N {ex_n}: Enter opens Why");
     }
 }
+
+// PAN-475: keep the current readback when inserting a decode after a QSY.
+async fn seed_cq_keeping_readback(app: &Arc<RwLock<App>>, dial_mhz: f64, panel: ActivePanel) {
+    let mut a = app.write().await;
+    a.add_decoded_message(ext_decode("CQ N4BP EM70", dial_mhz, "FT8", false))
+        .await
+        .unwrap();
+    a.active_panel = panel;
+    a.band_activity_scroll = 0;
+    a.dx_hunter_scroll = 0;
+    assert_eq!(a.focused_callsign().as_deref(), Some("N4BP"));
+}
+
+async fn submit_freq_modal(r: &mut TuiRunner, dial: &str) {
+    r.handle_key_event(key_shift('F')).await.unwrap();
+    for c in dial.chars() {
+        r.handle_key_event(key(c)).await.unwrap();
+    }
+    r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+}
+
+async fn band_keys_to_20m(r: &mut TuiRunner) {
+    r.handle_key_event(key('-')).await.unwrap();
+    r.handle_key_event(key('=')).await.unwrap();
+}
+
+#[tokio::test]
+async fn space_calls_a_same_dial_ext_row_after_a_frequency_modal_qsy_to_another_band() {
+    for panel in [ActivePanel::BandActivity, ActivePanel::DxHunter] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        band_keys_to_20m(&mut r).await;
+        while cmd_rx.try_recv().is_ok() {}
+        submit_freq_modal(&mut r, "7.074").await;
+        while cmd_rx.try_recv().is_ok() {}
+        r.handle_message(TuiMessage::FrequencyUpdate {
+            vfo: 0,
+            frequency: 7_074_000,
+        })
+        .await
+        .unwrap();
+        seed_cq_keeping_readback(&app, 7.074, panel).await;
+        r.handle_key_event(key(' ')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::CallStation { ref callsign, frequency: 1234, dx_parity: Some(pancetta_core::slot::SlotParity::Even) }) if callsign == "N4BP")
+        );
+        assert_eq!(app.read().await.status_message(), "Calling N4BP...");
+    }
+}
+
+#[tokio::test]
+async fn space_calls_a_same_dial_ext_row_after_a_front_panel_qsy_to_another_band() {
+    for panel in [ActivePanel::BandActivity, ActivePanel::DxHunter] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        band_keys_to_20m(&mut r).await;
+        while cmd_rx.try_recv().is_ok() {}
+        app.write().await.update_frequency_at(
+            7_074_000,
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
+        );
+        assert_eq!(app.read().await.station_info.operating_frequency, 7.074);
+        let state = app.read().await;
+        assert_eq!(
+            state.config.bands.bands[state.current_band_index].name,
+            "40M"
+        );
+        drop(state);
+        assert_eq!(
+            app.read().await.status_message(),
+            "Rig is on 7.074 MHz (40M)"
+        );
+        seed_cq_keeping_readback(&app, 7.074, panel).await;
+        r.handle_key_event(key(' ')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::CallStation { ref callsign, frequency: 1234, .. }) if callsign == "N4BP")
+        );
+        assert_eq!(app.read().await.status_message(), "Calling N4BP...");
+    }
+}
+
+#[tokio::test]
+async fn a_lagging_readback_after_a_band_key_still_refuses() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 7_074_000,
+    })
+    .await
+    .unwrap();
+    r.handle_key_event(key('=')).await.unwrap();
+    r.handle_key_event(key('=')).await.unwrap();
+    while cmd_rx.try_recv().is_ok() {}
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 7_074_000,
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.read().await.station_info.operating_frequency, 14.074);
+    seed_cq_keeping_readback(&app, 7.074, ActivePanel::BandActivity).await;
+    r.handle_key_event(key(' ')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Can't work N4BP. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8 (rig reads 40m)."
+    );
+}
+
+#[tokio::test]
+async fn space_refuses_an_old_band_ext_row_while_a_frequency_modal_qsy_settles() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    band_keys_to_20m(&mut r).await;
+    while cmd_rx.try_recv().is_ok() {}
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 14_074_000,
+    })
+    .await
+    .unwrap();
+    submit_freq_modal(&mut r, "7.074").await;
+    while cmd_rx.try_recv().is_ok() {}
+    r.handle_message(TuiMessage::FrequencyUpdate {
+        vfo: 0,
+        frequency: 14_074_000,
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.read().await.station_info.operating_frequency, 7.074);
+    seed_cq_keeping_readback(&app, 14.074, ActivePanel::BandActivity).await;
+    r.handle_key_event(key(' ')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Can't work N4BP. WSJT-X heard it on 20m FT8. Pancetta is on 40m FT8 (rig reads 20m)."
+    );
+}

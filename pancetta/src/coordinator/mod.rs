@@ -506,18 +506,8 @@ pub fn is_stale_band_decode(captured_dial_hz: Option<u64>, live_dial_hz: u64) ->
     }
 }
 
-/// Settle window (ms) after a pancetta-initiated frequency command during which
-/// the hamlib dial-poll loop suppresses its own C9 teardown.
-///
-/// When the TUI / autonomous operator commands a band change it updates the
-/// shared dial frequency and fires the `BandChanged` teardown *itself*. The
-/// rig then takes a moment to slew; until it reaches the commanded frequency
-/// the poll loop may read the **old** frequency once or twice. Without this
-/// window the poll would mistake that stale reading for an operator dial move
-/// *back* to the old band and fire a second (spurious) teardown. Sized to
-/// comfortably cover a rigctld round-trip plus VFO slew at the 500 ms poll
-/// cadence.
-pub const FREQ_COMMAND_SETTLE_MS: u64 = 3_000;
+// Shared with the TUI rig-band follower (PAN-475).
+pub use pancetta_core::types::band::FREQ_COMMAND_SETTLE_MS;
 
 /// Decide whether a band change the **dial-poll loop** just observed
 /// (`last_seen_hz` → `polled_hz`) is attributable to a frequency change

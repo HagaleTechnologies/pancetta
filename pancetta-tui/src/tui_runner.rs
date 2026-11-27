@@ -1925,6 +1925,7 @@ impl TuiRunner {
                             vfo: 0,
                             frequency: rx,
                         })?;
+                        app.apply_manual_qsy(rx);
                         let (split_enabled, split_freq) = match tx_hz {
                             Some(tx) => (true, tx),
                             None => (false, 0),

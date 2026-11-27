@@ -26,7 +26,10 @@ is the `remote.wsjtx` Diagnostics line through `super::emit_diagnostic`.
 decode refuse with a status line unless WSJT-X's dial is within 10 Hz of
 pancetta's dial (`same_dial`), the mode matches, and the rig readback is
 not a band change (`is_band_change`). Pancetta never retunes to WSJT-X's
-dial (PAN-435, PAN-443). Relaxing the check would let a call go out where
+dial (PAN-435, PAN-443). Since PAN-475 the operating frequency follows a
+settled cross-band readback, so a Shift+F or front-panel QSY no longer
+leaves the lag guard refusing; the guard itself is unchanged. Relaxing
+the check would let a call go out where
 pancetta never heard the station. The rule and its reasons are in
 `docs/DECISIONS/tui.md`, "WSJT-X decodes are matched by dial (PAN-443,
 2026-11)".
