@@ -58,9 +58,8 @@ async fn s1_auto_mode_switches_frequency_after_silent_cq_streak() {
     let op = auto_operator(2, 3);
     let mut sim = Sim::new(US, Some(GRID)).await.with_autonomous(op);
 
-    // Enough silent ticks to fire well past 3 no-response CQ rounds
-    // (cq_after_idle_cycles=2 means one idle tick + one CQ tick per round).
-    sim.tick_n(20).await;
+    // Allow three 30 s CQ timeouts plus idle slots between rounds.
+    sim.tick_n(30).await;
 
     let tl = sim.into_timeline();
     let cq_freqs: Vec<f64> = tl
@@ -72,7 +71,7 @@ async fn s1_auto_mode_switches_frequency_after_silent_cq_streak() {
 
     assert!(
         cq_freqs.len() >= 4,
-        "expected at least 4 self-CQ transmissions in 20 silent ticks, got {}\n{tl}",
+        "expected at least 4 self-CQ transmissions in 30 silent ticks, got {}\n{tl}",
         cq_freqs.len()
     );
     let first = cq_freqs[0];

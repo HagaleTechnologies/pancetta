@@ -21,7 +21,7 @@
 //! Run: `cargo test -p pancetta-qso --test adversarial_completion`.
 
 use pancetta_qso::sim::Sim;
-use pancetta_qso::{QsoFailureReason, QsoManagerConfig, TimeoutConfig};
+use pancetta_qso::{QsoFailureReason, QsoManagerConfig, QsoState, TimeoutConfig};
 
 const US: &str = "K5ARH";
 const GRID: &str = "EM10";
@@ -317,10 +317,28 @@ async fn a7_dx_corrects_report_we_latch_newest_and_complete() {
     // We must not have prematurely completed on the corrected report, and we
     // must still be able to complete on the close.
     tl.assert_completed_with("NP4VA");
+    assert!(tl.completions.iter().any(|completion| completion.slot == 3));
     // We re-sent our R-report at least twice (once per received report).
     assert!(
         tl.count_transmitted_containing("NP4VA K5ARH R") >= 2,
         "expected to re-send R on the corrected report\n{tl}"
+    );
+    assert!(
+        tl.transmissions
+            .iter()
+            .any(|tx| tx.slot == 2 && tx.text.contains("NP4VA K5ARH R")),
+        "corrected report must cause an R-report in slot 2\n{tl}"
+    );
+    assert!(
+        tl.transitions.iter().any(|tr| tr.slot == 2
+            && matches!(
+                tr.new_state,
+                QsoState::SendingReport {
+                    their_report: Some(-9),
+                    ..
+                }
+            )),
+        "corrected report must latch -9 in slot 2\n{tl}"
     );
 }
 
