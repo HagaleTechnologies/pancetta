@@ -112,7 +112,7 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let line2 = render_line2(app, last_decode);
     let line3 = render_line3(app, &call, last_decode);
 
-    let why = render_why_line(app, inner.width, UtcTimestamp::now());
+    let why = render_why_line(app, inner.width, crate::render_time::now());
     let mut lines = vec![line1];
     if let Some(info) = focused_qrz_info(app) {
         let parts: Vec<&str> = [&info.name, &info.qth, &info.grid, &info.country]

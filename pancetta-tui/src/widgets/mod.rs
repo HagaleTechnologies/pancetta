@@ -286,7 +286,7 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         }
 
         // Compute `now` once per render for the occupancy strip + cursor style.
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
 
         // Occupancy strip: top row of the waterfall.
         for col in 0..width {
@@ -394,7 +394,7 @@ mod tests {
         use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
         use pancetta_core::time::UtcTimestamp;
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let decoded = vec![(
             1500.0,
             SlotParity::Even,
@@ -409,7 +409,7 @@ mod tests {
         use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
         use pancetta_core::time::UtcTimestamp;
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let decoded = vec![(1500.0, SlotParity::Odd, now - SignedDuration::from_secs(10))];
         let c = occupancy(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
         assert_eq!(c, Occupancy::OtherParity);
@@ -420,7 +420,7 @@ mod tests {
         use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
         use pancetta_core::time::UtcTimestamp;
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let decoded = vec![(
             1500.0,
             SlotParity::Even,
@@ -437,7 +437,7 @@ mod tests {
         use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
         use pancetta_core::time::UtcTimestamp;
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let decoded = vec![(
             2000.0,
             SlotParity::Even,
@@ -459,7 +459,7 @@ mod tests {
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
 
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let data: Vec<Vec<f32>> = vec![vec![0.5; 64]; 30];
         let decoded = vec![(1500.0, SlotParity::Even, now - SignedDuration::from_secs(5))];
         let area = Rect::new(0, 0, 80, 10);
@@ -500,7 +500,7 @@ mod tests {
         use jiff::SignedDuration;
         use pancetta_core::slot::SlotParity;
         use pancetta_core::time::UtcTimestamp;
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let decoded = vec![(
             1500.0,
             SlotParity::Even,
@@ -521,7 +521,7 @@ mod tests {
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
 
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
         let decoded = vec![(1500.0, SlotParity::Even, now - SignedDuration::from_secs(5))];
         let area = Rect::new(0, 0, 80, 10);
@@ -557,7 +557,7 @@ mod tests {
             occupancy_own: Theme::DARK.occupancy_other,
             ..Theme::DARK
         };
-        let now = UtcTimestamp::now();
+        let now = crate::render_time::now();
         let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
         let area = Rect::new(0, 0, 80, 10);
 

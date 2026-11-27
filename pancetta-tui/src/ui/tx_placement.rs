@@ -555,7 +555,7 @@ fn render_park_line(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
         // the clause.
         let mins = app
             .parked_since
-            .map(|t| (UtcTimestamp::now() - t).as_mins().max(0))
+            .map(|t| (crate::render_time::now() - t).as_mins().max(0))
             .unwrap_or(0);
         let warn = if code.is_some_and(|c| c < 3) {
             "\u{26a0} "

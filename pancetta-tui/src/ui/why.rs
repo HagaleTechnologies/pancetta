@@ -15,7 +15,7 @@ pub fn render_why_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let modal = Rect::new(area.x + 2, area.y + 2, area.width - 4, area.height - 4);
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let (title, lines) = match dx_reason::focused(app, now) {
         FocusedReason::NoFocus => (
             " Why? — Esc/w close ".to_owned(),

@@ -66,7 +66,7 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    let now = UtcTimestamp::now();
+    let now = crate::render_time::now();
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(
         "QSO: ",
