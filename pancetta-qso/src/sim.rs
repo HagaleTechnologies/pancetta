@@ -106,18 +106,16 @@
 //!
 //! # A note on time
 //!
-//! The engine stamps the *message-received* timestamp inside
-//! [`process_message`](QsoManager::process_message) with the real wall clock,
-//! which the harness cannot intercept. That does **not** affect any timeline
-//! outcome: message routing and state transitions are time-independent, and the
-//! only time-driven behavior — the manual keep-call watchdog and the per-state
-//! timeouts — is governed entirely by the explicit virtual `now` the harness
-//! passes to [`check_timeouts_at`](QsoManager::check_timeouts_at) and
-//! [`rearm_manual_calls_at`](QsoManager::rearm_manual_calls_at). The virtual
-//! clock is the single source of truth for everything that matters.
+//! The manager reads the harness's virtual slot clock for message and state
+//! timestamps. The harness also runs rearm and timeout checks once per tick.
+//! Real time affects only the initial slot boundary and parity.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
 
 use jiff::SignedDuration;
 use pancetta_core::slot::SlotParity;
@@ -147,28 +145,10 @@ pub const SLOT_SECONDS: i64 = 15;
 /// harness is built** ([`SimClock::base`]) — i.e. real `now` snapped *down* to
 /// the current slot start. This anchoring is deliberate and load-bearing.
 ///
-/// The engine stamps `QsoState::started_at` / `first_call_at` with the real
-/// `UtcTimestamp::now()`, and the per-state timeouts / manual watchdog compute
-/// `virtual_now - started_at` (then cast to `u64` for comparison). Two failure
-/// modes must be avoided:
-///
-/// - If the virtual base were in the **past** of those real timestamps, the
-///   difference would be negative and the `as u64` cast would wrap to a huge
-///   value, spuriously timing out *every* QSO immediately.
-/// - If the virtual base were far in the **future** of real now, slot 0 would
-///   already show a large elapsed time, again risking a spurious per-state
-///   timeout on the very first slot.
-///
-/// Snapping *down* to the containing slot boundary puts `base` at most one slot
-/// (<15 s) before real `now`, so any `started_at` (captured during operator
-/// actions, essentially at real `now`) lands in `[base, base + 15 s)`. Elapsed
-/// time therefore starts in `[0, 15 s)` and grows by exactly one slot per
-/// [`SimClock::advance`]. The 30 s per-state timeouts fire ~2 slots after a
-/// state is entered (realistic FT8 behavior, and the harness advances the QSO
-/// out of those states with the next injected decode first), and the 5-minute /
-/// 10-call manual watchdog is reachable and deterministic. Slot parity is taken
-/// from the base boundary via [`SlotParity::of`], so it is internally consistent
-/// with the engine's own parity math.
+/// The QSO engine reads this same virtual clock for message and state stamps.
+/// The base remains anchored to the current wall-clock slot to preserve each
+/// scenario's parity; only explicit harness ticks advance its time. The
+/// harness runs the manager's watchdog once per tick.
 #[derive(Debug, Clone)]
 pub struct SimClock {
     base: UtcTimestamp,
@@ -217,12 +197,9 @@ impl SimClock {
     /// **of Even parity**: floor `UtcTimestamp::now()` to its slot boundary, then bump
     /// forward one slot if that boundary is Odd.
     ///
-    /// This is the base the autonomous-drive harness uses. It keeps `base`
-    /// within ~one slot of real `now` (so the QSO engine's real-clock
-    /// `started_at` stamps land just after `base`, avoiding the negative-
-    /// elapsed wrap the [`SimClock`] type docs warn about) while making the
-    /// per-slot parity deterministic — slot 0 Even, slot 1 Odd, … — so the
-    /// autonomous operator's Even-parity TX gating is reproducible.
+    /// This is the base the autonomous-drive harness uses. The manager's
+    /// virtual wall source is synchronized when the base changes, so parity
+    /// and message timestamps stay on the same slot grid.
     pub fn new_even() -> Self {
         let floored = Self::slot_floor(UtcTimestamp::now());
         let base = if SlotParity::of(floored) == SlotParity::Even {
@@ -786,6 +763,7 @@ pub struct Sim {
     exchange: MessageExchange,
     our_callsign: String,
     clock: SimClock,
+    manager_wall_ns: Arc<AtomicI64>,
     /// Decodes injected for the *current* slot, drained on `tick`.
     pending_injects: Vec<Reception>,
     /// The accumulated timeline.
@@ -818,8 +796,8 @@ struct AutonomousDrive {
 }
 
 impl Sim {
-    /// Build a harness for the given station. Starts the underlying
-    /// [`QsoManager`] and subscribes to its event stream.
+    /// Build a harness for the given station. Installs the virtual clock in
+    /// the [`QsoManager`] and subscribes to its event stream.
     pub async fn new(our_callsign: &str, our_grid: Option<&str>) -> Self {
         Self::with_config(QsoManagerConfig {
             our_callsign: our_callsign.to_string(),
@@ -840,17 +818,26 @@ impl Sim {
         manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             14_074_000,
         )));
-        manager
-            .start()
-            .await
-            .expect("QsoManager::start should not fail in the sim harness");
+        let clock = SimClock::new();
+        let manager_wall_ns = Arc::new(AtomicI64::new(
+            clock
+                .now()
+                .as_nanosecond_i64()
+                .expect("sim instant in range"),
+        ));
+        let wall = Arc::clone(&manager_wall_ns);
+        manager.set_slot_clock(pancetta_core::SlotClock::without_step_detection(
+            Arc::new(move || UtcTimestamp::from_nanosecond_i64(wall.load(Ordering::Acquire))),
+            Arc::new(AtomicI64::new(crate::qso_manager::DEFAULT_SLOT_NS)),
+        ));
         let events = manager.subscribe();
         Self {
             manager,
             events,
             exchange: MessageExchange::new(our_callsign.clone()),
             our_callsign,
-            clock: SimClock::new(),
+            clock,
+            manager_wall_ns,
             pending_injects: Vec::new(),
             timeline: Timeline::default(),
             band: BandModel::clear(),
@@ -910,22 +897,25 @@ impl Sim {
         operator: AutonomousOperator,
         evaluator: Box<dyn DxEvaluator>,
     ) -> Self {
-        // Anchor the virtual clock to a wall-clock Even-parity slot boundary so
-        // the operator's slot-parity TX gating (the sim never wires a
-        // slot-period source, so it runs on the default FT8 15 s grid)
-        // is deterministic — slot 0 Even, slot 1 Odd, … — while keeping `base`
-        // within ~one slot of real `now`. (The latter matters because the QSO
-        // engine stamps `started_at`/`first_call_at` with the REAL clock; an
-        // epoch-anchored base far in the past would make `virtual_now -
-        // started_at` negative and wrap the timeout math — see the SimClock
-        // type docs.) Without this, `Sim::new`'s base lands on a random parity,
-        // making autonomous-drive runs flaky.
+        // Keep the autonomous operator's slot 0 on Even parity and move the
+        // manager's virtual wall source to the same new base.
         self.clock = SimClock::new_even();
+        self.sync_manager_wall();
         self.autonomous = Some(AutonomousDrive {
             operator,
             evaluator,
         });
         self
+    }
+
+    fn sync_manager_wall(&self) {
+        self.manager_wall_ns.store(
+            self.clock
+                .now()
+                .as_nanosecond_i64()
+                .expect("sim instant in range"),
+            Ordering::Release,
+        );
     }
 
     /// `true` if this harness is in autonomous-drive mode.
@@ -1157,8 +1147,8 @@ impl Sim {
 
         // 1c. PAN-280: every frame we sent this slot aired, so a completion
         // held on its closing 73 logs now, at this same slot, and before the
-        // watchdog below could expire it (the engine stamps the queue time
-        // from the wall clock, which the virtual `now` runs ahead of).
+        // watchdog below can expire it. The engine stamps queue time from
+        // this same virtual slot clock.
         self.drain_events(slot);
         self.air_unconfirmed_sends(now).await;
 
@@ -1175,6 +1165,7 @@ impl Sim {
         // 4. Advance the clock.
         self.timeline.last_slot = slot;
         self.clock.advance();
+        self.sync_manager_wall();
     }
 
     /// Run one autonomous decision cycle for the current slot: feed the
@@ -2112,3 +2103,7 @@ mod hifi_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sim/tests/virtual_clock_tests.rs"]
+mod virtual_clock_tests;

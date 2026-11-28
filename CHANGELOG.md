@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-498: when a DX re-sends its report with a different value, a manual QSO now repeats its R-report on the next TX slot, as it does for an unchanged repeat. Before, the corrected report restamped the last-call time and held the repeat back a full slot, which could skip one of our TX slots. The QSO simulator now runs the QSO engine on its own virtual slot clock and drives the watchdog itself, so simulator tests no longer depend on the real time they run at; this removes the `a7_dx_corrects_report_we_latch_newest_and_complete` flake. Automated coverage only; not checked on air.
+
 - PAN-449: a needed-activity band hop that waits for a QSO in progress now says so. When cqdx.io shows more needed entities on another band but a partner has answered, the Diagnostics overlay reads `Band hop 20m -> 17m waiting: QSO with K1ABC in progress`, at most once per target band every 5 minutes, and the hop runs on the first slot after the QSO ends. Before, only a held band-plan move wrote this line. A needed hop held by Fox mode still writes none. Automated coverage only.
 
 - PAN-475: Shift+F now sets pancetta's target dial when Enter is pressed. Cross-band moves through Shift+F or the rig's own controls are reflected in the TUI after the rig settles, so Space on a same-dial WSJT-X `EXT` row can call. A cross-band readback not commanded by pancetta is followed with `Rig is on 7.074 MHz (40M)`; for 3 s after a band key, Shift+F or spot QSY, an old-band readback is treated as rig lag. Live decode rows stay visible. Automated coverage only; real rig and WSJT-X qualification pending.
