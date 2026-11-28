@@ -495,6 +495,132 @@ fn cqdx_spot(call: &str, rf_hz: u64) -> crate::tui_runner::CqdxSpotInfo {
     }
 }
 
+async fn seed_net(app: &Arc<RwLock<App>>, rf_hz: u64) {
+    let mut a = app.write().await;
+    a.station_info.operating_frequency = 14.074;
+    a.station_info.mode = "FT8".to_string();
+    a.radio_frequency = None;
+    a.merge_spot_groups(&[cqdx_spot("N4BP", rf_hz)]);
+    a.active_panel = ActivePanel::DxHunter;
+    a.dx_hunter_scroll = 0;
+    assert_eq!(
+        a.selected_dx_hunter_row().unwrap().source,
+        SpotSource::Network
+    );
+}
+
+#[tokio::test]
+async fn shift_h_refuses_a_cross_band_net_spot() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_net(&app, 7_075_210).await;
+    r.handle_key_event(key_shift('H')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Hound: tune to 7.074 MHz FT8 for N4BP."
+    );
+}
+
+#[tokio::test]
+async fn shift_h_engages_a_net_spot_on_the_current_dial() {
+    for readback in [None, Some(14.074_010)] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        seed_net(&app, 14_075_210).await;
+        app.write().await.radio_frequency = readback;
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::EngageHound { callsign, fox_freq: 1210, dx_parity: None, fox_grid: None }) if callsign == "N4BP")
+        );
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(
+            app.read().await.status_message(),
+            "Hound: engaging N4BP as Fox..."
+        );
+    }
+}
+
+#[tokio::test]
+async fn shift_h_refuses_a_net_spot_off_the_rig_dial() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_net(&app, 14_075_210).await;
+    app.write().await.radio_frequency = Some(14.074_011);
+    r.handle_key_event(key_shift('H')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Hound: tune to 14.074 MHz FT8 for N4BP."
+    );
+}
+
+#[tokio::test]
+async fn shift_h_refuses_a_net_spot_during_a_band_change() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_net(&app, 7_075_210).await;
+    app.write().await.radio_frequency = Some(7.074);
+    r.handle_key_event(key_shift('H')).await.unwrap();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        app.read().await.status_message(),
+        "Hound: rig and operating bands differ."
+    );
+}
+
+#[tokio::test]
+async fn shift_h_refuses_a_net_spot_without_a_confirmed_offset() {
+    for (rf_hz, missing_rf, unknown_dial, warning) in [
+        (
+            14_075_210,
+            true,
+            false,
+            "Hound: no usable FT8 spot frequency for N4BP.",
+        ),
+        (
+            14_025_000,
+            false,
+            false,
+            "Hound: no usable FT8 spot frequency for N4BP.",
+        ),
+        (
+            14_074_000,
+            false,
+            false,
+            "Hound: no usable FT8 spot frequency for N4BP.",
+        ),
+        (
+            14_075_210,
+            false,
+            true,
+            "Hound: pancetta's dial is unknown.",
+        ),
+    ] {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        seed_net(&app, rf_hz).await;
+        {
+            let mut a = app.write().await;
+            if missing_rf {
+                a.dx_stations.get_mut("N4BP").unwrap().spot_rf_hz = None;
+            }
+            if unknown_dial {
+                a.station_info.operating_frequency = 0.0;
+            }
+        }
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(app.read().await.status_message(), warning);
+    }
+}
+
+#[tokio::test]
+async fn space_on_a_cross_band_net_spot_sends_call_network_spot() {
+    let (mut r, cmd_rx, app) = make_runner().await;
+    seed_net(&app, 7_075_210).await;
+    r.handle_key_event(key(' ')).await.unwrap();
+    assert!(
+        matches!(cmd_rx.try_recv(), Ok(TuiCommand::CallNetworkSpot { callsign, dial_hz: 7_074_000, audio_offset_hz: Some(1210), .. }) if callsign == "N4BP")
+    );
+    assert!(cmd_rx.try_recv().is_err());
+}
+
 /// Put pancetta on `pancetta_mhz` FT8 with no rig readback, merge a cqdx.io
 /// spot of N4BP at 14 075 210 Hz, then add a WSJT-X CQ from N4BP heard on
 /// `dial_mhz` in `mode`. The row's `spot_rf_hz` is then set to `spot_rf_hz`,

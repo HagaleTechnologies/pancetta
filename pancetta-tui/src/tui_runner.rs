@@ -2447,17 +2447,16 @@ impl TuiRunner {
                 let selected = app.selected_dx_hunter_row().map(|station| {
                     (
                         station.call_sign.clone(),
-                        station.audio_offset_hz.unwrap_or(1500),
+                        app.hound_fox_offset(station),
                         station.slot_parity,
                         station.grid_square.clone(),
-                        app.external_row_refusal(station),
                     )
                 });
                 match selected {
-                    Some((_, _, _, _, Some(refusal))) => {
+                    Some((_, Err(refusal), _, _)) => {
                         app.set_local_status(refusal, pancetta_core::DiagnosticLevel::Warn);
                     }
-                    Some((callsign, fox_freq, dx_parity, fox_grid, None)) => {
+                    Some((callsign, Ok(fox_freq), dx_parity, fox_grid)) => {
                         self.message_tx.send(TuiCommand::EngageHound {
                             callsign: callsign.clone(),
                             fox_freq,
