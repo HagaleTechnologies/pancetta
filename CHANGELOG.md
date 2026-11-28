@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-449: a needed-activity band hop that waits for a QSO in progress now says so. When cqdx.io shows more needed entities on another band but a partner has answered, the Diagnostics overlay reads `Band hop 20m -> 17m waiting: QSO with K1ABC in progress`, at most once per target band every 5 minutes, and the hop runs on the first slot after the QSO ends. Before, only a held band-plan move wrote this line. A needed hop held by Fox mode still writes none. Automated coverage only.
+
 - PAN-475: Shift+F now sets pancetta's target dial when Enter is pressed. Cross-band moves through Shift+F or the rig's own controls are reflected in the TUI after the rig settles, so Space on a same-dial WSJT-X `EXT` row can call. A cross-band readback not commanded by pancetta is followed with `Rig is on 7.074 MHz (40M)`; for 3 s after a band key, Shift+F or spot QSY, an old-band readback is treated as rig lag. Live decode rows stay visible. Automated coverage only; real rig and WSJT-X qualification pending.
 
 - PAN-452: a band listed twice in an `[[autonomous.band_plan]]` window no longer stops quiet-band rotation from reaching bands listed after it. A window of 40m, 80m, 40m, 20m now rotates through 40m, 80m and 20m in first-occurrence order.

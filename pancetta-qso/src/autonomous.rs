@@ -680,9 +680,10 @@ pub struct BandStrategy {
     /// returned, so `hop_waited` can restore it when the hop is not carried
     /// out. Replaced at every `next_hop`.
     before_last_hop: Option<LowActivityState>,
-    /// PAN-385: the plan-window hop held back this slot because a partner
-    /// has answered, for the Diagnostics waiting line. Replaced at every
-    /// `next_hop`.
+    /// PAN-385: the hop held back this slot by the exchange or Fox-mode
+    /// gate, for the Diagnostics waiting line: a pending plan-window move,
+    /// or (PAN-449, exchange only) a due needed-activity hop. Replaced at
+    /// every `next_hop`.
     held_hop: Option<crate::band_scheduler::BandHopReason>,
 }
 
@@ -900,7 +901,8 @@ impl BandStrategy {
         }
     }
 
-    /// PAN-385: take the plan-window hop the last `next_hop` held back
+    /// PAN-385: take the plan-window move, or the due needed-activity hop
+    /// (PAN-449, not under Fox mode), the last `next_hop` held back
     /// because a partner had answered or Fox mode was on (PAN-447: the
     /// exchange or Fox-mode gate was closed). The
     /// coordinator reports it as a Diagnostics waiting line; nothing moves
@@ -966,9 +968,21 @@ impl BandStrategy {
             // An exchange is in progress or Fox mode is on (PAN-447).
             // The plan move stays pending; report it as waiting without
             // emitting a hop (no frequency command, no allocator reset).
-            self.held_hop = pending
+            // PAN-449: with no plan move, a needed-activity hop that is due
+            // now is held for the same waiting line while a partner has
+            // answered. Fox mode holds for a whole session, so a needed hop
+            // it holds stays silent (PAN-447). `needed_pick` changes nothing.
+            let plan_hold = pending
                 .and_then(|i| self.plan_pick(&plan[i], current, grey))
                 .map(|(_, _, reason)| reason);
+            self.held_hop = plan_hold.or_else(|| {
+                if self.scheduler.fox_mode() {
+                    return None;
+                }
+                self.needed_pick(now, slot_ns, current, active, grey)
+                    .filter(|(to, _)| self.dial_for(*to).is_some())
+                    .map(|(_, reason)| reason)
+            });
             return None;
         }
 
@@ -2838,7 +2852,8 @@ impl AutonomousOperator {
         self.band_strategy.hop_waited();
     }
 
-    /// PAN-385: take the plan-window hop the last `decide` held back because
+    /// PAN-385: take the plan-window move, or the due needed-activity hop
+    /// (PAN-449, not under Fox mode), the last `decide` held back because
     /// a partner had answered or Fox mode was on (PAN-447). No `ChangeBand`
     /// was emitted for it; the
     /// coordinator reports it as a Diagnostics waiting line.
