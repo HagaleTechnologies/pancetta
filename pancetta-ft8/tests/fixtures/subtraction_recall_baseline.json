@@ -1,188 +1,141 @@
 {
-  "tests/fixtures/wav/basicft8/170923_082000.wav:budgeted": [
-    "I07OGE LC1TVY EI22|2481.2|-0.080"
-  ],
-  "tests/fixtures/wav/basicft8/170923_082000.wav:unlimited": [
-    "I07OGE LC1TVY EI22|2481.2|-0.080"
-  ],
-  "tests/fixtures/wav/basicft8/170923_082015.wav:budgeted": [],
-  "tests/fixtures/wav/basicft8/170923_082015.wav:unlimited": [],
-  "tests/fixtures/wav/basicft8/170923_082030.wav:budgeted": [],
-  "tests/fixtures/wav/basicft8/170923_082030.wav:unlimited": [],
-  "tests/fixtures/wav/basicft8/170923_082045.wav:budgeted": [],
-  "tests/fixtures/wav/basicft8/170923_082045.wav:unlimited": [],
-  "tests/fixtures/wav/basicft8/live_now.wav:budgeted": [
-    "CQ AD8QW EM98|1678.1|1.920",
-    "CQ AD9DU EN52|240.6|2.400",
-    "CQ AE6CH CM97|2518.8|2.000",
-    "CQ AG6X DM12|1615.6|2.000",
-    "CQ DX EA8AQV IL28|165.6|2.400",
-    "CQ KD2YCK FN20|2796.9|2.000",
-    "CQ KG4OJT FM18|546.9|2.080",
-    "CQ VA3WL FN03|2396.9|2.000",
-    "CQ WA3YUV FM18|909.4|2.480",
-    "CQ WP4JKT EL95|296.9|1.680",
-    "K4TTL WA2HIP -16|1118.8|2.000",
-    "KD3ACB KB9DED R-03|2615.6|2.560",
-    "KE8USW K1HC -16|1746.9|2.080",
-    "KG5FLJ K3GC FM29|2134.4|1.760",
-    "KG5FLJ NY6C CM88|2071.9|2.080",
-    "N0KK WA8AHZ 73|625.0|2.080",
-    "N6IGV AC7WY R+07|2596.9|2.000",
-    "N6IGV V31DL EK57|1418.8|2.240",
-    "N6IGV W0OVX DN98|1928.1|2.000",
-    "N7KJL NV1U -04|1053.1|2.240",
-    "RX0AT KK4TE -02|740.6|2.080",
-    "SV9TLU K4CUL FM18|2021.9|2.000",
-    "TL8GD W9AV R-18|843.8|2.000",
-    "VE7LGP KO4LRW +16|2290.6|2.080",
-    "VE7LGP WB8P EM99|790.6|2.080",
-    "W1HFB W6TOX DM24|1496.9|2.240"
-  ],
-  "tests/fixtures/wav/basicft8/live_now.wav:unlimited": [
-    "CQ AD8QW EM98|1678.1|1.920",
-    "CQ AD9DU EN52|240.6|2.400",
-    "CQ AE6CH CM97|2518.8|2.000",
-    "CQ AG6X DM12|1615.6|2.000",
-    "CQ DX EA8AQV IL28|165.6|2.400",
-    "CQ KD2YCK FN20|2796.9|2.000",
-    "CQ KG4OJT FM18|546.9|2.080",
-    "CQ VA3WL FN03|2396.9|2.000",
-    "CQ WA3YUV FM18|909.4|2.480",
-    "CQ WP4JKT EL95|296.9|1.680",
-    "K4TTL WA2HIP -16|1118.8|2.000",
-    "KD3ACB KB9DED R-03|2615.6|2.560",
-    "KE8USW K1HC -16|1746.9|2.080",
-    "KG5FLJ K3GC FM29|2134.4|1.760",
-    "KG5FLJ NY6C CM88|2071.9|2.080",
-    "N0KK WA8AHZ 73|625.0|2.080",
-    "N6IGV AC7WY R+07|2596.9|2.000",
-    "N6IGV V31DL EK57|1418.8|2.240",
-    "N6IGV W0OVX DN98|1928.1|2.000",
-    "N7KJL NV1U -04|1053.1|2.240",
-    "RX0AT KK4TE -02|740.6|2.080",
-    "SV9TLU K4CUL FM18|2021.9|2.000",
-    "TL8GD W9AV R-18|843.8|2.000",
-    "VE7LGP KO4LRW +16|2290.6|2.080",
-    "VE7LGP WB8P EM99|790.6|2.080",
-    "W1HFB W6TOX DM24|1496.9|2.240"
-  ],
-  "tests/fixtures/wav/generated/ft8_cq.wav:budgeted": [
-    "CQ K1ABC FN42|1000.0|1.200"
-  ],
-  "tests/fixtures/wav/generated/ft8_cq.wav:unlimited": [
-    "CQ K1ABC FN42|1000.0|1.200"
-  ],
-  "tests/fixtures/wav/generated/ft8_report.wav:budgeted": [
-    "K1DEF W1ABC -12|1200.0|1.200"
-  ],
-  "tests/fixtures/wav/generated/ft8_report.wav:unlimited": [
-    "K1DEF W1ABC -12|1200.0|1.200"
-  ],
-  "tests/fixtures/wav/generated/ft8_rr73.wav:budgeted": [
-    "K1DEF W1ABC RR73|800.0|1.200"
-  ],
-  "tests/fixtures/wav/generated/ft8_rr73.wav:unlimited": [
-    "K1DEF W1ABC RR73|800.0|1.200"
-  ],
-  "tests/fixtures/wav/jtdx/000000_000001.wav:budgeted": [],
-  "tests/fixtures/wav/jtdx/000000_000001.wav:unlimited": [],
-  "tests/fixtures/wav/jtdx/190227_155815.wav:budgeted": [
-    "CQ A41ZZ LL93|1090.6|1.200",
-    "CQ ES6DO KO27|2168.8|0.880",
-    "CQ R9AAB MO04|2240.6|1.120",
-    "CQ RA9CAD LO96|2440.6|0.880",
-    "CQ RD3FC KO95|521.9|1.120",
-    "CQ RT4S LO36|1925.0|1.200",
-    "CQ UA3QNE LO01|2378.1|0.720",
-    "CQ YD0SCZ OI33|2018.8|1.840",
-    "EA1IPH UN7LAY -16|2309.4|1.120",
-    "EA3HRU R6LCM RR73|962.5|2.000",
-    "EA7DGC IK8DYE 73|1890.6|1.120",
-    "G3VAO UA3GDJ KO92|1293.8|2.560",
-    "GD3YUM BG4QNE PM01|2915.6|1.040",
-    "GD3YUM YB0BTA OI33|2265.6|0.080",
-    "KA7RLM R7NW R-23|2106.2|1.200",
-    "LB8ZH R2FAQ KO04|1006.2|1.120",
-    "R1BEQ UN7FU 73|425.0|1.200",
-    "R9AA IK5EEA 73|200.0|1.120",
-    "UA3AIU UR5GCK -03|1150.0|2.000",
-    "UA6LIK SP3AVS R+00|2568.8|1.120",
-    "UN7LZ RV3DQC -01|1659.4|1.120",
-    "YB3BBF SV2HXX R-20|821.9|1.200",
-    "YD1GNL R3KAB LN09|1434.4|1.120",
-    "YD1GNL UA8CW MO07|1493.8|1.360",
-    "YD1GNL UN7ZAI MO51|1800.0|1.200"
-  ],
-  "tests/fixtures/wav/jtdx/190227_155815.wav:unlimited": [
-    "CQ A41ZZ LL93|1090.6|1.200",
-    "CQ ES6DO KO27|2168.8|0.880",
-    "CQ R9AAB MO04|2240.6|1.120",
-    "CQ RA9CAD LO96|2440.6|0.880",
-    "CQ RD3FC KO95|521.9|1.120",
-    "CQ RT4S LO36|1925.0|1.200",
-    "CQ UA3QNE LO01|2378.1|0.720",
-    "CQ YD0SCZ OI33|2018.8|1.840",
-    "EA1IPH UN7LAY -16|2309.4|1.120",
-    "EA3HRU R6LCM RR73|962.5|2.000",
-    "EA7DGC IK8DYE 73|1890.6|1.120",
-    "G3VAO UA3GDJ KO92|1293.8|2.560",
-    "GD3YUM BG4QNE PM01|2915.6|1.040",
-    "GD3YUM YB0BTA OI33|2265.6|0.080",
-    "KA7RLM R7NW R-23|2106.2|1.200",
-    "LB8ZH R2FAQ KO04|1006.2|1.120",
-    "R1BEQ UN7FU 73|425.0|1.200",
-    "R9AA IK5EEA 73|200.0|1.120",
-    "UA3AIU UR5GCK -03|1150.0|2.000",
-    "UA6LIK SP3AVS R+00|2568.8|1.120",
-    "UN7LZ RV3DQC -01|1659.4|1.120",
-    "YB3BBF SV2HXX R-20|821.9|1.200",
-    "YD1GNL R3KAB LN09|1434.4|1.120",
-    "YD1GNL UA8CW MO07|1493.8|1.360",
-    "YD1GNL UN7ZAI MO51|1800.0|1.200"
-  ],
-  "tests/fixtures/wav/wsjt/170709_135615.wav:budgeted": [],
-  "tests/fixtures/wav/wsjt/170709_135615.wav:unlimited": [],
-  "tests/fixtures/wav/wsjt/181201_180245.wav:budgeted": [
-    "CQ RU K1BAA DM03|325.0|0.640",
-    "CQ RU NT2A FN20|1978.1|0.560",
-    "CQ RU W7BOB DN14|446.9|0.480",
-    "CQ UW5EJX/MM|753.1|0.400",
-    "K1JT 9A2JK RR73|1440.6|0.560",
-    "K8RGI W6BQ 73|231.2|0.560",
-    "N8HRZ W7CD 73|784.4|0.960",
-    "W1ATV F6DKQ 73|1246.9|0.640",
-    "W3RGA KM6JD RR73|1878.1|0.640"
-  ],
-  "tests/fixtures/wav/wsjt/181201_180245.wav:unlimited": [
-    "CQ RU K1BAA DM03|325.0|0.640",
-    "CQ RU NT2A FN20|1978.1|0.560",
-    "CQ RU W7BOB DN14|446.9|0.480",
-    "CQ UW5EJX/MM|753.1|0.400",
-    "K1JT 9A2JK RR73|1440.6|0.560",
-    "K8RGI W6BQ 73|231.2|0.560",
-    "N8HRZ W7CD 73|784.4|0.960",
-    "W1ATV F6DKQ 73|1246.9|0.640",
-    "W3RGA KM6JD RR73|1878.1|0.640"
-  ],
-  "tests/fixtures/wav/wsjt/210703_133430.wav:budgeted": [
-    "A92EE F5PSR -14|721.9|0.640",
-    "K1JT EA3AGB -15|1646.9|0.560",
-    "K1JT HA0DU KN07|590.6|0.800",
-    "N1JFU EA6EE R-07|640.6|0.720",
-    "W1DIG SV9CVY -14|2734.4|0.880",
-    "W1FC F5BZB -08|2571.9|0.720",
-    "WM3PEN EA6VQ -09|2159.4|0.400",
-    "XE2X HA2NP RR73|2853.1|0.640"
-  ],
-  "tests/fixtures/wav/wsjt/210703_133430.wav:unlimited": [
-    "A92EE F5PSR -14|721.9|0.640",
-    "K1JT EA3AGB -15|1646.9|0.560",
-    "K1JT HA0DU KN07|590.6|0.800",
-    "N1JFU EA6EE R-07|640.6|0.720",
-    "W1DIG SV9CVY -14|2734.4|0.880",
-    "W1FC F5BZB -08|2571.9|0.720",
-    "WM3PEN EA6VQ -09|2159.4|0.400",
-    "XE2X HA2NP RR73|2853.1|0.640"
-  ]
+  "tests/fixtures/wav/basicft8/170923_082000.wav": {
+    "first_pass": [
+      "I07OGE LC1TVY EI22"
+    ],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/basicft8/170923_082015.wav": {
+    "first_pass": [],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/basicft8/170923_082030.wav": {
+    "first_pass": [],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/basicft8/170923_082045.wav": {
+    "first_pass": [],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/basicft8/live_now.wav": {
+    "first_pass": [
+      "CQ AD8QW EM98",
+      "CQ AD9DU EN52",
+      "CQ AE6CH CM97",
+      "CQ AG6X DM12",
+      "CQ DX EA8AQV IL28",
+      "CQ KD2YCK FN20",
+      "CQ KG4OJT FM18",
+      "CQ VA3WL FN03",
+      "CQ WA3YUV FM18",
+      "CQ WP4JKT EL95",
+      "K4TTL WA2HIP -16",
+      "KD3ACB KB9DED R-03",
+      "KE8USW K1HC -16",
+      "KG5FLJ K3GC FM29",
+      "KG5FLJ NY6C CM88",
+      "N0KK WA8AHZ 73",
+      "N6IGV AC7WY R+07",
+      "N6IGV V31DL EK57",
+      "N6IGV W0OVX DN98",
+      "N7KJL NV1U -04",
+      "RX0AT KK4TE -02",
+      "SV9TLU K4CUL FM18",
+      "TL8GD W9AV R-18",
+      "VE7LGP KO4LRW +16",
+      "VE7LGP WB8P EM99",
+      "W1HFB W6TOX DM24"
+    ],
+    "second_pass_only": [
+      "CQ KK6KC DM03",
+      "VA3VD N3DAW FN31"
+    ]
+  },
+  "tests/fixtures/wav/generated/ft8_cq.wav": {
+    "first_pass": [
+      "CQ K1ABC FN42"
+    ],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/generated/ft8_report.wav": {
+    "first_pass": [
+      "K1DEF W1ABC -12"
+    ],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/generated/ft8_rr73.wav": {
+    "first_pass": [
+      "K1DEF W1ABC RR73"
+    ],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/jtdx/000000_000001.wav": {
+    "first_pass": [],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/jtdx/190227_155815.wav": {
+    "first_pass": [
+      "CQ A41ZZ LL93",
+      "CQ ES6DO KO27",
+      "CQ R9AAB MO04",
+      "CQ RA9CAD LO96",
+      "CQ RD3FC KO95",
+      "CQ RT4S LO36",
+      "CQ UA3QNE LO01",
+      "CQ YD0SCZ OI33",
+      "EA1IPH UN7LAY -16",
+      "EA3HRU R6LCM RR73",
+      "EA7DGC IK8DYE 73",
+      "G3VAO UA3GDJ KO92",
+      "GD3YUM BG4QNE PM01",
+      "GD3YUM YB0BTA OI33",
+      "KA7RLM R7NW R-23",
+      "LB8ZH R2FAQ KO04",
+      "R1BEQ UN7FU 73",
+      "R9AA IK5EEA 73",
+      "UA3AIU UR5GCK -03",
+      "UA6LIK SP3AVS R+00",
+      "UN7LZ RV3DQC -01",
+      "YB3BBF SV2HXX R-20",
+      "YD1GNL R3KAB LN09",
+      "YD1GNL UA8CW MO07",
+      "YD1GNL UN7ZAI MO51"
+    ],
+    "second_pass_only": [
+      "CQ LZ2SR KN23",
+      "CQ RN5AA KO85"
+    ]
+  },
+  "tests/fixtures/wav/wsjt/170709_135615.wav": {
+    "first_pass": [],
+    "second_pass_only": []
+  },
+  "tests/fixtures/wav/wsjt/181201_180245.wav": {
+    "first_pass": [
+      "CQ RU K1BAA DM03",
+      "CQ RU NT2A FN20",
+      "CQ RU W7BOB DN14",
+      "K1JT 9A2JK RR73",
+      "K8RGI W6BQ 73",
+      "N8HRZ W7CD 73",
+      "W1ATV F6DKQ 73",
+      "W3RGA KM6JD RR73"
+    ],
+    "second_pass_only": [
+      "CQ UW5EJX/MM"
+    ]
+  },
+  "tests/fixtures/wav/wsjt/210703_133430.wav": {
+    "first_pass": [
+      "A92EE F5PSR -14",
+      "K1JT EA3AGB -15",
+      "K1JT HA0DU KN07",
+      "N1JFU EA6EE R-07",
+      "W1DIG SV9CVY -14",
+      "W1FC F5BZB -08",
+      "WM3PEN EA6VQ -09",
+      "XE2X HA2NP RR73"
+    ],
+    "second_pass_only": []
+  }
 }
