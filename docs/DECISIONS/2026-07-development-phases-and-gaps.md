@@ -92,6 +92,9 @@
     the dial store is still torn down by `BandChanged` (Codex P1 on PR #613). The read cannot
     move under the gate (`apply_tx_offset_switch` takes `qsos` before `ptt_sync_gate`); closing
     it needs the QSO task to arbitrate the QSY, for example a request/ack through its message loop.
+    The autonomous band hop (`coordinator::band_hop::execute_band_hop`, PAN-385) reads the same
+    snapshot and has the same gap; the PAN-385 recheck listed it as its finding 1 of 3
+    (re-verified in PAN-449).
 
 ## Missing-docs lint status (verified 2026-11-18)
 

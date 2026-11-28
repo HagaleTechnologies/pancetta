@@ -1109,3 +1109,62 @@ fn pan385_needed_hop_needs_a_known_current_band_count() {
     let partial = |now| Some(snap(now, &[(Band::Band17m, 2, 0)]));
     assert!(first_hop_slot(&mut h, 60, partial).is_none());
 }
+
+#[test]
+fn pan449_needed_hop_held_by_an_exchange_is_reported_as_waiting() {
+    // PAN-385 finding 6: the AC1 needed hop falls due at t0 + 600 s. While a
+    // partner has answered no `ChangeBand` is emitted, but the hop is held
+    // for the Diagnostics waiting line, as a held plan move is.
+    let mut h = Harness::new(AC1_BANDS, vec![], Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    for k in 0..=46 {
+        let now = t0() + secs(15 * k);
+        h.op.set_exchange_in_progress((35..=45).contains(&k));
+        let a = h.slot(now, &two_cqs(), Some(ac1_snapshot(now)));
+        let held = h.op.take_held_band_hop();
+        assert!(h.op.take_held_band_hop().is_none(), "taken once");
+        match k {
+            0..=39 => {
+                assert!(hop_of(&a).is_none(), "no hop at t0 + {} s", 15 * k);
+                assert!(held.is_none(), "nothing due at t0 + {} s", 15 * k);
+            }
+            40..=45 => {
+                assert!(
+                    hop_of(&a).is_none(),
+                    "no ChangeBand while a partner answered"
+                );
+                let held = held.expect("the due needed hop is held");
+                assert!(
+                    matches!(held, BandHopReason::NeededActivity { .. }),
+                    "{held:?}"
+                );
+                assert_eq!(held.to_band(), Some(Band::Band17m));
+                assert_eq!(
+                    held.waiting_text("QSO with K1ABC in progress"),
+                    "Band hop 20m -> 17m waiting: QSO with K1ABC in progress"
+                );
+            }
+            _ => {
+                let (dial, reason) = hop_of(&a).expect("hop once the exchange ends");
+                assert_eq!(dial, 18_100_000);
+                assert!(reason
+                    .why_text()
+                    .starts_with("Band hop 20m -> 17m: needed activity"));
+                assert!(held.is_none());
+            }
+        }
+    }
+
+    // Fox mode wins over the exchange and keeps a held needed hop silent
+    // (PAN-447).
+    let mut h = Harness::new(AC1_BANDS, vec![], Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    for k in 0..=45 {
+        let now = t0() + secs(15 * k);
+        h.op.set_exchange_in_progress(k >= 35);
+        h.op.set_fox_mode(k >= 35);
+        let a = h.slot(now, &two_cqs(), Some(ac1_snapshot(now)));
+        assert!(hop_of(&a).is_none());
+        assert!(h.op.take_held_band_hop().is_none(), "t0 + {} s", 15 * k);
+    }
+}

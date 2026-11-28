@@ -2797,9 +2797,11 @@ impl super::ApplicationCoordinator {
                             // PAN-358: decide on the shared slot clock's time.
                             let actions = op.decide_at_time(slot_clock.now());
                             let skip_records = op.take_skip_log();
-                            // PAN-385: a plan-window hop held back by the
-                            // exchange (or PAN-447 Fox-mode) gate emits no
-                            // `ChangeBand`; report it as waiting below.
+                            // PAN-385: a plan-window move, or (PAN-449) a
+                            // due needed-activity hop, held back by the
+                            // exchange gate (a plan move also by the PAN-447
+                            // Fox-mode gate) emits no `ChangeBand`; report it
+                            // as waiting below.
                             let held_band_hop = if band_hopping_enabled {
                                 op.take_held_band_hop()
                             } else {
