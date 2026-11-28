@@ -170,7 +170,7 @@ cmd_guard_ci() {
                     continue
                 fi
                 matches+="$line"$'\n'
-            done < <(grep -rIn "$term" "${REPO_ROOT}/.github/workflows" 2>/dev/null || true)
+            done < <(grep -rIn -e "$term" "${REPO_ROOT}/.github/workflows" 2>/dev/null || true)
             if [ -n "$matches" ]; then
                 echo "FORBIDDEN reference in .github/workflows:"
                 echo "$matches" | head -5

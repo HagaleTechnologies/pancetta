@@ -96,7 +96,9 @@ RUBY
 # command, an --exclude flag, the path-filter glob) with a forbidden research
 # reference -- a research test run on the same line -- must still trip the
 # guard. Each fixture writes a one-line workflow inside a disposable git repo
-# and runs the shipped script against it.
+# and runs the shipped script against it. PAN-456 adds a rejecting row for
+# every forbidden term, including the `--bin <name>` terms grep once parsed as
+# options and so never matched.
 repo_root=$PWD
 guard_repo=$(mktemp -d)
 trap 'rm -rf "$guard_repo"' EXIT
@@ -128,4 +130,21 @@ guard_case accept "        run: cargo check -p pancetta-research --all-targets -
 guard_case accept "        run: cargo clippy --workspace --exclude pancetta-research --all-targets -- -D warnings"
 guard_case accept "              - 'pancetta-research/**'"
 guard_case accept "          # every Rust lane passes --exclude pancetta-research"
-echo "PASS: research guard allowances are occurrence-scoped"
+# PAN-456: terms that start with `--` must reach grep as a pattern, not an
+# option. A research bin run is forbidden alone and next to an allowed check.
+guard_case reject "        run: cargo run --bin eval"
+guard_case reject "        run: cargo run --bin compare"
+guard_case reject "        run: cargo run --bin leaderboard"
+guard_case reject "        run: cargo run --bin curate"
+guard_case reject "        run: cargo run --bin baseline"
+guard_case reject "        run: cargo check -p pancetta-research --all-targets && cargo run --bin eval"
+# Every other forbidden term trips the guard too, so none can fail open
+# silently.
+guard_case reject "        run: ./scripts/research-env.sh --status"
+guard_case reject "        run: cat research/scorecards/x.md"
+guard_case reject "        run: cat research/experiments/x.md"
+guard_case reject "        run: cat research/baselines/x.md"
+guard_case reject "        run: cat research/corpus/x.md"
+# A whole-line comment naming a research bin stays allowed.
+guard_case accept "          # cargo run --bin eval is local only"
+echo "PASS: research guard allowances are occurrence-scoped and every forbidden term is caught"
