@@ -5043,6 +5043,43 @@ impl App {
         }
     }
 
+    /// Resolve the Fox offset for Shift+H. A network-only spot must be on
+    /// the current dial before Hound can use its absolute RF frequency.
+    pub fn hound_fox_offset(&self, row: &DxStation) -> Result<u64, String> {
+        if row.source != SpotSource::Network {
+            return self
+                .external_row_refusal(row)
+                .map_or(Ok(row.audio_offset_hz.unwrap_or(1500)), Err);
+        }
+        let no_spot = || format!("Hound: no usable FT8 spot frequency for {}.", row.call_sign);
+        let rf = row.spot_rf_hz.ok_or_else(no_spot)?;
+        let target = crate::spot_call::resolve_spot_call(
+            rf,
+            &self.station_info.mode,
+            &self.config.bands.bands,
+        )
+        .map_err(|_| no_spot())?;
+        let offset = target.audio_offset_hz.ok_or_else(no_spot)?;
+        let operating = hz_from_mhz(self.station_info.operating_frequency);
+        let readback = self.radio_frequency.and_then(hz_from_mhz);
+        if matches!((operating, readback), (Some(o), Some(r)) if pancetta_core::types::band::is_band_change(o, r))
+        {
+            return Err("Hound: rig and operating bands differ.".to_string());
+        }
+        let current = readback
+            .or(operating)
+            .ok_or_else(|| "Hound: pancetta's dial is unknown.".to_string())?;
+        if !pancetta_core::types::band::same_dial(current, target.dial_hz) {
+            return Err(format!(
+                "Hound: tune to {} {} for {}.",
+                dial_label(target.dial_hz),
+                self.station_info.mode,
+                row.call_sign
+            ));
+        }
+        Ok(offset)
+    }
+
     /// PAN-435, PAN-443: refuse unless WSJT-X's dial (`wsjtx_dial_mhz`) is
     /// within [`pancetta_core::types::band::SAME_DIAL_SLACK_HZ`] of
     /// pancetta's dial and `mode` is pancetta's mode. Pancetta's dial is the
